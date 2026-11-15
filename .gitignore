@@ -1,0 +1,17 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Editor swap/backup/temp
+*.sw[po]
+*~
+*.tmp
+.quill/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
