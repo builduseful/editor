@@ -7,7 +7,7 @@ Cargo.lock.orig
 *.sw[po]
 *~
 *.tmp
-.quill/
+.editor/
 
 # OS
 .DS_Store

@@ -1,6 +1,6 @@
-# Quill — Plan
+# editor — Plan
 
-> Working title **Quill** (placeholder — easy to rename).
+> Name: **editor** (chosen).
 > Status: planning. No code yet.
 
 A terminal-native text editor built for **minimum memory, minimum CPU, maximum
@@ -71,8 +71,10 @@ Alternatives considered:
 | Zig | Great fit, tiny binaries | Immature ecosystem/tooling, smaller talent pool |
 | Go | Easy cross-compile | GC pauses, larger binaries, less control over allocation |
 
-**Decision needed:** confirm Rust. If the user prefers another language the plan
-structure holds; only §4, §5, and §11 change materially.
+**Decision:** Rust, standard library only (confirmed).
+
+If the language ever changes, the plan structure holds; only §4, §5, and §11
+change materially.
 
 Platform abstraction: a small `sys` module with `#[cfg(target_os = ...)]` blocks
 for the handful of OS-specific pieces (terminal raw mode, window size, mmap,
@@ -81,7 +83,7 @@ file watching). Everything else is portable `std`.
 ## 5. Architecture
 
 ```
-quill/
+editor/
 ├── Cargo.toml
 ├── crates/
 │   ├── core/         # buffer, piece table, line index, search, syntax, git,
@@ -98,17 +100,23 @@ but `std` (plus `sys`).
 
 - **Piece table** over the original file plus an append-only edit log. An edit is
   metadata, not a data copy. Undo/redo is just moving a cursor in the log.
-- **Line index**: lazy array of line-start offsets, built once per file, cached,
-  invalidated on edit. Gives O(1) line↔offset conversion and O(log n) lookup.
-- **Windows/paging**: reads go through `mmap` (POSIX) or
-  `CreateFileMapping`/`MapViewOfFile` (Windows); reads outside the mapped region
-  fall back to positioned `pread`. Memory is reclaimed by the OS under pressure.
-- **Writes**: mutate a copy-on-write segment, then write the whole logical
-  document to a temp file in the same directory, `fsync`, and atomic-rename over
-  the original. Never corrupt a file on crash. Preserve permissions/ownership.
-- **Large-file mode**: if a file exceeds a threshold (configurable, e.g. 64 MB),
-  the buffer operates in streaming mode — the piece table references the mmap and
-  edits are logged but only touched regions are materialized.
+- **Line index**: a sparse, block-based index of line-start offsets, built lazily
+  and cached, invalidated on edit. Each block covers a fixed number of lines
+  (e.g. 1 Ki). To find line N, load the block containing it and scan within that
+  block. Small files behave like a flat O(1) index; huge files keep memory bounded
+  because only touched blocks are resident.
+- **Memory-mapped reads**: the file is mapped with `mmap` (POSIX) or
+  `CreateFileMapping`/`MapViewOfFile` (Windows). The OS demand-pages only the
+  regions you touch and reclaims them under memory pressure. The *same* code path
+  handles a 1 KB file and a 100 GB file — no full read, no size threshold.
+- **Writes**: mutate a copy-on-write segment, then write the logical document to a
+  temp file in the same directory, `fsync`, and atomic-rename over the original.
+  Never corrupt a file on crash. Preserve permissions/ownership.
+- **Large files — simplest correct approach**: mmap *is* the streaming approach.
+  There is no separate "large-file mode" to special-case (a second code path is
+  where bugs live). The piece table references the mapping, edits append small
+  buffers, and only visible windows are ever materialized. If mmap is unavailable
+  (empty file, platform restriction), fall back to positioned `pread`.
 
 ### 5.2 Performance budget (targets)
 
@@ -131,10 +139,10 @@ but `std` (plus `sys`).
 
 ## 6. CLI specification (AI-first)
 
-Single binary `quill`. Two shapes:
+Single binary `editor`. Two shapes:
 
-- `quill <path>` → launch the TUI (human).
-- `quill <command> ...` → one-shot operation (agent). Deterministic output.
+- `editor <path>` → launch the TUI (human).
+- `editor <command> ...` → one-shot operation (agent). Deterministic output.
 
 ### 6.1 Command surface
 
@@ -143,16 +151,16 @@ when stdout is a TTY; `--json` is the default when stdout is piped.
 
 | Command | Purpose |
 | --- | --- |
-| `quill read <path> [--from N] [--to N] [--json]` | Read whole file or line range. Never loads more than needed. |
-| `quill write <path> [--stdin \| --content TEXT]` | Create/overwrite atomically. |
-| `quill insert <path> --at LINE[:COL] --text TEXT` | Insert text. |
-| `quill replace <path> --from LINE[:COL] --to LINE[:COL] --text TEXT` | Replace a range. |
-| `quill delete <path> --from LINE[:COL] --to LINE[:COL]` | Delete a range. |
-| `quill search <path\|dir> --pattern RE [--literal] [--json]` | Literal or regex search, file or tree. |
-| `quill goto <path> --line N [--col N]` | Report context around a location (for agents). |
-| `quill stats <path>` | Size, lines, encoding, line endings, hash. |
-| `quill apply <path> --patch FILE` | Apply a unified diff / edit transaction. |
-| `quill serve` | Long-lived JSON-lines RPC server (phase 2). |
+| `editor read <path> [--from N] [--to N] [--json]` | Read whole file or line range. Never loads more than needed. |
+| `editor write <path> [--stdin \| --content TEXT]` | Create/overwrite atomically. |
+| `editor insert <path> --at LINE[:COL] --text TEXT` | Insert text. |
+| `editor replace <path> --from LINE[:COL] --to LINE[:COL] --text TEXT` | Replace a range. |
+| `editor delete <path> --from LINE[:COL] --to LINE[:COL]` | Delete a range. |
+| `editor search <path\|dir> --pattern RE [--literal] [--json]` | Literal or regex search, file or tree. |
+| `editor goto <path> --line N [--col N]` | Report context around a location (for agents). |
+| `editor stats <path>` | Size, lines, encoding, line endings, hash. |
+| `editor apply <path> --patch FILE` | Apply a unified diff / edit transaction. |
+| `editor serve` | Long-lived JSON-lines RPC server (deferred — see §6.5). |
 
 ### 6.2 Output contract
 
@@ -176,11 +184,35 @@ golden output.
 ### 6.4 Example agent loop
 
 ```sh
-quill read src/main.rs --from 120 --to 160 --json
-quill replace src/main.rs --from 138 --to 139 --text "let x = compute();"
-quill search src --pattern "compute" --literal --json
-quill stats src/main.rs --json
+editor read src/main.rs --from 120 --to 160 --json
+editor replace src/main.rs --from 138 --to 139 --text "let x = compute();"
+editor search src --pattern "compute" --literal --json
+editor stats src/main.rs --json
 ```
+
+### 6.5 One-shot vs. a long-lived server
+
+**Decision: ship stateless one-shot commands in the MVP. Add `editor serve` later
+(phase 8) only if real usage shows repeated open/index cost.**
+
+The two options:
+
+- **One-shot** (`editor replace ...` per call): the process opens the file, applies
+  the edit, atomically saves, exits. Dead simple, trivially correct, and naturally
+  "always up to date" — there is no long-lived state to go stale. With mmap, open
+  is microseconds and the block line index is only built for the lines actually
+  touched, so even a large file does not pay a full-index cost per call.
+- **Server** (`editor serve`): a long-lived JSON-lines process keeps buffers, line
+  indexes, and undo stacks between calls. It avoids re-opening on every command and
+  can hold state, but adds a protocol, request IDs, lifecycle/timeouts, stale-buffer
+  handling, memory growth, and cross-platform process management.
+
+Why one-shot first: most agent edits are a handful of commands, mmap makes the
+per-call cost negligible, and the hash/`rev` optimistic-concurrency check already
+covers the main thing a server would otherwise provide (detecting concurrent
+modification). `serve` is **additive** — the same command handlers run in-process —
+so it can be introduced without changing command semantics. Revisit if profiling
+shows repeated open/index cost dominating.
 
 ## 7. TUI design
 
@@ -217,8 +249,8 @@ quill stats src/main.rs --json
 - **Markdown**: side-by-side or toggle preview; render from the same buffer using
   a small built-in renderer. Never blocks editing.
 - **Git**: native status/diff/commit via direct `git` CLI subprocess (fast,
-  correct, zero reimplementation). `quill git status|diff|commit ...`.
-- **Scripts**: a lightweight command runner (`quill run <script>`) that executes
+  correct, zero reimplementation). `editor git status|diff|commit ...`.
+- **Scripts**: a lightweight command runner (`editor run <script>`) that executes
   project scripts / `dotnet run`, streams output. This is the sanctioned escape
   hatch instead of building build systems into the editor.
 
@@ -262,16 +294,21 @@ quill stats src/main.rs --json
 - **Phase 5 — Markdown preview**.
 - **Phase 6 — Git** (via git CLI).
 - **Phase 7 — Script runner**.
-- **Phase 8 — `quill serve`** long-lived JSON-lines RPC for agent sessions.
+- **Phase 8 — `editor serve`** long-lived JSON-lines RPC for agent sessions.
 
 Explicitly out of scope: plugins/mods, network, telemetry.
 
 ## 15. Open questions
 
-1. **Language**: confirm Rust (std-only) vs. C/Zig preference.
-2. **Name**: keep "Quill" or pick another?
+Resolved:
+
+1. **Language**: Rust, standard library only.
+2. **Name**: `editor`.
+4. **File size**: no special threshold — mmap + piece table + block line index
+   handle small and huge files through one code path (see §5.1).
+5. **`serve` mode**: deferred; stateless one-shot CLI in the MVP (§6.5).
+
+Still open:
+
 3. **Editing model**: modal (vi-like) vs. modeless default for the TUI.
-4. **File size ceiling**: what "very large" means in practice (100 MB? 10 GB?),
-   which sets the streaming threshold and test targets.
-5. **`serve` mode**: needed in MVP, or fine to start with stateless one-shot CLI?
 6. **Config format**: built-in key=value, or a small embedded format (no serde).
