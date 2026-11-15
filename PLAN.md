@@ -49,9 +49,10 @@ biggest changes:
     for and ported later; syntax/Markdown/git/scripts deferred. The v1 feature
     list was IDE-shaped and would have killed the "minimal" goal.
 11. **"No third-party libraries" is restated precisely.** No vendored or bundled
-    third-party code. OS system libraries are allowed (Cocoa/AppKit/CoreText,
-    Win32/DirectWrite, X11/Xft/fontconfig/freetype/HarfBuzz). On Linux there is
-    no "OS framework" in the macOS sense; freedesktop libraries are the system.
+    third-party code. OS system libraries **and their FFI bindings** (`libc`,
+    `windows-sys`, `core-foundation`) are allowed — they are bindings to the OS,
+    not vendored functionality. This is the policy that makes the Rust core
+    viable; without it, choose C++ everywhere.
 
 ---
 
@@ -62,7 +63,8 @@ biggest changes:
 - Stay responsive with thousands of files in a project.
 - Near-zero idle CPU; small, predictable, **measured** memory footprint.
 - Genuine native app on macOS, Windows, Linux.
-- One shared core (Rust, std-only) for all platforms; thin native chrome.
+- One shared core (Rust, std + OS FFI bindings) for all platforms; thin native
+  chrome.
 - A CLI that exposes every feature, emits machine-readable output, and is driven by
   the same domain ops as the GUI.
 - No vendored third-party code.
@@ -81,10 +83,10 @@ biggest changes:
 
 | Decision | Choice |
 | --- | --- |
-| Core language | Rust, std-only, OS FFI confined to `core::sys` |
+| Core language | Rust, std-only + OS FFI bindings; all other unsafe in `core::sys` |
 | UI | Native OS windows + native chrome + custom/hybrid text view |
 | Platform order | macOS first; Windows/Linux designed-for-now, ported later |
-| Dependency rule | No vendored/bundled third-party; OS system libraries allowed |
+| Dependency rule | No vendored/bundled third-party; OS libraries **and their FFI bindings** allowed |
 | CLI model | Stateless one-shot + `batch` transactions; `serve` deferred |
 | Addressing | Bytes; line = byte range; col = UTF-8 byte offset |
 | Memory metric | Private footprint (not RSS) |
@@ -216,6 +218,68 @@ Non-negotiable rules written into the header as comments:
   until the next core call on that thread. No `strdup`, no retention.
 - **Windows CRT**: ship `core.dll` (`cdylib`) on Windows to avoid two heaps;
   `staticlib` on macOS/Linux.
+
+### 4.3 Language decision (final) and FFI budget
+
+Three independent reviews (systems, delivery, prior art) compared Rust, C, and
+C++ against this plan. Scores: **Rust 48/60, C++ 45/60, C 38/60** (systems
+scorecard). All three recommend **Rust for the core**, with **C++ as the
+legitimate fallback** and **C only if the scope collapses**. The developer is
+fluent in both Rust and C++, which removes the learning-curve argument; the
+decision is now purely architectural.
+
+**Decision: Rust core + CLI; C++ viewcore + platform; frozen C ABI.**
+
+Why Rust wins here, specifically:
+
+- **UTF-8 and byte-accurate addressing are the core contract.** `str`,
+  `Utf8Error::valid_up_to`, `is_char_boundary`, and `char_indices` are exactly
+  what a byte-accurate editor needs. C/C++ hand-write this.
+- **Untrusted input is a security boundary.** The AI-first CLI parses patches and
+  JSON-lines. Bounds-checked slices eliminate the patch-parser CVE class.
+- **Re-entrancy and aliasing are the classic editor crash class** (callbacks
+  mutating during iteration, undo holding a `&str` into a compacted buffer).
+  `&mut Editor` + drain makes most of these compile errors.
+- **Parallel search is race-free by construction** (`Send`/`Sync`).
+- **Compiler-assisted maintenance** for one developer over five years.
+
+Why C++ is the fallback, not a compromise:
+
+- **One language** for core + viewcore + platform: zero C ABI seam, one build
+  graph, direct OS headers.
+- **`std::pmr`** is a textbook fit for the bounded 1000–2000 line-layout cache.
+- **Kakoune** is the existence proof: a zero-dependency C++ editor, fast on huge
+  files.
+- Mature ASan/UBSan/TSan and lldb/VS/WinDbg.
+
+Why C is out for the core: hand-rolled containers, UTF-8, error plumbing, and
+platform code; the five-year bug/maintenance cost is too high for a
+reliability-focused project. C is right only for a much smaller editor.
+
+**The one policy that decides it:** OS FFI bindings (`libc`, `windows-sys`,
+`core-foundation`) are **allowed** and are not "third-party libraries" — they are
+bindings to the OS. Without them, Rust must hand-declare `mmap`, `madvise`,
+`clonefile`, `FICLONE`, `copy_file_range`, `F_FULLFSYNC`, `inotify`, `FSEvents`,
+`ReadDirectoryChangesW`, and every `#[repr(C)]` layout, with no compiler help.
+That lands on §5.5/5.6/5.7/9, the four hardest sections. If bindings are
+disallowed, **switch to C++ everywhere**.
+
+**Hard FFI budget and go/no-go gate (M0.5):**
+
+- `core::sys` (all `unsafe`) must stay **≤ 1.5–2k LOC** and **≤ 20–25%** of the
+  core. If it exceeds this, switch to C++.
+- `panic = "unwind"` in the core; `catch_unwind` at every exported entry; a
+  `poisoned` flag + `ED_E_PANIC` recovery. Do not use `panic = "abort"` until
+  after M2.
+- `#![forbid(unsafe_op_in_unsafe_fn)]`; all `unsafe` confined to `core::sys`.
+- Miri for pure logic; fuzz the patch/JSON/UTF-8 paths.
+- `#[repr(C)]` structs with C `_Static_assert`/`static_assert` size checks.
+- `Box<Editor>`; make it `!Send` (`PhantomData<*const ()>`) if one-per-thread is
+  to be compiler-enforced. No `&mut` across FFI; raw pointers only.
+- No `HashMap` iteration in JSON; use `BTreeMap`.
+- **M0.5 gate**: C conformance client (compiled with `cc`, no Rust knowledge) +
+  footprint/startup comparison against a small C++ prototype. If C++ beats Rust
+  by **>20% on footprint or startup** after LTO, or Rust adds **>1–2 MB**, switch.
 
 ---
 
@@ -627,9 +691,11 @@ Three tiers:
   incremental save, undo, domain ops, `read`/`write`/`edit`/`diff`/`apply`/
   `search`/`stats`/`move`/`restore`/`batch`/`info`, JSON envelope, security
   guardrails, tests, benchmarks. **Gate: edit 1 line in 1 GB < 100 ms (CoW).**
-- **M0.5 — Freeze the ABI + headless render oracle.** C conformance client;
-  viewport-read/layout harness with no UI; **5 GB read-only demo** scrolling at
-  60 fps with flat footprint; `editor stats` JSON.
+- **M0.5 — Freeze the ABI + headless render oracle + language go/no-go.** C
+  conformance client; viewport-read/layout harness with no UI; **5 GB read-only
+  demo** scrolling at 60 fps with flat footprint; `editor stats` JSON. Compare
+  footprint/startup against a small C++ prototype: if C++ wins by **>20%** or
+  Rust adds **>1–2 MB**, switch the core to C++.
 - **M1 — macOS read-only window.** AppKit + `viewcore` + CoreText backend:
   menu, open dialog, custom text view, scrolling. *First native app.*
 - **M1.5 — Windows read-only spike.** DirectWrite + D2D implementing the same
