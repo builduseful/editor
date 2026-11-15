@@ -49,9 +49,15 @@ underspecified. The biggest changes:
     for and ported later; syntax/Markdown/git/scripts deferred. The v1 feature
     list was IDE-shaped and would have killed the "minimal" goal.
 11. **"No third-party libraries" is restated precisely.** No vendored or bundled
-    third-party code. OS system libraries (Cocoa/AppKit/CoreText, Win32/DirectWrite,
-    X11/Xft/fontconfig/freetype/HarfBuzz) are allowed. C++ needs **no exception**
-    for OS FFI — the headers are part of the platform.
+    third-party code. OS system libraries (Cocoa/AppKit/CoreText, Win32/DirectWrite)
+    are allowed. On Linux there is no single OS framework; freedesktop libraries
+    (X11/Xft, fontconfig, freetype, HarfBuzz) are treated as system libraries —
+    confirm their availability (open decision). C++ needs **no exception** for OS
+    FFI — the headers are part of the platform.
+12. **Language is C++ all-in.** Three independent final reviews (correctness,
+    delivery, systems) reversed the earlier Rust lean: C++ 1st, Rust 2nd, C 3rd,
+    medium confidence. The C ABI is replaced by a frozen C++ `Editor` interface.
+    See §4.3 for the reasoning, the C++ safety process, and the flip conditions.
 
 ---
 
@@ -136,8 +142,7 @@ Split into three layers:
 
 1. **Domain ops (`core`)**: pure functions over a `Buffer` — `insert`,
    `replace`, `search`, `parse_patch` — returning `std::vector<EditOp>` +
-  `std::vector<Change>`.
-   No I/O policy, no persistence, no exit codes.
+   `std::vector<Change>`. No I/O policy, no persistence, no exit codes.
 2. **Transaction/undo layer**: inverse-op stack, dirty flag, save policy. Shared.
 3. **Adapters**: CLI (argv → ops → persist once → envelope) and GUI (menu → ops →
    mark dirty → repaint from change ranges). Neither calls the other.
@@ -175,6 +180,7 @@ struct Edit {
 
 class Editor {
  public:
+  static constexpr uint32_t kInterfaceVersion = 1;
   virtual ~Editor() = default;
   virtual Status open(std::string_view path_utf8) = 0;
   virtual Status info(Info* out) const = 0;
@@ -210,6 +216,8 @@ Non-negotiable rules written into the header as comments:
   error, and `0` must not be ambiguous between "empty line" and "error".
 - **`col` is a UTF-8 byte offset within the line.** Pin it once, conformance-test
   it, never mix conventions.
+- **Version tag:** `Editor::kInterfaceVersion`; reject a mismatch when the interface
+  crosses a shared-library boundary.
 - **Core never calls into the UI directly.** It bumps a revision and appends
   deltas; the UI calls `drain()` on its own thread. This removes re-entrancy.
 - **Exceptions must not escape the interface.** Catch at every boundary and return
@@ -258,8 +266,8 @@ What Rust still wins (acknowledged):
 
 Verification/corrections from the reviews:
 
-- **Rust `allocator_api` stabilized in 1.100.0 (Nov 12, 2026)** — the "no stable
-  allocator API" cost is nearly gone.
+- **Rust `allocator_api` stabilized in 1.100** (late 2026; verify the exact
+  release) — the "no stable allocator API" cost is nearly gone.
 - **`std::pmr` is not a free win**: the default `new_delete_resource` is the
   slowest; the gain requires `monotonic_buffer_resource` over a preallocated
   buffer. It does not carry the C++ case, and a bounded 1000–2000-entry LRU needs
@@ -328,8 +336,7 @@ C is out for the core at this scope.
 
 - Original file is an immutable base piece; edits append to an add buffer.
 - **Coalescing is mandatory**: adjacent inserts in the same region merge into one
-  piece. Without it, typing creates unbounded pieces and `editor_lines` degrades
-  to O(k).
+  piece. Without it, typing creates unbounded pieces and `lines()` degrades to O(k).
 - The base is an mmap (or a sliding window over one). Edits are metadata.
 
 ### 5.3 Chunk-relative line index
@@ -379,7 +386,7 @@ C is out for the core at this scope.
 - **In-place truncate** causes `SIGBUS` (Linux/macOS) or
   `EXCEPTION_IN_PAGE_ERROR` (Windows) on next page touch. On mismatch: re-map and
   rewrite pieces (O(pieces)) or prompt to reload.
-- Add `editor_reload`; detect changes via the recorded identity + file watching
+- Add `reload()`; detect changes via the recorded identity + file watching
   (FSEvents/inotify/`ReadDirectoryChangesW`), coalesced.
 
 ### 5.7 mmap policy (not "one mapping for everything")
@@ -484,9 +491,8 @@ Rules:
   (path + offset + length + sha256) so the caller mmaps it. `search` streams
   NDJSON with a terminal summary record (`"stream": true`).
 - **Determinism:** sort results by (path bytes, offset); fixed field order; no
-  `std::map` iteration (or sorted keys); no timestamps by default; golden tests
-  normalize
-  `duration_us`/`pid`/abs paths.
+  `unordered_map` iteration (deterministic ordering only); no timestamps by
+  default; golden tests normalize `duration_us`/`pid`/abs paths.
 - **Versioning:** `"editor.result/1"`. Additive-only within a major.
   `--schema 1` requests a version; unknown major → exit 4, `E_SCHEMA`.
   `editor info --schema` dumps command schemas so agents can adapt.
@@ -570,7 +576,7 @@ Batch program:
 
 ## 7. Resource budgets (measured where possible)
 
-Measured on macOS 27.2.1, Apple Silicon, 8 GB:
+Measured on macOS (Apple Silicon, 8 GB):
 
 | Fact | Measurement |
 | --- | --- |
@@ -617,9 +623,12 @@ budget** in CI, not average. Add a synthetic 5M-line file to the bench suite.
 ### 8.1 Hybrid view (the key change)
 
 - **Files below threshold (~2 MB and ~20k lines): use the OS native text control**
-  (`NSTextView`, RichEdit, or the platform equivalent). It gives IME, marked
-  text, accessibility, RTL, grapheme clusters, selection, drag-and-drop,
-  spellcheck, and 20 years of edge cases **for free and correctly**.
+  (`NSTextView` on macOS, RichEdit on Windows). It gives IME, marked text,
+  accessibility, RTL, grapheme clusters, selection, drag-and-drop, spellcheck, and
+  20 years of edge cases **for free and correctly**.
+- **Linux has no toolkit-free native text control**, so the native-control path is
+  macOS/Windows only. Linux always uses the custom view and must implement IME
+  (XIM) and AT-SPI accessibility itself — budget this in M5.
 - **Above threshold: custom view** driven by `viewcore` + `textbackend`, with a
   viewport-only line cache.
 - Both implement one `TextView` interface; **commands go through the same core**.
@@ -692,8 +701,8 @@ Three tiers:
 - **Sanitizers**: ASan/UBSan/TSan on every PR; hardened STL in debug.
 - **Benchmarks**: cold start, open 1 GB, edit viewport, scan 1 GB, 5M-line file,
   10k-file tree; memory-ceiling assertions on footprint.
-- **CI**: macOS / Windows / Linux; one CMake build graph; fmt/clang-tidy/test/bench;
-  footprint gate; p99 frame budget; platform build smoke tests.
+- **CI**: macOS / Windows / Linux; one CMake build graph; clang-format/clang-tidy/
+  test/bench; footprint gate; p99 frame budget; platform build smoke tests.
 
 ---
 
@@ -750,7 +759,8 @@ Explicitly out of scope: plugins/mods, network, telemetry, TUI, inverted index
 1. **Hybrid threshold**: exact MB/line count where the view switches.
 2. **Config format**: built-in key=value vs. a small embedded format (no third-party
    JSON).
-3. **Regex engine**: literal + documented subset vs. a small vendored engine.
+3. **Regex engine**: literal + documented subset vs. a small built-in engine (or
+   the platform regex where acceptable).
 4. **Linux text stack**: confirm HarfBuzz as an allowed system library.
 5. **Accessibility scope**: keyboard-complete + basic VoiceOver/Narrator, or full
    parity (recommend the former for the MVP).
@@ -758,6 +768,9 @@ Explicitly out of scope: plugins/mods, network, telemetry, TUI, inverted index
    small allowlist in `cli` only. Default: zero-dep.
 7. **Bundled font**: accept +200–800 KB for identical cross-platform metrics, or
    rely on OS fonts and accept slight rendering differences.
+8. **Linux native-control gap**: accept that Linux always uses the custom view
+   (and must implement IME/a11y), or allow a toolkit (GTK/Qt) as a system library.
+   Default: custom view.
 
 ---
 
@@ -768,5 +781,9 @@ Explicitly out of scope: plugins/mods, network, telemetry, TUI, inverted index
 2. **M0 core + CLI**, with the save-path benchmark as a hard gate.
 3. **M0.5 headless render oracle + C++ conformance test**, proving the interface
    and the 5 GB read-only resource story before any native window exists.
+
+Optional de-risking before committing: a 1-week side-by-side spike on (a) CoW
+save, (b) 5M-line open + random edits + undo, (c) the interface seam at 60/240 Hz.
+If C++ shows materially higher bug density or lower velocity, revisit §4.3.
 
 Everything else is downstream of those three.
