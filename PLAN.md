@@ -1,22 +1,22 @@
-# editor — Plan (v2)
+# editor — Plan (v3)
 
 > Name: **editor** (chosen).
-> Status: planning. v2 — refined after a four-way critical review.
+> Status: planning. v3 — language decision finalized to C++ all-in.
 > Review areas: architecture & data model · CLI & agent ergonomics ·
-> resource efficiency & rendering · cross-platform & UI.
+> resource efficiency & rendering · cross-platform & UI · final language review.
 
 A native desktop text editor for **minimum memory, minimum CPU, maximum speed**,
 with a **CLI-first** surface so AI agents can drive it as reliably as a human.
-Real native windows, one shared Rust core, thin per-OS chrome.
+Real native windows, one shared C++ core, thin per-OS chrome.
 
 ---
 
 ## 0. What changed from v1, and why
 
-v1 had the right shape (Rust core, native window, custom text view, piece table
-over an mmap'd base, atomic save). The review found several claims false and the
-two most important contracts (the C ABI and the save path) underspecified. The
-biggest changes:
+v1 had the right shape (native window, custom text view, piece table over an
+mmap'd base, atomic save). The review found several claims false and the two
+most important contracts (the core/view interface and the save path)
+underspecified. The biggest changes:
 
 1. **Memory is measured in private footprint, not RSS.** Measured on macOS:
    AppKit alone is ~28 MB RSS before a window; a shown window is ~40 MB RSS but
@@ -27,9 +27,9 @@ biggest changes:
    to a 1 GB file copied 1 GB. Now: no-op when clean, CoW-clone + `pwrite` of
    changed spans, `copy_file_range` fallback, fsync temp → rename → fsync dir.
    Benchmarked as an M0 gate.
-3. **The C ABI is frozen before any UI exists.** Status codes on every fallible
-   call, `int64_t`, `(ptr,len)`, one batched viewport read, drain-based events,
-   `undo`/`redo`/`reload`, a version handshake, and panics that never cross FFI.
+3. **The core/view interface is frozen before any UI exists.** Status codes on
+   every fallible call, `int64_t`, `(ptr,len)`, one batched viewport read,
+   drain-based events, `undo`/`redo`/`reload`, and a version handshake.
 4. **Bytes are the currency.** A line is a byte range; `col` is a UTF-8 byte
    offset within the line. No UTF-16, no graphemes in the core contract.
 5. **Line index is chunk-relative and never fully invalidated.** v1 made every
@@ -49,10 +49,9 @@ biggest changes:
     for and ported later; syntax/Markdown/git/scripts deferred. The v1 feature
     list was IDE-shaped and would have killed the "minimal" goal.
 11. **"No third-party libraries" is restated precisely.** No vendored or bundled
-    third-party code. OS system libraries **and their FFI bindings** (`libc`,
-    `windows-sys`, `core-foundation`) are allowed — they are bindings to the OS,
-    not vendored functionality. This is the policy that makes the Rust core
-    viable; without it, choose C++ everywhere.
+    third-party code. OS system libraries (Cocoa/AppKit/CoreText, Win32/DirectWrite,
+    X11/Xft/fontconfig/freetype/HarfBuzz) are allowed. C++ needs **no exception**
+    for OS FFI — the headers are part of the platform.
 
 ---
 
@@ -63,8 +62,7 @@ biggest changes:
 - Stay responsive with thousands of files in a project.
 - Near-zero idle CPU; small, predictable, **measured** memory footprint.
 - Genuine native app on macOS, Windows, Linux.
-- One shared core (Rust, std + OS FFI bindings) for all platforms; thin native
-  chrome.
+- One shared core (C++) for all platforms; thin native chrome.
 - A CLI that exposes every feature, emits machine-readable output, and is driven by
   the same domain ops as the GUI.
 - No vendored third-party code.
@@ -83,15 +81,15 @@ biggest changes:
 
 | Decision | Choice |
 | --- | --- |
-| Core language | Rust, std-only + OS FFI bindings; all other unsafe in `core::sys` |
+| Core language | C++ (core + viewcore + platform + CLI) |
 | UI | Native OS windows + native chrome + custom/hybrid text view |
 | Platform order | macOS first; Windows/Linux designed-for-now, ported later |
-| Dependency rule | No vendored/bundled third-party; OS libraries **and their FFI bindings** allowed |
+| Dependency rule | No vendored/bundled third-party; OS libraries allowed |
 | CLI model | Stateless one-shot + `batch` transactions; `serve` deferred |
 | Addressing | Bytes; line = byte range; col = UTF-8 byte offset |
 | Memory metric | Private footprint (not RSS) |
 | View | Hybrid: native control under threshold, custom view above |
-| ABI | Frozen v1 before UI; typed structs; drain-based events |
+| Interface | Frozen core/view interface before UI; typed structs; drain-based events |
 | Scope | Core + CLI + macOS first; search/syntax/markdown/git/scripts later |
 
 ---
@@ -100,13 +98,13 @@ biggest changes:
 
 ```
                        ┌──────────────────────────────┐
-  CLI (Rust) ─────────► │                              │
-                       │  core (Rust, std-only)       │
+  CLI (C++) ─────────► │                              │
+                       │  core (C++)                  │
   platform/macos ─────► │  document · edits · undo     │
   platform/windows ───► │  line index · save · search  │
   platform/linux ─────► │  domain ops (pure)           │
                        └───────────────┬──────────────┘
-                                       │ frozen C ABI
+                                       │ frozen C++ interface
                        ┌───────────────▼──────────────┐
                        │  viewcore (C++ · shared)     │
                        │  wrap · line cache · hit-test│
@@ -118,7 +116,7 @@ biggest changes:
         CoreText (macOS)          DirectWrite (Windows)      Xft+HarfBuzz (Linux)
 ```
 
-- **`core` (Rust)**: document model, piece table, chunk index, undo, save,
+- **`core` (C++)**: document model, piece table, chunk index, undo, save,
   search, pure domain ops. No UI, no I/O policy, no exit codes.
 - **`viewcore` (C++)**: all platform-independent view logic — wrapping, line
   cache, hit-testing, selection, scroll math, caret blink, IME composition state,
@@ -128,7 +126,7 @@ biggest changes:
 - **`platform/<os>`**: window, menus, dialogs, keyboard/mouse translation,
   clipboard, IME plumbing, a11y node emission, and the native-control path for
   small files. No editing logic.
-- **`cli` (Rust)**: argv → domain ops → persist once → JSON envelope.
+- **`cli` (C++)**: argv → domain ops → persist once → JSON envelope.
 
 ### 4.1 The three-layer command seam
 
@@ -137,7 +135,8 @@ codes/atomicity; the GUI needs undo granularity, selection, IME, cancellation.
 Split into three layers:
 
 1. **Domain ops (`core`)**: pure functions over a `Buffer` — `insert`,
-   `replace`, `search`, `parse_patch` — returning `Vec<EditOp>` + `Vec<Change>`.
+   `replace`, `search`, `parse_patch` — returning `std::vector<EditOp>` +
+  `std::vector<Change>`.
    No I/O policy, no persistence, no exit codes.
 2. **Transaction/undo layer**: inverse-op stack, dirty flag, save policy. Shared.
 3. **Adapters**: CLI (argv → ops → persist once → envelope) and GUI (menu → ops →
@@ -146,140 +145,164 @@ Split into three layers:
 Registry entry = `{ name, arg_schema, core_fn, cli_binding, gui_binding? }`.
 A command with a `gui_binding` but no undo entry is a test failure.
 
-### 4.2 The C ABI (frozen draft)
+### 4.2 Core/view interface (C++, frozen draft)
 
 This is the highest-leverage artifact in the project. It is cheap to write now and
-expensive to retrofit at M2. Ship it with a **C conformance client compiled with
-`cc` and no Rust knowledge**.
+expensive to retrofit at M2. Ship it with a **C++ conformance test** that drives
+the interface without a UI. An optional C ABI can be generated later for
+embedding/conformance; it is **not load-bearing**.
 
-```c
-// platform/shared/editor.h — v1
-typedef struct Editor Editor;
-typedef uint32_t EdStatus;              // 0 = ok; nonzero = EdCode
-#define ED_OK 0
-#define ED_E_IO 1
-#define ED_E_NOT_FOUND 2
-#define ED_E_RANGE 3
-#define ED_E_CONFLICT 4                   // changed since read
-#define ED_E_OOM 5
-#define ED_E_ENCODING 6
-#define ED_E_PANIC 99
+```cpp
+// platform/shared/editor.hpp — v1
+enum class Status : uint32_t {
+  Ok = 0, Io, NotFound, Range, Conflict, Oom, Encoding, Internal
+};
 
-typedef struct {
+struct Change {
   int64_t first, last, new_count, caret_line, caret_col;
-  uint32_t kind, flags;                   // INSERT / DELETE / REPLACE / RELOAD / SAVE
-} EdChange;
+  uint32_t kind;  // Insert / Delete / Replace / Reload / Save
+};
 
-typedef struct {
+struct Info {
   int64_t bytes, lines /* -1 = unknown */, mtime_ns;
   uint32_t eol, enc, flags;
-} EdInfo;
+};
 
-typedef struct { int64_t line, col, removed_len, inserted_len; uint32_t kind; } EdEdit;
+struct Edit {
+  int64_t line, col, removed_len, inserted_len;
+  uint32_t kind;
+};
 
-uint32_t   editor_abi_version(void);      // reject mismatch at load
-EdStatus   editor_open(const char* path_utf8, size_t path_len, Editor** out);
-void       editor_close(Editor*);
-EdStatus   editor_info(const Editor*, EdInfo*);
-const char* editor_errmsg(const Editor*); // borrowed; valid until next call on this thread
+class Editor {
+ public:
+  virtual ~Editor() = default;
+  virtual Status open(std::string_view path_utf8) = 0;
+  virtual Status info(Info* out) const = 0;
 
-// One batched viewport read per frame; caller-owned buffer.
-EdStatus   editor_lines(const Editor*, int64_t first, int64_t last,
-                        char* buf, size_t cap, size_t* used, int64_t* out_n);
-EdStatus   editor_read_range(const Editor*, int64_t off, size_t len,
-                             char* buf, size_t cap, size_t* used);
+  // One batched viewport read per frame; caller-owned buffer.
+  virtual Status lines(int64_t first, int64_t last, char* buf, size_t cap,
+                       size_t* used, int64_t* out_n) const = 0;
+  virtual Status read_range(int64_t off, size_t len, char* buf, size_t cap,
+                            size_t* used) const = 0;
 
-EdStatus   editor_apply(const Editor*, const EdEdit* edits, size_t n); // one transaction
-EdStatus   editor_undo(Editor*);
-EdStatus   editor_redo(Editor*);
-EdStatus   editor_save(Editor*);
-EdStatus   editor_save_as(Editor*, const char* path_utf8, size_t len);
-EdStatus   editor_reload(Editor*);
+  virtual Status apply(std::span<const Edit> edits) = 0;  // one transaction
+  virtual Status undo() = 0;
+  virtual Status redo() = 0;
+  virtual Status save() = 0;
+  virtual Status save_as(std::string_view path_utf8) = 0;
+  virtual Status reload() = 0;
 
-void       editor_on_change(Editor*, void (*fn)(Editor*, const EdChange*, void*), void*);
-void       editor_drain(Editor*);         // callbacks fire ONLY here, never re-entrantly
+  using ChangeFn = void (*)(Editor*, const Change&, void*);
+  virtual void on_change(ChangeFn, void* ud) = 0;
+  virtual void drain() = 0;  // callbacks fire ONLY here, never re-entrantly
+
+  virtual std::string_view errmsg() const = 0;  // borrowed; valid until next call
+};
 ```
 
 Non-negotiable rules written into the header as comments:
 
-- **Every fallible call returns `EdStatus`.** No `void` mutation/save entry points.
+- **Every fallible call returns `Status`.** No `void` mutation/save entry points.
   A silent save failure is a data-loss bug.
-- **`(ptr, len)` everywhere.** No NUL-terminated input; embedded NUL is data.
+- **`(ptr, len)` / `string_view` / `span` everywhere.** No NUL-terminated input;
+  embedded NUL is data.
 - **`int64_t` for lines/offsets.** `int32_t` cannot express a >2 GB line or an
   error, and `0` must not be ambiguous between "empty line" and "error".
 - **`col` is a UTF-8 byte offset within the line.** Pin it once, conformance-test
   it, never mix conventions.
 - **Core never calls into the UI directly.** It bumps a revision and appends
-  deltas; the UI calls `editor_drain` on its own thread. This removes re-entrancy.
-- **`catch_unwind` at every exported entry**, or `panic = "abort"`. Panics must
-  never cross FFI (UB).
+  deltas; the UI calls `drain()` on its own thread. This removes re-entrancy.
+- **Exceptions must not escape the interface.** Catch at every boundary and return
+  `Status::Internal`; a half-applied edit must leave the editor consistent.
 - **One `Editor` per thread** unless an explicit lock is added.
-- **Borrowed buffers** (`editor_errmsg`, `editor_lines`) are core-owned and valid
-  until the next core call on that thread. No `strdup`, no retention.
-- **Windows CRT**: ship `core.dll` (`cdylib`) on Windows to avoid two heaps;
-  `staticlib` on macOS/Linux.
+- **Borrowed buffers** (`errmsg`, `lines`) are core-owned and valid until the next
+  core call on that thread. No `strdup`, no retention.
+- **C++ hardening is mandatory in debug/CI:** `_GLIBCXX_ASSERTIONS` /
+  `_LIBCPP_HARDENING_MODE`, ASan/UBSan/TSan, and `-Wall -Wextra -Wconversion`.
 
-### 4.3 Language decision (final) and FFI budget
+### 4.3 Language decision (final)
 
-Three independent reviews (systems, delivery, prior art) compared Rust, C, and
-C++ against this plan. Scores: **Rust 48/60, C++ 45/60, C 38/60** (systems
-scorecard). All three recommend **Rust for the core**, with **C++ as the
-legitimate fallback** and **C only if the scope collapses**. The developer is
-fluent in both Rust and C++, which removes the learning-curve argument; the
-decision is now purely architectural.
+Three independent final reviews (correctness, delivery, systems) evaluated Rust,
+C++, and C against this plan, with the developer fluent in both Rust and C++.
+**All three returned the same ranking: C++ 1st, Rust 2nd, C 3rd**, with medium
+confidence (~55–60%). Scorecards: C++ 34–36/40, Rust 26–30/40, C 17–26/40.
 
-**Decision: Rust core + CLI; C++ viewcore + platform; frozen C ABI.**
+**Decision: C++ all-in — core + viewcore + platform + CLI. Rust is the documented
+fallback.**
 
-Why Rust wins here, specifically:
+Why C++ wins:
 
-- **UTF-8 and byte-accurate addressing are the core contract.** `str`,
-  `Utf8Error::valid_up_to`, `is_char_boundary`, and `char_indices` are exactly
-  what a byte-accurate editor needs. C/C++ hand-write this.
-- **Untrusted input is a security boundary.** The AI-first CLI parses patches and
-  JSON-lines. Bounds-checked slices eliminate the patch-parser CVE class.
-- **Re-entrancy and aliasing are the classic editor crash class** (callbacks
-  mutating during iteration, undo holding a `&str` into a compacted buffer).
-  `&mut Editor` + drain makes most of these compile errors.
-- **Parallel search is race-free by construction** (`Send`/`Sync`).
-- **Compiler-assisted maintenance** for one developer over five years.
+1. **The plan is already polyglot.** C++ viewcore + ObjC++ platform + a frozen
+   interface are already mandatory. A C++ core *subtracts* a language and the
+   foreign-ABI seam; a Rust core *adds* one.
+2. **The hardest code is exactly where Rust's safety does not reach.** CoW save,
+   mmap/madvise, file watching, and the FFI boundary are OS-edge in both
+   languages. Rust's guarantees concentrate in the lower-risk pure-logic and
+   parser layer.
+3. **The no-vendored rule is asymmetric.** It strips Rust's ecosystem (serde,
+   regex, rayon) while C++ still gets `<format>`, `<span>`, `<charconv>`,
+   `<filesystem>`, `std::variant`/`optional`, and direct OS headers. C++ needs no
+   special exception for OS FFI.
+4. **One language, one build graph, one debugger, one sanitizer pass.** For a solo
+   developer shipping 11 milestones across 3 OSes, fewer moving parts wins on
+   calendar risk. C++'s failure mode is a fixable bug; Rust's is a blocked
+   milestone at the Windows/CRT seam.
 
-Why C++ is the fallback, not a compromise:
+What Rust still wins (acknowledged):
 
-- **One language** for core + viewcore + platform: zero C ABI seam, one build
-  graph, direct OS headers.
-- **`std::pmr`** is a textbook fit for the bounded 1000–2000 line-layout cache.
-- **Kakoune** is the existence proof: a zero-dependency C++ editor, fast on huge
-  files.
-- Mature ASan/UBSan/TSan and lldb/VS/WinDbg.
+- UTF-8 validation in the CLI/JSON layer; untrusted patch/JSON parser safety;
+  race-free parallel search; borrow-checked chunk index; compiler-assisted
+  refactoring.
+- These are real, but localized to the part of the core that carries the least
+  consequence and is already covered by property tests and fuzzing.
 
-Why C is out for the core: hand-rolled containers, UTF-8, error plumbing, and
-platform code; the five-year bug/maintenance cost is too high for a
-reliability-focused project. C is right only for a much smaller editor.
+Verification/corrections from the reviews:
 
-**The one policy that decides it:** OS FFI bindings (`libc`, `windows-sys`,
-`core-foundation`) are **allowed** and are not "third-party libraries" — they are
-bindings to the OS. Without them, Rust must hand-declare `mmap`, `madvise`,
-`clonefile`, `FICLONE`, `copy_file_range`, `F_FULLFSYNC`, `inotify`, `FSEvents`,
-`ReadDirectoryChangesW`, and every `#[repr(C)]` layout, with no compiler help.
-That lands on §5.5/5.6/5.7/9, the four hardest sections. If bindings are
-disallowed, **switch to C++ everywhere**.
+- **Rust `allocator_api` stabilized in 1.100.0 (Nov 12, 2026)** — the "no stable
+  allocator API" cost is nearly gone.
+- **`std::pmr` is not a free win**: the default `new_delete_resource` is the
+  slowest; the gain requires `monotonic_buffer_resource` over a preallocated
+  buffer. It does not carry the C++ case, and a bounded 1000–2000-entry LRU needs
+  no arena.
+- **Kakoune's FAQ admits it is slow on big files** — a weaker existence proof
+  than "fast on huge files"; it proves the C++ route is completable.
+- **Windows CRT mixing is real and nasty** ("Mixing CRTs is unsupported"; Rust
+  links the release MSVC CRT even in debug). With C++ all-in, one build graph
+  controls the CRT.
+- **Rust's UTF-8 guarantee does not reach the byte-addressed core hot path**
+  (`&[u8]` over an mmap); it is confined to the CLI/JSON layer and boundary
+  checks on validated strings.
 
-**Hard FFI budget and go/no-go gate (M0.5):**
+C++ safety is a process, not a proof. The plan makes it concrete:
 
-- `core::sys` (all `unsafe`) must stay **≤ 1.5–2k LOC** and **≤ 20–25%** of the
-  core. If it exceeds this, switch to C++.
-- `panic = "unwind"` in the core; `catch_unwind` at every exported entry; a
-  `poisoned` flag + `ED_E_PANIC` recovery. Do not use `panic = "abort"` until
-  after M2.
-- `#![forbid(unsafe_op_in_unsafe_fn)]`; all `unsafe` confined to `core::sys`.
-- Miri for pure logic; fuzz the patch/JSON/UTF-8 paths.
-- `#[repr(C)]` structs with C `_Static_assert`/`static_assert` size checks.
-- `Box<Editor>`; make it `!Send` (`PhantomData<*const ()>`) if one-per-thread is
-  to be compiler-enforced. No `&mut` across FFI; raw pointers only.
-- No `HashMap` iteration in JSON; use `BTreeMap`.
-- **M0.5 gate**: C conformance client (compiled with `cc`, no Rust knowledge) +
-  footprint/startup comparison against a small C++ prototype. If C++ beats Rust
-  by **>20% on footprint or startup** after LTO, or Rust adds **>1–2 MB**, switch.
+- RAII, `std::span`/`string_view` with lifetime discipline, strong index types
+  (no raw `int` line/col), generation counters on the chunk index.
+- Hardened STL in debug (`_GLIBCXX_ASSERTIONS`, `_LIBCPP_HARDENING_MODE`).
+- ASan/UBSan/TSan in CI; libFuzzer on patch/JSON/argv parsers.
+- Property tests for UTF-8 boundary, line-index/undo invariants, remap/reload
+  round-trips.
+- C++26 profiles/contracts where available; `-Wall -Wextra -Wconversion`.
+- Never expose base pointers; copy-to-caller at the interface; remap by swapping
+  a new mapping, never mutate in place.
+
+**M0.5 gate (language validation):** C++ conformance test + ASan/UBSan/fuzzing
+run; measure parser bug density, footprint/startup, and save-path latency. If C++
+pure-logic bug density stays high despite sanitizers/fuzzing, or the untrusted
+surface grows (network `serve`, plugins, untrusted repos at scale), **switch to
+Rust**.
+
+**Flip conditions to Rust:**
+
+- The crate ban lifts to a small vetted allowlist (`serde_json`, `regex`,
+  `memchr`, `rayon`).
+- The product becomes primarily an untrusted-input processor.
+- The team grows beyond one developer.
+- M0.5 shows C++ bug density high despite sanitizers, or Rust velocity/seam is
+  clearly better.
+- The project drops the C++ viewcore/ObjC++ platform (then one language is Rust
+  again).
+
+C is out for the core at this scope.
 
 ---
 
@@ -461,7 +484,8 @@ Rules:
   (path + offset + length + sha256) so the caller mmaps it. `search` streams
   NDJSON with a terminal summary record (`"stream": true`).
 - **Determinism:** sort results by (path bytes, offset); fixed field order; no
-  HashMap iteration; no timestamps by default; golden tests normalize
+  `std::map` iteration (or sorted keys); no timestamps by default; golden tests
+  normalize
   `duration_us`/`pid`/abs paths.
 - **Versioning:** `"editor.result/1"`. Additive-only within a major.
   `--schema 1` requests a version; unknown major → exit 4, `E_SCHEMA`.
@@ -487,7 +511,7 @@ Error example:
 ### 6.3 One-shot + batch (no daemon for now)
 
 - **One-shot** for reads, search, stats, and single surgical edits. Process spawn
-  is ~1–2 ms for a static Rust binary — not the thing to optimize.
+  is ~1–2 ms for a static C++ binary — not the thing to optimize.
 - **`editor batch`** is the answer to atomicity: one process, a JSON-lines
   program on stdin/file, streaming responses, **one implicit transaction** with
   rollback. It gets ~80% of a daemon's benefit at ~5% of the cost (no socket, no
@@ -619,7 +643,7 @@ budget** in CI, not average. Add a synthetic 5M-line file to the bench suite.
 - **Do not enumerate fonts at launch.** `availableFontFamilies` = 80.8 ms and
   +4.8 MB; resolving one font (`userFixedPitchFontOfSize`) = 1.6 ms. Enumerate
   lazily only when the font menu opens.
-- Don't use Swift (libswiftCore overhead); ObjC++ + Rust is leaner.
+- Don't use Swift (libswiftCore overhead); ObjC++ + C++ is leaner.
 - Binary size is irrelevant (AppKit-linked exe = 51 KB); optimize memory and
   latency, not size.
 
@@ -658,29 +682,31 @@ Three tiers:
 
 ## 10. Testing & CI
 
-- **C ABI conformance client** compiled with `cc`, no Rust knowledge — the real
-  contract test.
+- **Core/view conformance test** driving `Editor` without a UI — the real contract
+  test. Optional generated C ABI for embedding.
 - **Golden CLI tests**: exact JSON for every command, including errors.
 - **Property tests**: edit/insert/delete/undo invariants; piece-table round-trips;
-  save/restore identity.
-- **Fuzzing**: argv parser, JSON reader/writer, line index, patch parser.
+  save/restore identity; UTF-8 boundary logic.
+- **Fuzzing**: argv parser, JSON reader/writer, line index, patch parser, UTF-8
+  boundaries.
+- **Sanitizers**: ASan/UBSan/TSan on every PR; hardened STL in debug.
 - **Benchmarks**: cold start, open 1 GB, edit viewport, scan 1 GB, 5M-line file,
   10k-file tree; memory-ceiling assertions on footprint.
-- **CI**: macOS / Windows / Linux; fmt, clippy, test, bench; footprint gate;
-  p99 frame budget; platform build smoke tests.
+- **CI**: macOS / Windows / Linux; one CMake build graph; fmt/clang-tidy/test/bench;
+  footprint gate; p99 frame budget; platform build smoke tests.
 
 ---
 
 ## 11. Build & distribution
 
-- Rust core: `cargo build --release` → `libcore.a` / `core.lib` / `core.dll` +
-  `editor` CLI.
-- macOS: Xcode project (or Makefile) compiles the ObjC++ app, links the core,
+- C++ core: CMake → `libcore.a` / `core.lib` + `editor` CLI. One build graph
+  across core, viewcore, platform, and CLI; one compiler controls the CRT.
+- macOS: Xcode project (or CMake) compiles the ObjC++ app, links the core,
   bundles `Editor.app`; notarization required (Developer account, hardened
   runtime, `notarytool`, staple).
-- Windows: MSVC project links `core.lib`; match CRT (`/MT` vs `/MD`); SmartScreen
-  reputation via EV cert or downloads.
-- Linux: Makefile/CMake links `libcore.a`; `.deb`/`.rpm`/AppImage/Flatpak.
+- Windows: MSVC project links `core.lib`; match CRT (`/MT` vs `/MD`) — one build
+  graph makes this manageable; SmartScreen reputation via EV cert or downloads.
+- Linux: CMake/Makefile links `libcore.a`; `.deb`/`.rpm`/AppImage/Flatpak.
 - No vendored third-party; only OS system libraries and the toolchain.
 
 ---
@@ -691,16 +717,16 @@ Three tiers:
   incremental save, undo, domain ops, `read`/`write`/`edit`/`diff`/`apply`/
   `search`/`stats`/`move`/`restore`/`batch`/`info`, JSON envelope, security
   guardrails, tests, benchmarks. **Gate: edit 1 line in 1 GB < 100 ms (CoW).**
-- **M0.5 — Freeze the ABI + headless render oracle + language go/no-go.** C
-  conformance client; viewport-read/layout harness with no UI; **5 GB read-only
-  demo** scrolling at 60 fps with flat footprint; `editor stats` JSON. Compare
-  footprint/startup against a small C++ prototype: if C++ wins by **>20%** or
-  Rust adds **>1–2 MB**, switch the core to C++.
+- **M0.5 — Freeze the interface + headless render oracle + language validation.**
+  C++ conformance test; viewport-read/layout harness with no UI; **5 GB read-only
+  demo** scrolling at 60 fps with flat footprint; `editor stats` JSON; ASan/UBSan/
+  fuzzing run. If C++ bug density stays high despite sanitizers, or the untrusted
+  surface grows, switch the core to Rust.
 - **M1 — macOS read-only window.** AppKit + `viewcore` + CoreText backend:
   menu, open dialog, custom text view, scrolling. *First native app.*
 - **M1.5 — Windows read-only spike.** DirectWrite + D2D implementing the same
-  `TextView`; validates the ABI against the least forgiving stack. Port, don't
-  redesign.
+  `TextView`; validates the interface against the least forgiving stack. Port,
+  don't redesign.
 - **M2 — macOS editing.** Cursor, keyboard, insert/delete, undo, save, dirty
   indicator. *First usable native editor.*
 - **M3 — macOS polish.** Selection, clipboard, find, go-to-line, status bar, line
@@ -722,13 +748,14 @@ Explicitly out of scope: plugins/mods, network, telemetry, TUI, inverted index
 ## 13. Open decisions
 
 1. **Hybrid threshold**: exact MB/line count where the view switches.
-2. **Config format**: built-in key=value vs. a small embedded format (no serde).
+2. **Config format**: built-in key=value vs. a small embedded format (no third-party
+   JSON).
 3. **Regex engine**: literal + documented subset vs. a small vendored engine.
 4. **Linux text stack**: confirm HarfBuzz as an allowed system library.
 5. **Accessibility scope**: keyboard-complete + basic VoiceOver/Narrator, or full
    parity (recommend the former for the MVP).
 6. **CLI zero-dependency purity**: hand-rolled JSON + SHA-256 (fuzzed) vs. a
-   2-crate allowlist in `cli` only. Default: zero-dep.
+   small allowlist in `cli` only. Default: zero-dep.
 7. **Bundled font**: accept +200–800 KB for identical cross-platform metrics, or
    rely on OS fonts and accept slight rendering differences.
 
@@ -736,10 +763,10 @@ Explicitly out of scope: plugins/mods, network, telemetry, TUI, inverted index
 
 ## 14. What I would build first
 
-1. **Freeze `platform/shared/editor.h`** (the draft above) and write the one-page
+1. **Freeze `platform/shared/editor.hpp`** (the draft above) and write the one-page
    data-model contract (§5). These are cheap now, expensive at M2.
 2. **M0 core + CLI**, with the save-path benchmark as a hard gate.
-3. **M0.5 headless render oracle + C client**, proving the ABI and the 5 GB
-   read-only resource story before any native window exists.
+3. **M0.5 headless render oracle + C++ conformance test**, proving the interface
+   and the 5 GB read-only resource story before any native window exists.
 
 Everything else is downstream of those three.
