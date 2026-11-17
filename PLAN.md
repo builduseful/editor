@@ -312,7 +312,8 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
   after the last successful `save`/`reload`; not updated by unsaved edits.
 - `Status::BufferTooSmall` is returned by `read_lines`/`read_range` when a
   non-null buffer is smaller than needed (no bytes written, `used`=needed);
-  `buf=nullptr` is the size query. `FileSystem::pread` clamps to EOF.
+  `buf=nullptr` is the size query. `FileSystem::pread`/`pwrite` clamp to EOF
+  (short count in `used`, never `BufferTooSmall`).
 - `errmsg` is thread-local and borrowed; no retention.
 - Version tag `kInterfaceVersion`; core is statically linked into GUI/CLI.
 - C++20, pinned toolchain; statically link core into GUI/CLI.
@@ -357,7 +358,9 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
   exactly at the append offset. Without it, typing creates unbounded pieces.
 - Add buffer is **capped at 8 MB resident and spilled to a temp file**; compacted
   before save. A single insert larger than the cap spills and is not coalesced;
-  the cap is resident, not per-edit. Non-tail inserts do not coalesce.
+  the cap is resident, not per-edit. Non-tail inserts do not coalesce. An edit
+  whose insert would push the resident add buffer over the cap spills the add
+  buffer and restarts the insert in the fresh (disk-backed) buffer.
 - "Edits are metadata" = piece descriptors + inserted bytes, not a document copy.
 - The `Editor` owns the base fd, the add-buffer fd, and all spill fds; `~Editor`
   closes them.
@@ -390,7 +393,8 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
 - Cap: 10k steps or **8 MB resident**. Larger inverse text spills to a temp file;
   if that is impossible, undo is disabled for that edit, `errmsg()` reports it,
   and `undo()` returns `Status::Unsupported`.
-- Redo is cleared on any new edit.
+- Redo is cleared on any new edit. Undo/redo on an empty stack return `Ok`
+  with no change (no-op).
 - **Undo is GUI/conformance-only in v1**; the CLI is one-shot and has no `undo`.
 - At save: flatten the piece table, clear the add buffer, drop undo older than the
   save (piece offsets are invalid after flatten). "Undo to last save" is the only
@@ -472,6 +476,7 @@ once, splits it into dir + name, and opens the directory before the rename.
   Windows `EXCEPTION_IN_PAGE_ERROR` is post-1.0.
 - On mismatch: auto-reload if clean **and the identity differs**; if dirty,
   `E_STALE` with a reload hint. If the identity matches, do nothing.
+  `reload()`/`check_identity()` on an already-current identity are no-ops (Ok).
   `reload()` discards undo, maps new content, maps the caret to the nearest valid
   position. `check_identity()` is the explicit trigger for the GUI.
 - File watching (FSEvents) is post-1.0 and is **not** the source of truth; the
