@@ -195,7 +195,9 @@ class Editor {
   // All edits in one call are relative to the state at the start of that call
   // (shared base). The caller must sort; unsorted or overlapping edits ->
   // E_RANGE. Edits at the same offset overlap, including zero-length inserts.
-  // `removed_len` may cross lines. Inserted newlines use the dominant EOL.
+  // `removed_len` may cross lines. `line > line_count`, `col` outside the line
+  // (except append at line_count/col 0), or a removed range past EOF -> E_RANGE.
+  // Inserted newlines use the dominant EOL.
   virtual Status apply(std::span<const Edit> edits) = 0;
 
   virtual Status undo() = 0;       // empty stack -> Ok, no change
@@ -291,6 +293,8 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
   `uint16_t` for mode. `0` is a valid line/length, never an error. Negative
   document values → `E_RANGE`.
 - Core is 0-based; CLI is 1-based. `col` is a UTF-8 byte offset.
+- `open`/`create`/`save` use `nofollow=true` and reject non-regular files
+  (`Stat::regular=false` → `E_IO`).
 - `apply` validates UTF-8 and overlap; violations → `E_INVALID_UTF8`/`E_RANGE`.
 - An `apply` call pushes exactly one undo step.
 - Core never calls the UI; it appends changes and the UI calls `drain()`.
@@ -538,8 +542,9 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
 - `write`: a mutation. If `<path>` exists, `--expect` (or `--force`) is
   **required**; if it does not exist, neither is required and `--expect` →
   `E_USAGE`. Creates the file if missing; otherwise replaces its contents
-  atomically (temp + rename). `--in-place` for hardlinks. Missing
-  `--expect`/`--force` on an existing target → `E_USAGE` (exit 3). Result:
+  atomically (temp + rename). `--in-place` for hardlinks and requires an
+  existing target (`E_USAGE` otherwise). Missing `--expect`/`--force` on an
+  existing target → `E_USAGE` (exit 3). Result:
   `bytes` (resulting size), `bytes_written` (this call; 0 for an identical
   no-op), `rev`, `save` (`full_rewrite` for a new file, `none` for a no-op),
   `changed` (replacement: `{0, max(bytes_before, bytes)}`; new file:
@@ -675,7 +680,8 @@ first error. `batch --check` with `valid:false` → exit **2**.
 ```
 
 - Ops: `write`, `edit`. `write` uses `content`/`content_file` plus
-  `in_place`/`expect`/`force`. `edit` uses `old`/`new`/`text`/`at`/`op`/
+  `in_place`/`expect`/`force` (`in_place` requires an existing target, else
+  `E_USAGE`). `edit` uses `old`/`new`/`text`/`at`/`op`/
   `length`/`count`/`all`/`dry_run`/`expect`/`force`. `count` and `all` are
   mutually exclusive; `count: N` replaces the first N (at least N required);
   `count: 0` → `E_USAGE`; `op:"replace"` without `text` → `E_USAGE`.
