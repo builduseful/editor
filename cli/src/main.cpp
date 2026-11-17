@@ -183,6 +183,12 @@ bool inside_root(const std::string& real, const std::string& root) {
          real.compare(0, root.size(), root) == 0 && real[root.size()] == '/';
 }
 
+// §6.1: the input-size cap applies to read/write/edit/info/validate (target size
+// at open, plus a write payload) unless --allow-huge.
+bool exceeds_cap(const Ctx& ctx, uint64_t bytes) {
+  return !ctx.allow_huge && bytes > ctx.max_file_bytes;
+}
+
 // Line starts of a logical document under the §5.1 convention.
 std::vector<uint64_t> line_starts_of(const std::string& s) {
   std::vector<uint64_t> out;
@@ -432,6 +438,9 @@ Run cmd_info(const Ctx& ctx, const std::string& raw_path) {
   if (s != Status::Ok) return fail_run("info", code_of(s), "cannot open", path);
   Info info;
   if (ed->info(&info) != Status::Ok) return fail_run("info", "E_INTERNAL", "info", path);
+  if (exceeds_cap(ctx, info.bytes)) {
+    return fail_run("info", "E_TOO_LARGE", "file exceeds --max-file-bytes", path);
+  }
 
   Env env;
   env.command = "info";
@@ -502,6 +511,9 @@ Run cmd_read(const Ctx& ctx, const std::string& raw_path, const Args& args) {
   if (os != Status::Ok) return fail_run("read", code_of(os), "cannot open", path);
   Info info;
   ed->info(&info);
+  if (exceeds_cap(ctx, info.bytes)) {
+    return fail_run("read", "E_TOO_LARGE", "file exceeds --max-file-bytes", path);
+  }
 
   const bool line_axis = args.has("--from") || args.has("--to");
   const bool byte_axis = args.has("--from-offset") || args.has("--length");
@@ -633,6 +645,9 @@ Run cmd_write(const Ctx& ctx, const std::string& raw_path, const Args& args) {
     std::fclose(f);
     if (!ok) return fail_run("write", "E_IO", "payload read failed", fp);
   }
+  if (exceeds_cap(ctx, payload.size())) {
+    return fail_run("write", "E_TOO_LARGE", "payload exceeds --max-file-bytes", path);
+  }
 
   const bool exists = file_exists(path);
   if (exists && !args.has("--expect") && !args.has("--force")) {
@@ -656,6 +671,9 @@ Run cmd_write(const Ctx& ctx, const std::string& raw_path, const Args& args) {
 
   Info before;
   ed->info(&before);
+  if (exceeds_cap(ctx, before.bytes)) {
+    return fail_run("write", "E_TOO_LARGE", "file exceeds --max-file-bytes", path);
+  }
 
   // Current logical document size (BOM excluded).
   size_t logical = 0;
@@ -774,6 +792,9 @@ Run cmd_edit(const Ctx& ctx, const std::string& raw_path, const Args& args) {
   if (os != Status::Ok) return fail_run("edit", code_of(os), "cannot open", path);
   Info before;
   ed->info(&before);
+  if (exceeds_cap(ctx, before.bytes)) {
+    return fail_run("edit", "E_TOO_LARGE", "file exceeds --max-file-bytes", path);
+  }
 
   if (has_expect) {
     std::string spec;
@@ -1644,6 +1665,9 @@ Run cmd_batch(const Ctx& ctx, const Args& args) {
       } else {
         payload = o.content;
       }
+      if (exceeds_cap(ctx, payload.size())) {
+        return {"E_TOO_LARGE", "payload exceeds --max-file-bytes"};
+      }
       if (o.in_place && !exists) {
         return {"E_USAGE", "in_place requires an existing target"};
       }
@@ -1784,6 +1808,11 @@ Run cmd_batch(const Ctx& ctx, const Args& args) {
       const Status s = read_original(path, &exists, &info, &doc);
       if (s != Status::Ok) {
         verrors.push_back({{code_of(s), "cannot read"}, o.index});
+        o.path = path;
+        continue;
+      }
+      if (exists && exceeds_cap(ctx, info.bytes)) {
+        verrors.push_back({{"E_TOO_LARGE", "file exceeds --max-file-bytes"}, o.index});
         o.path = path;
         continue;
       }

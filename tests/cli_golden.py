@@ -196,6 +196,14 @@ def main():
         check(env["ok"] is True and r["errors"] == [], "validate ok")
         check("truncated" not in env, "validate ok omits truncated")
 
+        # --- input size cap (§6.1) -----------------------------------------
+        for cmd in (["info", "ok.txt"], ["read", "ok.txt"], ["validate", "ok.txt"],
+                    ["edit", "ok.txt", "--old", "ok", "--new", "OK", "--force"]):
+            env = run(["--max-file-bytes", "4"] + cmd, tmp, 2)
+            check(env["error"]["code"] == "E_TOO_LARGE", f"cap applies to {cmd[0]}")
+        env = run(["--max-file-bytes", "4", "--allow-huge", "info", "ok.txt"], tmp, 0)
+        check(env["ok"] is True, "--allow-huge ignores the cap")
+
         with open(os.path.join(tmp, "bad.txt"), "wb") as f:
             f.write(b"bad \xff byte\n")
         env = run(["validate", "bad.txt"], tmp, 2)
@@ -298,6 +306,14 @@ def main():
                            input='{"op":"write","path":"b1.txt","content":"x","force":true}\n')
         check(json.loads(p.stdout)["error"]["code"] == "E_USAGE",
               "batch inline content from stdin")
+
+        # The input cap applies to each batch unit (§6.1).
+        p = subprocess.run([os.path.abspath(ED), "--max-file-bytes", "4", "batch"],
+                           cwd=tmp, capture_output=True, text=True,
+                           input='{"op":"edit","path":"ok.txt","old":"ok",'
+                                 '"new":"OK","force":true}\n')
+        check(json.loads(p.stdout)["error"]["code"] == "E_TOO_LARGE",
+              "batch unit cap")
 
         with open(os.path.join(tmp, "dry.jsonl"), "w") as f:
             f.write('{"op":"edit","path":"m.txt","old":"y1","new":"Y1","force":true,'
