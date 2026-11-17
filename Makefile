@@ -30,7 +30,7 @@ PLATFORM_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(PLATFORM_SRC))
 CLI_OBJ  := $(patsubst %.cpp,$(BUILD)/%.o,$(CLI_SRC))
 TEST_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(TEST_SRC))
 
-.PHONY: all test clean
+.PHONY: all test golden clean
 
 all: $(BUILD)/editor_tests
 ifneq ($(CORE_SRC),)
@@ -60,6 +60,9 @@ $(BUILD)/%.o: %.cpp
 
 test: $(BUILD)/editor_tests
 	$(BUILD)/editor_tests
+
+golden: $(BUILD)/editor
+	python3 tests/cli_golden.py $(BUILD)/editor
 
 clean:
 	rm -rf build build-asan

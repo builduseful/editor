@@ -161,6 +161,47 @@ bool file_exists(const std::string& p) {
   return ::stat(p.c_str(), &st) == 0;
 }
 
+bool inside_root(const std::string& real, const std::string& root) {
+  if (root == "/") return !real.empty() && real[0] == '/';
+  if (real == root) return true;
+  return real.size() > root.size() &&
+         real.compare(0, root.size(), root) == 0 && real[root.size()] == '/';
+}
+
+// Line starts of a logical document under the §5.1 convention.
+std::vector<uint64_t> line_starts_of(const std::string& s) {
+  std::vector<uint64_t> out;
+  out.push_back(0);
+  size_t i = 0;
+  while (i < s.size()) {
+    if (s[i] == '\n') {
+      i += 1;
+      out.push_back(i);
+    } else if (s[i] == '\r') {
+      i += (i + 1 < s.size() && s[i + 1] == '\n') ? 2 : 1;
+      out.push_back(i);
+    } else {
+      i += 1;
+    }
+  }
+  if (out.back() != s.size()) out.push_back(s.size());
+  return out;
+}
+
+size_t line_index_of(const std::vector<uint64_t>& starts, uint64_t off) {
+  // greatest i with starts[i] <= off
+  size_t lo = 0, hi = starts.size();
+  while (lo + 1 < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (starts[mid] <= off) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
+}
+
 bool read_stream(std::FILE* f, std::string* out) {
   char buf[65536];
   size_t n = 0;
@@ -211,11 +252,58 @@ bool parse_u64(const std::string& s, uint64_t* out) {
   return true;
 }
 
+bool parse_rev(const std::string& s, Rev* out) {
+  if (s.rfind("stat:", 0) != 0) return false;
+  std::vector<std::string> parts;
+  size_t pos = 5;
+  while (true) {
+    const size_t c = s.find(':', pos);
+    if (c == std::string::npos) {
+      parts.push_back(s.substr(pos));
+      break;
+    }
+    parts.push_back(s.substr(pos, c - pos));
+    pos = c + 1;
+  }
+  if (parts.size() != 5) return false;
+  uint64_t v[5] = {0, 0, 0, 0, 0};
+  for (int i = 0; i < 5; ++i) {
+    if (!parse_u64(parts[static_cast<size_t>(i)], &v[i])) return false;
+  }
+  out->dev = v[0];
+  out->ino = v[1];
+  out->size = v[2];
+  out->mtime_ns = v[3];
+  out->ctime_ns = v[4];
+  return true;
+}
+
+bool rev_eq(const Rev& a, const Rev& b) {
+  return a.dev == b.dev && a.ino == b.ino && a.size == b.size &&
+         a.mtime_ns == b.mtime_ns && a.ctime_ns == b.ctime_ns;
+}
+
+bool read_text_value(const Ctx& ctx, const std::string& v, std::string* out) {
+  if (v == "-") return read_stream(stdin, out);
+  if (!v.empty() && v[0] == '@') {
+    const std::string fp = resolve_path(ctx, v.substr(1));
+    std::FILE* f = std::fopen(fp.c_str(), "rb");
+    if (f == nullptr) return false;
+    const bool ok = read_stream(f, out);
+    std::fclose(f);
+    return ok;
+  }
+  *out = v;
+  return true;
+}
+
 // Options that take a value.
 bool takes_value(std::string_view k) {
   return k == "--from" || k == "--to" || k == "--from-offset" ||
          k == "--length" || k == "--max-bytes" || k == "--root" ||
-         k == "--max-file-bytes";
+         k == "--max-file-bytes" || k == "--old" || k == "--new" ||
+         k == "--at" || k == "--op" || k == "--text" || k == "--count" ||
+         k == "--expect" || k == "--file";
 }
 
 // --- Commands ---------------------------------------------------------------
@@ -268,6 +356,9 @@ std::string file_fields(const Info& info) {
 
 Run cmd_info(const Ctx& ctx, const std::string& raw_path) {
   const std::string path = resolve_path(ctx, raw_path);
+  if (!inside_root(path, ctx.root)) {
+    return fail_run("info", "E_OUTSIDE_ROOT", "path outside --root", path);
+  }
   std::unique_ptr<FileSystem> fs;
   if (create_file_system(&fs) != Status::Ok) return fail_run("info", "E_INTERNAL", "fs");
   std::unique_ptr<Editor> ed;
@@ -335,6 +426,9 @@ int64_t count_lines(const std::string& s) {
 
 Run cmd_read(const Ctx& ctx, const std::string& raw_path, const Args& args) {
   const std::string path = resolve_path(ctx, raw_path);
+  if (!inside_root(path, ctx.root)) {
+    return fail_run("read", "E_OUTSIDE_ROOT", "path outside --root", path);
+  }
   std::unique_ptr<FileSystem> fs;
   create_file_system(&fs);
   std::unique_ptr<Editor> ed;
@@ -449,6 +543,9 @@ Run cmd_read(const Ctx& ctx, const std::string& raw_path, const Args& args) {
 
 Run cmd_write(const Ctx& ctx, const std::string& raw_path, const Args& args) {
   const std::string path = resolve_path(ctx, raw_path);
+  if (!inside_root(path, ctx.root)) {
+    return fail_run("write", "E_OUTSIDE_ROOT", "path outside --root", path);
+  }
   const bool use_stdin = args.has("--stdin");
   std::string file_arg;
   const bool use_file = args.get("@file", &file_arg);
@@ -549,6 +646,9 @@ Run cmd_write(const Ctx& ctx, const std::string& raw_path, const Args& args) {
                            .dump();
   fields.pop_back();
   if (!created) {
+    fields += ",\"rev_before\":" + json::rev_object(before.rev.dev, before.rev.ino,
+                                                    before.rev.size, before.rev.mtime_ns,
+                                                    before.rev.ctime_ns);
     fields += ",\"bytes_before\":" + json::unum(before.bytes);
   }
   fields += ",\"bytes_written\":" + json::unum(si.bytes_written);
@@ -560,6 +660,319 @@ Run cmd_write(const Ctx& ctx, const std::string& raw_path, const Args& args) {
     if (created) to = after.bytes;
     fields += ",\"changed\":{\"from\":" + json::unum(from) + ",\"to\":" + json::unum(to) + "}";
   }
+  fields += "}";
+  env.results = json::Array().add(fields).dump();
+  Run r;
+  r.out = env.dump();
+  return r;
+}
+
+Run cmd_edit(const Ctx& ctx, const std::string& raw_path, const Args& args) {
+  const std::string path = resolve_path(ctx, raw_path);
+  if (!inside_root(path, ctx.root)) {
+    return fail_run("edit", "E_OUTSIDE_ROOT", "path outside --root", path);
+  }
+
+  const bool has_expect = args.has("--expect");
+  const bool has_force = args.has("--force");
+  if (has_expect && has_force) {
+    return fail_run("edit", "E_USAGE", "--expect and --force are mutually exclusive", path);
+  }
+  if (!has_expect && !has_force) {
+    return fail_run("edit", "E_USAGE", "one of --expect or --force is required", path);
+  }
+
+  const bool form_a = args.has("--old") || args.has("--new");
+  const bool form_b = args.has("--at") || args.has("--op");
+  if (form_a && form_b) {
+    return fail_run("edit", "E_USAGE", "the two edit forms are mutually exclusive", path);
+  }
+  if (!form_a && !form_b) return fail_run("edit", "E_USAGE", "an edit form is required", path);
+
+  const bool in_place = args.has("--in-place");
+  const bool dry_run = args.has("--dry-run");
+
+  std::unique_ptr<FileSystem> fs;
+  create_file_system(&fs);
+  std::unique_ptr<Editor> ed;
+  create_editor(*fs, &ed);
+  const Status os = ed->open(path);
+  if (os != Status::Ok) return fail_run("edit", code_of(os), "cannot open", path);
+  Info before;
+  ed->info(&before);
+
+  if (has_expect) {
+    std::string spec;
+    args.get("--expect", &spec);
+    Rev want{};
+    if (!parse_rev(spec, &want)) return fail_run("edit", "E_USAGE", "bad --expect", path);
+    if (!rev_eq(want, before.rev)) return fail_run("edit", "E_CONFLICT", "expected rev mismatch", path);
+  }
+
+  std::string doc;
+  {
+    size_t need = 0;
+    int64_t n = 0;
+    ed->read_lines(0, before.line_count, nullptr, 0, &need, &n);
+    doc.resize(need);
+    if (need > 0) {
+      size_t got = 0;
+      ed->read_lines(0, before.line_count, doc.data(), doc.size(), &got, &n);
+      doc.resize(got);
+    }
+  }
+
+  std::vector<Edit> edits;
+  std::string edit_text;  // stable storage for edit text views
+  uint64_t ch_from = 0, ch_to = 0;  // logical offsets
+  bool noop = false;
+
+  if (form_a) {
+    for (const char* k : {"--at", "--op", "--text", "--length"}) {
+      if (args.has(k)) return fail_run("edit", "E_USAGE", "flag not valid with --old/--new", path);
+    }
+    std::string oldv, newv;
+    if (!args.get("--old", &oldv)) return fail_run("edit", "E_USAGE", "--old is required", path);
+    if (!args.get("--new", &newv)) return fail_run("edit", "E_USAGE", "--new is required", path);
+    if (oldv == "-" && newv == "-") {
+      return fail_run("edit", "E_USAGE", "--old and --new cannot both be -", path);
+    }
+    std::string needle, repl;
+    if (!read_text_value(ctx, oldv, &needle)) return fail_run("edit", "E_IO", "cannot read --old", path);
+    if (!read_text_value(ctx, newv, &repl)) return fail_run("edit", "E_IO", "cannot read --new", path);
+    if (needle.empty()) return fail_run("edit", "E_USAGE", "--old must be non-empty", path);
+
+    const bool all = args.has("--all");
+    std::string cv;
+    const bool have_count = args.get("--count", &cv);
+    if (all && have_count) {
+      return fail_run("edit", "E_USAGE", "--all and --count are mutually exclusive", path);
+    }
+    int64_t count = 0;
+    if (have_count && (!parse_i64(cv, &count) || count < 1)) {
+      return fail_run("edit", "E_USAGE", "--count must be >= 1", path);
+    }
+
+    std::vector<size_t> matches;
+    size_t at = 0;
+    while (at + needle.size() <= doc.size()) {
+      const size_t m = doc.find(needle, at);
+      if (m == std::string::npos) break;
+      matches.push_back(m);
+      at = m + needle.size();
+    }
+    if (matches.empty()) return fail_run("edit", "E_NO_MATCH", "no match", path);
+    if (!all && !have_count && matches.size() != 1) {
+      return fail_run("edit", "E_AMBIGUOUS", "multiple matches", path);
+    }
+    if (have_count && matches.size() < static_cast<size_t>(count)) {
+      return fail_run("edit", "E_NO_MATCH", "fewer matches than --count", path);
+    }
+
+    size_t take = all ? matches.size() : (have_count ? static_cast<size_t>(count) : 1);
+    if (take > matches.size()) take = matches.size();
+
+    const std::vector<uint64_t> starts = line_starts_of(doc);
+    edit_text = repl;
+    for (size_t i = 0; i < take; ++i) {
+      const size_t m = matches[i];
+      const size_t li = line_index_of(starts, m);
+      Edit e;
+      e.line = static_cast<int64_t>(li);
+      e.col = static_cast<int64_t>(m - starts[li]);
+      e.removed_len = static_cast<int64_t>(needle.size());
+      e.text = edit_text;
+      edits.push_back(e);
+    }
+    ch_from = matches[0];
+    ch_to = matches[take - 1] + std::max(needle.size(), repl.size());
+    noop = (needle == repl);
+  } else {
+    for (const char* k : {"--old", "--new", "--all", "--count"}) {
+      if (args.has(k)) return fail_run("edit", "E_USAGE", "flag not valid with --at/--op", path);
+    }
+    std::string at_s, op;
+    if (!args.get("--at", &at_s)) return fail_run("edit", "E_USAGE", "--at is required", path);
+    if (!args.get("--op", &op)) return fail_run("edit", "E_USAGE", "--op is required", path);
+    if (op != "insert" && op != "replace" && op != "delete") {
+      return fail_run("edit", "E_USAGE", "bad --op", path);
+    }
+    int64_t line1 = 0, col = 0;
+    const size_t colon = at_s.find(':');
+    const std::string line_s = colon == std::string::npos ? at_s : at_s.substr(0, colon);
+    if (!parse_i64(line_s, &line1)) return fail_run("edit", "E_USAGE", "bad --at", path);
+    if (line1 < 1) return fail_run("edit", "E_USAGE", "--at line must be >= 1", path);
+    if (colon != std::string::npos) {
+      if (!parse_i64(at_s.substr(colon + 1), &col) || col < 0) {
+        return fail_run("edit", "E_USAGE", "bad --at column", path);
+      }
+    }
+    const bool has_text = args.has("--text");
+    const bool has_length = args.has("--length");
+    std::string text;
+    if (has_text) {
+      std::string tv;
+      args.get("--text", &tv);
+      if (!read_text_value(ctx, tv, &text)) return fail_run("edit", "E_IO", "cannot read --text", path);
+    }
+    uint64_t length = 0;
+    if (has_length) {
+      std::string lv;
+      args.get("--length", &lv);
+      if (!parse_u64(lv, &length)) return fail_run("edit", "E_USAGE", "bad --length", path);
+    }
+    if ((op == "insert" || op == "replace") && !has_text) {
+      return fail_run("edit", "E_USAGE", "--op insert|replace require --text", path);
+    }
+    if ((op == "replace" || op == "delete") && !has_length) {
+      return fail_run("edit", "E_USAGE", "--op replace|delete require --length", path);
+    }
+    if (op == "insert" && has_length) {
+      return fail_run("edit", "E_USAGE", "--length is not valid with --op insert", path);
+    }
+    if (line1 > before.line_count + 1) return fail_run("edit", "E_RANGE", "line past EOF", path);
+    if (line1 == before.line_count + 1 && col != 0) {
+      return fail_run("edit", "E_RANGE", "column must be 0 when appending at EOF", path);
+    }
+
+    const std::vector<uint64_t> starts = line_starts_of(doc);
+    const uint64_t off = starts[static_cast<size_t>(line1 - 1)] + static_cast<uint64_t>(col);
+    if (off > doc.size()) return fail_run("edit", "E_RANGE", "column past end of line", path);
+
+    Edit e;
+    e.line = line1 - 1;
+    e.col = col;
+    e.removed_len = (op == "insert") ? 0 : static_cast<int64_t>(length);
+    edit_text = text;
+    if (op != "delete") e.text = edit_text;
+    edits.push_back(e);
+
+    ch_from = off;
+    ch_to = off + std::max<uint64_t>(static_cast<uint64_t>(e.removed_len), text.size());
+    if (op == "insert") {
+      noop = text.empty();
+    } else if (op == "delete") {
+      noop = (length == 0);
+    } else {
+      noop = (length == text.size() && off + length <= doc.size() &&
+              doc.compare(off, length, text) == 0);
+    }
+  }
+
+  // Predicted post-edit document (only needed for --dry-run reporting).
+  if (dry_run) {
+    std::string predicted;
+    {
+      const std::vector<uint64_t> starts = line_starts_of(doc);
+      size_t cursor = 0;
+      for (const Edit& e : edits) {
+        const uint64_t o =
+            starts[static_cast<size_t>(e.line)] + static_cast<uint64_t>(e.col);
+        predicted.append(doc, cursor, o - cursor);
+        predicted.append(e.text.data(), e.text.size());
+        cursor = o + static_cast<uint64_t>(e.removed_len);
+      }
+      predicted.append(doc, cursor, doc.size() - cursor);
+    }
+    const uint64_t new_logical = predicted.size();
+    std::string method = "none";
+    if (!noop) {
+      if (new_logical == doc.size()) {
+        method = "clone_pwrite";
+      } else if ((new_logical - ch_to) * 4 <= new_logical) {
+        method = "clone_pwrite_tail";
+      } else {
+        method = "full_rewrite";
+      }
+    }
+    Env env;
+    env.command = "edit";
+    std::string fields = json::Object()
+                             .set("path", json::str(path))
+                             .set("bytes", json::unum(new_logical + (before.bom ? 3 : 0)))
+                             .set("line_count", json::num(count_lines(predicted)))
+                             .set("eol", json::str(eol_str(before.eol)))
+                             .set("encoding", json::str(encoding_str(before.encoding)))
+                             .set("bom", json::boolean(before.bom))
+                             .set("final_newline",
+                                  json::boolean(!predicted.empty() &&
+                                                (predicted.back() == '\n' ||
+                                                 predicted.back() == '\r')))
+                             .set("rev_before", json::rev_object(
+                                                    before.rev.dev, before.rev.ino,
+                                                    before.rev.size, before.rev.mtime_ns,
+                                                    before.rev.ctime_ns))
+                             .set("bytes_before", json::unum(before.bytes))
+                             .set("save", json::str(method))
+                             .dump();
+    fields.pop_back();
+    if (!noop) {
+      fields += ",\"changed\":{\"from\":" + json::unum(ch_from + (before.bom ? 3 : 0)) +
+                ",\"to\":" + json::unum(ch_to + (before.bom ? 3 : 0)) + "}";
+    }
+    if (in_place) fields += ",\"in_place\":true";
+    fields += "}";
+    env.results = json::Array().add(fields).dump();
+    Run r;
+    r.out = env.dump();
+    return r;
+  }
+
+  if (!noop) {
+    const Status as = ed->apply(edits);
+    if (as != Status::Ok) {
+      const std::string msg = ed->errmsg().empty() ? std::string("apply failed")
+                                                   : std::string(ed->errmsg());
+      return fail_run("edit", code_of(as), msg, path);
+    }
+  }
+
+  Rev expect{};
+  const Rev* expect_ptr = nullptr;
+  if (has_expect) {
+    std::string spec;
+    args.get("--expect", &spec);
+    parse_rev(spec, &expect);
+    expect_ptr = &expect;
+  }
+  SaveInfo si;
+  const Status ss = ed->save(expect_ptr, in_place, &si);
+  if (ss != Status::Ok) {
+    const std::string msg = ed->errmsg().empty() ? std::string("save failed")
+                                                 : std::string(ed->errmsg());
+    return fail_run("edit", code_of(ss), msg, path);
+  }
+
+  Info after;
+  ed->info(&after);
+
+  Env env;
+  env.command = "edit";
+  std::string fields = json::Object()
+                           .set("path", json::str(after.path))
+                           .set("bytes", json::unum(after.bytes))
+                           .set("line_count", json::num(after.line_count))
+                           .set("eol", json::str(eol_str(after.eol)))
+                           .set("encoding", json::str(encoding_str(after.encoding)))
+                           .set("bom", json::boolean(after.bom))
+                           .set("final_newline", json::boolean(after.final_newline))
+                           .set("rev_before", json::rev_object(
+                                                  before.rev.dev, before.rev.ino,
+                                                  before.rev.size, before.rev.mtime_ns,
+                                                  before.rev.ctime_ns))
+                           .set("rev", json::rev_object(after.rev.dev, after.rev.ino,
+                                                        after.rev.size, after.rev.mtime_ns,
+                                                        after.rev.ctime_ns))
+                           .set("bytes_before", json::unum(before.bytes))
+                           .set("bytes_written", json::unum(si.bytes_written))
+                           .set("save", json::str(si.method))
+                           .dump();
+  fields.pop_back();
+  if (!noop) {
+    fields += ",\"changed\":{\"from\":" + json::unum(ch_from + (before.bom ? 3 : 0)) +
+              ",\"to\":" + json::unum(ch_to + (before.bom ? 3 : 0)) + "}";
+  }
+  if (in_place) fields += ",\"in_place\":true";
   fields += "}";
   env.results = json::Array().add(fields).dump();
   Run r;
@@ -635,6 +1048,9 @@ int main(int argc, char** argv) {
   } else if (command == "write") {
     if (positional.empty()) r = fail_run("write", "E_USAGE", "missing path");
     else r = cmd_write(ctx, positional[0], args);
+  } else if (command == "edit") {
+    if (positional.empty()) r = fail_run("edit", "E_USAGE", "missing path");
+    else r = cmd_edit(ctx, positional[0], args);
   } else {
     r = fail_run(command, "E_USAGE", "unknown command");
   }
