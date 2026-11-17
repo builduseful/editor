@@ -212,8 +212,9 @@ class Editor {
   virtual Status save(const Rev* expected_rev = nullptr, bool in_place = false,
                       SaveInfo* out = nullptr) = 0;
   // save_as: no-op if clean and dst is the same file; expected_rev is checked
-  // even when clean. dst == the open path is the in-place case (same checks as
-  // save). Refuses a symlink or non-regular dst (lstat, no-follow) with
+  // even when clean. With in_place, dst must be an existing regular file to
+  // rewrite in place (a nonexistent dst is E_NOT_FOUND; use in_place=false to
+  // create). Refuses a symlink or non-regular dst (lstat, no-follow) with
   // E_CONFLICT; refuses to overwrite an existing dst with E_CONFLICT unless
   // expected_rev matches dst's identity; if dst does not exist, expected_rev
   // must be null (otherwise E_CONFLICT). On success the open path becomes dst
@@ -333,6 +334,8 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
 - A **line** is a byte range `[start, end)` excluding its terminator.
 - `line_count` = terminators + (1 if the last line is non-empty). Empty = 0;
   `a\n` = 1; `a` = 1; `a\n\n` = 2.
+- `final_newline` = true iff the file is non-empty and its last byte is a
+  terminator: empty and `a` → false; `a\n` → true.
 - **BOM:** a UTF-8 BOM is accepted, excluded from every logical line range, and
   reported as `bom: true`; a UTF-16 BOM → `E_UNSUPPORTED`. `col` is relative to
   the post-BOM start of line 1. `read_lines` excludes the BOM; `read_range` is
@@ -442,9 +445,9 @@ name, and opens the directory before the rename.
   `fchown` before `fchmod`. Setuid/setgid are not preserved. New files use
   `fchmod(tmp_fd, 0666 & ~umask)` before rename.
 - **In-place** (`--in-place`): `open_write(path, create=false, truncate=false,
-  nofollow=true)`. Core `save_as` to a non-existent dst uses `create=true`
-  (behaves as create; `expected_rev` must be null); CLI `write --in-place` and
-  batch `in_place` require an existing target (`E_USAGE` otherwise, §6.1/§6.4).
+  nofollow=true)`. **In-place requires an existing regular target**; a
+  nonexistent `save_as` dst is `E_NOT_FOUND` in core / `E_USAGE` on the CLI
+  (§6.1/§6.4). Creating a new file always uses `in_place=false` (temp + rename).
   Then `fstat` the new fd and require the same full `Rev`
   (`dev`, `ino`, `size`, `mtime_ns`, `ctime_ns`) as the applicable expected Rev
   — the open-time `Rev` for `save`, `expected_rev` (dst) for `save_as`
@@ -558,9 +561,11 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
   `E_USAGE`. On an existing file, `--expect` (or `--force`) is required;
   missing → `E_USAGE` (exit 3). `--dry-run` reports the planned
   edit (`changed`, `bytes`, `line_count`, predicted `save` method) plus
-  `rev_before`, and **omits `rev`**. `changed.from/to` = first and last changed
-  raw byte. Result: `changed`, `rev`, `bytes_before`, `bytes`, `bytes_written`,
-  `save`, `in_place` (when set).
+  `rev_before`, and **omits `rev`**. `changed = {from, to}` where `from` is the
+  first affected byte and `to = max(old_end, new_end)` over the edited region
+  (same rule as `write`; a pure insert at X of L bytes → `{X, X+L}`, a pure
+  delete of R bytes at X → `{X, X+R}`). Result: `changed`, `rev`, `bytes_before`,
+  `bytes`, `bytes_written`, `save`, `in_place` (when set).
 - `write`: a mutation. If `<path>` exists, `--expect` (or `--force`) is
   **required**; if it does not exist, neither is required and `--expect` →
   `E_USAGE`. Creates the file if missing; otherwise replaces its contents
@@ -736,7 +741,8 @@ first error. `batch --check` with `valid:false` → exit **2**.
   `write` to a non-existent path needs neither. Mismatch → `E_CONFLICT`, exit 2.
 - Lock: `<path>.editor.lock`, `O_CREAT|O_EXCL`, 0600, random token + pid + start
   time; stale by pid liveness + token; held for the expect-check + write + rename
-  critical section.
+  critical section. Each file's lock is acquired and released around that file's
+  own commit (never held across files), so concurrent batches cannot deadlock.
 - Symlinks: `resolve` + re-check inside `--root`; open with `nofollow=true` and
   `lstat` the final component; never rename over a symlink.
 - Refuse non-regular files; `--max-file-bytes` unless `--allow-huge`.
