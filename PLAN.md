@@ -204,10 +204,11 @@ class Editor {
 
   virtual Status undo() = 0;       // empty stack -> Ok, no change
   virtual Status redo() = 0;       // empty stack -> Ok, no change
-  // save: no-op if clean AND expected_rev matches; a clean file whose Rev
-  // differs reloads (mtime/ctime changed) then returns Ok. A clean no-op still
-  // verifies the expected_rev. in_place writes the original inode; otherwise
-  // clone/temp.
+  // save: no-op if clean and expected_rev (if given) matches the current
+  // on-disk Rev; method="none". An expected_rev mismatch, or a changed base
+  // inode/path (§5.5), is E_CONFLICT — save never auto-reloads. Auto-reload of
+  // a clean file after external mutation is check_identity()'s job (§5.6).
+  // in_place writes the original inode; otherwise clone/temp.
   virtual Status save(const Rev* expected_rev = nullptr, bool in_place = false,
                       SaveInfo* out = nullptr) = 0;
   // save_as: no-op if clean and dst is the same file; expected_rev is checked
@@ -416,7 +417,8 @@ comparison and the post-rename identity check, but not the post-save
 `open_readonly` reopen. The core resolves the open path once, splits it into dir +
 name, and opens the directory before the rename.
 
-- **No-op if clean.** `SaveInfo::method = "none"`. `expected_rev` is still checked.
+- **No-op if clean.** `SaveInfo::method = "none"`. `expected_rev` is still checked
+  (mismatch → `E_CONFLICT`).
 - **Same-length edits**: `clone_to_new(dir, &tmp, src_fd, &tmp_fd)` (O(1) on APFS;
   O(file) elsewhere), `pwrite` changed spans into `tmp_fd`, `fsync`, `rename_at`,
   `fsync_dir`. `SaveInfo::method = "clone_pwrite"`.
@@ -440,9 +442,10 @@ name, and opens the directory before the rename.
   `fchown` before `fchmod`. Setuid/setgid are not preserved. New files use
   `fchmod(tmp_fd, 0666 & ~umask)` before rename.
 - **In-place** (`--in-place`): `open_write(path, create=false, truncate=false,
-  nofollow=true)` (if the target does not exist, `create=true` and it behaves as
-  create; a `--expect` on a missing target is `E_USAGE`), then `fstat` the new fd
-  and require the same full `Rev`
+  nofollow=true)`. Core `save_as` to a non-existent dst uses `create=true`
+  (behaves as create; `expected_rev` must be null); CLI `write --in-place` and
+  batch `in_place` require an existing target (`E_USAGE` otherwise, §6.1/§6.4).
+  Then `fstat` the new fd and require the same full `Rev`
   (`dev`, `ino`, `size`, `mtime_ns`, `ctime_ns`) as the applicable expected Rev
   — the open-time `Rev` for `save`, `expected_rev` (dst) for `save_as`
   (otherwise `E_CONFLICT`, no write). `pwrite` changed spans
