@@ -204,9 +204,10 @@ class Editor {
   // when clean. in_place writes the original inode; otherwise clone/temp.
   virtual Status save(const Rev* expected_rev = nullptr, bool in_place = false,
                       SaveInfo* out = nullptr) = 0;
-  // save_as: refuses to overwrite an existing dst with E_CONFLICT unless
-  // expected_rev matches dst's identity; if dst does not exist, expected_rev
-  // must be null (otherwise E_CONFLICT). Updates open path/identity.
+  // save_as: refuses a symlink dst (lstat, no-follow) with E_CONFLICT;
+  // refuses to overwrite an existing dst with E_CONFLICT unless expected_rev
+  // matches dst's identity; if dst does not exist, expected_rev must be null
+  // (otherwise E_CONFLICT). Updates open path/identity.
   virtual Status save_as(std::string_view path_utf8,
                          const Rev* expected_rev = nullptr, bool in_place = false,
                          SaveInfo* out = nullptr) = 0;
@@ -420,8 +421,9 @@ once, splits it into dir + name, and opens the directory before the rename.
   `fchown` before `fchmod`. Setuid/setgid are not preserved. New files use
   `fchmod(tmp_fd, 0666 & ~umask)` before rename.
 - **In-place** (`--in-place`): `open_write(path, create=false, truncate=false,
-  nofollow=true)`, then `fstat` the new fd and require the same `(dev, ino)` as
-  the open-time `Rev` (otherwise `E_CONFLICT`, no write). `pwrite` changed spans
+  nofollow=true)`, then `fstat` the new fd and require the same full `Rev`
+  (`dev`, `ino`, `size`, `mtime_ns`, `ctime_ns`) as the open-time `Rev`
+  (otherwise `E_CONFLICT`, no write). `pwrite` changed spans
   (or full rewrite), `ftruncate` for length changes, `fsync(original)`, update
   identity/rev. No temp/rename; `SaveInfo::method` is `copy_range` or
   `full_rewrite` with `in_place=true`. Expect-check under the lock. A failure may
@@ -429,7 +431,8 @@ once, splits it into dir + name, and opens the directory before the rename.
 - **Temp**: `create_temp` returns a 0600 path + fd in the same directory; hold the
   fd from create through rename. On any in-process failure, close and `unlink`
   the temp. Never leave the temp at 0600. A crash may leave a stale
-  `*.editor-tmp-*`; it is ignored (or swept at startup).
+  `*.editor-tmp-*`; it is ignored (or swept at startup). A read-only destination
+  directory → `E_IO`; `--in-place` is the fallback.
 - **Durability**: `fsync(tmp_fd, full)` → `rename_at` → `fsync_dir(dirfd)`; open
   the directory **before** the rename. If `fsync(full=true)` returns
   `Status::Unsupported`, retry with `full=false` and set `durable=false`. A
@@ -844,9 +847,9 @@ separate `find` command and no core search API.
 
 - Unit: core, viewcore, CLI parsers.
 - Property: edit/insert/delete/undo invariants; piece-table round-trips;
-  save/restore identity; UTF-8 boundaries; chunk split/merge; line-count
-  conventions; coalescing; CRLF/CR/mixed EOL; empty file; no trailing newline;
-  huge line.
+  save/restore identity, mode/owner/ACL/xattr round-trip; UTF-8 boundaries;
+  chunk split/merge; line-count conventions; coalescing; CRLF/CR/mixed EOL;
+  empty file; no trailing newline; huge line.
 - Fuzz: argv, JSON reader/writer, patch parser (post-1.0), UTF-8, line index.
 - Golden CLI: exact JSON for every command after the §6.2 normalizations,
   including errors.
@@ -884,7 +887,7 @@ width + wrap settings, status bar, gutter, decorations, and the CLI (`read`,
 | **M0b** | `edit` + undo + length-changing save + fault injection. | 3–4 wk | Edit/undo property tests; double-save and save-crash tests. |
 | **M0c** | `batch` + `validate` + security + full error model (`E_NO_MATCH`/`E_AMBIGUOUS`) + batch symlink handling/TOCTOU + binding invariant. | 2–3 wk | Batch validation/rollback; fuzz; CLI golden. |
 | **M0.5** | Headless render oracle + viewcore skeleton + **5 GB read-only demo** + C++ validation + conformance check. | 2 wk | 5 GB at 60 fps, flat footprint; sanitizers clean; conformance pass; D1 kill-gate decision recorded. |
-| **M1** | macOS read-only custom view: AppKit + CoreText + viewcore; keyboard/mouse. | 4–6 wk | Open 1 GB to first paint < 100 ms; scroll 5 GB at ≥60 fps. |
+| **M1** | macOS read-only custom view: AppKit + CoreText + viewcore; keyboard/mouse. | 4–6 wk | Open 1 GB to first paint < 100 ms; open 5 GB < 250 ms; scroll 5 GB at ≥60 fps. |
 | **M2** | macOS editing + undo + save + **find/replace** (literal) + settings (font size, tab width, wrap via `NSUserDefaults`; keybindings hardcoded). | 4–6 wk | v1 checklist: edit, undo, find/replace, settings. |
 | **M3** | macOS polish: status bar, gutter, decorations. | 3–4 wk | v1 checklist complete. |
 | **M3.5** | Release engineering: notarization, packaging, CI perf gates. | 2–3 wk | Signed `.app`; CI green. |
