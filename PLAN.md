@@ -405,8 +405,11 @@ once, splits it into dir + name, and opens the directory before the rename.
   `ftruncate(tmp_fd, new_size)`, `fsync`, `rename_at`, `fsync_dir`; otherwise full
   rewrite. `method = "clone_pwrite_tail"`.
 - **Clone the original fd/inode**, not the path. The core holds the original fd
-  from `open`; `fstat` it and compare to the open-time `Rev`. If the identity
-  changed, fail `E_CONFLICT`; never mix old offsets with new bytes.
+  from `open`; before cloning, require **both** `identity(path)` (path not
+  replaced) and `fstat(src_fd)` (inode not truncated/rewritten in place) to
+  match the open-time `Rev`. If either differs, fail `E_CONFLICT`; never mix old
+  offsets with new bytes. `--force` skips the explicit `--expect` comparison,
+  not this safety check.
 - **Copy paths** (clone unavailable, non-APFS): `create_temp` (0600), stream the
   unchanged prefix/suffix ranges via `pread`/`pwrite` into the temp, write the
   edited span, `copy_metadata(src_fd, tmp_fd)`, `fsync`, `rename_at`,
@@ -417,14 +420,16 @@ once, splits it into dir + name, and opens the directory before the rename.
   `fchown` before `fchmod`. Setuid/setgid are not preserved. New files use
   `fchmod(tmp_fd, 0666 & ~umask)` before rename.
 - **In-place** (`--in-place`): `open_write(path, create=false, truncate=false,
-  nofollow=true)`, `pwrite` changed spans (or full rewrite), `ftruncate` for
-  length changes, `fsync(original)`, update identity/rev. No temp/rename;
-  `SaveInfo::method` is `copy_range` or `full_rewrite` with `in_place=true`.
-  Expect-check under the lock. A failure may leave a partial file; report `E_IO`.
-  Hardlinks and crash-safety are user opt-in.
+  nofollow=true)`, then `fstat` the new fd and require the same `(dev, ino)` as
+  the open-time `Rev` (otherwise `E_CONFLICT`, no write). `pwrite` changed spans
+  (or full rewrite), `ftruncate` for length changes, `fsync(original)`, update
+  identity/rev. No temp/rename; `SaveInfo::method` is `copy_range` or
+  `full_rewrite` with `in_place=true`. Expect-check under the lock. A failure may
+  leave a partial file; report `E_IO`. Hardlinks and crash-safety are user opt-in.
 - **Temp**: `create_temp` returns a 0600 path + fd in the same directory; hold the
-  fd from create through rename. Never leave the temp at 0600. A crash may leave
-  a stale `*.editor-tmp-*`; it is ignored (or swept at startup).
+  fd from create through rename. On any in-process failure, close and `unlink`
+  the temp. Never leave the temp at 0600. A crash may leave a stale
+  `*.editor-tmp-*`; it is ignored (or swept at startup).
 - **Durability**: `fsync(tmp_fd, full)` → `rename_at` → `fsync_dir(dirfd)`; open
   the directory **before** the rename. If `fsync(full=true)` returns
   `Status::Unsupported`, retry with `full=false` and set `durable=false`. A
@@ -432,8 +437,9 @@ once, splits it into dir + name, and opens the directory before the rename.
   **never blind-retry**. The warning is reported only on the call that produced it.
 - **Post-save transition**: close the pre-save base fd, reopen the path with
   `open_readonly(path, nofollow=true, &fd)` under the same lock, and verify the
-  `fstat` matches the new `Rev`; on mismatch, `E_CONFLICT`. Update
-  identity/mtime/rev. Atomic w.r.t.
+  `fstat` matches the new `Rev`; on mismatch, `E_CONFLICT`. If the reopen itself
+  fails, return `E_IO` and require `reload()`/`open()` before further edits (the
+  on-disk save succeeded). Update identity/mtime/rev. Atomic w.r.t.
   other threads, not w.r.t. process crash; a crash **before** rename leaves the
   old file intact; after rename the new file is visible. Double-save test.
 - **Gate**: same-length edit in 1 GB on APFS < 100 ms p99 with **crash-only
@@ -442,7 +448,7 @@ once, splits it into dir + name, and opens the directory before the rename.
 
 ### 5.6 External mutation and mmap
 
-- Record `(dev, ino, size, mtime_ns, ctime_ns)` at open.
+- Record `(dev, ino, size, mtime_ns, ctime_ns)` from `fstat(src_fd)` at open.
 - Rename-based replacement is safe (old inode stays mapped). In-place truncate
   causes `SIGBUS` on macOS; handle with a signal handler + `sigsetjmp(env, 1)`/
   `siglongjmp` around risky accesses (**no locks or allocations in the handler**),
@@ -533,7 +539,8 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
   `--expect`/`--force` on an existing target → `E_USAGE` (exit 3). Result:
   `bytes` (resulting size), `bytes_written` (this call; 0 for an identical
   no-op), `rev`, `save` (`full_rewrite` for a new file, `none` for a no-op),
-  `bytes_before` (existing target only).
+  `changed` (replacement: `{0, max(bytes_before, bytes)}`; new file:
+  `{0, bytes}`; omitted for a no-op), `bytes_before` (existing target only).
 - `info`: `path`, `bytes`, `line_count`, `eol`, `encoding`, `bom`,
   `final_newline`, `rev`, `dirty`.
 - `validate`: `errors[]` of `{line, col, byte_offset, code}`; capped at 100 with
@@ -680,7 +687,8 @@ first error. `batch --check` with `valid:false` → exit **2**.
   the `--at`/`--length` range; `--op insert` is a zero-length range at the
   insertion point); overlap is byte-range intersection. Two inserts at the same
   offset overlap (`E_RANGE`), matching `apply`. Same-file ops must not overlap;
-  disjoint edits are merged into one `apply`.
+  disjoint edits are merged into one `apply`, and the merged op reports one
+  `changed` range covering all merged edits.
 - `batch` adds `rolled_back` (bool) and per-op `results[]` to the envelope;
   results are capped at 1000 with `"truncated": true`. `--check` returns
   `results: []`, `valid` + `errors[]` and writes nothing; on `valid:false`,
