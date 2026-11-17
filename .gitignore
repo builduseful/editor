@@ -5,8 +5,7 @@
 .editor/
 
 # Build output
-/build/
-build/
+build*/
 
 # OS
 .DS_Store

@@ -1,17 +1,66 @@
 #include "line_index.hpp"
 
 #include <algorithm>
+#include <utility>
 
 #include "line_stream.hpp"
 
 namespace ed {
 
-Status LineIndex::build(const Source& doc) {
-  chunks_.clear();
-  Status s = rescan(doc, 0, doc.size(), &chunks_);
-  if (s != Status::Ok) return s;
-  rebuild_prefix();
-  return Status::Ok;
+LineIndex::LineIndex() {
+  root_ = std::make_unique<Node>();
+  root_->leaf = true;
+}
+
+LineIndex::~LineIndex() = default;
+
+LineIndex::Sum LineIndex::node_sum(const Node* n) const {
+  Sum s;
+  if (n->leaf) {
+    for (const LineChunk& c : n->chunks) {
+      s.lines += c.lines;
+      s.bytes += c.bytes;
+    }
+  } else {
+    for (const Sum& k : n->sums) {
+      s.lines += k.lines;
+      s.bytes += k.bytes;
+    }
+  }
+  return s;
+}
+
+void LineIndex::recompute(Node* n) {
+  if (n->leaf) return;
+  for (std::unique_ptr<Node>& k : n->kids) recompute(k.get());
+  n->sums.assign(n->kids.size(), Sum{});
+  for (size_t i = 0; i < n->kids.size(); ++i) {
+    n->sums[i] = node_sum(n->kids[i].get());
+  }
+}
+
+void LineIndex::adopt_root(std::vector<std::unique_ptr<Node>> level) {
+  if (level.empty()) {
+    root_ = std::make_unique<Node>();
+    root_->leaf = true;
+  } else {
+    while (level.size() > 1) {
+      std::vector<std::unique_ptr<Node>> next;
+      for (size_t i = 0; i < level.size(); i += kMaxKids) {
+        auto node = std::make_unique<Node>();
+        node->leaf = false;
+        const size_t end = std::min(level.size(), i + kMaxKids);
+        for (size_t j = i; j < end; ++j) node->kids.push_back(std::move(level[j]));
+        next.push_back(std::move(node));
+      }
+      level = std::move(next);
+    }
+    root_ = std::move(level[0]);
+  }
+  recompute(root_.get());
+  const Sum s = node_sum(root_.get());
+  total_lines_ = s.lines;
+  total_bytes_ = s.bytes;
 }
 
 Status LineIndex::rescan(const Source& doc, uint64_t start, uint64_t end,
@@ -38,58 +87,53 @@ Status LineIndex::rescan(const Source& doc, uint64_t start, uint64_t end,
   return Status::Ok;
 }
 
-void LineIndex::rebuild_prefix() {
-  prefix_lines_.assign(chunks_.size() + 1, 0);
-  prefix_bytes_.assign(chunks_.size() + 1, 0);
-  for (size_t i = 0; i < chunks_.size(); ++i) {
-    prefix_lines_[i + 1] = prefix_lines_[i] + chunks_[i].lines;
-    prefix_bytes_[i + 1] = prefix_bytes_[i] + chunks_[i].bytes;
+Status LineIndex::build(const Source& doc) {
+  std::vector<LineChunk> flat;
+  Status s = rescan(doc, 0, doc.size(), &flat);
+  if (s != Status::Ok) return s;
+
+  std::vector<std::unique_ptr<Node>> level;
+  for (size_t i = 0; i < flat.size(); i += kMaxChunks) {
+    auto leaf = std::make_unique<Node>();
+    leaf->leaf = true;
+    const size_t end = std::min(flat.size(), i + kMaxChunks);
+    leaf->chunks.assign(flat.begin() + static_cast<std::ptrdiff_t>(i),
+                        flat.begin() + static_cast<std::ptrdiff_t>(end));
+    level.push_back(std::move(leaf));
   }
-  total_lines_ = prefix_lines_.back();
-  total_bytes_ = prefix_bytes_.back();
+  adopt_root(std::move(level));
+  return Status::Ok;
 }
 
-size_t LineIndex::chunk_for_line(uint64_t line) const {
-  // greatest c with prefix_lines_[c] <= line
-  size_t lo = 0, hi = chunks_.size();
-  while (lo + 1 < hi) {
-    size_t mid = lo + (hi - lo) / 2;
-    if (prefix_lines_[mid] <= line) {
-      lo = mid;
-    } else {
-      hi = mid;
+void LineIndex::locate_byte(uint64_t off, Loc* out) const {
+  Node* n = root_.get();
+  uint64_t acc_b = 0, acc_l = 0;
+  while (!n->leaf) {
+    size_t i = 0;
+    while (i + 1 < n->kids.size() && off >= acc_b + n->sums[i].bytes) {
+      acc_b += n->sums[i].bytes;
+      acc_l += n->sums[i].lines;
+      ++i;
     }
+    n = n->kids[i].get();
   }
-  return lo;
+  size_t i = 0;
+  while (i + 1 < n->chunks.size() && off >= acc_b + n->chunks[i].bytes) {
+    acc_b += n->chunks[i].bytes;
+    acc_l += n->chunks[i].lines;
+    ++i;
+  }
+  out->leaf = n;
+  out->index = i;
+  out->start_byte = acc_b;
+  out->start_line = acc_l;
 }
 
-size_t LineIndex::chunk_for_byte(uint64_t off) const {
-  size_t lo = 0, hi = chunks_.size();
-  while (lo + 1 < hi) {
-    size_t mid = lo + (hi - lo) / 2;
-    if (prefix_bytes_[mid] <= off) {
-      lo = mid;
-    } else {
-      hi = mid;
-    }
-  }
-  return lo;
-}
-
-Status LineIndex::line_start(const Source& doc, int64_t line,
-                             uint64_t* out) const {
-  if (line < 0 || static_cast<uint64_t>(line) > total_lines_) {
-    return Status::Range;
-  }
-  if (static_cast<uint64_t>(line) == total_lines_) {
-    *out = total_bytes_;
-    return Status::Ok;
-  }
-  const size_t c = chunk_for_line(static_cast<uint64_t>(line));
-  const uint64_t walk = static_cast<uint64_t>(line) - prefix_lines_[c];
-  uint64_t pos = prefix_bytes_[c];
-  LineStream ls(doc, pos);
-  for (uint64_t i = 0; i < walk; ++i) {
+Status LineIndex::line_start_in(const Source& doc, uint64_t within,
+                                uint64_t start_byte, uint64_t* out) const {
+  LineStream ls(doc, start_byte);
+  uint64_t pos = start_byte;
+  for (uint64_t i = 0; i < within; ++i) {
     bool has_line = false;
     uint64_t line_bytes = 0;
     bool has_term = false;
@@ -102,17 +146,169 @@ Status LineIndex::line_start(const Source& doc, int64_t line,
   return Status::Ok;
 }
 
-Status LineIndex::merge_chunks(const Source& doc, size_t i) {
-  // Rescans [start_i, start_{i+2}) and replaces chunks i and i+1.
+Status LineIndex::line_start(const Source& doc, int64_t line,
+                             uint64_t* out) const {
+  if (line < 0 || static_cast<uint64_t>(line) > total_lines_) {
+    return Status::Range;
+  }
+  if (static_cast<uint64_t>(line) == total_lines_) {
+    *out = total_bytes_;
+    return Status::Ok;
+  }
+  const uint64_t want = static_cast<uint64_t>(line);
+  Node* n = root_.get();
+  uint64_t acc_lines = 0, acc_bytes = 0;
+  while (!n->leaf) {
+    size_t i = 0;
+    while (i + 1 < n->kids.size() && want >= acc_lines + n->sums[i].lines) {
+      acc_lines += n->sums[i].lines;
+      acc_bytes += n->sums[i].bytes;
+      ++i;
+    }
+    n = n->kids[i].get();
+  }
+  size_t i = 0;
+  while (i + 1 < n->chunks.size() && want >= acc_lines + n->chunks[i].lines) {
+    acc_lines += n->chunks[i].lines;
+    acc_bytes += n->chunks[i].bytes;
+    ++i;
+  }
+  return line_start_in(doc, want - acc_lines, acc_bytes, out);
+}
+
+std::vector<std::unique_ptr<LineIndex::Node>> LineIndex::splice(
+    Node* n, uint64_t base, uint64_t from, uint64_t to,
+    const std::vector<LineChunk>& ins, bool* inserted) {
+  std::vector<std::unique_ptr<Node>> result;
+
+  if (n->leaf) {
+    uint64_t leaf_end = base;
+    for (const LineChunk& c : n->chunks) leaf_end += c.bytes;
+    const bool insert_here = !*inserted && from >= base && from < leaf_end;
+
+    std::vector<LineChunk> content;
+    content.reserve(n->chunks.size() + ins.size());
+    uint64_t cb = base;
+    size_t before_count = 0;
+    for (const LineChunk& c : n->chunks) {
+      if (cb < from) {
+        content.push_back(c);
+        ++before_count;
+      } else if (cb >= to) {
+        content.push_back(c);
+      }
+      cb += c.bytes;
+    }
+    if (insert_here) {
+      content.insert(content.begin() + static_cast<std::ptrdiff_t>(before_count),
+                     ins.begin(), ins.end());
+      *inserted = true;
+    }
+    for (size_t i = 0; i < content.size(); i += kMaxChunks) {
+      auto leaf = std::make_unique<Node>();
+      leaf->leaf = true;
+      const size_t end = std::min(content.size(), i + kMaxChunks);
+      leaf->chunks.assign(content.begin() + static_cast<std::ptrdiff_t>(i),
+                          content.begin() + static_cast<std::ptrdiff_t>(end));
+      result.push_back(std::move(leaf));
+    }
+    return result;
+  }
+
+  std::vector<std::unique_ptr<Node>> kids;
+  uint64_t cb = base;
+  for (size_t i = 0; i < n->kids.size(); ++i) {
+    const uint64_t kid_end = cb + n->sums[i].bytes;
+    const bool removal = kid_end > from && cb < to;
+    const bool insertion = !*inserted && from >= cb && from < kid_end;
+    if (removal || insertion) {
+      auto sub = splice(n->kids[i].get(), cb, from, to, ins, inserted);
+      for (std::unique_ptr<Node>& s : sub) kids.push_back(std::move(s));
+    } else {
+      kids.push_back(std::move(n->kids[i]));
+    }
+    cb = kid_end;
+  }
+  for (size_t i = 0; i < kids.size(); i += kMaxKids) {
+    auto node = std::make_unique<Node>();
+    node->leaf = false;
+    const size_t end = std::min(kids.size(), i + kMaxKids);
+    for (size_t j = i; j < end; ++j) node->kids.push_back(std::move(kids[j]));
+    result.push_back(std::move(node));
+  }
+  return result;
+}
+
+Status LineIndex::merge_boundary(const Source& doc, uint64_t boundary) {
+  if (boundary == 0 || boundary >= total_bytes_) return Status::Ok;
+  Loc a;
+  locate_byte(boundary - 1, &a);
+  Loc b;
+  locate_byte(boundary, &b);
+  const LineChunk before = a.leaf->chunks[a.index];
+  const LineChunk after = b.leaf->chunks[b.index];
+  if (before.lines >= kMinChunkLines) return Status::Ok;
+  if (static_cast<uint64_t>(before.lines) + after.lines > kChunkLines) {
+    return Status::Ok;
+  }
+  const uint64_t end = boundary + after.bytes;
   std::vector<LineChunk> merged;
-  Status s = rescan(doc, prefix_bytes_[i], prefix_bytes_[i + 2], &merged);
+  Status s = rescan(doc, a.start_byte, end, &merged);
   if (s != Status::Ok) return s;
-  chunks_.erase(chunks_.begin() + static_cast<std::ptrdiff_t>(i),
-                chunks_.begin() + static_cast<std::ptrdiff_t>(i) + 2);
-  chunks_.insert(chunks_.begin() + static_cast<std::ptrdiff_t>(i),
-                 merged.begin(), merged.end());
-  rebuild_prefix();
+  bool inserted = false;
+  auto level = splice(root_.get(), 0, a.start_byte, end, merged, &inserted);
+  adopt_root(std::move(level));
   return Status::Ok;
+}
+
+size_t LineIndex::count_nodes(const Node* n) {
+  if (n->leaf) return 1;
+  size_t total = 1;
+  for (const std::unique_ptr<Node>& k : n->kids) total += count_nodes(k.get());
+  return total;
+}
+
+size_t LineIndex::count_chunks(const Node* n) {
+  if (n->leaf) return n->chunks.size();
+  size_t total = 0;
+  for (const std::unique_ptr<Node>& k : n->kids) total += count_chunks(k.get());
+  return total;
+}
+
+size_t LineIndex::chunk_count() const { return count_chunks(root_.get()); }
+size_t LineIndex::node_count() const { return count_nodes(root_.get()); }
+
+bool LineIndex::check(const Node* n, size_t depth, size_t* leaf_depth) const {
+  if (n->leaf) {
+    if (*leaf_depth == SIZE_MAX) {
+      *leaf_depth = depth;
+    } else if (*leaf_depth != depth) {
+      return false;
+    }
+    if (n->chunks.size() > kMaxChunks) return false;
+    for (const LineChunk& c : n->chunks) {
+      if (c.lines == 0 || c.lines > kChunkLines) return false;
+    }
+    return true;
+  }
+  if (n->kids.empty() || n->kids.size() > kMaxKids) return false;
+  if (n->sums.size() != n->kids.size()) return false;
+  for (size_t i = 0; i < n->kids.size(); ++i) {
+    const Sum want = node_sum(n->kids[i].get());
+    if (n->sums[i].lines != want.lines || n->sums[i].bytes != want.bytes) {
+      return false;
+    }
+    if (!check(n->kids[i].get(), depth + 1, leaf_depth)) return false;
+  }
+  return true;
+}
+
+bool LineIndex::validate_tree() const {
+  if (root_ == nullptr) return false;
+  size_t leaf_depth = SIZE_MAX;
+  if (!check(root_.get(), 0, &leaf_depth)) return false;
+  const Sum s = node_sum(root_.get());
+  return s.lines == total_lines_ && s.bytes == total_bytes_;
 }
 
 Status LineIndex::apply_edit(const Source& doc, uint64_t off, uint64_t removed,
@@ -121,37 +317,38 @@ Status LineIndex::apply_edit(const Source& doc, uint64_t off, uint64_t removed,
   const uint64_t old_size = total_bytes_;
   if (off > old_size || removed > old_size - off) return Status::Range;
 
-  // First chunk to rebuild: the one containing `off` (or the last, if the edit
-  // is an append at EOF).
-  size_t c0 = 0;
-  uint64_t s0 = 0;
-  if (chunks_.empty()) {
-    c0 = 0;
-    s0 = 0;
-  } else if (off < old_size) {
-    c0 = chunk_for_byte(off);
-    s0 = prefix_bytes_[c0];
-  } else {
-    c0 = chunks_.size() - 1;
-    s0 = prefix_bytes_[c0];
+  // Empty document: rebuild from the inserted bytes.
+  if (total_bytes_ == 0) {
+    std::vector<LineChunk> fresh;
+    Status s = rescan(doc, 0, inserted, &fresh);
+    if (s != Status::Ok) return s;
+    std::vector<std::unique_ptr<Node>> level;
+    for (size_t i = 0; i < fresh.size(); i += kMaxChunks) {
+      auto leaf = std::make_unique<Node>();
+      leaf->leaf = true;
+      const size_t end = std::min(fresh.size(), i + kMaxChunks);
+      leaf->chunks.assign(fresh.begin() + static_cast<std::ptrdiff_t>(i),
+                          fresh.begin() + static_cast<std::ptrdiff_t>(end));
+      level.push_back(std::move(leaf));
+    }
+    adopt_root(std::move(level));
+    return Status::Ok;
   }
 
-  // Smallest old chunk start >= off+removed (the unchanged tail begins there).
+  Loc start;
+  locate_byte(off, &start);
+  const uint64_t s0 = start.start_byte;
+
   const uint64_t edit_end = off + removed;
-  size_t c1 = 0;
   uint64_t s1 = old_size;
-  if (!chunks_.empty() && edit_end < old_size) {
-    const size_t c = chunk_for_byte(edit_end);
-    if (prefix_bytes_[c] == edit_end) {
-      c1 = c;
+  if (edit_end < old_size) {
+    Loc e;
+    locate_byte(edit_end, &e);
+    if (e.start_byte == edit_end) {
       s1 = edit_end;
     } else {
-      c1 = c + 1;
-      s1 = prefix_bytes_[c + 1];
+      s1 = e.start_byte + e.leaf->chunks[e.index].bytes;
     }
-  } else {
-    c1 = chunks_.size();
-    s1 = old_size;
   }
 
   const uint64_t new_end = s1 - removed + inserted;
@@ -159,27 +356,20 @@ Status LineIndex::apply_edit(const Source& doc, uint64_t off, uint64_t removed,
   Status s = rescan(doc, s0, new_end, &fresh);
   if (s != Status::Ok) return s;
 
-  chunks_.erase(chunks_.begin() + static_cast<std::ptrdiff_t>(c0),
-                chunks_.begin() + static_cast<std::ptrdiff_t>(c1));
-  chunks_.insert(chunks_.begin() + static_cast<std::ptrdiff_t>(c0),
-                 fresh.begin(), fresh.end());
-  rebuild_prefix();
-
-  // Local fixups: re-merge a boundary chunk that dropped below the minimum.
-  if (!fresh.empty()) {
-    const size_t last = c0 + fresh.size() - 1;
-    if (last + 1 < chunks_.size() &&
-        chunks_[last].lines < kMinChunkLines &&
-        chunks_[last].lines + chunks_[last + 1].lines <= kChunkLines) {
-      Status ms = merge_chunks(doc, last);
-      if (ms != Status::Ok) return ms;
-    }
-    if (c0 > 0 && chunks_[c0].lines < kMinChunkLines &&
-        chunks_[c0 - 1].lines + chunks_[c0].lines <= kChunkLines) {
-      Status ms = merge_chunks(doc, c0 - 1);
-      if (ms != Status::Ok) return ms;
-    }
+  bool inserted_flag = false;
+  auto level = splice(root_.get(), 0, s0, s1, fresh, &inserted_flag);
+  if (!inserted_flag && !fresh.empty()) {
+    auto leaf = std::make_unique<Node>();
+    leaf->leaf = true;
+    leaf->chunks = fresh;
+    level.push_back(std::move(leaf));
   }
+  adopt_root(std::move(level));
+
+  Status ms = merge_boundary(doc, s0);
+  if (ms != Status::Ok) return ms;
+  ms = merge_boundary(doc, new_end);
+  if (ms != Status::Ok) return ms;
   return Status::Ok;
 }
 

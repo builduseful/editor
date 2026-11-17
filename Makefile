@@ -16,7 +16,9 @@ ifdef SANITIZE
 CXXFLAGS += -fsanitize=address,undefined -fno-omit-frame-pointer
 endif
 
-BUILD := build
+# Keep sanitizer objects in a separate tree so toggling SANITIZE never mixes
+# instrumented and plain objects in one link.
+BUILD := build$(if $(SANITIZE),-asan,)
 
 CORE_SRC := $(wildcard core/src/*.cpp)
 PLATFORM_SRC := $(wildcard platform/macos/*.cpp)
@@ -58,4 +60,4 @@ test: $(BUILD)/editor_tests
 	$(BUILD)/editor_tests
 
 clean:
-	rm -rf $(BUILD)
+	rm -rf build build-asan

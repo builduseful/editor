@@ -14,6 +14,7 @@ using ed_test::MemSource;
 namespace {
 
 void expect_matches(const LineIndex& idx, const std::string& s) {
+  CHECK(idx.validate_tree());
   const std::vector<uint64_t> starts = ed_test::naive_line_starts(s);
   CHECK_EQ(idx.line_count(), static_cast<int64_t>(starts.size()) - 1);
   CHECK_EQ(idx.byte_count(), static_cast<uint64_t>(s.size()));
@@ -116,5 +117,35 @@ TEST(line_index_chunk_occupancy_stays_bounded) {
     }
     CHECK_EQ(idx.line_count(), 2000);
     expect_matches(idx, model);
+    // 2000 lines at <= 64 lines/chunk is at most ~32 chunks plus slack.
+    CHECK(idx.chunk_count() <= 64);
+    CHECK(idx.node_count() <= 8);
   }
+}
+
+TEST(line_index_multi_chunk_edits) {
+  // Edits that add and remove many lines at once exercise splits and merges.
+  ed_test::Prng rng(0x1234ABCD);
+  std::string model;
+  for (int i = 0; i < 500; ++i) model += "seed\n";
+  MemSource src(model);
+  LineIndex idx;
+  CHECK(idx.build(src) == Status::Ok);
+  expect_matches(idx, model);
+
+  for (int iter = 0; iter < 200; ++iter) {
+    const size_t off = static_cast<size_t>(rng.below(model.size() + 1));
+    const size_t max_rem = std::min<size_t>(200, model.size() - off);
+    const size_t removed =
+        max_rem == 0 ? 0 : static_cast<size_t>(rng.below(max_rem) + 1);
+    std::string inserted;
+    const size_t n = static_cast<size_t>(rng.below(120));
+    for (size_t i = 0; i < n; ++i) inserted += (rng.below(4) == 0) ? "long\n" : "z\n";
+    model = model.substr(0, off) + inserted + model.substr(off + removed);
+
+    MemSource next(model);
+    CHECK(idx.apply_edit(next, off, removed, inserted.size()) == Status::Ok);
+    if (iter % 10 == 0) expect_matches(idx, model);
+  }
+  expect_matches(idx, model);
 }
