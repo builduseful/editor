@@ -65,6 +65,14 @@ class Parser {
   }
 
   bool parse_value(Value* out) {
+    if (depth_ >= kMaxDepth) return fail("nesting too deep");
+    ++depth_;
+    const bool ok = parse_value_inner(out);
+    --depth_;
+    return ok;
+  }
+
+  bool parse_value_inner(Value* out) {
     *out = Value{};  // reset so a reused Value does not accumulate
     if (pos_ >= s_.size()) return fail("unexpected end of input");
     const char c = s_[pos_];
@@ -203,17 +211,19 @@ class Parser {
           case 'u': {
             uint32_t cp = 0;
             if (!parse_hex4(&cp)) return false;
-            if (cp >= 0xD800 && cp <= 0xDBFF && pos_ + 1 < s_.size() &&
-                s_[pos_] == '\\' && s_[pos_ + 1] == 'u') {
-              pos_ += 2;
-              uint32_t lo = 0;
-              if (!parse_hex4(&lo)) return false;
-              if (lo >= 0xDC00 && lo <= 0xDFFF) {
+            if (cp >= 0xD800 && cp <= 0xDBFF) {
+              // High surrogate: require an immediately following low surrogate.
+              if (pos_ + 1 < s_.size() && s_[pos_] == '\\' && s_[pos_ + 1] == 'u') {
+                pos_ += 2;
+                uint32_t lo = 0;
+                if (!parse_hex4(&lo)) return false;
+                if (lo < 0xDC00 || lo > 0xDFFF) return fail("unpaired surrogate");
                 cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
               } else {
-                append_utf8(out, cp);
-                cp = lo;
+                return fail("unpaired surrogate");
               }
+            } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+              return fail("unpaired surrogate");
             }
             append_utf8(out, cp);
             break;
@@ -221,6 +231,9 @@ class Parser {
           default: return fail("bad escape");
         }
         continue;
+      }
+      if (static_cast<unsigned char>(c) < 0x20) {
+        return fail("control character in string");
       }
       out->push_back(c);
       pos_ += 1;
@@ -256,17 +269,32 @@ class Parser {
   bool parse_number(Value* out) {
     const size_t start = pos_;
     if (pos_ < s_.size() && s_[pos_] == '-') pos_ += 1;
-    while (pos_ < s_.size() && s_[pos_] >= '0' && s_[pos_] <= '9') pos_ += 1;
-    if (pos_ < s_.size() && s_[pos_] == '.') {
+    // Integer part: 0, or [1-9][0-9]* (no leading zeros).
+    if (pos_ >= s_.size() || s_[pos_] < '0' || s_[pos_] > '9') {
+      return fail("bad number");
+    }
+    if (s_[pos_] == '0') {
       pos_ += 1;
+    } else {
       while (pos_ < s_.size() && s_[pos_] >= '0' && s_[pos_] <= '9') pos_ += 1;
     }
+    // Fraction: '.' [0-9]+
+    if (pos_ < s_.size() && s_[pos_] == '.') {
+      pos_ += 1;
+      if (pos_ >= s_.size() || s_[pos_] < '0' || s_[pos_] > '9') {
+        return fail("bad number");
+      }
+      while (pos_ < s_.size() && s_[pos_] >= '0' && s_[pos_] <= '9') pos_ += 1;
+    }
+    // Exponent: [eE] [+-]? [0-9]+
     if (pos_ < s_.size() && (s_[pos_] == 'e' || s_[pos_] == 'E')) {
       pos_ += 1;
       if (pos_ < s_.size() && (s_[pos_] == '+' || s_[pos_] == '-')) pos_ += 1;
+      if (pos_ >= s_.size() || s_[pos_] < '0' || s_[pos_] > '9') {
+        return fail("bad number");
+      }
       while (pos_ < s_.size() && s_[pos_] >= '0' && s_[pos_] <= '9') pos_ += 1;
     }
-    if (pos_ == start) return fail("bad number");
     out->kind = Value::Kind::Number;
     out->text = s_.substr(start, pos_ - start);
     return true;
@@ -274,7 +302,12 @@ class Parser {
 
   const std::string& s_;
   size_t pos_ = 0;
+  int depth_ = 0;
   std::string err_;
+
+  // The reader is recursive; cap nesting so a hostile program cannot exhaust the
+  // stack (§6.5 DoS defaults).
+  static constexpr int kMaxDepth = 256;
 };
 
 inline bool parse(const std::string& text, Value* out, std::string* err) {

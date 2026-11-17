@@ -32,7 +32,7 @@ CLI_OBJ  := $(patsubst %.cpp,$(BUILD)/%.o,$(CLI_SRC))
 BENCH_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(BENCH_SRC))
 TEST_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(TEST_SRC))
 
-.PHONY: all test golden bench clean
+.PHONY: all test golden fuzz bench clean
 
 all: $(BUILD)/editor_tests
 ifneq ($(CORE_SRC),)
@@ -65,6 +65,11 @@ test: $(BUILD)/editor_tests
 
 golden: $(BUILD)/editor
 	python3 tests/cli_golden.py $(BUILD)/editor
+
+# Deterministic fuzzing. The C++ fuzzers (UTF-8, JSON reader/writer, line index)
+# run under `test`; this drives the CLI argv/batch fuzzer (§9).
+fuzz: $(BUILD)/editor
+	python3 tests/cli_fuzz.py $(BUILD)/editor
 
 $(BUILD)/bench_edit: $(BENCH_OBJ) $(PLATFORM_OBJ) $(BUILD)/libcore.a
 	@mkdir -p $(@D)

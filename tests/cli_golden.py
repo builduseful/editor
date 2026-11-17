@@ -299,6 +299,21 @@ def main():
               "batch dry_run omits rev/bytes_written")
         check(r["save"] == "clone_pwrite", "batch dry_run predicted method")
 
+        # --- strict JSON reader (§10): malformed programs are rejected -------
+        for bad in ('{"op":"info","path":"a.txt","count":1e}',
+                    '{"op":"info","path":"a.txt","count":01}',
+                    '{"op":"info","path":"a.txt","bad":}',):
+            p = subprocess.run([os.path.abspath(ED), "batch"], cwd=tmp,
+                               capture_output=True, text=True, input=bad + "\n")
+            env = json.loads(p.stdout)
+            check(env["error"]["code"] == "E_PARSE", f"strict JSON rejects {bad}")
+
+        deep = "[" * 400 + "]" * 400
+        p = subprocess.run([os.path.abspath(ED), "batch"], cwd=tmp,
+                           capture_output=True, text=True, input=deep + "\n")
+        env = json.loads(p.stdout)
+        check(env["error"]["code"] == "E_PARSE", "deep nesting rejected")
+
         # --- outside root --------------------------------------------------
         env = run(["info", "/etc/hosts"], tmp, 2)
         check(env["error"]["code"] == "E_OUTSIDE_ROOT", "outside root")

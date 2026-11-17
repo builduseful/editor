@@ -7,6 +7,7 @@
 #include <utility>
 
 #include "line_stream.hpp"
+#include "utf8.hpp"
 
 namespace ed {
 
@@ -22,67 +23,6 @@ std::string dirname_of(std::string_view p) {
 std::string basename_of(std::string_view p) {
   const size_t pos = p.find_last_of('/');
   return std::string(pos == std::string_view::npos ? p : p.substr(pos + 1));
-}
-
-bool is_continuation(char c) {
-  return (static_cast<unsigned char>(c) & 0xC0) == 0x80;
-}
-
-bool valid_utf8(std::string_view s) {
-  size_t i = 0;
-  const size_t n = s.size();
-  while (i < n) {
-    const unsigned char c = static_cast<unsigned char>(s[i]);
-    size_t extra = 0;
-    unsigned int cp = 0;
-    if (c < 0x80) {
-      i += 1;
-      continue;
-    } else if ((c & 0xE0) == 0xC0) {
-      extra = 1;
-      cp = c & 0x1Fu;
-    } else if ((c & 0xF0) == 0xE0) {
-      extra = 2;
-      cp = c & 0x0Fu;
-    } else if ((c & 0xF8) == 0xF0) {
-      extra = 3;
-      cp = c & 0x07u;
-    } else {
-      return false;
-    }
-    if (i + extra >= n) return false;
-    for (size_t k = 1; k <= extra; ++k) {
-      const unsigned char cc = static_cast<unsigned char>(s[i + k]);
-      if ((cc & 0xC0) != 0x80) return false;
-      cp = (cp << 6) | (cc & 0x3Fu);
-    }
-    if (extra == 1 && cp < 0x80) return false;
-    if (extra == 2 && cp < 0x800) return false;
-    if (extra == 3 && cp < 0x10000) return false;
-    if (cp > 0x10FFFF) return false;
-    if (cp >= 0xD800 && cp <= 0xDFFF) return false;
-    i += extra + 1;
-  }
-  return true;
-}
-
-std::string normalize_newlines(std::string_view s, Eol eol) {
-  const char* rep = eol == Eol::CrLf ? "\r\n" : (eol == Eol::Cr ? "\r" : "\n");
-  const size_t replen = eol == Eol::CrLf ? 2 : 1;
-  std::string out;
-  out.reserve(s.size());
-  for (size_t i = 0; i < s.size(); ++i) {
-    const char c = s[i];
-    if (c == '\r') {
-      out.append(rep, replen);
-      if (i + 1 < s.size() && s[i + 1] == '\n') i += 1;
-    } else if (c == '\n') {
-      out.append(rep, replen);
-    } else {
-      out.push_back(c);
-    }
-  }
-  return out;
 }
 
 bool rev_equal(const Rev& a, const Rev& b) {
