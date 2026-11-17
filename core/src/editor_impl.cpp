@@ -876,49 +876,8 @@ Status EditorImpl::do_save(const Rev* expected_rev, bool in_place, SaveInfo* out
 
   // Changed regions of the new file, derived from the piece structure.
   std::vector<std::pair<uint64_t, uint64_t>> spans;
-  uint64_t expected_base = 0, doc_pos = 0;
-  bool open_span = false;
-  uint64_t os = 0, oe = 0;
-  auto flush = [&]() {
-    if (open_span) {
-      spans.push_back({os, oe});
-      open_span = false;
-    }
-  };
-  for (const Piece& p : pieces_.pieces()) {
-    if (p.src == Piece::Src::Base) {
-      if (p.off == expected_base) {
-        flush();
-      } else if (p.off > expected_base) {
-        spans.push_back({doc_pos, doc_pos});  // deletion point
-        flush();
-      }
-      expected_base = p.off + p.len;
-      doc_pos += p.len;
-    } else {
-      if (!open_span) {
-        open_span = true;
-        os = doc_pos;
-      }
-      oe = doc_pos + p.len;
-      doc_pos += p.len;
-    }
-  }
-  flush();
-
   uint64_t fc = 0, lc2 = 0;
-  bool any = false;
-  for (const auto& sp : spans) {
-    if (!any) {
-      fc = sp.first;
-      lc2 = sp.second;
-      any = true;
-    } else {
-      fc = std::min(fc, sp.first);
-      lc2 = std::max(lc2, sp.second);
-    }
-  }
-  (void)any;
+  changed_spans(&spans, &fc, &lc2);
 
   const uint64_t new_size = pieces_.size();
   const bool new_file = base_size_ == 0;
@@ -934,39 +893,11 @@ Status EditorImpl::do_save(const Rev* expected_rev, bool in_place, SaveInfo* out
   }
 
   auto write_doc = [&](int fd, uint64_t off, uint64_t len) -> Status {
-    char buf[65536];
-    uint64_t done = 0;
-    while (done < len) {
-      const uint64_t want = std::min<uint64_t>(sizeof(buf), len - done);
-      size_t got = 0;
-      Status st = pieces_.read(off + done, want, buf, sizeof(buf), &got);
-      if (st != Status::Ok) return st;
-      if (got == 0) return Status::Internal;
-      size_t w = 0;
-      st = fs_->pwrite(fd, off + done, buf, got, &w);
-      if (st != Status::Ok) return st;
-      if (w != got) return Status::Io;
-      done += got;
-    }
-    return Status::Ok;
+    return write_doc_to(fd, off, len);
   };
   auto write_base = [&](int fd, uint64_t base_off, uint64_t dst_off,
                         uint64_t len) -> Status {
-    char buf[65536];
-    uint64_t done = 0;
-    while (done < len) {
-      const uint64_t want = std::min<uint64_t>(sizeof(buf), len - done);
-      size_t got = 0;
-      Status st = fs_->pread(base_fd_.get(), base_off + done, buf, want, &got);
-      if (st != Status::Ok) return st;
-      if (got == 0) return Status::Internal;
-      size_t w = 0;
-      st = fs_->pwrite(fd, dst_off + done, buf, got, &w);
-      if (st != Status::Ok) return st;
-      if (w != got) return Status::Io;
-      done += got;
-    }
-    return Status::Ok;
+    return write_base_to(fd, base_off, dst_off, len);
   };
 
   bool used_clone = false;
@@ -1110,6 +1041,7 @@ Status EditorImpl::do_save(const Rev* expected_rev, bool in_place, SaveInfo* out
   base_src_.reset(fs_, newfd, nst.size);
   rev_ = Rev{nst.dev, nst.ino, nst.size, nst.mtime_ns, nst.ctime_ns};
   flatten_after_save(new_size);
+  emit_save_change();  // §5.4: a save that wrote invalidates everything
 
   si.durable = durable;
   if (out != nullptr) *out = si;
@@ -1121,9 +1053,324 @@ Status EditorImpl::save(const Rev* expected_rev, bool in_place, SaveInfo* out) {
   return do_save(expected_rev, in_place, out);
 }
 
-Status EditorImpl::save_as(std::string_view /*p*/, const Rev* /*expected_rev*/,
-                           bool /*in_place*/, SaveInfo* /*out*/) {
-  return fail(Status::Unsupported, "save_as is M0b");
+void EditorImpl::changed_spans(
+    std::vector<std::pair<uint64_t, uint64_t>>* spans, uint64_t* first_changed,
+    uint64_t* last_changed) const {
+  spans->clear();
+  uint64_t expected_base = 0, doc_pos = 0;
+  bool open_span = false;
+  uint64_t os = 0, oe = 0;
+  auto flush = [&]() {
+    if (open_span) {
+      spans->push_back({os, oe});
+      open_span = false;
+    }
+  };
+  for (const Piece& p : pieces_.pieces()) {
+    if (p.src == Piece::Src::Base) {
+      if (p.off == expected_base) {
+        flush();
+      } else if (p.off > expected_base) {
+        spans->push_back({doc_pos, doc_pos});  // deletion point
+        flush();
+      }
+      expected_base = p.off + p.len;
+      doc_pos += p.len;
+    } else {
+      if (!open_span) {
+        open_span = true;
+        os = doc_pos;
+      }
+      oe = doc_pos + p.len;
+      doc_pos += p.len;
+    }
+  }
+  flush();
+  *first_changed = 0;
+  *last_changed = 0;
+  bool any = false;
+  for (const auto& sp : *spans) {
+    if (!any) {
+      *first_changed = sp.first;
+      *last_changed = sp.second;
+      any = true;
+    } else {
+      *first_changed = std::min(*first_changed, sp.first);
+      *last_changed = std::max(*last_changed, sp.second);
+    }
+  }
+}
+
+Status EditorImpl::write_doc_to(int fd, uint64_t off, uint64_t len) const {
+  char buf[65536];
+  uint64_t done = 0;
+  while (done < len) {
+    const uint64_t want = std::min<uint64_t>(sizeof(buf), len - done);
+    size_t got = 0;
+    Status st = pieces_.read(off + done, want, buf, sizeof(buf), &got);
+    if (st != Status::Ok) return st;
+    if (got == 0) return Status::Internal;
+    size_t w = 0;
+    st = fs_->pwrite(fd, off + done, buf, got, &w);
+    if (st != Status::Ok) return st;
+    if (w != got) return Status::Io;
+    done += got;
+  }
+  return Status::Ok;
+}
+
+Status EditorImpl::write_base_to(int fd, uint64_t base_off, uint64_t dst_off,
+                                 uint64_t len) const {
+  char buf[65536];
+  uint64_t done = 0;
+  while (done < len) {
+    const uint64_t want = std::min<uint64_t>(sizeof(buf), len - done);
+    size_t got = 0;
+    Status st = fs_->pread(base_fd_.get(), base_off + done, buf, want, &got);
+    if (st != Status::Ok) return st;
+    if (got == 0) return Status::Internal;
+    size_t w = 0;
+    st = fs_->pwrite(fd, dst_off + done, buf, got, &w);
+    if (st != Status::Ok) return st;
+    if (w != got) return Status::Io;
+    done += got;
+  }
+  return Status::Ok;
+}
+
+// One Save change meaning "invalidate everything" (§4/§5.4). Geometry:
+// first=0, last=line_count before, new_count=line_count after (equal for a save).
+Status EditorImpl::emit_save_change() {
+  int64_t lines = 0;
+  if (ensure_index() == Status::Ok) lines = index_.line_count();
+  Change ch;
+  ch.first = 0;
+  ch.last = lines;
+  ch.new_count = lines;
+  ch.kind = ChangeKind::Save;
+  emit(ch);
+  return Status::Ok;
+}
+
+// save_as (§4/§5.5): write the document to a different path. The clean
+// same-file no-op wins first; otherwise the dst's identity is checked against
+// expected_rev, then the copy path (temp + rename, dst metadata) or the in-place
+// path (rewrite the dst inode). On success the open path becomes dst.
+Status EditorImpl::save_as(std::string_view dst_in, const Rev* expected_rev,
+                           bool in_place, SaveInfo* out) {
+  if (needs_reload_) return fail(Status::Stale, "needs reload");
+  if (!opened_) return fail(Status::Io, "no document");
+  if (dst_in.empty()) return fail(Status::Range, "empty dst");
+
+  // Resolve the destination: resolve the parent (which exists) and append the
+  // basename, so a not-yet-existing dst still resolves against the current dir.
+  std::string dst(dst_in);
+  {
+    const std::string parent = dirname_of(dst);
+    const std::string name = basename_of(dst);
+    std::string rp;
+    if (fs_->resolve(parent, &rp) == Status::Ok) dst = rp + "/" + name;
+  }
+
+  Stat dst_st;
+  Status ls = fs_->lstat(dst, &dst_st);  // no-follow: a symlink is not regular
+  const bool exists = (ls == Status::Ok);
+  if (!exists && ls != Status::NotFound) return fail(ls, "dst lstat");
+
+  // Same-file no-op wins first, even with expected_rev=null and when clean.
+  if (exists && dst_st.regular && dst_st.dev == rev_.dev &&
+      dst_st.ino == rev_.ino) {
+    if (pieces_.pristine()) {
+      SaveInfo si;
+      si.method = "none";
+      si.in_place = in_place;
+      if (out != nullptr) *out = si;
+      return Status::Ok;
+    }
+    return do_save(expected_rev, in_place, out);  // same inode: normal save
+  }
+
+  if (exists) {
+    if (!dst_st.regular) {
+      return fail(Status::Conflict, "dst is not a regular file");
+    }
+    if (expected_rev == nullptr) return fail(Status::Conflict, "dst exists");
+    const Rev dst_rev{dst_st.dev, dst_st.ino, dst_st.size, dst_st.mtime_ns,
+                      dst_st.ctime_ns};
+    if (!rev_equal(*expected_rev, dst_rev)) {
+      return fail(Status::Conflict, "dst rev mismatch");
+    }
+  } else {
+    if (in_place) return fail(Status::NotFound, "in-place dst must exist");
+    if (expected_rev != nullptr) {
+      return fail(Status::Conflict, "new dst with expected_rev");
+    }
+  }
+
+  // Source expect-check: lstat(source) + fstat(src_fd), without locking the
+  // source (we hold the dst lock, never two) (§5.5).
+  {
+    Stat cur;
+    Status s = fs_->lstat(path_, &cur);
+    if (s != Status::Ok) return fail(Status::Conflict, "source missing");
+    if (!cur.regular || cur.dev != rev_.dev || cur.ino != rev_.ino) {
+      return fail(Status::Conflict, "source identity changed");
+    }
+    Stat bst;
+    s = fs_->fstat(base_fd_.get(), &bst);
+    if (s != Status::Ok) return fail(s, "fstat base");
+    if (bst.size != rev_.size || bst.mtime_ns != rev_.mtime_ns ||
+        bst.ctime_ns != rev_.ctime_ns) {
+      return fail(Status::Conflict, "base changed");
+    }
+  }
+
+  std::vector<std::pair<uint64_t, uint64_t>> spans;
+  uint64_t fc = 0, lc2 = 0;
+  changed_spans(&spans, &fc, &lc2);
+  const uint64_t new_size = pieces_.size();
+
+  SaveInfo si;
+  si.in_place = in_place;
+  bool durable = true;
+
+  const std::string dst_dir = dirname_of(dst);
+  const std::string dst_name = basename_of(dst);
+
+  if (in_place) {
+    // Rewrite the existing dst inode; its metadata is untouched. A different
+    // inode never uses the clone/tail partition (§5.5), so write in full.
+    int dfd = -1;
+    Status s = fs_->open_write(dst, false, false, true, &dfd);
+    if (s != Status::Ok) return fail(s, "in-place open");
+    Stat cur;
+    s = fs_->fstat(dfd, &cur);
+    if (s != Status::Ok) {
+      fs_->close_fd(dfd);
+      return fail(s, "fstat dst");
+    }
+    const Rev cur_rev{cur.dev, cur.ino, cur.size, cur.mtime_ns, cur.ctime_ns};
+    if (expected_rev == nullptr || !rev_equal(*expected_rev, cur_rev)) {
+      fs_->close_fd(dfd);
+      return fail(Status::Conflict, "dst rev mismatch");
+    }
+    s = write_doc_to(dfd, 0, new_size);
+    if (s != Status::Ok) {
+      needs_reload_ = true;
+      fs_->close_fd(dfd);
+      return fail(s, "write");
+    }
+    if (new_size != cur.size) {
+      s = fs_->ftruncate(dfd, new_size);
+      if (s != Status::Ok) {
+        needs_reload_ = true;
+        fs_->close_fd(dfd);
+        return fail(s, "ftruncate");
+      }
+    }
+    s = fs_->fsync(dfd, false);
+    if (s != Status::Ok) {
+      needs_reload_ = true;
+      fs_->close_fd(dfd);
+      return fail(s, "fsync");
+    }
+    fs_->close_fd(dfd);
+    si.method = "full_rewrite";
+    si.bytes_written = new_size;
+  } else {
+    // Copy path: write the whole document into a temp in the dst directory,
+    // give it the dst's metadata (existing dst) or 0666 & ~umask (new dst),
+    // then rename. Never clone the source's metadata (§5.5).
+    std::string tmp;
+    int tfd = -1;
+    Status s = fs_->create_temp(dst_dir, &tmp, &tfd);
+    if (s != Status::Ok) return fail(s, "temp");
+    auto discard = [&]() {
+      fs_->close_fd(tfd);
+      fs_->unlink(tmp);
+    };
+    if (exists) {
+      int dfd = -1;
+      s = fs_->open_readonly(dst, true, &dfd);
+      if (s != Status::Ok) {
+        discard();
+        return fail(s, "dst open");
+      }
+      fs_->copy_metadata(dfd, tfd);
+      fs_->close_fd(dfd);
+    } else {
+      // Create the dst so the OS applies 0666 & ~umask, copy that onto the
+      // temp, then rename over the placeholder. A crash here leaves only an
+      // empty new file, never data loss.
+      int dfd = -1;
+      s = fs_->open_write(dst, true, false, true, &dfd);
+      if (s != Status::Ok) {
+        discard();
+        return fail(s, "dst create");
+      }
+      fs_->copy_metadata(dfd, tfd);
+      fs_->close_fd(dfd);
+    }
+    s = write_doc_to(tfd, 0, new_size);
+    if (s != Status::Ok) {
+      discard();
+      return fail(s, "write");
+    }
+    s = fs_->fsync(tfd, false);
+    if (s != Status::Ok) {
+      discard();
+      return fail(s, "fsync");
+    }
+    int dirfd = -1;
+    s = fs_->open_dir(dst_dir, &dirfd);
+    if (s != Status::Ok) {
+      discard();
+      return fail(s, "open dir");
+    }
+    s = fs_->rename_at(dirfd, dst_name, tmp);
+    if (s != Status::Ok) {
+      fs_->close_fd(dirfd);
+      discard();
+      return fail(s, "rename");
+    }
+    s = fs_->fsync_dir(dirfd);
+    fs_->close_fd(dirfd);
+    if (s != Status::Ok) durable = false;
+    fs_->close_fd(tfd);
+    si.method = (base_size_ == 0) ? "full_rewrite" : "copy_range";
+    si.bytes_written = new_size;
+  }
+
+  si.first_changed = fc;
+  si.last_changed = lc2;
+
+  // Post-save transition: adopt dst as the new base (same as save).
+  int newfd = -1;
+  Status s = fs_->open_readonly(dst, true, &newfd);
+  if (s != Status::Ok) {
+    needs_reload_ = true;
+    return fail(Status::Io, "post-save reopen failed");
+  }
+  Stat nst;
+  s = fs_->fstat(newfd, &nst);
+  if (s != Status::Ok || nst.size != new_size) {
+    fs_->close_fd(newfd);
+    needs_reload_ = true;
+    return fail(Status::Conflict, "post-save identity mismatch");
+  }
+  base_fd_.adopt(fs_, newfd);
+  base_src_.reset(fs_, newfd, nst.size);
+  path_ = dst;
+  dir_ = dst_dir;
+  rev_ = Rev{nst.dev, nst.ino, nst.size, nst.mtime_ns, nst.ctime_ns};
+  base_size_ = nst.size;
+  flatten_after_save(nst.size);
+  emit_save_change();
+
+  si.durable = durable;
+  if (out != nullptr) *out = si;
+  if (!durable) return fail(Status::SavedButNotDurable, "directory sync failed");
+  return Status::Ok;
 }
 
 Status EditorImpl::reload() {

@@ -706,3 +706,150 @@ TEST(editor_double_save_is_noop) {
   CHECK_EQ(read_file(p), std::string("aXcdef\n"));
   CHECK_EQ(count_temps(fx.dir), 0);
 }
+
+// --- save_as (§4/§5.5) ------------------------------------------------------
+
+static std::vector<Change> g_changes;
+static void record_change(Editor*, const Change& c, void*) {
+  g_changes.push_back(c);
+}
+
+TEST(editor_save_as_new_file) {
+  Fixture fx(make_temp_dir());
+  const std::string a = fx.path("a.txt");
+  const std::string b = fx.path("b.txt");
+  write_file(a, "abc\n");
+  CHECK(fx.ed->open(a) == Status::Ok);
+  const Edit e[1] = {Edit{0, 0, 0, std::string_view("X")}};
+  CHECK(fx.ed->apply(e) == Status::Ok);
+
+  SaveInfo si;
+  CHECK(fx.ed->save_as(b, nullptr, false, &si) == Status::Ok);
+  CHECK_EQ(std::string(si.method), std::string("copy_range"));
+  CHECK_EQ(read_file(a), std::string("abc\n"));   // source untouched
+  CHECK_EQ(read_file(b), std::string("Xabc\n"));
+
+  // The open path is now dst: a later save writes there.
+  Info in;
+  CHECK(fx.ed->info(&in) == Status::Ok);
+  CHECK_EQ(std::string(in.path),
+           std::filesystem::weakly_canonical(b).string());
+  const Edit e2[1] = {Edit{0, 0, 0, std::string_view("Y")}};
+  CHECK(fx.ed->apply(e2) == Status::Ok);
+  SaveInfo si2;
+  CHECK(fx.ed->save(nullptr, false, &si2) == Status::Ok);
+  CHECK_EQ(read_file(b), std::string("YXabc\n"));
+  CHECK_EQ(read_file(a), std::string("abc\n"));
+}
+
+TEST(editor_save_as_same_file_clean_is_noop) {
+  Fixture fx(make_temp_dir());
+  const std::string a = fx.path("same.txt");
+  write_file(a, "abc\n");
+  CHECK(fx.ed->open(a) == Status::Ok);
+  SaveInfo si;
+  CHECK(fx.ed->save_as(a, nullptr, false, &si) == Status::Ok);
+  CHECK_EQ(std::string(si.method), std::string("none"));
+  CHECK_EQ(si.bytes_written, 0u);
+}
+
+TEST(editor_save_as_existing_requires_matching_rev) {
+  Fixture fx(make_temp_dir());
+  const std::string a = fx.path("src.txt");
+  const std::string b = fx.path("dst.txt");
+  write_file(a, "abc\n");
+  write_file(b, "old\n");
+  CHECK(fx.ed->open(a) == Status::Ok);
+  const Edit e[1] = {Edit{0, 0, 0, std::string_view("X")}};
+  CHECK(fx.ed->apply(e) == Status::Ok);
+
+  SaveInfo si;
+  CHECK(fx.ed->save_as(b, nullptr, false, &si) == Status::Conflict);
+  CHECK_EQ(read_file(b), std::string("old\n"));
+
+  Rev drev;
+  CHECK(fx.fs->identity(b, &drev) == Status::Ok);
+  CHECK(fx.ed->save_as(b, &drev, false, &si) == Status::Ok);
+  CHECK_EQ(read_file(b), std::string("Xabc\n"));
+  CHECK_EQ(read_file(a), std::string("abc\n"));
+}
+
+TEST(editor_save_as_refuses_symlink_and_bad_new_rev) {
+  Fixture fx(make_temp_dir());
+  const std::string a = fx.path("src.txt");
+  const std::string target = fx.path("real.txt");
+  const std::string link = fx.path("link.txt");
+  write_file(a, "abc\n");
+  write_file(target, "t\n");
+  std::error_code ec;
+  std::filesystem::create_symlink(target, link, ec);
+  CHECK(fx.ed->open(a) == Status::Ok);
+
+  SaveInfo si;
+  // A symlink dst is refused (lstat, no-follow).
+  CHECK(fx.ed->save_as(link, nullptr, false, &si) == Status::Conflict);
+
+  // A new dst with expected_rev set is refused; in_place on a new dst is NotFound.
+  Rev any{};
+  CHECK(fx.ed->save_as(fx.path("new.txt"), &any, false, &si) == Status::Conflict);
+  CHECK(fx.ed->save_as(fx.path("new.txt"), nullptr, true, &si) == Status::NotFound);
+}
+
+TEST(editor_save_as_in_place_preserves_inode) {
+  Fixture fx(make_temp_dir());
+  const std::string a = fx.path("src.txt");
+  const std::string b = fx.path("dst.txt");
+  write_file(a, "abc\n");
+  write_file(b, "old content\n");
+  CHECK(fx.ed->open(a) == Status::Ok);
+  const Edit e[1] = {Edit{0, 0, 0, std::string_view("X")}};
+  CHECK(fx.ed->apply(e) == Status::Ok);
+
+  Rev drev;
+  CHECK(fx.fs->identity(b, &drev) == Status::Ok);
+  SaveInfo si;
+  CHECK(fx.ed->save_as(b, &drev, true, &si) == Status::Ok);
+  CHECK_EQ(read_file(b), std::string("Xabc\n"));
+  Rev after;
+  CHECK(fx.fs->identity(b, &after) == Status::Ok);
+  CHECK_EQ(after.ino, drev.ino);  // inode preserved
+}
+
+TEST(editor_save_as_preserves_bom) {
+  Fixture fx(make_temp_dir());
+  const std::string a = fx.path("bom.txt");
+  const std::string b = fx.path("bomout.txt");
+  write_file(a, "\xEF\xBB\xBFhi\n");
+  CHECK(fx.ed->open(a) == Status::Ok);
+  SaveInfo si;
+  CHECK(fx.ed->save_as(b, nullptr, false, &si) == Status::Ok);
+  CHECK_EQ(read_file(b), std::string("\xEF\xBB\xBFhi\n"));
+}
+
+TEST(editor_save_and_save_as_emit_save_change) {
+  Fixture fx(make_temp_dir());
+  const std::string a = fx.path("chg.txt");
+  const std::string b = fx.path("chg2.txt");
+  write_file(a, "abc\n");
+  CHECK(fx.ed->open(a) == Status::Ok);
+  fx.ed->on_change(&record_change, nullptr);
+
+  const Edit e[1] = {Edit{0, 0, 0, std::string_view("X")}};
+  CHECK(fx.ed->apply(e) == Status::Ok);
+  CHECK(fx.ed->drain() == Status::Ok);  // flush the apply change
+  g_changes.clear();
+  SaveInfo si;
+  CHECK(fx.ed->save(nullptr, false, &si) == Status::Ok);
+  CHECK(fx.ed->drain() == Status::Ok);
+  CHECK_EQ(g_changes.size(), 1u);
+  CHECK(g_changes[0].kind == ChangeKind::Save);
+
+  const Edit e2[1] = {Edit{0, 0, 0, std::string_view("Y")}};
+  CHECK(fx.ed->apply(e2) == Status::Ok);
+  CHECK(fx.ed->drain() == Status::Ok);
+  g_changes.clear();
+  CHECK(fx.ed->save_as(b, nullptr, false, &si) == Status::Ok);
+  CHECK(fx.ed->drain() == Status::Ok);
+  CHECK_EQ(g_changes.size(), 1u);
+  CHECK(g_changes[0].kind == ChangeKind::Save);
+}

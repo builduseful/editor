@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "add_buffer.hpp"
@@ -84,7 +85,17 @@ class EditorImpl final : public Editor {
   Status line_of_byte(uint64_t off, int64_t* out) const;
   void emit(const Change& c);
   Status do_save(const Rev* expected_rev, bool in_place, SaveInfo* out);
+  Status do_save_as(std::string_view dst, const Rev* expected_rev, bool in_place,
+                    SaveInfo* out);
   Status flatten_after_save(uint64_t new_size);
+  // Changed byte-spans of the new document, from the piece structure, plus the
+  // bounding [first_changed,last_changed) of the changed (not shifted) spans.
+  void changed_spans(std::vector<std::pair<uint64_t, uint64_t>>* spans,
+                     uint64_t* first_changed, uint64_t* last_changed) const;
+  Status write_doc_to(int fd, uint64_t off, uint64_t len) const;
+  Status write_base_to(int fd, uint64_t base_off, uint64_t dst_off,
+                       uint64_t len) const;
+  Status emit_save_change();
 
   FileSystem* fs_ = nullptr;
   OwnedFd base_fd_;
