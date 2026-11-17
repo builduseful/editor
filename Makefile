@@ -9,7 +9,7 @@
 CXX      ?= clang++
 CXXFLAGS ?= -std=c++20 -Wall -Wextra -Wconversion -O2 -g \
             -mmacosx-version-min=15.0 -arch arm64
-CPPFLAGS += -Icore/include -Itests
+CPPFLAGS += -Icore/include -Icore/src -Itests
 
 # make SANITIZE=1 -> ASan + UBSan (PLAN.md §10: every PR, lite).
 ifdef SANITIZE

@@ -1,7 +1,6 @@
 // tests/check.hpp — hand-rolled test macros (PLAN.md §10: no vendored framework).
 //
-// Deliberately tiny: a CHECK/CHECK_EQ pair, a SKIP, and a counter. Property
-// tests add their own PRNG separately (§10).
+// TEST(name) registers a function; the runner in tests/main.cpp calls them all.
 #pragma once
 
 #include <cstdio>
@@ -9,6 +8,17 @@
 #include <vector>
 
 namespace check {
+
+using TestFn = void (*)();
+
+inline std::vector<TestFn>& tests() {
+  static std::vector<TestFn> t;
+  return t;
+}
+
+struct Registrar {
+  explicit Registrar(TestFn f) { tests().push_back(f); }
+};
 
 struct Context {
   int passed = 0;
@@ -42,11 +52,12 @@ inline Context& ctx() {
   return c;
 }
 
-inline int report(const char* suite) {
+inline int run_all() {
+  for (TestFn f : tests()) f();
   Context& c = ctx();
   for (const std::string& f : c.failures) std::fprintf(stderr, "%s\n", f.c_str());
-  std::printf("%s: %d passed, %d failed, %d skipped\n", suite, c.passed, c.failed,
-              c.skipped);
+  std::printf("editor_tests: %d passed, %d failed, %d skipped\n", c.passed,
+              c.failed, c.skipped);
   return c.failed == 0 ? 0 : 1;
 }
 
@@ -54,12 +65,17 @@ inline int report(const char* suite) {
 
 #define CHECK(cond) ::check::ctx().ok((cond), #cond, __FILE__, __LINE__)
 
-#define CHECK_EQ(a, b)                          \
-  do {                                          \
-    auto check_eq_lhs_ = (a);                   \
-    auto check_eq_rhs_ = (b);                   \
-    ::check::ctx().eq(check_eq_lhs_ == check_eq_rhs_, \
-                      #a " == " #b, __FILE__, __LINE__); \
+#define CHECK_EQ(a, b)                                        \
+  do {                                                        \
+    auto check_lhs_ = (a);                                    \
+    auto check_rhs_ = (b);                                    \
+    ::check::ctx().eq(check_lhs_ == check_rhs_, #a " == " #b, \
+                      __FILE__, __LINE__);                    \
   } while (0)
 
 #define SKIP(what) ::check::ctx().skip((what), __FILE__, __LINE__)
+
+#define TEST(name)                                    \
+  static void name();                                 \
+  static ::check::Registrar check_reg_##name(&name);  \
+  static void name()
