@@ -368,17 +368,16 @@ Status LineIndex::apply_edit(const Source& doc, uint64_t off, uint64_t removed,
   locate_byte(off, &start);
   const uint64_t s0 = start.start_byte;
 
-  const uint64_t edit_end = off + removed;
-  uint64_t s1 = old_size;
-  if (edit_end < old_size) {
-    Loc e;
-    locate_byte(edit_end, &e);
-    if (e.start_byte == edit_end) {
-      s1 = edit_end;
-    } else {
-      s1 = e.start_byte + e.leaf->chunks[e.index].bytes;
-    }
-  }
+  // The rescan must cover the whole of the last affected line, so `s1` is the
+  // end of the chunk containing the edit's last byte (or the chunk containing
+  // the insertion point, for a pure insert). Taking "the first chunk start at or
+  // after the edit end" instead would leave an empty range for a pure insert at
+  // a chunk boundary, splicing a second chunk over the same bytes.
+  const uint64_t last_off = removed > 0 ? off + removed - 1 : off;
+  Loc last;
+  locate_byte(last_off, &last);
+  uint64_t s1 = last.start_byte + last.leaf->chunks[last.index].bytes;
+  if (off + removed >= old_size) s1 = old_size;
 
   const uint64_t new_end = s1 - removed + inserted;
   std::vector<LineChunk> fresh;

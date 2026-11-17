@@ -165,3 +165,32 @@ TEST(line_index_multi_chunk_edits) {
   }
   expect_matches(idx, model);
 }
+
+TEST(line_index_pure_insert_at_chunk_boundary) {
+  // Regression: a pure insert at a chunk start must rescan the whole affected
+  // line. Taking "the first chunk start at or after the edit end" gave an empty
+  // range and spliced a second chunk over the same bytes, corrupting the index.
+  std::string model;
+  for (int i = 0; i < 200; ++i) model += "line\n";
+  MemSource src(model);
+  LineIndex idx;
+  CHECK(idx.build(src) == Status::Ok);
+  expect_matches(idx, model);
+
+  for (int i = 0; i < 10; ++i) {  // at the very start (chunk 0's boundary)
+    const std::string ins = "Z";
+    model.insert(0, ins);
+    MemSource next(model);
+    CHECK(idx.apply_edit(next, 0, 0, ins.size()) == Status::Ok);
+    expect_matches(idx, model);
+  }
+  for (int i = 0; i < 10; ++i) {  // at a mid-document line start (64-line chunk)
+    const std::vector<uint64_t> starts = ed_test::naive_line_starts(model);
+    const uint64_t off = starts[64];
+    const std::string ins = "Q\n";
+    model.insert(off, ins);
+    MemSource next(model);
+    CHECK(idx.apply_edit(next, off, 0, ins.size()) == Status::Ok);
+    expect_matches(idx, model);
+  }
+}

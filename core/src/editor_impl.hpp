@@ -52,6 +52,33 @@ class EditorImpl final : public Editor {
   Status count_terms_range(uint64_t a, uint64_t b, uint64_t* lf,
                            uint64_t* crlf, uint64_t* cr) const;
   bool final_newline() const;
+
+  // A byte-offset edit: the internal currency for apply/undo/redo.
+  struct ByteOp {
+    uint64_t off = 0;
+    uint64_t removed = 0;
+    std::string_view text;
+  };
+  // The inverse of one applied op, captured so undo can replay it (§5.4).
+  struct UndoOp {
+    uint64_t off = 0;
+    uint64_t removed = 0;
+    std::string text;
+  };
+  struct UndoStep {
+    std::vector<UndoOp> ops;
+    uint64_t bytes = 0;
+  };
+
+  static constexpr size_t kUndoMaxSteps = 10000;
+  static constexpr uint64_t kUndoResidentCap = 8ull << 20;  // 8 MB (§5.4)
+
+  Status apply_byte_ops(std::span<const ByteOp> ops,
+                        std::vector<UndoOp>* inverse);
+  void push_undo(std::vector<UndoOp> ops);
+  Status step_between(std::vector<UndoStep>& from, std::vector<UndoStep>& to);
+  void clear_undo();
+
   Status logical_offset(int64_t line, int64_t col, uint64_t* out) const;
   Status line_content_len(int64_t line, uint64_t* out) const;
   Status line_of_byte(uint64_t off, int64_t* out) const;
@@ -90,6 +117,11 @@ class EditorImpl final : public Editor {
   std::vector<Cb> cbs_;
   std::vector<Change> pending_;
   uint64_t next_cb_id_ = 1;
+
+  std::vector<UndoStep> undo_stack_;
+  std::vector<UndoStep> redo_stack_;
+  uint64_t undo_bytes_ = 0;
+  bool undo_disabled_ = false;
 };
 
 }  // namespace ed

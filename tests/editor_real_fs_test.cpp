@@ -121,6 +121,23 @@ Eol naive_eol(const std::string& s) {
   return first;
 }
 
+std::string normalize(const std::string& s, Eol eol) {
+  const char* rep = eol == Eol::CrLf ? "\r\n" : (eol == Eol::Cr ? "\r" : "\n");
+  const size_t replen = eol == Eol::CrLf ? 2 : 1;
+  std::string out;
+  for (size_t i = 0; i < s.size(); ++i) {
+    if (s[i] == '\r') {
+      out.append(rep, replen);
+      if (i + 1 < s.size() && s[i + 1] == '\n') i += 1;
+    } else if (s[i] == '\n') {
+      out.append(rep, replen);
+    } else {
+      out.push_back(s[i]);
+    }
+  }
+  return out;
+}
+
 size_t line_of(const std::vector<uint64_t>& starts, uint64_t off) {
   size_t lo = 0, hi = starts.size();
   while (lo + 1 < hi) {
@@ -392,4 +409,135 @@ TEST(editor_eol_matches_naive_under_random_edits) {
       CHECK(in2.eol == naive_eol(doc_of(*fx.ed)));
     }
   }
+}
+
+TEST(editor_undo_redo_basics) {
+  Fixture fx(make_temp_dir());
+  const std::string p = fx.path("u.txt");
+  write_file(p, "abc\n");
+  CHECK(fx.ed->open(p) == Status::Ok);
+
+  CHECK(fx.ed->undo() == Status::Ok);  // empty stack: Ok, no change
+  CHECK_EQ(doc_of(*fx.ed), std::string("abc\n"));
+  CHECK(fx.ed->redo() == Status::Ok);
+  CHECK_EQ(doc_of(*fx.ed), std::string("abc\n"));
+
+  const Edit ins[1] = {Edit{0, 1, 0, std::string_view("X")}};
+  CHECK(fx.ed->apply(ins) == Status::Ok);
+  CHECK_EQ(doc_of(*fx.ed), std::string("aXbc\n"));
+
+  CHECK(fx.ed->undo() == Status::Ok);
+  CHECK_EQ(doc_of(*fx.ed), std::string("abc\n"));
+  CHECK(fx.ed->undo() == Status::Ok);  // exhausted
+  CHECK_EQ(doc_of(*fx.ed), std::string("abc\n"));
+
+  CHECK(fx.ed->redo() == Status::Ok);
+  CHECK_EQ(doc_of(*fx.ed), std::string("aXbc\n"));
+  CHECK(fx.ed->redo() == Status::Ok);  // exhausted
+  CHECK_EQ(doc_of(*fx.ed), std::string("aXbc\n"));
+
+  // A new edit clears redo.
+  const Edit del[1] = {Edit{0, 1, 2, std::string_view()}};
+  CHECK(fx.ed->apply(del) == Status::Ok);
+  CHECK_EQ(doc_of(*fx.ed), std::string("ac\n"));
+  CHECK(fx.ed->redo() == Status::Ok);
+  CHECK_EQ(doc_of(*fx.ed), std::string("ac\n"));
+
+  // Undo a multi-edit call in one step.
+  const Edit multi[2] = {Edit{0, 0, 1, std::string_view("A")},
+                         Edit{0, 1, 1, std::string_view("B")}};
+  CHECK(fx.ed->apply(multi) == Status::Ok);
+  CHECK_EQ(doc_of(*fx.ed), std::string("AB\n"));
+  CHECK(fx.ed->undo() == Status::Ok);
+  CHECK_EQ(doc_of(*fx.ed), std::string("ac\n"));
+
+  // Save drops the undo history ("undo to last save").
+  SaveInfo si;
+  CHECK(fx.ed->save(nullptr, false, &si) == Status::Ok);
+  const Edit ins2[1] = {Edit{0, 0, 0, std::string_view("Z")}};
+  CHECK(fx.ed->apply(ins2) == Status::Ok);
+  CHECK(fx.ed->undo() == Status::Ok);
+  CHECK_EQ(doc_of(*fx.ed), std::string("ac\n"));
+  CHECK(fx.ed->undo() == Status::Ok);  // nothing before the save
+  CHECK_EQ(doc_of(*fx.ed), std::string("ac\n"));
+}
+
+TEST(editor_undo_redo_property) {
+  ed_test::Prng rng(0xABCDEF);
+  Fixture fx(make_temp_dir());
+  const std::string p = fx.path("uprop.txt");
+  write_file(p, "start\n");
+  CHECK(fx.ed->open(p) == Status::Ok);
+
+  std::string model = "start\n";
+  std::vector<std::string> undo_hist, redo_hist;
+  const char* inserts[] = {"a", "\n", "zz", "Q\n", "\r\n"};
+
+  for (int iter = 0; iter < 800; ++iter) {
+    const uint64_t action = rng.below(10);
+    if (action < 6) {
+      const std::vector<uint64_t> starts = starts_of(model);
+      const uint64_t off = rng.below(model.size() + 1);
+      const size_t li = line_of(starts, off);
+      const uint64_t col = off - starts[li];
+      if (model.size() > 0 && rng.below(3) == 0) {
+        const uint64_t maxrem = model.size() - off;
+        const uint64_t rem = maxrem == 0 ? 0 : rng.below(maxrem) + 1;
+        if (rem == 0) continue;
+        const Edit e[1] = {Edit{static_cast<int64_t>(li),
+                                static_cast<int64_t>(col),
+                                static_cast<int64_t>(rem), std::string_view()}};
+        const Status s = fx.ed->apply(e);
+        CHECK(s == Status::Ok || s == Status::Range);
+        if (s == Status::Ok) {
+          undo_hist.push_back(model);
+          redo_hist.clear();
+          model.erase(off, rem);
+        }
+      } else {
+        const std::string ins = inserts[rng.below(5)];
+        const Edit e[1] = {Edit{static_cast<int64_t>(li),
+                                static_cast<int64_t>(col), 0, ins}};
+        const Status s = fx.ed->apply(e);
+        CHECK(s == Status::Ok || s == Status::Range);
+        if (s == Status::Ok) {
+          undo_hist.push_back(model);
+          redo_hist.clear();
+          model.insert(off, normalize(ins, naive_eol(model)));
+        }
+      }
+    } else if (action < 8) {
+      CHECK(fx.ed->undo() == Status::Ok);
+      if (!undo_hist.empty()) {
+        redo_hist.push_back(model);
+        model = undo_hist.back();
+        undo_hist.pop_back();
+      }
+    } else {
+      CHECK(fx.ed->redo() == Status::Ok);
+      if (!redo_hist.empty()) {
+        undo_hist.push_back(model);
+        model = redo_hist.back();
+        redo_hist.pop_back();
+      }
+    }
+    CHECK_EQ(doc_of(*fx.ed), model);
+    Info in;
+    fx.ed->info(&in);
+    CHECK_EQ(in.line_count, static_cast<int64_t>(starts_of(model).size()) - 1);
+  }
+}
+
+TEST(editor_insert_at_start_keeps_content) {
+  // Regression: the same index bug made an insert at offset 0 drop the tail.
+  Fixture fx(make_temp_dir());
+  const std::string p = fx.path("ins0.txt");
+  write_file(p, "\nazz\nazz\n\n");
+  CHECK(fx.ed->open(p) == Status::Ok);
+  const Edit e[1] = {Edit{0, 0, 0, std::string_view("zz")}};
+  CHECK(fx.ed->apply(e) == Status::Ok);
+  CHECK_EQ(doc_of(*fx.ed), std::string("zz\nazz\nazz\n\n"));
+  Info in;
+  fx.ed->info(&in);
+  CHECK_EQ(in.line_count, 4);
 }

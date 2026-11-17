@@ -116,6 +116,7 @@ Status EditorImpl::install_fd(int fd, const Stat& st, const std::string& path) {
   dirty_ = false;
   opened_ = true;
   needs_reload_ = false;
+  clear_undo();
   return Status::Ok;
 }
 
@@ -493,9 +494,6 @@ Status EditorImpl::apply(std::span<const Edit> edits) {
     uint64_t off = 0;
     uint64_t removed = 0;
     std::string text;
-    int64_t pfirst = 0;
-    int64_t plast = 0;
-    bool virt = false;
   };
   std::vector<Plan> plan;
   plan.reserve(edits.size());
@@ -515,14 +513,18 @@ Status EditorImpl::apply(std::span<const Edit> edits) {
   }
 
   for (size_t i = 1; i < plan.size(); ++i) {
-    if (plan[i].off <= plan[i - 1].off) return fail(Status::Range, "unsorted or overlapping edits");
+    if (plan[i].off <= plan[i - 1].off) {
+      return fail(Status::Range, "unsorted or overlapping edits");
+    }
     if (plan[i - 1].off + plan[i - 1].removed > plan[i].off) {
       return fail(Status::Range, "overlapping edits");
     }
   }
 
   for (const Plan& p : plan) {
-    if (!valid_utf8(p.text)) return fail(Status::InvalidUtf8, "invalid UTF-8 in inserted text");
+    if (!valid_utf8(p.text)) {
+      return fail(Status::InvalidUtf8, "invalid UTF-8 in inserted text");
+    }
   }
   for (const Plan& p : plan) {
     char c = 0;
@@ -549,50 +551,97 @@ Status EditorImpl::apply(std::span<const Edit> edits) {
   }
   if (!effective) return Status::Ok;
 
-  const int64_t before_lines = lc;
+  // Inserted newlines use the file's dominant EOL (§5.1). Reserved so the
+  // string_views below stay valid.
+  std::vector<std::string> texts;
+  texts.reserve(plan.size());
+  std::vector<ByteOp> ops;
+  ops.reserve(plan.size());
+  for (Plan& p : plan) {
+    const bool has_term = p.text.find('\n') != std::string::npos ||
+                          p.text.find('\r') != std::string::npos;
+    if (has_term) {
+      s = ensure_eol();
+      if (s != Status::Ok) return fail(s, "eol");
+      texts.push_back(normalize_newlines(p.text, eol_));
+    } else {
+      texts.push_back(p.text);
+    }
+    ops.push_back(ByteOp{p.off, p.removed, texts.back()});
+  }
+
+  std::vector<UndoOp> inverse;
+  s = apply_byte_ops(ops, &inverse);
+  if (s != Status::Ok) return s;
+  if (!inverse.empty()) {
+    push_undo(std::move(inverse));
+    redo_stack_.clear();
+  }
+  return Status::Ok;
+}
+
+// Applies sorted, non-overlapping byte ops, updates the index and EOL counts,
+// and emits one Change (§4 bounding rule). If `inverse` is non-null it receives
+// the ops that would undo this call.
+Status EditorImpl::apply_byte_ops(std::span<const ByteOp> ops,
+                                  std::vector<UndoOp>* inverse) {
+  bool effective = false;
+  for (const ByteOp& op : ops) {
+    if (!op.text.empty() || op.removed > 0) {
+      effective = true;
+      break;
+    }
+  }
+  if (!effective) return Status::Ok;
+
+  Status s = ensure_index();
+  if (s != Status::Ok) return fail(s, "index");
+  const int64_t before_lines = index_.line_count();
+  const uint64_t doc_bytes = index_.byte_count();
   const bool ends_with_term = final_newline();
+
   int64_t first = INT64_MAX;
   int64_t last = 0;
-  for (Plan& p : plan) {
+  for (const ByteOp& op : ops) {
     int64_t pf = 0;
     bool virt = false;
-    if (p.off < doc_bytes) {
-      s = line_of_byte(p.off, &pf);
+    if (op.off < doc_bytes) {
+      s = line_of_byte(op.off, &pf);
       if (s != Status::Ok) return fail(s, "line_of_byte");
     } else if (doc_bytes == 0 || ends_with_term) {
-      pf = lc;
+      pf = before_lines;
       virt = true;
     } else {
-      pf = lc - 1;
+      pf = before_lines - 1;
     }
-    p.pfirst = pf;
-    p.virt = virt;
-    if (p.removed > 0) {
+    int64_t pl = 0;
+    if (op.removed > 0) {
       int64_t le = 0;
-      s = line_of_byte(p.off + p.removed - 1, &le);
+      s = line_of_byte(op.off + op.removed - 1, &le);
       if (s != Status::Ok) return fail(s, "line_of_byte");
-      p.plast = le + 1;
+      pl = le + 1;
     } else {
-      p.plast = virt ? lc : pf + 1;
+      pl = virt ? before_lines : pf + 1;
     }
-    first = std::min(first, p.pfirst);
-    last = std::max(last, p.plast);
+    first = std::min(first, pf);
+    last = std::max(last, pl);
   }
   if (first == INT64_MAX) first = 0;
 
   uint64_t delta = 0;
-  for (Plan& p : plan) {
-    const bool text_has_term = p.text.find('\n') != std::string::npos ||
-                               p.text.find('\r') != std::string::npos;
+  for (const ByteOp& op : ops) {
+    const bool text_has_term = op.text.find('\n') != std::string_view::npos ||
+                               op.text.find('\r') != std::string_view::npos;
     if (text_has_term) {
       s = ensure_eol();
       if (s != Status::Ok) return fail(s, "eol");
     }
-    const std::string text = normalize_newlines(p.text, eol_);
     uint64_t add_off = 0;
-    s = add_.append(text.data(), text.size(), &add_off);
-    if (s != Status::Ok) return fail(s, "add buffer");
-    const uint64_t logical_at = p.off + delta;
+    if (!op.text.empty()) {
+      s = add_.append(op.text.data(), op.text.size(), &add_off);
+      if (s != Status::Ok) return fail(s, "add buffer");
+    }
+    const uint64_t logical_at = op.off + delta;
     const uint64_t at = logical_at + bom_len_;
 
     // Terminator bookkeeping. Cheap in the common case (no terminators touch
@@ -611,8 +660,8 @@ Status EditorImpl::apply(std::span<const Edit> edits) {
       have_old_first = (g == 1);
     }
     uint64_t rlf = 0, rcrlf = 0, rcr = 0;
-    if (p.removed > 0) {
-      s = count_terms_range(logical_at, logical_at + p.removed, &rlf, &rcrlf, &rcr);
+    if (op.removed > 0) {
+      s = count_terms_range(logical_at, logical_at + op.removed, &rlf, &rcrlf, &rcr);
       if (s != Status::Ok) return fail(s, "count terms");
     }
     const bool boundary_old =
@@ -624,16 +673,32 @@ Status EditorImpl::apply(std::span<const Edit> edits) {
       if (s != Status::Ok) return fail(s, "eol");
     }
 
-    if (p.removed > 0) pieces_.remove(at, p.removed);
-    if (!text.empty()) pieces_.insert(at, add_off, text.size());
-    s = index_.apply_edit(logical_src_, logical_at, p.removed, text.size());
+    // Capture the inverse before mutating: the bytes this op removes.
+    if (inverse != nullptr) {
+      UndoOp uo;
+      uo.off = logical_at;
+      uo.removed = op.text.size();
+      if (op.removed > 0) {
+        uo.text.resize(static_cast<size_t>(op.removed));
+        size_t g2 = 0;
+        s = logical_src_.read(logical_at, op.removed, uo.text.data(),
+                              uo.text.size(), &g2);
+        if (s != Status::Ok) return fail(s, "capture inverse");
+        uo.text.resize(g2);
+      }
+      inverse->push_back(std::move(uo));
+    }
+
+    if (op.removed > 0) pieces_.remove(at, op.removed);
+    if (!op.text.empty()) pieces_.insert(at, add_off, op.text.size());
+    s = index_.apply_edit(logical_src_, logical_at, op.removed, op.text.size());
     if (s != Status::Ok) return fail(s, "line index");
 
     if (touches) {
       uint64_t alf = 0, acrlf = 0, acr = 0;
-      if (!text.empty()) {
-        s = count_terms_range(logical_at, logical_at + text.size(), &alf, &acrlf,
-                              &acr);
+      if (!op.text.empty()) {
+        s = count_terms_range(logical_at, logical_at + op.text.size(), &alf,
+                              &acrlf, &acr);
         if (s != Status::Ok) return fail(s, "count terms");
       }
       char new_first = 0;
@@ -658,7 +723,7 @@ Status EditorImpl::apply(std::span<const Edit> edits) {
       eol_ = eol_from_counts();
     }
 
-    delta += text.size() - p.removed;
+    delta += op.text.size() - op.removed;
   }
 
   dirty_ = !pieces_.pristine();
@@ -669,9 +734,9 @@ Status EditorImpl::apply(std::span<const Edit> edits) {
   ch.last = last;
   ch.new_count = (last - first) + (after_lines - before_lines);
   bool ins = false, del = false;
-  for (const Edit& e : edits) {
-    if (!e.text.empty()) ins = true;
-    if (e.removed_len > 0) del = true;
+  for (const ByteOp& op : ops) {
+    if (!op.text.empty()) ins = true;
+    if (op.removed > 0) del = true;
   }
   ch.kind = (ins && del) ? ChangeKind::Replace
                          : (ins ? ChangeKind::Insert : ChangeKind::Delete);
@@ -679,10 +744,94 @@ Status EditorImpl::apply(std::span<const Edit> edits) {
   return Status::Ok;
 }
 
-void EditorImpl::emit(const Change& c) { pending_.push_back(c); }
+void EditorImpl::push_undo(std::vector<UndoOp> ops) {
+  uint64_t bytes = 0;
+  for (const UndoOp& o : ops) bytes += o.text.size();
+  if (bytes > kUndoResidentCap) {
+    // The inverse is too large to keep resident. §5.4 allows spilling to a temp
+    // file; that is not implemented yet, so undo is disabled for this edit.
+    clear_undo();
+    undo_disabled_ = true;
+    errmsg_ = "undo disabled: edit larger than the undo cap";
+    return;
+  }
+  UndoStep st;
+  st.ops = std::move(ops);
+  st.bytes = bytes;
+  undo_bytes_ += bytes;
+  undo_stack_.push_back(std::move(st));
+  undo_disabled_ = false;
+  while (!undo_stack_.empty() &&
+         (undo_stack_.size() > kUndoMaxSteps ||
+          undo_bytes_ > kUndoResidentCap)) {
+    undo_bytes_ -= undo_stack_.front().bytes;
+    undo_stack_.erase(undo_stack_.begin());
+  }
+}
 
-Status EditorImpl::undo() { return fail(Status::Unsupported, "undo is M0b"); }
-Status EditorImpl::redo() { return fail(Status::Unsupported, "redo is M0b"); }
+// Moves one step from `from` to `to`, applying it. The reverse ops are captured
+// by reading the bytes the step removes.
+Status EditorImpl::step_between(std::vector<UndoStep>& from,
+                                std::vector<UndoStep>& to) {
+  if (from.empty()) return Status::Ok;
+  UndoStep step = std::move(from.back());
+  from.pop_back();
+  undo_bytes_ -= std::min(undo_bytes_, step.bytes);
+
+  std::vector<std::string> texts;
+  std::vector<ByteOp> ops;
+  std::vector<UndoOp> reverse;
+  texts.reserve(step.ops.size());
+  ops.reserve(step.ops.size());
+  reverse.reserve(step.ops.size());
+  for (const UndoOp& uo : step.ops) {
+    UndoOp ro;
+    ro.off = uo.off;
+    ro.removed = uo.text.size();
+    if (uo.removed > 0) {
+      ro.text.resize(static_cast<size_t>(uo.removed));
+      size_t g = 0;
+      Status s = logical_src_.read(uo.off, uo.removed, ro.text.data(),
+                                   ro.text.size(), &g);
+      if (s != Status::Ok) return fail(s, "capture reverse");
+      ro.text.resize(g);
+    }
+    reverse.push_back(std::move(ro));
+    texts.push_back(uo.text);
+    ops.push_back(ByteOp{uo.off, uo.removed, texts.back()});
+  }
+
+  Status s = apply_byte_ops(ops, nullptr);
+  if (s != Status::Ok) return s;
+
+  UndoStep rs;
+  for (const UndoOp& o : reverse) rs.bytes += o.text.size();
+  undo_bytes_ += rs.bytes;
+  rs.ops = std::move(reverse);
+  to.push_back(std::move(rs));
+  return Status::Ok;
+}
+
+void EditorImpl::clear_undo() {
+  undo_stack_.clear();
+  redo_stack_.clear();
+  undo_bytes_ = 0;
+  undo_disabled_ = false;
+}
+
+Status EditorImpl::undo() {
+  if (needs_reload_) return fail(Status::Stale, "needs reload");
+  if (undo_disabled_) return fail(Status::Unsupported, "undo disabled for an edit");
+  return step_between(undo_stack_, redo_stack_);
+}
+
+Status EditorImpl::redo() {
+  if (needs_reload_) return fail(Status::Stale, "needs reload");
+  if (undo_disabled_) return fail(Status::Unsupported, "undo disabled for an edit");
+  return step_between(redo_stack_, undo_stack_);
+}
+
+void EditorImpl::emit(const Change& c) { pending_.push_back(c); }
 
 Status EditorImpl::flatten_after_save(uint64_t new_size) {
   add_.reset();
@@ -691,6 +840,7 @@ Status EditorImpl::flatten_after_save(uint64_t new_size) {
   pieces_.reset(&base_src_, &add_, new_size);
   logical_src_.reset(&pieces_, bom_len_);
   dirty_ = false;
+  clear_undo();  // "undo to last save" is the only v1 behavior (§5.4)
   return Status::Ok;
 }
 
@@ -973,6 +1123,7 @@ Status EditorImpl::reload() {
   eol_known_ = false;
   dirty_ = false;
   needs_reload_ = false;
+  clear_undo();
   Change ch;
   ch.first = 0;
   ch.last = 0;
