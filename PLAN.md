@@ -1,8 +1,7 @@
-# editor — Plan (v6.8)
+# editor — Plan (v6.9)
 
-> Name: **editor**. Status: planning. v6.8 — fifth refinement pass: needs-reload
-> base-fd retention, plus error-code, type, and budget-scope clarifications.
-> Scope unchanged.
+> Name: **editor**. Status: planning. v6.9 — sixth refinement pass: minor
+> textual consistency cleanups only (no contract changes). Scope unchanged.
 > A native macOS text editor for **small, predictable memory, low CPU, and high
 > throughput**, with a **CLI-first** surface so AI agents can drive it
 > deterministically.
@@ -690,8 +689,8 @@ to `read`/`write`/`edit`/`info`/`validate` (the target's size at open, plus a
 → `E_TOO_LARGE`. Core itself imposes no cap, so the GUI and the 5 GB read-only
 demo are unaffected. Global flags may appear **before or after** the subcommand
 (`editor --root R read f` ≡ `editor read f --root R`). Always JSON on stdout; no
-`--json`. Help/usage text
-goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
+`--json`. Help/usage text goes to **stderr** and exits 0. `editor --version` is
+an alias of `version`;
 `editor --help`/`editor help` and `editor <cmd> --help` print usage to stderr.
 `--` ends option parsing.
 
@@ -710,8 +709,8 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
   `to == from` on the byte axis (both clamp to file size).
   `--max-bytes` is the **output cap** (default 256 KiB); if content exceeds it,
   return the first N **at a UTF-8 codepoint boundary** with `truncated:true`.
-  `--max-bytes 0` = unlimited.
-  `--max-bytes` is the read output cap; `--max-file-bytes` is the input cap.
+  `--max-bytes 0` = unlimited. It is the read output cap; `--max-file-bytes` is
+  the input cap (§6.1).
   `content` is always valid UTF-8: a range that starts/ends inside a codepoint or
   contains invalid bytes → `E_INVALID_UTF8` at the first offending byte (use
   `validate` for a full report). Result: `content`; `from`/`to` delimit the
@@ -751,8 +750,8 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
   (`clone_pwrite`/`clone_pwrite_tail` on a clone or in-place path,
   `full_rewrite` when the tail exceeds 25%). It is advisory: the dry run does
   not probe clone support, so an actual save on a copy path reports
-  `copy_range`. A dry
-  run **omits `rev`** (a standard file field) and `bytes_written`; the other
+  `copy_range`. A dry run **omits `rev`** (a standard file field) and
+  `bytes_written`; the other
   standard file fields and `bytes_before` (existing target) are present;
   `in_place:true` appears only with `--in-place`. `changed = {from, to}` where
   `from` is the first affected byte and `to = max(old_end, new_end)` over the
@@ -1093,8 +1092,8 @@ windows/`pread` policy.
 Spilled undo/add-buffer data is disk, not footprint. Both loaded-resident caps
 are a total resident footprint: 12 (baseline) + 6 (cache) + 8 (undo) + 8 (add
 buffer) = 34 MB, plus the index cap — 37 MB at 5M lines (cap 40 MB) and 49 MB at
-25M lines (cap 50 MB). The §5.3 layout estimates at ~75% chunk occupancy are ~2.9 MB and
-~14.6 MB. Line count is not separately capped.
+25M lines (cap 50 MB). The §5.3 layout estimates at ~75% chunk occupancy are
+~2.9 MB and ~14.6 MB. Line count is not separately capped.
 Post-1.0, the content-mmap LRU (50–60 MB) is additional.
 
 **Performance**
