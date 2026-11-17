@@ -196,15 +196,54 @@ Status EditorImpl::ensure_index() const {
 
 Status EditorImpl::ensure_eol() const {
   if (eol_known_) return Status::Ok;
-  eol_ = detect_eol();
-  eol_known_ = true;
-  return Status::Ok;
+  return scan_eol_counts();
 }
 
-Eol EditorImpl::detect_eol() const {
+Eol EditorImpl::eol_from_counts() const {
+  const uint64_t total = eol_lf_ + eol_crlf_ + eol_cr_;
+  if (total == 0) return Eol::Lf;
+  const uint64_t mx = std::max(eol_lf_, std::max(eol_crlf_, eol_cr_));
+  const int winners =
+      (eol_lf_ == mx ? 1 : 0) + (eol_crlf_ == mx ? 1 : 0) + (eol_cr_ == mx ? 1 : 0);
+  if (winners == 1) {
+    if (eol_lf_ == mx) return Eol::Lf;
+    if (eol_crlf_ == mx) return Eol::CrLf;
+    return Eol::Cr;
+  }
+  return first_terminator_eol();  // tie -> first seen
+}
+
+Eol EditorImpl::first_terminator_eol() const {
+  const uint64_t n = logical_src_.size();
+  char buf[4096];
+  uint64_t pos = 0;
+  while (pos < n) {
+    const uint64_t want = std::min<uint64_t>(sizeof(buf), n - pos);
+    size_t got = 0;
+    if (logical_src_.read(pos, want, buf, sizeof(buf), &got) != Status::Ok) break;
+    if (got == 0) break;
+    for (size_t i = 0; i < got; ++i) {
+      if (buf[i] == '\n') return Eol::Lf;
+      if (buf[i] == '\r') {
+        if (i + 1 < got) return buf[i + 1] == '\n' ? Eol::CrLf : Eol::Cr;
+        char nb = 0;
+        size_t g = 0;
+        if (pos + i + 1 < n &&
+            logical_src_.read(pos + i + 1, 1, &nb, 1, &g) == Status::Ok && g == 1 &&
+            nb == '\n') {
+          return Eol::CrLf;
+        }
+        return Eol::Cr;
+      }
+    }
+    pos += got;
+  }
+  return Eol::Lf;
+}
+
+// Full scan, run once: fills the terminator counts (§5.1 dominant EOL).
+Status EditorImpl::scan_eol_counts() const {
   uint64_t lf = 0, crlf = 0, cr = 0;
-  Eol first_seen = Eol::Lf;
-  bool have_first = false;
   const uint64_t n = logical_src_.size();
   char buf[65536];
   uint64_t pos = 0;
@@ -219,56 +258,79 @@ Eol EditorImpl::detect_eol() const {
       if (c == '\n') {
         if (prev_cr) {
           crlf += 1;
-          if (!have_first) {
-            first_seen = Eol::CrLf;
-            have_first = true;
-          }
-          prev_cr = false;
         } else {
           lf += 1;
-          if (!have_first) {
-            first_seen = Eol::Lf;
-            have_first = true;
-          }
         }
+        prev_cr = false;
       } else if (c == '\r') {
-        if (prev_cr) {
-          cr += 1;
-          if (!have_first) {
-            first_seen = Eol::Cr;
-            have_first = true;
-          }
-        }
+        if (prev_cr) cr += 1;
         prev_cr = true;
       } else {
-        if (prev_cr) {
-          cr += 1;
-          if (!have_first) {
-            first_seen = Eol::Cr;
-            have_first = true;
-          }
-          prev_cr = false;
-        }
+        if (prev_cr) cr += 1;
+        prev_cr = false;
       }
     }
     pos += got;
   }
-  if (prev_cr) {
-    cr += 1;
-    if (!have_first) {
-      first_seen = Eol::Cr;
-      have_first = true;
+  if (prev_cr) cr += 1;
+  eol_lf_ = lf;
+  eol_crlf_ = crlf;
+  eol_cr_ = cr;
+  eol_ = eol_from_counts();
+  eol_known_ = true;
+  return Status::Ok;
+}
+
+// Counts terminators whose first byte lies in [a, b); reads one byte past b for
+// CRLF lookahead.
+Status EditorImpl::count_terms_range(uint64_t a, uint64_t b, uint64_t* lf,
+                                     uint64_t* crlf, uint64_t* cr) const {
+  if (a >= b) return Status::Ok;
+  const uint64_t n = logical_src_.size();
+  const uint64_t end = std::min<uint64_t>(b + 1, n);
+  char buf[65536];
+  uint64_t pos = a;
+  bool have_prev = false;
+  char prev = 0;
+  while (pos < end) {
+    const uint64_t want = std::min<uint64_t>(sizeof(buf), end - pos);
+    size_t got = 0;
+    Status s = logical_src_.read(pos, want, buf, sizeof(buf), &got);
+    if (s != Status::Ok) return s;
+    if (got == 0) break;
+    for (size_t i = 0; i < got; ++i) {
+      const uint64_t off = pos + i;
+      const char c = buf[i];
+      if (c == '\n') {
+        if (!(have_prev && prev == '\r' && off >= a + 1)) {
+          if (off < b) *lf += 1;
+        }
+      } else if (c == '\r') {
+        char nb = 0;
+        bool have_nb = false;
+        if (i + 1 < got) {
+          nb = buf[i + 1];
+          have_nb = true;
+        } else if (off + 1 < n) {
+          size_t g2 = 0;
+          Status s2 = logical_src_.read(off + 1, 1, &nb, 1, &g2);
+          if (s2 != Status::Ok) return s2;
+          have_nb = (g2 == 1);
+        }
+        if (off < b) {
+          if (have_nb && nb == '\n') {
+            *crlf += 1;
+          } else {
+            *cr += 1;
+          }
+        }
+      }
+      have_prev = true;
+      prev = c;
     }
+    pos += got;
   }
-  if (!have_first) return Eol::Lf;
-  const uint64_t mx = std::max(lf, std::max(crlf, cr));
-  const int winners = (lf == mx ? 1 : 0) + (crlf == mx ? 1 : 0) + (cr == mx ? 1 : 0);
-  if (winners == 1) {
-    if (lf == mx) return Eol::Lf;
-    if (crlf == mx) return Eol::CrLf;
-    return Eol::Cr;
-  }
-  return first_seen;  // tie -> first seen
+  return Status::Ok;
 }
 
 bool EditorImpl::final_newline() const {
@@ -487,8 +549,6 @@ Status EditorImpl::apply(std::span<const Edit> edits) {
   }
   if (!effective) return Status::Ok;
 
-  s = ensure_eol();
-  if (s != Status::Ok) return fail(s, "eol");
   const int64_t before_lines = lc;
   const bool ends_with_term = final_newline();
   int64_t first = INT64_MAX;
@@ -522,17 +582,83 @@ Status EditorImpl::apply(std::span<const Edit> edits) {
 
   uint64_t delta = 0;
   for (Plan& p : plan) {
+    const bool text_has_term = p.text.find('\n') != std::string::npos ||
+                               p.text.find('\r') != std::string::npos;
+    if (text_has_term) {
+      s = ensure_eol();
+      if (s != Status::Ok) return fail(s, "eol");
+    }
     const std::string text = normalize_newlines(p.text, eol_);
     uint64_t add_off = 0;
     s = add_.append(text.data(), text.size(), &add_off);
     if (s != Status::Ok) return fail(s, "add buffer");
-    const uint64_t at = p.off + delta + bom_len_;
+    const uint64_t logical_at = p.off + delta;
+    const uint64_t at = logical_at + bom_len_;
+
+    // Terminator bookkeeping. Cheap in the common case (no terminators touch
+    // the edit), so a same-length edit never rescans the document for EOL.
+    char prev = 0;
+    bool have_prev = false;
+    char old_first = 0;
+    bool have_old_first = false;
+    size_t g = 0;
+    if (logical_at > 0) {
+      logical_src_.read(logical_at - 1, 1, &prev, 1, &g);
+      have_prev = (g == 1);
+    }
+    if (logical_at < logical_src_.size()) {
+      logical_src_.read(logical_at, 1, &old_first, 1, &g);
+      have_old_first = (g == 1);
+    }
+    uint64_t rlf = 0, rcrlf = 0, rcr = 0;
+    if (p.removed > 0) {
+      s = count_terms_range(logical_at, logical_at + p.removed, &rlf, &rcrlf, &rcr);
+      if (s != Status::Ok) return fail(s, "count terms");
+    }
+    const bool boundary_old =
+        have_prev && prev == '\r' && have_old_first && old_first == '\n';
+    const bool touches = text_has_term || rlf > 0 || rcrlf > 0 || rcr > 0 ||
+                         (have_prev && prev == '\r');
+    if (touches && !eol_known_) {
+      s = ensure_eol();
+      if (s != Status::Ok) return fail(s, "eol");
+    }
+
     if (p.removed > 0) pieces_.remove(at, p.removed);
     if (!text.empty()) pieces_.insert(at, add_off, text.size());
-    s = index_.apply_edit(logical_src_, p.off + delta, p.removed, text.size());
+    s = index_.apply_edit(logical_src_, logical_at, p.removed, text.size());
     if (s != Status::Ok) return fail(s, "line index");
+
+    if (touches) {
+      uint64_t alf = 0, acrlf = 0, acr = 0;
+      if (!text.empty()) {
+        s = count_terms_range(logical_at, logical_at + text.size(), &alf, &acrlf,
+                              &acr);
+        if (s != Status::Ok) return fail(s, "count terms");
+      }
+      char new_first = 0;
+      bool have_new_first = false;
+      if (logical_at < logical_src_.size()) {
+        logical_src_.read(logical_at, 1, &new_first, 1, &g);
+        have_new_first = (g == 1);
+      }
+      eol_lf_ = eol_lf_ + alf - rlf;
+      eol_crlf_ = eol_crlf_ + acrlf - rcrlf;
+      eol_cr_ = eol_cr_ + acr - rcr;
+      const bool boundary_new =
+          have_prev && prev == '\r' && have_new_first && new_first == '\n';
+      if (boundary_old && !boundary_new) {
+        eol_crlf_ -= 1;
+        eol_cr_ += 1;
+      }
+      if (!boundary_old && boundary_new) {
+        eol_cr_ -= 1;
+        eol_crlf_ += 1;
+      }
+      eol_ = eol_from_counts();
+    }
+
     delta += text.size() - p.removed;
-    eol_known_ = false;
   }
 
   dirty_ = !pieces_.pristine();
@@ -564,7 +690,6 @@ Status EditorImpl::flatten_after_save(uint64_t new_size) {
   base_size_ = new_size;
   pieces_.reset(&base_src_, &add_, new_size);
   logical_src_.reset(&pieces_, bom_len_);
-  eol_known_ = false;
   dirty_ = false;
   return Status::Ok;
 }

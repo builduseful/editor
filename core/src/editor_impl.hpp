@@ -46,7 +46,11 @@ class EditorImpl final : public Editor {
   Status install_fd(int fd, const Stat& st, const std::string& path);
   Status ensure_index() const;
   Status ensure_eol() const;
-  Eol detect_eol() const;
+  Status scan_eol_counts() const;
+  Eol eol_from_counts() const;
+  Eol first_terminator_eol() const;
+  Status count_terms_range(uint64_t a, uint64_t b, uint64_t* lf,
+                           uint64_t* crlf, uint64_t* cr) const;
   bool final_newline() const;
   Status logical_offset(int64_t line, int64_t col, uint64_t* out) const;
   Status line_content_len(int64_t line, uint64_t* out) const;
@@ -69,6 +73,9 @@ class EditorImpl final : public Editor {
   mutable bool index_built_ = false;
   mutable Eol eol_ = Eol::Lf;
   mutable bool eol_known_ = false;
+  mutable uint64_t eol_lf_ = 0;    // terminator counts, maintained incrementally
+  mutable uint64_t eol_crlf_ = 0;  // so a same-length edit never rescans the file
+  mutable uint64_t eol_cr_ = 0;
   bool dirty_ = false;
   bool opened_ = false;
   bool needs_reload_ = false;

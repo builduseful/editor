@@ -31,8 +31,9 @@ reference, not a component library.
 - Decisions D1–D13 in `PLAN.md` are locked unless the plan says otherwise.
 - Build/test commands: `make` (builds `build/editor_tests`, plus `libcore.a`/`editor`
   once those sources exist) and `make test` (runs the suite); `make golden` runs
-  the CLI golden-JSON tests against `build/editor`; `make SANITIZE=1 test` adds
-  ASan+UBSan; `make clean`. Apple clang + make only, no third-party tooling.
+  the CLI golden-JSON tests against `build/editor`; `make bench` builds and runs
+  the §5.5/§7 save-gate benchmark (`bench/bench_edit.cpp`); `make SANITIZE=1 test`
+  adds ASan+UBSan; `make clean`. Apple clang + make only, no third-party tooling.
   This plain Makefile is a Pre-M0.0 stand-in for the `PLAN.md` §10 CMake graph,
   which wraps the same sources when the GUI/`.app`/notarization work begins.
 

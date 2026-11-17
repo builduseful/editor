@@ -1,12 +1,15 @@
 // tests/editor_real_fs_test.cpp — core Editor against the real macOS FileSystem.
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <filesystem>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "check.hpp"
 #include "editor.hpp"
+#include "prng.hpp"
 
 namespace {
 
@@ -52,6 +55,83 @@ std::string doc_of(Editor& ed) {
     out.resize(used);
   }
   return out;
+}
+
+std::vector<uint64_t> starts_of(const std::string& s) {
+  std::vector<uint64_t> out;
+  out.push_back(0);
+  size_t i = 0;
+  while (i < s.size()) {
+    if (s[i] == '\n') {
+      i += 1;
+      out.push_back(i);
+    } else if (s[i] == '\r') {
+      i += (i + 1 < s.size() && s[i + 1] == '\n') ? 2 : 1;
+      out.push_back(i);
+    } else {
+      i += 1;
+    }
+  }
+  if (out.back() != s.size()) out.push_back(s.size());
+  return out;
+}
+
+Eol naive_eol(const std::string& s) {
+  uint64_t lf = 0, crlf = 0, cr = 0;
+  Eol first = Eol::Lf;
+  bool have = false;
+  bool prev_cr = false;
+  for (size_t i = 0; i < s.size(); ++i) {
+    const char c = s[i];
+    if (c == '\n') {
+      if (prev_cr) {
+        crlf += 1;
+        if (!have) { first = Eol::CrLf; have = true; }
+      } else {
+        lf += 1;
+        if (!have) { first = Eol::Lf; have = true; }
+      }
+      prev_cr = false;
+    } else if (c == '\r') {
+      if (prev_cr) {
+        cr += 1;
+        if (!have) { first = Eol::Cr; have = true; }
+      }
+      prev_cr = true;
+    } else {
+      if (prev_cr) {
+        cr += 1;
+        if (!have) { first = Eol::Cr; have = true; }
+        prev_cr = false;
+      }
+    }
+  }
+  if (prev_cr) {
+    cr += 1;
+    if (!have) { first = Eol::Cr; have = true; }
+  }
+  if (!have) return Eol::Lf;
+  const uint64_t mx = std::max(lf, std::max(crlf, cr));
+  const int w = (lf == mx) + (crlf == mx) + (cr == mx);
+  if (w == 1) {
+    if (lf == mx) return Eol::Lf;
+    if (crlf == mx) return Eol::CrLf;
+    return Eol::Cr;
+  }
+  return first;
+}
+
+size_t line_of(const std::vector<uint64_t>& starts, uint64_t off) {
+  size_t lo = 0, hi = starts.size();
+  while (lo + 1 < hi) {
+    const size_t mid = lo + (hi - lo) / 2;
+    if (starts[mid] <= off) {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo;
 }
 
 struct Fixture {
@@ -241,4 +321,75 @@ TEST(editor_apply_validation) {
   Info in;
   fx.ed->info(&in);
   CHECK(!in.dirty);
+}
+
+TEST(editor_eol_counts_track_edits) {
+  Fixture fx(make_temp_dir());
+  const std::string p = fx.path("eol.txt");
+  write_file(p, "a\r\nb\n");
+  CHECK(fx.ed->open(p) == Status::Ok);
+  Info in;
+  fx.ed->info(&in);
+  CHECK(in.eol == Eol::CrLf);  // 1 CRLF vs 1 LF -> tie -> first seen
+
+  const Edit e1[1] = {Edit{1, 0, 0, std::string_view("x\ny\n")}};
+  CHECK(fx.ed->apply(e1) == Status::Ok);
+  SaveInfo si;
+  CHECK(fx.ed->save(nullptr, false, &si) == Status::Ok);
+  CHECK_EQ(read_file(p), std::string("a\r\nx\r\ny\r\nb\n"));
+  fx.ed->info(&in);
+  CHECK(in.eol == Eol::CrLf);
+
+  const Edit e2[1] = {Edit{3, 1, 1, std::string_view("")}};
+  CHECK(fx.ed->apply(e2) == Status::Ok);
+  CHECK(fx.ed->save(nullptr, false, &si) == Status::Ok);
+  CHECK_EQ(read_file(p), std::string("a\r\nx\r\ny\r\nb"));
+  fx.ed->info(&in);
+  CHECK(in.eol == Eol::CrLf);
+  CHECK(!in.final_newline);
+}
+
+TEST(editor_eol_matches_naive_under_random_edits) {
+  ed_test::Prng rng(0x5151);
+  Fixture fx(make_temp_dir());
+  const std::string p = fx.path("eolrand.txt");
+  write_file(p, "a\r\nb\nc\r\n\r\nd\n");
+  CHECK(fx.ed->open(p) == Status::Ok);
+  const char* inserts[] = {"\n", "\r", "\r\n", "x", "a\n", "\n\n", "zz"};
+
+  for (int iter = 0; iter < 400; ++iter) {
+    const std::string doc = doc_of(*fx.ed);
+    const std::vector<uint64_t> starts = starts_of(doc);
+    const uint64_t off = rng.below(doc.size() + 1);
+    const size_t li = line_of(starts, off);
+    const uint64_t col = off - starts[li];
+    if (doc.size() > 0 && rng.below(3) == 0) {
+      const uint64_t maxrem = doc.size() - off;
+      const uint64_t rem = maxrem == 0 ? 0 : rng.below(maxrem) + 1;
+      if (rem == 0) continue;
+      const Edit e[1] = {Edit{static_cast<int64_t>(li),
+                              static_cast<int64_t>(col),
+                              static_cast<int64_t>(rem), std::string_view()}};
+      const Status s = fx.ed->apply(e);
+      CHECK(s == Status::Ok || s == Status::Range);
+    } else {
+      const std::string ins = inserts[rng.below(7)];
+      const Edit e[1] = {Edit{static_cast<int64_t>(li),
+                              static_cast<int64_t>(col), 0, ins}};
+      const Status s = fx.ed->apply(e);
+      CHECK(s == Status::Ok || s == Status::Range);
+    }
+
+    Info in;
+    fx.ed->info(&in);
+    CHECK(in.eol == naive_eol(doc_of(*fx.ed)));
+
+    if (iter % 50 == 49) {
+      SaveInfo si;
+      CHECK(fx.ed->save(nullptr, false, &si) == Status::Ok);
+      Info in2;
+      fx.ed->info(&in2);
+      CHECK(in2.eol == naive_eol(doc_of(*fx.ed)));
+    }
+  }
 }

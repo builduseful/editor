@@ -23,14 +23,16 @@ BUILD := build$(if $(SANITIZE),-asan,)
 CORE_SRC := $(wildcard core/src/*.cpp)
 PLATFORM_SRC := $(wildcard platform/macos/*.cpp)
 CLI_SRC  := $(wildcard cli/src/*.cpp)
+BENCH_SRC := $(wildcard bench/*.cpp)
 TEST_SRC := $(wildcard tests/*.cpp tests/conformance/*.cpp)
 
 CORE_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(CORE_SRC))
 PLATFORM_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(PLATFORM_SRC))
 CLI_OBJ  := $(patsubst %.cpp,$(BUILD)/%.o,$(CLI_SRC))
+BENCH_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(BENCH_SRC))
 TEST_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(TEST_SRC))
 
-.PHONY: all test golden clean
+.PHONY: all test golden bench clean
 
 all: $(BUILD)/editor_tests
 ifneq ($(CORE_SRC),)
@@ -56,13 +58,20 @@ $(BUILD)/%.o: %.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
--include $(CORE_OBJ:.o=.d) $(PLATFORM_OBJ:.o=.d) $(CLI_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
+-include $(CORE_OBJ:.o=.d) $(PLATFORM_OBJ:.o=.d) $(CLI_OBJ:.o=.d) $(BENCH_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
 
 test: $(BUILD)/editor_tests
 	$(BUILD)/editor_tests
 
 golden: $(BUILD)/editor
 	python3 tests/cli_golden.py $(BUILD)/editor
+
+$(BUILD)/bench_edit: $(BENCH_OBJ) $(PLATFORM_OBJ) $(BUILD)/libcore.a
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $(BENCH_OBJ) $(PLATFORM_OBJ) $(BUILD)/libcore.a
+
+bench: $(BUILD)/bench_edit
+	$(BUILD)/bench_edit
 
 clean:
 	rm -rf build build-asan
