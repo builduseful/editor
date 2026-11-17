@@ -307,30 +307,7 @@ Status EditorImpl::line_content_len(int64_t line, uint64_t* out) const {
 }
 
 Status EditorImpl::line_of_byte(uint64_t off, int64_t* out) const {
-  const uint64_t n = index_.byte_count();
-  if (off >= n) {
-    *out = index_.line_count();
-    return Status::Ok;
-  }
-  LineStream ls(logical_src_, 0);
-  uint64_t pos = 0;
-  int64_t line = 0;
-  while (pos <= off) {
-    bool has = false;
-    uint64_t lb = 0;
-    bool term = false;
-    Status s = ls.next(&has, &lb, &term);
-    if (s != Status::Ok) return s;
-    if (!has) break;
-    if (pos + lb > off) {
-      *out = line;
-      return Status::Ok;
-    }
-    pos += lb;
-    line += 1;
-  }
-  *out = line;
-  return Status::Ok;
+  return index_.line_of_byte(logical_src_, off, out);
 }
 
 Status EditorImpl::logical_offset(int64_t line, int64_t col, uint64_t* out) const {

@@ -43,6 +43,10 @@ class LineIndex {
   // yields the document size. Scans at most one chunk.
   Status line_start(const Source& doc, int64_t line, uint64_t* out) const;
 
+  // 0-based line containing byte `off` (off == byte_count() -> line_count).
+  // Scans at most one chunk.
+  Status line_of_byte(const Source& doc, uint64_t off, int64_t* out) const;
+
   // Updates the index after replacing old-document bytes [off, off+removed)
   // with `inserted` bytes. `doc` is the NEW document.
   Status apply_edit(const Source& doc, uint64_t off, uint64_t removed,

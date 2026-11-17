@@ -54,7 +54,9 @@ $(BUILD)/editor_tests: $(TEST_OBJ) $(PLATFORM_OBJ) $(CORE_OBJ)
 
 $(BUILD)/%.o: %.cpp
 	@mkdir -p $(@D)
-	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
+
+-include $(CORE_OBJ:.o=.d) $(PLATFORM_OBJ:.o=.d) $(CLI_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
 
 test: $(BUILD)/editor_tests
 	$(BUILD)/editor_tests

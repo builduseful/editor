@@ -123,6 +123,22 @@ TEST(line_index_chunk_occupancy_stays_bounded) {
   }
 }
 
+TEST(line_index_crlf_across_buffer_boundary) {
+  // A CRLF whose '\r' is the last byte of the scanner buffer must still count
+  // as one terminator (regression: refill saw scan_ == buf_len_ + 1).
+  const size_t block = 16 * 1024;
+  for (size_t lead : {block - 1, block - 2, block, 2 * block - 1}) {
+    std::string s(lead, 'a');
+    s += "\r\n";
+    s += "tail\n";
+    MemSource src(s);
+    LineIndex idx;
+    CHECK(idx.build(src) == Status::Ok);
+    expect_matches(idx, s);
+    CHECK_EQ(idx.line_count(), 2);
+  }
+}
+
 TEST(line_index_multi_chunk_edits) {
   // Edits that add and remove many lines at once exercise splits and merges.
   ed_test::Prng rng(0x1234ABCD);

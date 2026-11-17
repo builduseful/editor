@@ -176,6 +176,35 @@ Status LineIndex::line_start(const Source& doc, int64_t line,
   return line_start_in(doc, want - acc_lines, acc_bytes, out);
 }
 
+Status LineIndex::line_of_byte(const Source& doc, uint64_t off,
+                               int64_t* out) const {
+  if (off >= total_bytes_) {
+    *out = static_cast<int64_t>(total_lines_);
+    return Status::Ok;
+  }
+  Loc loc;
+  locate_byte(off, &loc);
+  LineStream ls(doc, loc.start_byte);
+  uint64_t pos = loc.start_byte;
+  uint64_t line = loc.start_line;
+  while (true) {
+    bool has_line = false;
+    uint64_t line_bytes = 0;
+    bool has_term = false;
+    Status s = ls.next(&has_line, &line_bytes, &has_term);
+    if (s != Status::Ok) return s;
+    if (!has_line) break;
+    if (pos + line_bytes > off) {
+      *out = static_cast<int64_t>(line);
+      return Status::Ok;
+    }
+    pos += line_bytes;
+    line += 1;
+  }
+  *out = static_cast<int64_t>(line);
+  return Status::Ok;
+}
+
 std::vector<std::unique_ptr<LineIndex::Node>> LineIndex::splice(
     Node* n, uint64_t base, uint64_t from, uint64_t to,
     const std::vector<LineChunk>& ins, bool* inserted) {
