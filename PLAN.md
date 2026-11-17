@@ -617,7 +617,9 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
 ```
 
 - The **top-level** envelope always has `schema`, `command`, `ok`, `duration_us`,
-  `cwd`, `warnings`, `results`, `error`, `meta`. Each element of `results[]` for
+  `cwd`, `warnings`, `results`, `error`, `meta`. Commands may add conditional
+  top-level fields: `truncated` (validate/batch), `valid` + `errors[]`
+  (batch `--check`), `rolled_back` (batch). Each element of `results[]` for
   a **file command** (`read`/`write`/`edit`/`info`/`validate`, and each such op
   of `batch`) always has `path`, `rev`, `bytes`, `line_count`, `eol`,
   `encoding`, `bom`, `final_newline`; per-command lines list only extras.
@@ -625,8 +627,9 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
   documented fields (`version`, or `commands[]`) and **omit** the file fields
   (never emit `null`). `batch --check` returns `results: []` plus top-level
   `valid` and `errors[]`.
-- `rev` is stat-only in v1 and always present for file commands. Each `rev`/
-  `rev_before` field is a **decimal string** (nanosecond fields exceed 2^53):
+- `rev` is stat-only in v1 and present on every file-command result **except
+  `edit --dry-run`**, which reports `rev_before` instead and omits `rev` (§6.1).
+  Each `rev`/`rev_before` field is a **decimal string** (nanosecond fields exceed 2^53):
   `{"dev":"1","ino":"2","size":"4096","mtime_ns":"…","ctime_ns":"…"}`.
   `--expect` accepts `stat:<dev>:<ino>:<size>:<mtime_ns>:<ctime_ns>` and the
   object form with string values. Local/advisory; `--force` overrides.
@@ -669,7 +672,7 @@ most 20 entries of `{line, col, byte_offset}` (1-based, CLI).
 | Base inode changed at save | `E_CONFLICT` |
 | Lock contention (`Status::Locked`) | `E_LOCKED` |
 | External mutation detected while dirty | `E_STALE` |
-| External mutation detected while clean | silent auto-reload |
+| External mutation detected while clean (via `check_identity()`) | silent auto-reload |
 
 | Exit | Meaning | Examples |
 | --- | --- | --- |
