@@ -391,7 +391,7 @@ the base fd, the add-buffer fd, and all spill fds. Use an RAII `OwnedFd` in core
 ### 5.5 Save path (honest cost model)
 
 v1 targets macOS/APFS; Windows/Linux fallbacks are post-1.0. All paths hold the
-expect-check + write + rename under the OS lock. The core resolves the open path
+expect-check + write (+ rename) under the OS lock. The core resolves the open path
 once, splits it into dir + name, and opens the directory before the rename.
 
 - **No-op if clean.** `SaveInfo::method = "none"`. `expected_rev` is still checked.
@@ -413,7 +413,7 @@ once, splits it into dir + name, and opens the directory before the rename.
 - **Clone carries mode/ownership/ACLs/xattrs**; do **not** call `fchmod` after a
   clone. `copy_metadata` is only for `copy_range`/`full_rewrite`; it does
   `fchown` before `fchmod`. Setuid/setgid are not preserved. New files use
-  `0666 & ~umask`.
+  `fchmod(tmp_fd, 0666 & ~umask)` before rename.
 - **In-place** (`--in-place`): `open_write(path, create=false, truncate=false,
   nofollow=true)`, `pwrite` changed spans (or full rewrite), `ftruncate` for
   length changes, `fsync(original)`, update identity/rev. No temp/rename.
@@ -428,8 +428,9 @@ once, splits it into dir + name, and opens the directory before the rename.
   post-rename failure → `SavedButNotDurable` warning, `ok: true`, `durable=false`;
   **never blind-retry**. The warning is reported only on the call that produced it.
 - **Post-save transition**: close the pre-save base fd, reopen the path with
-  `open_readonly` under the same lock, and verify the `fstat` matches the new
-  `Rev`; on mismatch, `E_CONFLICT`. Update identity/mtime/rev. Atomic w.r.t.
+  `open_readonly(path, nofollow=true, &fd)` under the same lock, and verify the
+  `fstat` matches the new `Rev`; on mismatch, `E_CONFLICT`. Update
+  identity/mtime/rev. Atomic w.r.t.
   other threads, not w.r.t. process crash; a crash **before** rename leaves the
   old file intact; after rename the new file is visible. Double-save test.
 - **Gate**: same-length edit in 1 GB on APFS < 100 ms p99 with **crash-only
@@ -453,7 +454,7 @@ once, splits it into dir + name, and opens the directory before the rename.
 - File watching (FSEvents) is post-1.0 and is **not** the source of truth; the
   identity check is.
 - mmap policy: **sliding window** (256 MB–1 GB) for large files; `pread` for
-  network FS; buffered `read()` under ~64 KB (use `pread`); **no `MAP_PRIVATE`
+  network FS; a buffered `read()` is fine under ~64 KB; **no `MAP_PRIVATE`
   writes** for large files (use the capped add buffer); base mapping is read-only;
   scans use `open_scan` (`F_NOCACHE`) + `pread`, or a bounded `mmap` window with
   `madvise(MADV_SEQUENTIAL)` (done inside `map_readonly`); never mmap-the-world.
