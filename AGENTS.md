@@ -28,7 +28,7 @@ reference, not a component library.
 - No vendored/bundled third-party libraries; OS system libraries and the C++ standard
   library are allowed.
 - Custom-drawn view only; no native-control hybrid.
-- Decisions D1–D12 in `PLAN.md` are locked unless the plan says otherwise.
+- Decisions D1–D13 in `PLAN.md` are locked unless the plan says otherwise.
 - Build/test commands: none yet (Pre-M0.0).
 
 ## Repo hygiene
