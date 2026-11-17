@@ -661,10 +661,14 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
 
 Core `Status` covers document/IO; the CLI adds `E_USAGE`, `E_SCHEMA`, `E_PARSE`,
 `E_OUTSIDE_ROOT`, `E_NO_MATCH`, `E_AMBIGUOUS`. `E_LOCKED` is `Status::Locked`.
-`E_*` = SCREAMING_SNAKE_CASE of the Status name. Errors carry `code`, `message`,
-`retryable`, `path`, `hint`, and command-specific fields.
-`E_INVALID_UTF8` includes the byte offset; `E_NO_MATCH`/`E_AMBIGUOUS` include at
-most 20 entries of `{line, col, byte_offset}` (1-based, CLI).
+`E_*` = SCREAMING_SNAKE_CASE of the Status name. The top-level `error` object
+carries `code`, `message`, `retryable`, `path`, `hint`, and command-specific
+fields. `E_INVALID_UTF8` includes the byte offset; `E_NO_MATCH`/`E_AMBIGUOUS`
+include at most 20 entries of `{line, col, byte_offset}` (1-based, CLI).
+`validate`'s `errors[]` are lightweight findings with lowercase `code`
+(`invalid_utf8`, `unsupported`, §6.1); when the first finding is promoted to the
+top-level `error` (validate, or `batch --check` with failures), `code` is the E_
+form (`E_INVALID_UTF8`/`E_UNSUPPORTED`) with the full field set.
 
 | Condition | Code |
 | --- | --- |
