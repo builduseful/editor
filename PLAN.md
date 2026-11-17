@@ -206,7 +206,7 @@ class Editor {
                       SaveInfo* out = nullptr) = 0;
   // save_as: refuses to overwrite an existing dst with E_CONFLICT unless
   // expected_rev matches dst's identity; if dst does not exist, expected_rev
-  // must be null. Updates open path/identity.
+  // must be null (otherwise E_CONFLICT). Updates open path/identity.
   virtual Status save_as(std::string_view path_utf8,
                          const Rev* expected_rev = nullptr, bool in_place = false,
                          SaveInfo* out = nullptr) = 0;
@@ -275,10 +275,11 @@ class FileSystem {
 };
 ```
 
-**Ownership.** A successful `open_*`/`create_temp`/`clone_to_new`/`map_readonly`
-transfers the fd/mapping to the caller. On any later `Status` failure the caller
-closes it. `Editor::open` closes its fd on every failing path; `~Editor` closes
-the base fd, the add-buffer fd, and all spill fds. Use an RAII `OwnedFd` in core.
+**Ownership.** A successful `open_*`, `open_dir`, `create_temp`, `clone_to_new`,
+or `map_readonly` transfers the fd/mapping to the caller. On any later `Status`
+failure the caller closes it. `Editor::open` closes its fd on every failing path;
+`~Editor` closes the base fd, the add-buffer fd, and all spill fds. Use an RAII
+`OwnedFd` in core.
 
 **Rules**
 
@@ -300,8 +301,9 @@ the base fd, the add-buffer fd, and all spill fds. Use an RAII `OwnedFd` in core
 - One `Editor` per thread; mutations are serialized by the owning thread.
 - `rev()`/`Info::rev` return the last on-disk identity observed at `open` or
   after the last successful `save`/`reload`; not updated by unsaved edits.
-- `Status::BufferTooSmall` is reserved for `FileSystem::pread` into a fixed
-  buffer; `Editor::read_lines`/`read_range` clamp and never return it.
+- `Status::BufferTooSmall` is returned by `read_lines`/`read_range` when a
+  non-null buffer is smaller than needed (no bytes written, `used`=needed);
+  `buf=nullptr` is the size query. `FileSystem::pread` clamps to EOF.
 - `errmsg` is thread-local and borrowed; no retention.
 - Version tag `kInterfaceVersion`; core is statically linked into GUI/CLI.
 - C++20, pinned toolchain; statically link core into GUI/CLI.
@@ -416,7 +418,8 @@ once, splits it into dir + name, and opens the directory before the rename.
   `fchmod(tmp_fd, 0666 & ~umask)` before rename.
 - **In-place** (`--in-place`): `open_write(path, create=false, truncate=false,
   nofollow=true)`, `pwrite` changed spans (or full rewrite), `ftruncate` for
-  length changes, `fsync(original)`, update identity/rev. No temp/rename.
+  length changes, `fsync(original)`, update identity/rev. No temp/rename;
+  `SaveInfo::method` is `copy_range` or `full_rewrite` with `in_place=true`.
   Expect-check under the lock. A failure may leave a partial file; report `E_IO`.
   Hardlinks and crash-safety are user opt-in.
 - **Temp**: `create_temp` returns a 0600 path + fd in the same directory; hold the
@@ -611,7 +614,7 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
 - EOL casing: enum `Eol` -> lowercase JSON (`lf`, `crlf`, `cr`, `mixed`).
   `Encoding` -> `"utf-8"`, `"utf-16le"`, `"utf-16be"`, `"other"`.
 - `warnings[]` elements are `{code, message, path?}`; `SavedButNotDurable` →
-  `{"code":"E_SAVED_NOT_DURABLE","message":"post-rename fsync failed","path":…}`
+  `{"code":"E_SAVED_BUT_NOT_DURABLE","message":"post-rename fsync failed","path":…}`
   with `ok:true`, exit 0.
 
 ### 6.3 Errors and exit codes
@@ -674,8 +677,10 @@ first error. `batch --check` with `valid:false` → exit **2**.
   commit. `--check` validates only. **Not crash-atomic.**
 - Ops see the original files. A `write` op covers the whole file and overlaps
   every other op on that path. An `edit` op covers the matched `old` range (or
-  the `--at`/`--length` range); overlap is byte-range intersection. Same-file
-  ops must not overlap (`E_RANGE`); disjoint edits are merged into one `apply`.
+  the `--at`/`--length` range; `--op insert` is a zero-length range at the
+  insertion point); overlap is byte-range intersection. Two inserts at the same
+  offset overlap (`E_RANGE`), matching `apply`. Same-file ops must not overlap;
+  disjoint edits are merged into one `apply`.
 - `batch` adds `rolled_back` (bool) and per-op `results[]` to the envelope;
   results are capped at 1000 with `"truncated": true`. `--check` returns
   `results: []`, `valid` + `errors[]` and writes nothing; on `valid:false`,
@@ -752,8 +757,9 @@ windows/`pread` policy.
 | **Loaded, resident (1 GB file with ≤5M lines, i.e. ≥200 B/line; cache + undo + index + add buffer)** | **≤ 40 MB** |
 
 Spilled undo/add-buffer data is disk, not footprint; the 40 MB cap is resident
-only and assumes ≤5M lines. At 25M lines the index is ~9.4 MB, so the 40 MB cap
-does not apply. Add a line-count budget or a hard line cap for the GUI.
+only and assumes ≤5M lines. At 25M lines the index is ~9.4 MB, so the loaded
+total (≈43 MB) exceeds the cap; add a line-count budget or a hard line cap for
+the GUI.
 Post-1.0, the content-mmap LRU (50–60 MB) is additional.
 
 **Performance**
