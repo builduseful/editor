@@ -9,6 +9,7 @@
 
 #include "check.hpp"
 #include "editor.hpp"
+#include "fault_fs.hpp"
 #include "prng.hpp"
 
 namespace {
@@ -161,6 +162,39 @@ struct Fixture {
   }
   std::string path(const std::string& name) const { return dir + "/" + name; }
 };
+
+// A Fixture whose FileSystem can be armed to fail one operation on one call.
+struct FaultFixture {
+  std::string dir;
+  std::unique_ptr<FileSystem> fs;
+  ed_test::FaultFs* fault = nullptr;
+  std::unique_ptr<Editor> ed;
+  explicit FaultFixture(std::string d) : dir(std::move(d)) {
+    std::unique_ptr<FileSystem> inner;
+    create_file_system(&inner);
+    auto ff = std::make_unique<ed_test::FaultFs>(std::move(inner));
+    fault = ff.get();
+    fs = std::move(ff);
+    create_editor(*fs, &ed);
+  }
+  std::string path(const std::string& name) const { return dir + "/" + name; }
+};
+
+// Count leftover temp/clone files in `dir` (save must clean these up on any
+// pre-rename failure; a crash may leave one, but an in-process failure may not).
+int count_temps(const std::string& dir) {
+  int n = 0;
+  std::error_code ec;
+  for (const auto& e : std::filesystem::directory_iterator(dir, ec)) {
+    const std::string name = e.path().filename().string();
+    if (name.rfind(".editor-tmp-", 0) == 0 ||
+        name.rfind(".editor-clone-", 0) == 0) {
+      ++n;
+    }
+  }
+  return n;
+}
+
 
 }  // namespace
 
@@ -540,4 +574,135 @@ TEST(editor_insert_at_start_keeps_content) {
   Info in;
   fx.ed->info(&in);
   CHECK_EQ(in.line_count, 4);
+}
+
+// --- Fault injection (§5.5, M0b) -------------------------------------------
+
+// A failed pwrite on the temp path must leave the original untouched and clean
+// up the temp; the document stays dirty and a retry succeeds.
+TEST(editor_save_pwrite_failure_is_atomic) {
+  FaultFixture fx(make_temp_dir());
+  const std::string p = fx.path("pw.txt");
+  write_file(p, "abcdef\n");
+  CHECK(fx.ed->open(p) == Status::Ok);
+  const Edit e[1] = {Edit{0, 0, 0, std::string_view("XYZ")}};  // tail > 25%: full_rewrite
+  CHECK(fx.ed->apply(e) == Status::Ok);
+
+  fx.fault->fail_op("pwrite", 1, Status::Io);
+  SaveInfo si;
+  CHECK(fx.ed->save(nullptr, false, &si) == Status::Io);
+  CHECK_EQ(read_file(p), std::string("abcdef\n"));
+  CHECK_EQ(count_temps(fx.dir), 0);
+
+  Info in;
+  fx.ed->info(&in);
+  CHECK(in.dirty);
+  CHECK(fx.ed->save(nullptr, false, &si) == Status::Ok);  // retry works
+  CHECK_EQ(read_file(p), std::string("XYZabcdef\n"));
+  CHECK_EQ(count_temps(fx.dir), 0);
+}
+
+TEST(editor_save_fsync_failure_is_atomic) {
+  FaultFixture fx(make_temp_dir());
+  const std::string p = fx.path("fs.txt");
+  write_file(p, "abcdef\n");
+  CHECK(fx.ed->open(p) == Status::Ok);
+  const Edit e[1] = {Edit{0, 0, 0, std::string_view("XYZ")}};
+  CHECK(fx.ed->apply(e) == Status::Ok);
+
+  fx.fault->fail_op("fsync", 1, Status::Io);
+  SaveInfo si;
+  CHECK(fx.ed->save(nullptr, false, &si) == Status::Io);
+  CHECK_EQ(read_file(p), std::string("abcdef\n"));
+  CHECK_EQ(count_temps(fx.dir), 0);
+}
+
+TEST(editor_save_rename_failure_is_atomic) {
+  FaultFixture fx(make_temp_dir());
+  const std::string p = fx.path("rn.txt");
+  write_file(p, "abcdef\n");
+  CHECK(fx.ed->open(p) == Status::Ok);
+  const Edit e[1] = {Edit{0, 0, 0, std::string_view("XYZ")}};
+  CHECK(fx.ed->apply(e) == Status::Ok);
+
+  // The crash-before-rename case: the temp is written and fsynced, then the
+  // commit point fails. The old file must still be the visible one.
+  fx.fault->fail_op("rename_at", 1, Status::Io);
+  SaveInfo si;
+  CHECK(fx.ed->save(nullptr, false, &si) == Status::Io);
+  CHECK_EQ(read_file(p), std::string("abcdef\n"));
+  CHECK_EQ(count_temps(fx.dir), 0);
+}
+
+TEST(editor_save_clone_rename_failure_is_atomic) {
+  FaultFixture fx(make_temp_dir());
+  const std::string p = fx.path("cl.txt");
+  write_file(p, "abcdef\n");
+  CHECK(fx.ed->open(p) == Status::Ok);
+  const Edit e[1] = {Edit{0, 1, 1, std::string_view("X")}};  // same length: clone path
+  CHECK(fx.ed->apply(e) == Status::Ok);
+
+  fx.fault->fail_op("rename_at", 1, Status::Io);
+  SaveInfo si;
+  CHECK(fx.ed->save(nullptr, false, &si) == Status::Io);
+  CHECK_EQ(read_file(p), std::string("abcdef\n"));
+  CHECK_EQ(count_temps(fx.dir), 0);
+}
+
+// A post-rename directory-sync failure is non-fatal: the bytes are committed,
+// reported as SavedButNotDurable with durable=false, and never blind-retried.
+TEST(editor_save_fsync_dir_warns_not_durable) {
+  FaultFixture fx(make_temp_dir());
+  const std::string p = fx.path("dir.txt");
+  write_file(p, "abcdef\n");
+  CHECK(fx.ed->open(p) == Status::Ok);
+  const Edit e[1] = {Edit{0, 0, 0, std::string_view("XYZ")}};
+  CHECK(fx.ed->apply(e) == Status::Ok);
+
+  fx.fault->fail_op("fsync_dir", 1, Status::Io);
+  SaveInfo si;
+  CHECK(fx.ed->save(nullptr, false, &si) == Status::SavedButNotDurable);
+  CHECK(!si.durable);
+  CHECK_EQ(read_file(p), std::string("XYZabcdef\n"));  // committed
+  CHECK_EQ(count_temps(fx.dir), 0);                    // temp was renamed away
+}
+
+// In-place failure after the write starts must enter the needs-reload state and
+// keep the retained base readable for line reads (§5.5).
+TEST(editor_in_place_write_failure_needs_reload) {
+  FaultFixture fx(make_temp_dir());
+  const std::string p = fx.path("ip.txt");
+  write_file(p, "abcdef\n");
+  CHECK(fx.ed->open(p) == Status::Ok);
+  const Edit e[1] = {Edit{0, 1, 1, std::string_view("X")}};
+  CHECK(fx.ed->apply(e) == Status::Ok);
+
+  fx.fault->fail_op("pwrite", 1, Status::Io);
+  SaveInfo si;
+  CHECK(fx.ed->save(nullptr, true, &si) == Status::Io);
+  CHECK(fx.ed->save(nullptr, true, &si) == Status::Stale);
+  CHECK(fx.ed->apply(e) == Status::Stale);
+  CHECK_EQ(doc_of(*fx.ed), std::string("aXcdef\n"));  // retained base still reads
+}
+
+// Saving twice is safe: the second save is a clean no-op.
+TEST(editor_double_save_is_noop) {
+  Fixture fx(make_temp_dir());
+  const std::string p = fx.path("twice.txt");
+  write_file(p, "abcdef\n");
+  CHECK(fx.ed->open(p) == Status::Ok);
+  const Edit e[1] = {Edit{0, 1, 1, std::string_view("X")}};
+  CHECK(fx.ed->apply(e) == Status::Ok);
+
+  SaveInfo si;
+  CHECK(fx.ed->save(nullptr, false, &si) == Status::Ok);
+  CHECK_EQ(std::string(si.method), std::string("clone_pwrite"));
+  CHECK_EQ(read_file(p), std::string("aXcdef\n"));
+
+  SaveInfo si2;
+  CHECK(fx.ed->save(nullptr, false, &si2) == Status::Ok);
+  CHECK_EQ(std::string(si2.method), std::string("none"));
+  CHECK_EQ(si2.bytes_written, 0u);
+  CHECK_EQ(read_file(p), std::string("aXcdef\n"));
+  CHECK_EQ(count_temps(fx.dir), 0);
 }

@@ -1007,27 +1007,48 @@ Status EditorImpl::do_save(const Rev* expected_rev, bool in_place, SaveInfo* out
       if (have_tmp) {
         fs_->close_fd(target_fd);
         fs_->unlink(tmp_path);
+      } else {
+        // In-place write already started: the base may be partial (§5.5).
+        needs_reload_ = true;
       }
       return fail(s, "write");
     }
-    if (new_size < base_size_) fs_->ftruncate(target_fd, new_size);
+    if (new_size < base_size_) {
+      s = fs_->ftruncate(target_fd, new_size);
+      if (s != Status::Ok) {
+        if (!have_tmp) needs_reload_ = true;
+        return fail(s, "ftruncate");
+      }
+    }
     si.bytes_written = new_size;
   } else {
     uint64_t written = 0;
     for (const auto& sp : spans) {
       if (sp.second <= sp.first) continue;
       s = write_doc(target_fd, sp.first, sp.second - sp.first);
-      if (s != Status::Ok) return fail(s, "write span");
+      if (s != Status::Ok) {
+        if (!have_tmp) needs_reload_ = true;
+        return fail(s, "write span");
+      }
       written += sp.second - sp.first;
     }
     if (method == "clone_pwrite_tail") {
       const uint64_t tail_len = new_size - lc2;
       const uint64_t base_tail_off = base_size_ - tail_len;
       s = write_base(target_fd, base_tail_off, lc2, tail_len);
-      if (s != Status::Ok) return fail(s, "write tail");
+      if (s != Status::Ok) {
+        if (!have_tmp) needs_reload_ = true;
+        return fail(s, "write tail");
+      }
       written += tail_len;
     }
-    if (new_size != base_size_) fs_->ftruncate(target_fd, new_size);
+    if (new_size != base_size_) {
+      s = fs_->ftruncate(target_fd, new_size);
+      if (s != Status::Ok) {
+        if (!have_tmp) needs_reload_ = true;
+        return fail(s, "ftruncate");
+      }
+    }
     si.bytes_written = written;
   }
 
@@ -1043,10 +1064,13 @@ Status EditorImpl::do_save(const Rev* expected_rev, bool in_place, SaveInfo* out
     if (have_tmp) {
       fs_->close_fd(target_fd);
       fs_->unlink(tmp_path);
+    } else {
+      needs_reload_ = true;
     }
     return fail(s, "fsync");
   }
 
+  bool durable = true;
   if (have_tmp) {
     s = fs_->open_dir(dir_, &dirfd);
     if (s != Status::Ok) {
@@ -1055,12 +1079,17 @@ Status EditorImpl::do_save(const Rev* expected_rev, bool in_place, SaveInfo* out
       return fail(s, "open dir");
     }
     s = fs_->rename_at(dirfd, basename_of(path_), tmp_path);
-    fs_->close_fd(dirfd);
     if (s != Status::Ok) {
+      fs_->close_fd(dirfd);
       fs_->close_fd(target_fd);
       fs_->unlink(tmp_path);
       return fail(s, "rename");
     }
+    // The rename is the commit point. A post-rename directory sync failure is
+    // reported as a durability warning, never blind-retried (§5.5).
+    s = fs_->fsync_dir(dirfd);
+    fs_->close_fd(dirfd);
+    if (s != Status::Ok) durable = false;
   }
   fs_->close_fd(target_fd);
 
@@ -1082,7 +1111,9 @@ Status EditorImpl::do_save(const Rev* expected_rev, bool in_place, SaveInfo* out
   rev_ = Rev{nst.dev, nst.ino, nst.size, nst.mtime_ns, nst.ctime_ns};
   flatten_after_save(new_size);
 
+  si.durable = durable;
   if (out != nullptr) *out = si;
+  if (!durable) return fail(Status::SavedButNotDurable, "directory sync failed");
   return Status::Ok;
 }
 

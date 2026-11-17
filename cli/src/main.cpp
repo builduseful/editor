@@ -94,6 +94,7 @@ struct Env {
   bool ok = true;
   std::string extra_top;   // e.g. "\"truncated\":true"
   std::string results = "[]";
+  std::string warnings = "[]";
   std::string error = "null";
 
   std::string dump() const {
@@ -103,7 +104,7 @@ struct Env {
     out += ",\"ok\":" + json::boolean(ok);
     out += ",\"duration_us\":0";
     out += ",\"cwd\":" + json::str(cwd_string());
-    out += ",\"warnings\":[]";
+    out += ",\"warnings\":" + warnings;
     if (!extra_top.empty()) out += "," + extra_top;
     out += ",\"results\":" + results;
     out += ",\"error\":" + error;
@@ -113,6 +114,16 @@ struct Env {
     return out;
   }
 };
+
+// §6.2: a warning element is {code, message, path?}. Non-fatal: ok stays true.
+std::string warning_object(const char* code, const std::string& message,
+                           const std::string& path) {
+  json::Object o;
+  o.set("code", json::str(code));
+  o.set("message", json::str(message));
+  if (!path.empty()) o.set("path", json::str(path));
+  return o.dump();
+}
 
 std::string error_object(const char* code, const std::string& message,
                          const std::string& path = "",
@@ -624,17 +635,26 @@ Run cmd_write(const Ctx& ctx, const std::string& raw_path, const Args& args) {
 
   SaveInfo si;
   s = ed->save(nullptr, in_place, &si);
-  if (s != Status::Ok) {
+  if (s != Status::Ok && s != Status::SavedButNotDurable) {
     const std::string msg = ed->errmsg().empty() ? std::string("save failed")
                                                  : std::string(ed->errmsg());
     return fail_run("write", code_of(s), msg, path);
   }
+  const bool not_durable = (s == Status::SavedButNotDurable);
 
   Info after;
   ed->info(&after);
 
   Env env;
   env.command = "write";
+  if (not_durable) {
+    env.warnings = json::Array()
+                       .add(warning_object("E_SAVED_BUT_NOT_DURABLE",
+                                           "save completed without the requested "
+                                           "durability",
+                                           path))
+                       .dump();
+  }
   std::string fields = json::Object()
                            .set("path", json::str(after.path))
                            .set("bytes", json::unum(after.bytes))
@@ -940,17 +960,26 @@ Run cmd_edit(const Ctx& ctx, const std::string& raw_path, const Args& args) {
   }
   SaveInfo si;
   const Status ss = ed->save(expect_ptr, in_place, &si);
-  if (ss != Status::Ok) {
+  if (ss != Status::Ok && ss != Status::SavedButNotDurable) {
     const std::string msg = ed->errmsg().empty() ? std::string("save failed")
                                                  : std::string(ed->errmsg());
     return fail_run("edit", code_of(ss), msg, path);
   }
+  const bool not_durable = (ss == Status::SavedButNotDurable);
 
   Info after;
   ed->info(&after);
 
   Env env;
   env.command = "edit";
+  if (not_durable) {
+    env.warnings = json::Array()
+                       .add(warning_object("E_SAVED_BUT_NOT_DURABLE",
+                                           "save completed without the requested "
+                                           "durability",
+                                           path))
+                       .dump();
+  }
   std::string fields = json::Object()
                            .set("path", json::str(after.path))
                            .set("bytes", json::unum(after.bytes))
@@ -1899,6 +1928,7 @@ Run cmd_batch(const Ctx& ctx, const Args& args) {
     Rev post_rev{};
   };
   std::vector<Applied> applied;
+  std::vector<std::string> batch_warnings;
   struct Out {
     std::string path;
     uint64_t off = 0;
@@ -2031,7 +2061,12 @@ Run cmd_batch(const Ctx& ctx, const Args& args) {
 
     SaveInfo si;
     s = ed->save(expect_ptr, u.ops.front()->in_place, &si);
-    if (s != Status::Ok) {
+    if (s == Status::SavedButNotDurable) {
+      // Rename succeeded; only the directory sync failed. Non-fatal (§5.5).
+      batch_warnings.push_back(
+          warning_object("E_SAVED_BUT_NOT_DURABLE",
+                         "save completed without the requested durability", u.path));
+    } else if (s != Status::Ok) {
       const bool wrote = (s == Status::Io);
       bool ok = true;
       // The failed unit: restore unconditionally only if it may have written.
@@ -2221,6 +2256,11 @@ Run cmd_batch(const Ctx& ctx, const Args& args) {
   env.extra_top = "\"rolled_back\":false";
   if (outs_truncated) env.extra_top += ",\"truncated\":true";
   env.results = dump_outs();
+  if (!batch_warnings.empty()) {
+    json::Array w;
+    for (const std::string& ws : batch_warnings) w.add(ws);
+    env.warnings = w.dump();
+  }
   Run r;
   r.out = env.dump();
   return r;
