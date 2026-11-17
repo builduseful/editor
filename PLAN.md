@@ -1,8 +1,8 @@
-# editor — Plan (v6.7)
+# editor — Plan (v6.8)
 
-> Name: **editor**. Status: planning. v6.7 — fourth refinement pass: `Change`
-> geometry, needs-reload state, and CLI/batch dry-run, cap, and error contracts
-> tightened. Scope unchanged.
+> Name: **editor**. Status: planning. v6.8 — fifth refinement pass: needs-reload
+> base-fd retention, plus error-code, type, and budget-scope clarifications.
+> Scope unchanged.
 > A native macOS text editor for **small, predictable memory, low CPU, and high
 > throughput**, with a **CLI-first** surface so AI agents can drive it
 > deterministically.
@@ -134,7 +134,7 @@ struct Rev {                       // stat-only in v1
 
 struct Stat {
   uint64_t dev = 0, ino = 0, size = 0;
-  uint32_t mode = 0, uid = 0, gid = 0;
+  uint16_t mode = 0; uint32_t uid = 0, gid = 0;
   uint64_t mtime_ns = 0, ctime_ns = 0;
   bool regular = false;
 };
@@ -144,7 +144,7 @@ struct Info {
   uint64_t bytes = 0;              // on-disk size, BOM included
   int64_t line_count = 0;          // document state (includes unsaved edits)
   Eol eol = Eol::Lf;               // document state
-  Encoding encoding = Encoding::Utf8;
+  Encoding encoding = Encoding::Utf8;  // document state
   bool bom = false, final_newline = true, dirty = false;  // document state
   Rev rev;
 };
@@ -464,8 +464,9 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
   scan reads the mapping/add buffer on demand. "Lazy" means the index is not
   built until the first line query/edit, not that descriptors are evicted.
 - Node layout: 63-way B-tree — 62 chunk descriptors + 63 subtree sums per node:
-  62 × 12 B + 63 × 16 B = 1752 B per node, i.e. **≈28 B per chunk**. Chunks are
-  split at 64 lines and merged below 32; the estimate assumes ~75% occupancy
+  62 × 12 B + 63 × 16 B = 1752 B per node, i.e. **≈28 B per chunk**. (Each
+  subtree sum is a line-count + byte-length pair, so 16 B each.) Chunks are split
+  at 64 lines and merged below 32; the estimate assumes ~75% occupancy
   (≈48 lines per chunk, a design target), which gives **≈0.58 B per line**:
   5M lines ≈ 2.9 MB, 25M ≈ 14.6 MB. The §7 caps assume this average; a workload
   that keeps chunks near half-full (≈32 lines, ≈0.88 B/line → 4.4 MB / 22 MB)
@@ -606,22 +607,26 @@ So a same-length save is `clone_pwrite` on the clone/in-place paths but
   `ok: true`, `durable=false`; **never blind-retry**. The warning is reported
   only on the call that produced it. A failed post-save reopen is `E_IO`, not a
   durability warning (below).
-- **Post-save transition**: with the lock still held, close the pre-save base fd,
-  reopen the path with `open_readonly(path, nofollow=true, &fd)`, and verify the
-  `fstat` matches the new `Rev`. On success, update identity and rev (also for
-  `SavedButNotDurable`), then release the lock. A reopen failure (`E_IO`) or an
-  `fstat` mismatch (`E_CONFLICT`) means the write succeeded but no new base could
-  be established: return that status and enter the needs-reload state.
-  Atomic w.r.t. other threads, not w.r.t. process crash; a crash **before** rename
-  leaves the old file intact; after rename the new file is visible. Double-save
-  test.
+- **Post-save transition**: with the lock still held, reopen the path with
+  `open_readonly(path, nofollow=true, &new_fd)` **while the pre-save base fd and
+  its mapping are still open**, and verify the `fstat` matches the new `Rev`. On
+  success, adopt the new fd, then close and unmap the pre-save base, update
+  identity and rev (also for `SavedButNotDurable`), and release the lock. A
+  reopen failure (`E_IO`) or an `fstat` mismatch (`E_CONFLICT`) means the write
+  succeeded but no new base could be established: return that status and enter
+  the needs-reload state **keeping the pre-save base fd/mapping**, so base bytes
+  remain readable. Atomic w.r.t. other threads, not w.r.t. process crash; a crash
+  **before** rename leaves the old file intact; after rename the new file is
+  visible. Double-save test.
 - **Needs-reload state** (entered by an in-place failure once the write started,
   a failed post-save reopen, or a post-save `fstat` mismatch): the in-memory
-  document is kept, but there is no valid base. `apply`/`undo`/`redo`/`save`/
+  document is kept and its base fd/mapping is retained, but it no longer
+  corresponds to a known on-disk identity. `apply`/`undo`/`redo`/`save`/
   `save_as`/`check_identity` return `E_STALE`, `read_range` returns `E_IO`, and
-  `rev()`/`Info::rev` are zeroed; `read_lines` and the document-state fields of
-  `info` keep working, with `Info::bytes` zeroed too (file state is unknown).
-  Only `reload()` or `open()` leave the state. The CLI is one-shot and only
+  the file-state fields `rev()`/`Info::rev` and `Info::bytes` are zeroed;
+  `read_lines` and the document-state fields of `info` (`line_count`, `eol`,
+  `encoding`, `bom`, `final_newline`, `dirty`) keep working from the retained
+  base. Only `reload()` or `open()` leave the state. The CLI is one-shot and only
   reports the original error.
 - **Gate**: same-length edit in 1 GB on APFS < 100 ms p99 with **crash-only
   `fsync`**. `F_FULLFSYNC` is measured separately (§7) and is **not gated in
@@ -681,9 +686,11 @@ editor diff | restore | patch-apply | gui | tree | search | move | serve | run
 **Global flags:** `--root DIR` (default cwd), `--max-file-bytes N` (input size
 cap, default 2 GB), `--allow-huge` (ignore `--max-file-bytes`). The cap applies
 to `read`/`write`/`edit`/`info`/`validate` (the target's size at open, plus a
-`write` payload) and to each `batch` unit; core itself imposes no cap, so the GUI
-and the 5 GB read-only demo are unaffected. Global flags may appear **before or
-after** the subcommand (`editor --root R read f` ≡ `editor read f --root R`). Always JSON on stdout; no `--json`. Help/usage text
+`write` payload) and to each `batch` unit; exceeding it (without `--allow-huge`)
+→ `E_TOO_LARGE`. Core itself imposes no cap, so the GUI and the 5 GB read-only
+demo are unaffected. Global flags may appear **before or after** the subcommand
+(`editor --root R read f` ≡ `editor read f --root R`). Always JSON on stdout; no
+`--json`. Help/usage text
 goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
 `editor --help`/`editor help` and `editor <cmd> --help` print usage to stderr.
 `--` ends option parsing.
@@ -834,7 +841,8 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
 
 - The **top-level** envelope always has `schema`, `command`, `ok`, `duration_us`,
   `cwd`, `warnings`, `results`, `error`, `meta`. Commands may add conditional
-  top-level fields: `truncated` (validate/batch), `valid` + `errors[]`
+  top-level fields: `truncated` (validate/batch — top-level; `read`'s `truncated`
+  is a per-result field, §6.1), `valid` + `errors[]`
   (batch `--check`), `rolled_back` (batch). Each element of `results[]` for
   a **file command** (`read`/`write`/`edit`/`info`/`validate`, and each such unit
   of `batch`) always has `path`, `bytes`, `line_count`, `eol`, `encoding`,
@@ -894,8 +902,11 @@ Core `Status` covers document/IO; the CLI adds `E_USAGE`, `E_SCHEMA`, `E_PARSE`,
 `E_OUTSIDE_ROOT`, `E_NO_MATCH`, `E_AMBIGUOUS`. `E_LOCKED` is `Status::Locked`.
 `E_*` = SCREAMING_SNAKE_CASE of the Status name. The top-level `error` object
 carries `code`, `message`, `retryable`, `path`, `hint`, and command-specific
-fields; `batch` errors add `op_index` (0-based, omitted for a whole-program
-parse failure). `E_INVALID_UTF8` includes the byte offset; `E_NO_MATCH`/
+fields (`retryable` is a fixed per-code boolean — true for the transient
+`E_IO`/`E_LOCKED`/`E_CONFLICT` conditions, false otherwise; `hint` is a
+free-form, optional human string); `batch` errors add `op_index` (0-based,
+omitted for a whole-program parse failure, which is `E_PARSE`, exit 3).
+`E_INVALID_UTF8` includes the byte offset; `E_NO_MATCH`/
 `E_AMBIGUOUS` include at most 20 entries of `{line, col, byte_offset}` (CLI:
 `line` 1-based; `col` and `byte_offset` 0-based).
 `validate`'s `errors[]` are lightweight findings with lowercase `code`
@@ -1076,13 +1087,13 @@ windows/`pread` policy.
 | + add buffer (resident portion) | ≤ 8 MB (overflow spills to disk) |
 | + sparse line index (5M lines, incl. nodes) | ≤ 3 MB |
 | + sparse line index (25M lines, incl. nodes) | ≤ 15 MB |
-| **Loaded, resident (1 GB file with ≤5M lines, i.e. ≥200 B/line; cache + undo + index + add buffer)** | **≤ 40 MB** |
+| **Loaded, resident (1 GB file with ≤5M lines, i.e. ≥200 B/line; baseline + cache + undo + index + add buffer)** | **≤ 40 MB** |
 | **Loaded, resident (1 GB file with ≤25M lines; same components)** | **≤ 50 MB** |
 
 Spilled undo/add-buffer data is disk, not footprint. Both loaded-resident caps
-are resident only: 12 (baseline) + 6 (cache) + 8 (undo) + 8 (add buffer) = 34 MB,
-plus the index cap — 37 MB at 5M lines (cap 40 MB) and 49 MB at 25M lines
-(cap 50 MB). The §5.3 layout estimates at ~75% chunk occupancy are ~2.9 MB and
+are a total resident footprint: 12 (baseline) + 6 (cache) + 8 (undo) + 8 (add
+buffer) = 34 MB, plus the index cap — 37 MB at 5M lines (cap 40 MB) and 49 MB at
+25M lines (cap 50 MB). The §5.3 layout estimates at ~75% chunk occupancy are ~2.9 MB and
 ~14.6 MB. Line count is not separately capped.
 Post-1.0, the content-mmap LRU (50–60 MB) is additional.
 
@@ -1198,7 +1209,7 @@ width + wrap settings, status bar, gutter, decorations, and the CLI (`read`,
 | --- | --- | --- | --- |
 | **Pre-M0.0** | Freeze `editor.hpp` + C++ conformance test + §5.1–5.3 data-model rules + test/JSON decisions. | 1 wk | Interface compiles; conformance skeleton runs. |
 | **M0a** | Piece table + sparse index + core `apply` + `read`/`write`/`info` + root/symlink checks + same-length CoW save + JSON + basic Status→`E_*` mapping. | 3–4 wk | Open + read + write + reopen + read round-trip; golden JSON; 1 GB same-length `apply`+`save` < 100 ms p99 (APFS, crash-only `fsync`). |
-| **M0b** | `edit` + undo + length-changing save + fault injection. | 3–4 wk | Edit/undo property tests; double-save and save-crash tests. |
+| **M0b** | `edit` (basic `E_NO_MATCH`/`E_AMBIGUOUS`; full model in M0c) + undo + length-changing save + fault injection. | 3–4 wk | Edit/undo property tests; double-save and save-crash tests. |
 | **M0c** | `batch` + `validate` + security + full error model (`E_NO_MATCH`/`E_AMBIGUOUS`) + batch symlink handling/TOCTOU + binding invariant. | 2–3 wk | Batch validation/rollback; fuzz; CLI golden. |
 | **M0.5** | Headless render oracle + viewcore skeleton + **5 GB read-only demo** + C++ validation + conformance check. | 2 wk | 5 GB at 60 fps, flat footprint; sanitizers clean; conformance pass; D1 kill-gate decision recorded. |
 | **M1** | macOS read-only custom view: AppKit + CoreText + viewcore; keyboard/mouse. | 4–6 wk | Open 1 GB to first paint < 100 ms; open 5 GB < 250 ms; scroll 5 GB at ≥60 fps. |
