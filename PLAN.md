@@ -174,6 +174,8 @@ class Editor {
 
   virtual Status open(std::string_view path_utf8) = 0;
   // Create a new empty file. Existing path -> E_CONFLICT. Never truncates.
+  // The new file becomes the open document (empty, clean); the path must be
+  // absolute and resolved. No expected-rev check (nothing existed).
   virtual Status create(std::string_view path_utf8) = 0;
   virtual Status info(Info* out) const = 0;
   virtual Rev rev() const = 0;
@@ -209,11 +211,12 @@ class Editor {
   virtual Status save(const Rev* expected_rev = nullptr, bool in_place = false,
                       SaveInfo* out = nullptr) = 0;
   // save_as: no-op if clean and dst is the same file; expected_rev is checked
-  // even when clean. Refuses a symlink or non-regular dst (lstat, no-follow)
-  // with E_CONFLICT; refuses to overwrite an existing dst with E_CONFLICT
-  // unless expected_rev matches dst's identity; if dst does not exist,
-  // expected_rev must be null (otherwise E_CONFLICT). dst == current path is
-  // the in-place case (same checks as save). Updates open path/identity.
+  // even when clean. dst == the open path is the in-place case (same checks as
+  // save). Refuses a symlink or non-regular dst (lstat, no-follow) with
+  // E_CONFLICT; refuses to overwrite an existing dst with E_CONFLICT unless
+  // expected_rev matches dst's identity; if dst does not exist, expected_rev
+  // must be null (otherwise E_CONFLICT). On success the open path becomes dst
+  // (relative dst resolves against the current dir, then realpath).
   virtual Status save_as(std::string_view path_utf8,
                          const Rev* expected_rev = nullptr, bool in_place = false,
                          SaveInfo* out = nullptr) = 0;
@@ -295,7 +298,9 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
 - `(ptr, len)` / `string_view` / `span` everywhere; no NUL-terminated input.
 - `int64_t` for document lines/byte offsets; `uint64_t` for file offsets/sizes;
   `uint16_t` for mode. `0` is a valid line/length, never an error. Negative
-  document values → `E_RANGE`.
+  document values → `E_RANGE`. A successful `open`/`create`/`save_as` stores an
+  absolute, symlink-resolved (`realpath`) open path; a relative `save_as` dst
+  resolves against the current directory first.
 - Core is 0-based; CLI is 1-based. `col` is a UTF-8 byte offset.
 - `open`/`create`/`save` use `nofollow=true` and reject non-regular files
   (`Stat::regular=false` → `E_IO`).
@@ -406,8 +411,10 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
 ### 5.5 Save path (honest cost model)
 
 v1 targets macOS/APFS; Windows/Linux fallbacks are post-1.0. All paths hold the
-expect-check + write (+ rename) under the OS lock. The core resolves the open path
-once, splits it into dir + name, and opens the directory before the rename.
+expect-check + write (+ rename) under the OS lock, including the `expected_rev`
+comparison and the post-rename identity check, but not the post-save
+`open_readonly` reopen. The core resolves the open path once, splits it into dir +
+name, and opens the directory before the rename.
 
 - **No-op if clean.** `SaveInfo::method = "none"`. `expected_rev` is still checked.
 - **Same-length edits**: `clone_to_new(dir, &tmp, src_fd, &tmp_fd)` (O(1) on APFS;
