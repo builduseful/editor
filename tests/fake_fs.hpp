@@ -41,8 +41,8 @@ class FakeFileSystem final : public FileSystem {
     return open_readonly(path, nofollow, out_fd);
   }
 
-  Status open_dir(std::string_view /*path*/, int* out_fd) override {
-    *out_fd = new_fd("");
+  Status open_dir(std::string_view path, int* out_fd) override {
+    *out_fd = new_fd(std::string(path));
     return Status::Ok;
   }
 
@@ -124,9 +124,11 @@ class FakeFileSystem final : public FileSystem {
     return Status::Ok;
   }
 
-  Status rename_at(int /*dst_dirfd*/, std::string_view dst_name,
+  Status rename_at(int dst_dirfd, std::string_view dst_name,
                    std::string_view tmp_path) override {
-    const std::string dst(dst_name);
+    auto dit = fds_.find(dst_dirfd);
+    if (dit == fds_.end()) return Status::Io;
+    const std::string dst = dit->second + "/" + std::string(dst_name);
     auto it = files_.find(std::string(tmp_path));
     if (it == files_.end()) return Status::NotFound;
     files_[dst] = it->second;

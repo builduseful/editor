@@ -5,11 +5,19 @@
 
 namespace ed {
 
-AddBuffer::~AddBuffer() {
-  if (spilled_ && fs_ != nullptr) {
+AddBuffer::~AddBuffer() { reset(); }
+
+void AddBuffer::reset() {
+  if (spilled_ && fs_ != nullptr && !path_.empty()) {
     fd_.reset();
-    if (!path_.empty()) fs_->unlink(path_);
+    fs_->unlink(path_);
+  } else {
+    fd_.reset();
   }
+  path_.clear();
+  resident_.clear();
+  spilled_ = false;
+  size_ = 0;
 }
 
 Status AddBuffer::init(FileSystem* fs, std::string temp_dir) {

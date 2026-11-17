@@ -19,10 +19,12 @@ endif
 BUILD := build
 
 CORE_SRC := $(wildcard core/src/*.cpp)
+PLATFORM_SRC := $(wildcard platform/macos/*.cpp)
 CLI_SRC  := $(wildcard cli/src/*.cpp)
 TEST_SRC := $(wildcard tests/*.cpp tests/conformance/*.cpp)
 
 CORE_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(CORE_SRC))
+PLATFORM_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(PLATFORM_SRC))
 CLI_OBJ  := $(patsubst %.cpp,$(BUILD)/%.o,$(CLI_SRC))
 TEST_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(TEST_SRC))
 
@@ -40,13 +42,13 @@ $(BUILD)/libcore.a: $(CORE_OBJ)
 	@mkdir -p $(@D)
 	ar rcs $@ $^
 
-$(BUILD)/editor: $(CLI_OBJ) $(BUILD)/libcore.a
+$(BUILD)/editor: $(CLI_OBJ) $(PLATFORM_OBJ) $(BUILD)/libcore.a
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -o $@ $(CLI_OBJ) $(BUILD)/libcore.a
+	$(CXX) $(CXXFLAGS) -o $@ $(CLI_OBJ) $(PLATFORM_OBJ) $(BUILD)/libcore.a
 
-$(BUILD)/editor_tests: $(TEST_OBJ) $(CORE_OBJ)
+$(BUILD)/editor_tests: $(TEST_OBJ) $(PLATFORM_OBJ) $(CORE_OBJ)
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -o $@ $(TEST_OBJ) $(CORE_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $(TEST_OBJ) $(PLATFORM_OBJ) $(CORE_OBJ)
 
 $(BUILD)/%.o: %.cpp
 	@mkdir -p $(@D)

@@ -30,6 +30,9 @@ class AddBuffer final : public Source {
   // Appends `len` bytes; returns the offset of the appended run.
   Status append(const char* data, uint64_t len, uint64_t* out_off);
 
+  // Drops all bytes and the spill file (used after a save flattens the table).
+  void reset();
+
   bool spilled() const { return spilled_; }
   uint64_t resident_bytes() const { return resident_.size(); }
 
