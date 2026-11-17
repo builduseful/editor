@@ -29,7 +29,11 @@ reference, not a component library.
   library are allowed.
 - Custom-drawn view only; no native-control hybrid.
 - Decisions D1–D13 in `PLAN.md` are locked unless the plan says otherwise.
-- Build/test commands: none yet (Pre-M0.0).
+- Build/test commands: `make` (builds `build/editor_tests`, plus `libcore.a`/`editor`
+  once those sources exist) and `make test` (runs the suite); `make SANITIZE=1 test`
+  adds ASan+UBSan; `make clean`. Apple clang + make only, no third-party tooling.
+  This plain Makefile is a Pre-M0.0 stand-in for the `PLAN.md` §10 CMake graph,
+  which wraps the same sources when the GUI/`.app`/notarization work begins.
 
 ## Repo hygiene
 
