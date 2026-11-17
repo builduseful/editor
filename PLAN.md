@@ -206,7 +206,8 @@ class Editor {
   // when clean. in_place writes the original inode; otherwise clone/temp.
   virtual Status save(const Rev* expected_rev = nullptr, bool in_place = false,
                       SaveInfo* out = nullptr) = 0;
-  // save_as: refuses a symlink dst (lstat, no-follow) with E_CONFLICT;
+  // save_as: refuses a symlink or non-regular dst (lstat, no-follow) with
+  // E_CONFLICT;
   // refuses to overwrite an existing dst with E_CONFLICT unless expected_rev
   // matches dst's identity; if dst does not exist, expected_rev must be null
   // (otherwise E_CONFLICT). Updates open path/identity.
@@ -425,8 +426,10 @@ once, splits it into dir + name, and opens the directory before the rename.
   `fchown` before `fchmod`. Setuid/setgid are not preserved. New files use
   `fchmod(tmp_fd, 0666 & ~umask)` before rename.
 - **In-place** (`--in-place`): `open_write(path, create=false, truncate=false,
-  nofollow=true)`, then `fstat` the new fd and require the same full `Rev`
-  (`dev`, `ino`, `size`, `mtime_ns`, `ctime_ns`) as the open-time `Rev`
+  nofollow=true)` (if the target does not exist, `create=true` and it behaves as
+  create), then `fstat` the new fd and require the same full `Rev`
+  (`dev`, `ino`, `size`, `mtime_ns`, `ctime_ns`) as the applicable expected Rev
+  — the open-time `Rev` for `save`, `expected_rev` (dst) for `save_as`
   (otherwise `E_CONFLICT`, no write). `pwrite` changed spans
   (or full rewrite), `ftruncate` for length changes, `fsync(original)`, update
   identity/rev. No temp/rename; `SaveInfo::method` is `copy_range` or
