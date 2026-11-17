@@ -179,6 +179,49 @@ def main():
         check("rev_before" in r and "bytes_before" in r, "dry-run keeps rev_before")
         check(r["save"] == "clone_pwrite", "dry-run predicted method")
 
+        # --- validate ------------------------------------------------------
+        with open(os.path.join(tmp, "ok.txt"), "w") as f:
+            f.write("ok line\nsecond\n")
+        env = run(["validate", "ok.txt"], tmp, 0)
+        r = result(env, tmp)
+        check(env["ok"] is True and r["errors"] == [], "validate ok")
+        check("truncated" not in env, "validate ok omits truncated")
+
+        with open(os.path.join(tmp, "bad.txt"), "wb") as f:
+            f.write(b"bad \xff byte\n")
+        env = run(["validate", "bad.txt"], tmp, 2)
+        r = result(env, tmp)
+        check(env["ok"] is False, "validate bad ok=false")
+        check(r["errors"][0]["code"] == "invalid_utf8", "validate invalid_utf8")
+        check(r["errors"][0]["byte_offset"] == 4, "validate byte_offset")
+        check(env["error"]["code"] == "E_INVALID_UTF8", "validate promoted error")
+        check(env["error"]["byte_offset"] == 4, "validate error field set")
+
+        with open(os.path.join(tmp, "nul.txt"), "wb") as f:
+            f.write(b"nul\x00here\n")
+        env = run(["validate", "nul.txt"], tmp, 2)
+        r = result(env, tmp)
+        check(r["errors"][0]["code"] == "binary", "validate binary")
+        check(r["line_count"] == 0 and r["final_newline"] is False,
+              "validate binary placeholder fields")
+        check(env["error"]["code"] == "E_BINARY", "validate binary promoted")
+
+        with open(os.path.join(tmp, "u16.txt"), "wb") as f:
+            f.write(b"\xff\xfea\x00")
+        env = run(["validate", "u16.txt"], tmp, 2)
+        r = result(env, tmp)
+        check(r["errors"][0]["code"] == "unsupported", "validate unsupported")
+        check(r["encoding"] == "utf-16le", "validate utf-16le encoding")
+        check(r["bom"] is False, "validate utf-16 bom flag false")
+        check(env["error"]["code"] == "E_UNSUPPORTED", "validate unsupported promoted")
+
+        with open(os.path.join(tmp, "bom.txt"), "wb") as f:
+            f.write(b"\xef\xbb\xbfbom\n")
+        env = run(["validate", "bom.txt"], tmp, 0)
+        r = result(env, tmp)
+        check(r["bom"] is True, "validate utf-8 bom")
+        check(r["bytes"] == 7, "validate bytes includes bom")
+
         # --- outside root --------------------------------------------------
         env = run(["info", "/etc/hosts"], tmp, 2)
         check(env["error"]["code"] == "E_OUTSIDE_ROOT", "outside root")

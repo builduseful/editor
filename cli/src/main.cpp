@@ -980,6 +980,308 @@ Run cmd_edit(const Ctx& ctx, const std::string& raw_path, const Args& args) {
   return r;
 }
 
+// --- validate ---------------------------------------------------------------
+
+struct Finding {
+  int64_t line = 1;
+  int64_t col = 0;
+  uint64_t byte_offset = 0;
+  const char* code = "invalid_utf8";
+};
+
+std::string finding_json(const Finding& f) {
+  return json::Object()
+      .set("line", json::num(f.line))
+      .set("col", json::num(f.col))
+      .set("byte_offset", json::unum(f.byte_offset))
+      .set("code", json::str(f.code))
+      .dump();
+}
+
+// Incremental UTF-8 validator: reports the raw offset of each malformed
+// sequence. State persists across chunk boundaries.
+struct Utf8Scan {
+  unsigned need = 0;
+  unsigned cp = 0;
+  unsigned min_cp = 0;
+  uint64_t seq_start = 0;
+
+  template <class Report>
+  void feed(const char* p, size_t n, uint64_t base, Report&& report) {
+    size_t i = 0;
+    while (i < n) {
+      const unsigned char c = static_cast<unsigned char>(p[i]);
+      if (need == 0) {
+        if (c < 0x80) {
+          i += 1;
+          continue;
+        }
+        if ((c & 0xE0) == 0xC0) {
+          need = 1; cp = c & 0x1Fu; min_cp = 0x80;
+        } else if ((c & 0xF0) == 0xE0) {
+          need = 2; cp = c & 0x0Fu; min_cp = 0x800;
+        } else if ((c & 0xF8) == 0xF0) {
+          need = 3; cp = c & 0x07u; min_cp = 0x10000;
+        } else {
+          report(base + i);
+          i += 1;
+          continue;
+        }
+        seq_start = base + i;
+        i += 1;
+        continue;
+      }
+      if ((c & 0xC0) != 0x80) {
+        report(seq_start);
+        need = 0;
+        continue;  // reprocess this byte
+      }
+      cp = (cp << 6) | (c & 0x3Fu);
+      need -= 1;
+      i += 1;
+      if (need == 0) {
+        const bool bad = cp < min_cp || cp > 0x10FFFF ||
+                         (cp >= 0xD800 && cp <= 0xDFFF);
+        if (bad) report(seq_start);
+      }
+    }
+  }
+};
+
+Run cmd_validate(const Ctx& ctx, const std::string& raw_path) {
+  const std::string path = resolve_path(ctx, raw_path);
+  if (!inside_root(path, ctx.root)) {
+    return fail_run("validate", "E_OUTSIDE_ROOT", "path outside --root", path);
+  }
+
+  std::unique_ptr<FileSystem> fs;
+  create_file_system(&fs);
+  int fd = -1;
+  Status s = fs->open_readonly(path, true, &fd);
+  if (s != Status::Ok) return fail_run("validate", code_of(s), "cannot open", path);
+  Stat st;
+  s = fs->fstat(fd, &st);
+  if (s != Status::Ok) {
+    fs->close_fd(fd);
+    return fail_run("validate", code_of(s), "fstat failed", path);
+  }
+  if (!st.regular) {
+    fs->close_fd(fd);
+    return fail_run("validate", "E_IO", "not a regular file", path);
+  }
+  if (!ctx.allow_huge && st.size > ctx.max_file_bytes) {
+    fs->close_fd(fd);
+    return fail_run("validate", "E_TOO_LARGE", "file exceeds --max-file-bytes", path);
+  }
+
+  char head[8192];
+  size_t got = 0;
+  s = fs->pread(fd, 0, head, sizeof(head), &got);
+  if (s != Status::Ok) {
+    fs->close_fd(fd);
+    return fail_run("validate", code_of(s), "read failed", path);
+  }
+
+  bool utf8_bom = false;
+  uint64_t bom_len = 0;
+  if (got >= 3 && static_cast<unsigned char>(head[0]) == 0xEF &&
+      static_cast<unsigned char>(head[1]) == 0xBB &&
+      static_cast<unsigned char>(head[2]) == 0xBF) {
+    utf8_bom = true;
+    bom_len = 3;
+  }
+
+  Encoding enc = Encoding::Utf8;
+  std::vector<Finding> errors;
+  bool truncated = false;
+  bool early = false;
+  std::string early_code;
+
+  if (got >= 2 && ((static_cast<unsigned char>(head[0]) == 0xFF &&
+                    static_cast<unsigned char>(head[1]) == 0xFE) ||
+                   (static_cast<unsigned char>(head[0]) == 0xFE &&
+                    static_cast<unsigned char>(head[1]) == 0xFF))) {
+    enc = static_cast<unsigned char>(head[0]) == 0xFF ? Encoding::Utf16Le
+                                                      : Encoding::Utf16Be;
+    errors.push_back(Finding{1, 0, 0, "unsupported"});
+    early = true;
+    early_code = "unsupported";
+  } else {
+    for (size_t i = 0; i < got; ++i) {
+      if (head[i] == '\0') {
+        errors.push_back(
+            Finding{1, 0, static_cast<uint64_t>(i), "binary"});
+        early = true;
+        early_code = "binary";
+        break;
+      }
+    }
+  }
+
+  int64_t line_count = 0;
+  Eol eol = Eol::Lf;
+  bool final_newline = false;
+  bool bom = utf8_bom;
+
+  if (!early) {
+    // Single streaming pass: line/terminator tracking + UTF-8 validation.
+    int64_t line = 1;
+    uint64_t line_start = bom_len;
+    bool prev_cr = false;
+    uint64_t lf = 0, crlf = 0, cr = 0;
+    Eol first_seen = Eol::Lf;
+    bool have_first = false;
+    bool any = false;
+    uint64_t last_byte_off = 0;
+    char last_byte = 0;
+    Utf8Scan scan;
+
+    auto report = [&](uint64_t off) {
+      if (errors.size() >= 100) {
+        truncated = true;
+        return;
+      }
+      errors.push_back(Finding{line, static_cast<int64_t>(off - line_start), off,
+                               "invalid_utf8"});
+    };
+
+    char buf[1 << 20];
+    uint64_t pos = bom_len;
+    while (pos < st.size) {
+      const uint64_t want = std::min<uint64_t>(sizeof(buf), st.size - pos);
+      size_t n = 0;
+      s = fs->pread(fd, pos, buf, static_cast<size_t>(want), &n);
+      if (s != Status::Ok) {
+        fs->close_fd(fd);
+        return fail_run("validate", code_of(s), "read failed", path);
+      }
+      if (n == 0) break;
+      scan.feed(buf, n, pos, report);
+      for (size_t i = 0; i < n; ++i) {
+        const char c = buf[i];
+        const uint64_t off = pos + i;
+        any = true;
+        last_byte = c;
+        last_byte_off = off;
+        if (c == '\n') {
+          if (prev_cr) {
+            crlf += 1;
+          } else {
+            lf += 1;
+          }
+          if (!have_first) {
+            first_seen = prev_cr ? Eol::CrLf : Eol::Lf;
+            have_first = true;
+          }
+          prev_cr = false;
+          line += 1;
+          line_start = off + 1;
+        } else if (c == '\r') {
+          if (prev_cr) {
+            cr += 1;
+            if (!have_first) {
+              first_seen = Eol::Cr;
+              have_first = true;
+            }
+            line += 1;
+            line_start = off;
+          }
+          prev_cr = true;
+        } else {
+          if (prev_cr) {
+            cr += 1;
+            if (!have_first) {
+              first_seen = Eol::Cr;
+              have_first = true;
+            }
+            line += 1;
+            line_start = off;
+            prev_cr = false;
+          }
+        }
+      }
+      pos += n;
+    }
+    if (scan.need != 0) report(scan.seq_start);
+    if (prev_cr) {
+      cr += 1;
+      if (!have_first) {
+        first_seen = Eol::Cr;
+        have_first = true;
+      }
+      line += 1;
+      line_start = st.size;
+    }
+    (void)line_start;
+    (void)any;
+
+    const uint64_t terminators = lf + crlf + cr;
+    final_newline = st.size > 0 &&
+                    (last_byte == '\n' || last_byte == '\r');
+    line_count = static_cast<int64_t>(terminators) + (final_newline ? 0 : 1);
+    if (st.size == bom_len) line_count = 0;
+    if (terminators == 0) {
+      eol = Eol::Lf;
+    } else {
+      const uint64_t mx = std::max(lf, std::max(crlf, cr));
+      const int winners =
+          (lf == mx ? 1 : 0) + (crlf == mx ? 1 : 0) + (cr == mx ? 1 : 0);
+      if (winners == 1) {
+        eol = (lf == mx) ? Eol::Lf : (crlf == mx ? Eol::CrLf : Eol::Cr);
+      } else {
+        eol = first_seen;
+      }
+    }
+    (void)last_byte_off;
+  }
+
+  fs->close_fd(fd);
+
+  Env env;
+  env.command = "validate";
+  json::Array errs;
+  for (const Finding& f : errors) errs.add(finding_json(f));
+
+  std::string fields = json::Object()
+                           .set("path", json::str(path))
+                           .set("bytes", json::unum(st.size))
+                           .set("line_count", json::num(line_count))
+                           .set("eol", json::str(eol_str(eol)))
+                           .set("encoding", json::str(encoding_str(enc)))
+                           .set("bom", json::boolean(bom))
+                           .set("final_newline", json::boolean(final_newline))
+                           .set("rev", json::rev_object(
+                                          st.dev, st.ino, st.size, st.mtime_ns,
+                                          st.ctime_ns))
+                           .dump();
+  fields.pop_back();
+  fields += ",\"errors\":" + errs.dump() + "}";
+  env.results = json::Array().add(fields).dump();
+  env.ok = errors.empty();
+  if (truncated) env.extra_top = "\"truncated\":true";
+  if (!errors.empty()) {
+    const Finding& f = errors.front();
+    const char* code = std::strcmp(f.code, "unsupported") == 0
+                           ? "E_UNSUPPORTED"
+                           : (std::strcmp(f.code, "binary") == 0 ? "E_BINARY"
+                                                                 : "E_INVALID_UTF8");
+    std::string e = "{";
+    e += "\"code\":" + json::str(code);
+    e += ",\"message\":" + json::str("validation failed");
+    e += ",\"retryable\":false";
+    e += ",\"path\":" + json::str(path);
+    e += ",\"line\":" + json::num(f.line);
+    e += ",\"col\":" + json::num(f.col);
+    e += ",\"byte_offset\":" + json::unum(f.byte_offset);
+    e += ",\"hint\":null}";
+    env.error = e;
+  }
+  Run r;
+  r.exit_code = env.ok ? 0 : 2;
+  r.out = env.dump();
+  return r;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -1051,6 +1353,9 @@ int main(int argc, char** argv) {
   } else if (command == "edit") {
     if (positional.empty()) r = fail_run("edit", "E_USAGE", "missing path");
     else r = cmd_edit(ctx, positional[0], args);
+  } else if (command == "validate") {
+    if (positional.empty()) r = fail_run("validate", "E_USAGE", "missing path");
+    else r = cmd_validate(ctx, positional[0]);
   } else {
     r = fail_run(command, "E_USAGE", "unknown command");
   }
