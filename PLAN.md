@@ -1,8 +1,8 @@
-# editor — Plan (v6.10)
+# editor — Plan (v6.11)
 
-> Name: **editor**. Status: planning. v6.10 — seventh refinement pass: `E_PARSE`
-> exit-code contradiction fixed; `create` binding and `read_range` wording
-> corrected. Scope unchanged.
+> Name: **editor**. Status: planning. v6.11 — eighth refinement pass:
+> `batch --check` exit class, `edit` binding, copy-path and `open`/`create`
+> wording tightened. Scope unchanged.
 > A native macOS text editor for **small, predictable memory, low CPU, and high
 > throughput**, with a **CLI-first** surface so AI agents can drive it
 > deterministically.
@@ -339,8 +339,9 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
   first.
 - Core is 0-based. CLI lines are 1-based; CLI `col` and byte offsets are 0-based
   UTF-8 byte offsets unless a command says otherwise.
-- `open`/`create` use `nofollow=true` and reject non-regular files
-  (`Stat::regular=false` → `E_IO`). `save`/`save_as` refuse a symlink or
+- `open` uses `nofollow=true` and rejects non-regular files
+  (`Stat::regular=false` → `E_IO`); `create` is `O_CREAT|O_EXCL`, so an existing
+  path (any type) is `E_CONFLICT`. `save`/`save_as` refuse a symlink or
   non-regular target with `E_CONFLICT` (§5.5).
 - `apply` validates, in order: negative ranges, caller ordering, overlap (two
   edits at the same offset overlap, even two empty inserts), line/col bounds,
@@ -521,7 +522,8 @@ chosen as follows:
 - `clone_pwrite_tail` — length-changing edit with tail ≤25%: the changed span
   and the shifted tail are written (same clone/in-place mechanisms).
 - `copy_range` — clone unavailable (e.g. non-APFS) or `save_as` to a different
-  inode: the whole file is written, with the unchanged ranges streamed from the
+  inode (never with `in_place=true`): the whole file is written, with the
+  unchanged ranges streamed from the
   base around the edited span.
 - `full_rewrite` — new file, or tail >25%: the whole file is written from the
   piece table (a temp then `rename_at`, or over the original inode for
@@ -560,7 +562,8 @@ So a same-length save is `clone_pwrite` on the clone/in-place paths but
   `E_CONFLICT` (temp discarded) if the source changed mid-copy. `--force` skips
   the explicit `--expect` comparison, not this safety check.
 - **Copy paths** (clone unavailable, non-APFS, or `save_as` to a different
-  inode): `create_temp` (0600), stream the unchanged prefix/suffix ranges via
+  inode — never `in_place=true`): `create_temp` (0600), stream the unchanged
+  prefix/suffix ranges via
   `pread`/`pwrite` into the temp at their new offsets, write the edited span,
   copy metadata (see below), `fsync`, `rename_at`, `fsync_dir`; O(file),
   `method = "copy_range"` — except tail >25%, which uses `full_rewrite` (all
@@ -932,7 +935,8 @@ full field set.
 | 4 | internal | `E_OOM`, `E_INTERNAL` |
 
 `validate` with a non-empty `errors[]` → `ok:false`, exit **2**, `error` = the
-first error. `batch --check` with `valid:false` → exit **2**.
+first error. `batch --check` with `valid:false` exits with the class of its first
+error (`error.code`): exit **2** for a domain code, **3** for `E_USAGE`/`E_SCHEMA`.
 The CLI always size-queries before a read, so a `Status::BufferTooSmall` that
 reaches the CLI boundary is an internal invariant failure: it is reported as
 `E_INTERNAL`, exit 4.
@@ -1049,7 +1053,7 @@ reaches the CLI boundary is an internal invariant failure: it is reported as
 
 Every `core_fn` has a `cli_binding` or `gui_binding` (or an explicit
 `cli_excluded`); `editor schema` is generated from that table. `write` =
-`(open|create)+apply+save`; `edit` = `apply+save`; `batch` = the ops it
+`(open|create)+apply+save`; `edit` = `open+apply+save`; `batch` = the ops it
 dispatches. `version`/`schema` are CLI-only entries. `save_as`/`reload`/`undo`/
 `redo` are GUI/conformance-only in v1; `create` has no dedicated CLI command but
 is used internally by `write`. The golden menu test is a code-level check.
