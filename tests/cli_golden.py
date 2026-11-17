@@ -90,6 +90,15 @@ def main():
         env = run(["schema"], tmp, 0)
         names = [c["name"] for c in env["results"][0]["commands"]]
         check("edit" in names and "write" in names, "schema lists commands")
+        check("version" in names and "schema" in names, "schema lists CLI-only")
+        binds = env["results"][0]["bindings"]
+        # §6.6: every core fn is bound to cli or gui, or explicitly excluded.
+        check(all(b["cli"] or b["gui"] or b["cli_excluded"] for b in binds),
+              "every core fn is bound")
+        check(all(not (b["cli_excluded"] and b["cli"]) for b in binds),
+              "cli_excluded implies no cli binding")
+        check(len({b["core_fn"] for b in binds}) == len(binds),
+              "no duplicate core_fn bindings")
         env = run(["schema", "nope"], tmp, 3)
         check(env["error"]["code"] == "E_USAGE", "schema unknown -> E_USAGE")
 

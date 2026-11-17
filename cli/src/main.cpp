@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "binding.hpp"
 #include "editor.hpp"
 #include "json.hpp"
 #include "json_parse.hpp"
@@ -331,24 +332,74 @@ Run cmd_version() {
   return r;
 }
 
+std::vector<std::string> split_commas(const std::string& s) {
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (start <= s.size()) {
+    const size_t comma = s.find(',', start);
+    const size_t end = (comma == std::string::npos) ? s.size() : comma;
+    if (end > start) out.push_back(s.substr(start, end - start));
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return out;
+}
+
+// `editor schema` is generated from the §6.6 binding table: the CLI command list
+// is the CLI-only entries plus every command named in a binding, and
+// `bindings[]` exposes each core op's cli/gui/excluded state.
 Run cmd_schema(const std::vector<std::string>& args) {
-  const char* kCommands[] = {"read", "write", "edit", "info", "validate", "batch",
-                             "version", "schema"};
-  if (!args.empty()) {
-    bool known = false;
-    for (const char* c : kCommands) {
-      if (args[0] == c) known = true;
+  const char* kCliOnly[] = {"version", "schema"};
+  std::size_t n = 0;
+  const binding::Entry* table = binding::table(&n);
+
+  std::vector<std::string> commands;
+  auto add_unique = [&](const std::string& c) {
+    if (std::find(commands.begin(), commands.end(), c) == commands.end()) {
+      commands.push_back(c);
     }
-    if (!known) return fail_run("schema", "E_USAGE", "unknown command", args[0]);
+  };
+  for (const char* c : kCliOnly) add_unique(c);
+  for (std::size_t i = 0; i < n; ++i) {
+    for (const std::string& c : split_commas(table[i].cli)) add_unique(c);
   }
-  json::Array commands;
-  for (const char* c : kCommands) {
-    if (!args.empty() && args[0] != c) continue;
-    commands.add(json::Object().set("name", json::str(c)).dump());
+
+  const std::string filter = args.empty() ? std::string() : args[0];
+  if (!filter.empty() &&
+      std::find(commands.begin(), commands.end(), filter) == commands.end()) {
+    return fail_run("schema", "E_USAGE", "unknown command", filter);
   }
+
+  json::Array cmds;
+  for (const std::string& c : commands) {
+    if (!filter.empty() && c != filter) continue;
+    cmds.add(json::Object().set("name", json::str(c)).dump());
+  }
+
+  json::Array binds;
+  for (std::size_t i = 0; i < n; ++i) {
+    const std::vector<std::string> cli_cmds = split_commas(table[i].cli);
+    if (!filter.empty() &&
+        std::find(cli_cmds.begin(), cli_cmds.end(), filter) == cli_cmds.end()) {
+      continue;
+    }
+    json::Array cli_list;
+    for (const std::string& c : cli_cmds) cli_list.add(json::str(c));
+    binds.add(json::Object()
+                  .set("core_fn", json::str(table[i].core_fn))
+                  .set("cli", cli_list.dump())
+                  .set("gui", json::str(table[i].gui))
+                  .set("cli_excluded", json::boolean(table[i].cli_excluded))
+                  .dump());
+  }
+
   Env env;
   env.command = "schema";
-  env.results = json::Array().add(json::Object().set("commands", commands.dump()).dump()).dump();
+  std::string fields = json::Object()
+                           .set("commands", cmds.dump())
+                           .set("bindings", binds.dump())
+                           .dump();
+  env.results = json::Array().add(fields).dump();
   Run r;
   r.out = env.dump();
   return r;
