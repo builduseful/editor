@@ -3,6 +3,7 @@
 // The only OS-dependent factory in the frozen interface. Uses POSIX + a couple
 // of macOS extras (clonefile, F_FULLFSYNC, F_GETPATH).
 #include <fcntl.h>
+#include <signal.h>
 #include <sys/clonefile.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -11,7 +12,9 @@
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <memory>
 #include <string>
 
@@ -79,6 +82,23 @@ class PosixMapping final : public Mapping {
 struct LockHandle {
   std::string path;
 };
+
+// A lock file records "pid token start_time". It is stale only when its owner
+// process is gone (pid liveness), so a crashed process cannot wedge the lock
+// forever (§6.4).
+bool lock_is_stale(const std::string& lp) {
+  const int fd = ::open(lp.c_str(), O_RDONLY);
+  if (fd < 0) return true;  // vanished between O_EXCL and here
+  char buf[128];
+  const ssize_t n = ::read(fd, buf, sizeof(buf) - 1);
+  ::close(fd);
+  if (n <= 0) return true;
+  buf[n] = '\0';
+  int pid = 0;
+  if (std::sscanf(buf, "%d", &pid) != 1 || pid <= 0) return true;
+  if (::kill(pid, 0) == 0) return false;  // owner alive
+  return errno == ESRCH;                  // dead -> stale
+}
 
 class PosixFileSystem final : public FileSystem {
  public:
@@ -301,14 +321,29 @@ class PosixFileSystem final : public FileSystem {
 
   Status lock(std::string_view path, void** out) override {
     const std::string lp = std::string(path) + ".editor.lock";
-    const int fd = ::open(lp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
-    if (fd < 0) return errno_status(errno);
-    const std::string token = std::to_string(::getpid());
-    (void)::write(fd, token.data(), token.size());
-    ::close(fd);
-    auto* h = new LockHandle{lp};
-    *out = h;
-    return Status::Ok;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      const int fd = ::open(lp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0600);
+      if (fd >= 0) {
+        char buf[128];
+        const int n = std::snprintf(
+            buf, sizeof(buf), "%d %u %llu", static_cast<int>(::getpid()),
+            ::arc4random(),
+            static_cast<unsigned long long>(::time(nullptr)));
+        if (n > 0) (void)::write(fd, buf, static_cast<size_t>(n));
+        ::close(fd);
+        auto* h = new LockHandle{lp};
+        *out = h;
+        return Status::Ok;
+      }
+      if (errno != EEXIST) return errno_status(errno);
+      // Held: steal it only if the recorded owner is gone, else report Locked.
+      if (attempt == 0 && lock_is_stale(lp)) {
+        ::unlink(lp.c_str());
+        continue;
+      }
+      return Status::Locked;
+    }
+    return Status::Locked;
   }
 
   void unlock(void* lock) override {

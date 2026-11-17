@@ -30,6 +30,25 @@ bool rev_equal(const Rev& a, const Rev& b) {
          a.mtime_ns == b.mtime_ns && a.ctime_ns == b.ctime_ns;
 }
 
+// Holds FileSystem::lock for the whole save critical section (§5.5). Locking is
+// best-effort: a live holder is E_LOCKED, but a filesystem that cannot host the
+// lock file (e.g. a read-only directory, where --in-place is the fallback) is
+// allowed to proceed unlocked.
+struct LockGuard {
+  FileSystem* fs = nullptr;
+  void* handle = nullptr;
+  ~LockGuard() {
+    if (handle != nullptr) fs->unlock(handle);
+  }
+};
+
+Status acquire_lock(FileSystem* fs, std::string_view path, void** out) {
+  *out = nullptr;
+  const Status s = fs->lock(path, out);
+  if (s == Status::Ok || s == Status::Locked) return s;
+  return Status::Ok;  // best-effort: proceed unlocked
+}
+
 }  // namespace
 
 EditorImpl::EditorImpl(FileSystem* fs) : fs_(fs) {}
@@ -788,6 +807,15 @@ Status EditorImpl::do_save(const Rev* expected_rev, bool in_place, SaveInfo* out
   if (needs_reload_) return fail(Status::Stale, "needs reload");
   if (!opened_) return fail(Status::Io, "no document");
 
+  // Hold the target's lock for the whole expect-check + write + commit section,
+  // including the no-op path so its base check runs under the lock (§5.5).
+  void* lock = nullptr;
+  {
+    const Status ls = acquire_lock(fs_, path_, &lock);
+    if (ls != Status::Ok) return fail(ls, "lock");
+  }
+  LockGuard lg{fs_, lock};
+
   SaveInfo si;
   si.in_place = in_place;
 
@@ -1129,6 +1157,14 @@ Status EditorImpl::save_as(std::string_view dst_in, const Rev* expected_rev,
     }
     return do_save(expected_rev, in_place, out);  // same inode: normal save
   }
+
+  // A different inode (or a new dst): lock the dst for the whole section (§5.5).
+  void* lock = nullptr;
+  {
+    const Status ls2 = acquire_lock(fs_, dst, &lock);
+    if (ls2 != Status::Ok) return fail(ls2, "lock");
+  }
+  LockGuard lg{fs_, lock};
 
   if (exists) {
     if (!dst_st.regular) {

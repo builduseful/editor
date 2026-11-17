@@ -2077,8 +2077,13 @@ Run cmd_batch(const Ctx& ctx, const Args& args) {
         return std::string();
       }();
       if (wrote) {
-        if (!exists) {
+        // Rollback reacquires the file's lock after save released it (§6.4).
+        void* lk = nullptr;
+        if (fs->lock(u.path, &lk) != Status::Ok) {
+          ok = false;
+        } else if (!exists) {
           fs->unlink(u.path);
+          fs->unlock(lk);
         } else if (!bp.empty()) {
           if (u.ops.front()->in_place) {
             int bfd2 = -1;
@@ -2111,6 +2116,9 @@ Run cmd_batch(const Ctx& ctx, const Args& args) {
               ok = false;
             }
           }
+          fs->unlock(lk);
+        } else {
+          fs->unlock(lk);
         }
       }
       for (auto it = applied.rbegin(); it != applied.rend(); ++it) {
@@ -2120,6 +2128,11 @@ Run cmd_batch(const Ctx& ctx, const Args& args) {
           }
           return std::string();
         }();
+        void* lk = nullptr;
+        if (fs->lock(it->path, &lk) != Status::Ok) {
+          ok = false;
+          continue;
+        }
         if (!it->existed) {
           fs->unlink(it->path);
         } else if (!bp2.empty()) {
@@ -2132,6 +2145,7 @@ Run cmd_batch(const Ctx& ctx, const Args& args) {
             ok = false;
           }
         }
+        fs->unlock(lk);
       }
       cleanup_backups();
       Env env;

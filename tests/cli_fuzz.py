@@ -112,6 +112,33 @@ def main():
             p = run(["batch"] + extra, tmp, stdin=prog)
             check_output(["batch"] + extra + ["<stdin>"], p, tmp)
 
+    # Two-process lock stress (§9): concurrent writes must never interleave, and
+    # each must either succeed or fail with a clean lock/conflict status.
+    stress = tempfile.mkdtemp(prefix="editor_stress_")
+    target = os.path.join(stress, "shared.txt")
+    with open(target, "w") as f:
+        f.write("seed\n")
+    procs = []
+    contents = []
+    for i in range(8):
+        c = f"content-{i}-" + ("x" * 4000) + "\n"
+        contents.append(c)
+        p = subprocess.Popen([ED, "write", "shared.txt", "--stdin", "--force"],
+                             cwd=stress, stdin=subprocess.PIPE,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True)
+        procs.append((p, c))
+    for p, c in procs:
+        out, _ = p.communicate(c)
+        check(p.returncode in (0, 2), f"stress exit {p.returncode}")
+        if out.strip():
+            env = json.loads(out)
+            check(env["ok"] in (True, False), "stress envelope")
+    with open(target) as f:
+        final = f.read()
+    check(final in contents, "stress: file is exactly one writer's content")
+    check(not os.path.exists(target + ".editor.lock"), "stress: lock released")
+
     if failures:
         for f in failures[:20]:
             print("FAIL:", f, file=sys.stderr)
