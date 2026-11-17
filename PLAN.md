@@ -1,7 +1,8 @@
-# editor — Plan (v6.9)
+# editor — Plan (v6.10)
 
-> Name: **editor**. Status: planning. v6.9 — sixth refinement pass: minor
-> textual consistency cleanups only (no contract changes). Scope unchanged.
+> Name: **editor**. Status: planning. v6.10 — seventh refinement pass: `E_PARSE`
+> exit-code contradiction fixed; `create` binding and `read_range` wording
+> corrected. Scope unchanged.
 > A native macOS text editor for **small, predictable memory, low CPU, and high
 > throughput**, with a **CLI-first** surface so AI agents can drive it
 > deterministically.
@@ -327,9 +328,10 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
 - Every fallible call returns `Status`; `close_fd`/`unlock` are void and
   no-op-safe. No `void` mutation/save.
 - `(ptr, len)` / `string_view` / `span` everywhere; no NUL-terminated input.
-- `int64_t` for document lines/byte offsets and for offsets that accept a
-  negative sentinel (`read_range::off`); `uint64_t` for file sizes and `Rev`
-  fields; `uint16_t` for mode. `0` is a valid line/length, never an error.
+- `int64_t` for document lines/byte offsets (including `read_range::off`, so a
+  negative input is representable and rejected as `E_RANGE`); `uint64_t` for file
+  sizes and `Rev` fields; `uint16_t` for mode. `0` is a valid line/length, never
+  an error.
   Negative document values → `E_RANGE`. A successful `open`/`create`/`save_as`
   stores an absolute path with every existing component symlink-resolved; for a
   path that does not exist yet, the parent is resolved and the basename
@@ -904,7 +906,7 @@ carries `code`, `message`, `retryable`, `path`, `hint`, and command-specific
 fields (`retryable` is a fixed per-code boolean — true for the transient
 `E_IO`/`E_LOCKED`/`E_CONFLICT` conditions, false otherwise; `hint` is a
 free-form, optional human string); `batch` errors add `op_index` (0-based,
-omitted for a whole-program parse failure, which is `E_PARSE`, exit 3).
+omitted for a whole-program parse failure, which is `E_PARSE`, exit 2).
 `E_INVALID_UTF8` includes the byte offset; `E_NO_MATCH`/
 `E_AMBIGUOUS` include at most 20 entries of `{line, col, byte_offset}` (CLI:
 `line` 1-based; `col` and `byte_offset` 0-based).
@@ -1199,8 +1201,9 @@ only** in v1. No vendored third-party.
 
 MVP = **macOS M0–M3.5**. Windows/Linux/search/syntax are post-1.0.
 
-**v1 checklist:** open/save, edit, undo/redo, save_as/reload/create (GUI or
-conformance-only), find/replace (CLI `edit --old/--new` + GUI), font size + tab
+**v1 checklist:** open/save, edit, undo/redo, save_as/reload (GUI or
+conformance-only), `create` (internal, used by `write`), find/replace (CLI
+`edit --old/--new` + GUI), font size + tab
 width + wrap settings, status bar, gutter, decorations, and the CLI (`read`,
 `write`, `edit`, `info`, `validate`, `batch`, `version`, `schema`).
 
