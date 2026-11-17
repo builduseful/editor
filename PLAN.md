@@ -621,8 +621,9 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
   top-level fields: `truncated` (validate/batch), `valid` + `errors[]`
   (batch `--check`), `rolled_back` (batch). Each element of `results[]` for
   a **file command** (`read`/`write`/`edit`/`info`/`validate`, and each such op
-  of `batch`) always has `path`, `rev`, `bytes`, `line_count`, `eol`,
-  `encoding`, `bom`, `final_newline`; per-command lines list only extras.
+  of `batch`) always has `path`, `bytes`, `line_count`, `eol`, `encoding`,
+  `bom`, `final_newline`, and `rev` (except `edit --dry-run`, §6.1);
+  per-command lines list only extras.
 - `version` and `schema` return a 1-element `results[]` containing only their
   documented fields (`version`, or `commands[]`) and **omit** the file fields
   (never emit `null`). `batch --check` returns `results: []` plus top-level
@@ -639,8 +640,8 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
 - `changed.from`/`to` are **raw file byte offsets** (BOM included); `line_count`
   is logical lines.
 - `rev_before` is present for mutations on an existing target and omitted for
-  new files. `rev` is always present. `bytes_before` is present for existing
-  targets.
+  new files. `rev` is present except for `edit --dry-run` (§6.1). `bytes_before`
+  is present for existing targets.
 - All `write`/`edit` mutations (and each `batch` write/edit op) always include
   `rev_before` (existing target), `rev`, `bytes_before` (existing target),
   `bytes`, `bytes_written`, `save`, `in_place` (when set), and `changed` (when
