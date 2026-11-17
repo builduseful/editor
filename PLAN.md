@@ -30,6 +30,15 @@
 
 Rationale for D1 is in the [appendix](#appendix-language-choice).
 
+**D1 kill gate — M0.5, decided 2026-11-17: keep C++.** The M0.5 viewcore
+skeleton, headless render oracle, and 5 GB read-only demo landed without the
+warning signs the gate lists. Sanitizers (ASan/UBSan) and the seeded fuzzers are
+clean; the code is small and the seams (`FileSystem`, `textbackend`, `Canvas`)
+are holding; the untrusted surface is still just argv and the JSON reader. The
+5 GB gate passes: scroll p99 0.25 ms (>60 fps) with a flat ~78 MB footprint, and
+the line cache stays bounded (1024 entries / ≤6 MB). Reproduce with
+`make demo` / `demo/view_demo.cpp`.
+
 ## 2. Goals and non-goals
 
 **Goals**

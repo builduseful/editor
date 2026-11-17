@@ -1,0 +1,129 @@
+// viewcore/include/viewcore.hpp — platform-independent view logic (§3, §8).
+//
+// Wrapping, a bounded line cache, hit-testing, selection, scroll, caret, and
+// decorations. One implementation, one conformance suite. `viewcore` depends on
+// `core` (for the document) and on `textbackend`/`Canvas` (pure virtual).
+#pragma once
+
+#include <cstdint>
+#include <list>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "canvas.hpp"
+#include "editor.hpp"
+#include "textbackend.hpp"
+#include "types.hpp"
+
+namespace vc {
+
+struct Decoration {
+  int64_t line = 0;
+  Color color;
+  bool operator==(const Decoration& o) const {
+    return line == o.line && color.r == o.color.r && color.g == o.color.g &&
+           color.b == o.color.b && color.a == o.color.a;
+  }
+};
+
+struct Selection {
+  int64_t anchor_line = 0, anchor_col = 0;
+  int64_t caret_line = 0, caret_col = 0;
+  bool operator==(const Selection& o) const {
+    return anchor_line == o.anchor_line && anchor_col == o.anchor_col &&
+           caret_line == o.caret_line && caret_col == o.caret_col;
+  }
+};
+
+struct Hit {
+  int64_t line = 0, col = 0;  // logical line; col = UTF-8 byte offset in the line
+};
+
+class ViewCore {
+ public:
+  ViewCore(Editor& ed, TextBackend& tb);
+  ~ViewCore();
+  ViewCore(const ViewCore&) = delete;
+  ViewCore& operator=(const ViewCore&) = delete;
+
+  void set_document(Editor& ed);
+  void resize(double width, double height);
+  void set_wrap(bool on);
+  void set_font(const FontSpec& f);
+  void set_decorations(std::vector<Decoration> d);
+
+  double line_height() const;
+  int64_t line_count() const;
+  bool wrap() const { return wrap_; }
+  const FontSpec& font() const { return font_; }
+  double viewport_width() const { return width_; }
+  double viewport_height() const { return height_; }
+
+  int64_t first_visible_line() const { return first_line_; }
+  void scroll_to_line(int64_t line);
+  void scroll_lines(int64_t n);
+  void scroll_by(double dy);
+  double scroll_px() const { return scroll_px_; }
+  // Estimated content height (exact without wrap; an upper estimate with wrap,
+  // since a 5 GB document is not fully measured).
+  double content_height() const;
+
+  Hit hit_test(double x, double y) const;
+  Rect caret_rect(int64_t line, int64_t col) const;
+
+  Selection selection() const { return sel_; }
+  void set_selection(const Selection& s) { sel_ = s; }
+  void set_caret(int64_t line, int64_t col) {
+    sel_.anchor_line = sel_.caret_line = line;
+    sel_.anchor_col = sel_.caret_col = col;
+  }
+
+  // Draw the visible viewport into `c`.
+  void draw(Canvas& c) const;
+
+  // Cache statistics (for tests and the footprint gate).
+  size_t cache_entries() const { return cache_.size(); }
+  size_t cache_bytes() const { return cache_bytes_; }
+
+ private:
+  struct VisualLine {
+    int64_t line = 0;
+    uint64_t byte_start = 0, byte_end = 0;
+    Run run;
+  };
+  struct LineEntry {
+    std::vector<VisualLine> visual;
+    size_t bytes = 0;
+    bool truncated = false;  // a >1000-visual-line line is only partly cached
+  };
+
+  static constexpr size_t kMaxCacheEntries = 1024;
+  static constexpr size_t kMaxCacheBytes = 6ull << 20;  // 6 MB (§8)
+  static constexpr size_t kMaxVisualPerLine = 1000;     // skip caching beyond
+
+  const LineEntry& entry_for(int64_t line) const;
+  void touch(int64_t line) const;
+  void evict_if_needed() const;
+  void invalidate_all() const;
+  double block_height(int64_t line) const;
+  int64_t col_at_x(const VisualLine& v, double x) const;
+  std::string line_text(int64_t line) const;  // logical line, terminator stripped
+
+  Editor* ed_ = nullptr;
+  TextBackend* tb_ = nullptr;
+  FontSpec font_;
+  double width_ = 800, height_ = 600;
+  bool wrap_ = false;
+
+  int64_t first_line_ = 0;
+  double scroll_px_ = 0;
+  std::vector<Decoration> decorations_;
+  Selection sel_;
+
+  mutable std::map<int64_t, LineEntry> cache_;
+  mutable std::list<int64_t> lru_;  // front = most recent
+  mutable size_t cache_bytes_ = 0;
+};
+
+}  // namespace vc
