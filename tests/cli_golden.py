@@ -222,6 +222,83 @@ def main():
         check(r["bom"] is True, "validate utf-8 bom")
         check(r["bytes"] == 7, "validate bytes includes bom")
 
+        # --- batch ---------------------------------------------------------
+        with open(os.path.join(tmp, "b1.txt"), "w") as f:
+            f.write("aaa\n")
+        with open(os.path.join(tmp, "b2.txt"), "w") as f:
+            f.write("bbb\n")
+        with open(os.path.join(tmp, "p1"), "w") as f:
+            f.write("AAA\n")
+        with open(os.path.join(tmp, "prog.jsonl"), "w") as f:
+            f.write('{"op":"write","path":"b1.txt","content_file":"p1","force":true}\n')
+            f.write('{"op":"edit","path":"b2.txt","old":"bbb","new":"BBB","force":true}\n')
+        env = run(["batch", "--file", "prog.jsonl"], tmp, 0)
+        check(env["ok"] is True and env["rolled_back"] is False, "batch ok")
+        check(len(env["results"]) == 2, "batch two units")
+        check(env["results"][0]["save"] == "clone_pwrite", "batch write save")
+        check(env["results"][0]["changed"] == {"from": 0, "to": 4}, "batch write changed")
+        check(env["results"][1]["save"] == "clone_pwrite", "batch edit save")
+
+        with open(os.path.join(tmp, "m.txt"), "w") as f:
+            f.write("x1\nx2\n")
+        with open(os.path.join(tmp, "prog2.jsonl"), "w") as f:
+            f.write('{"op":"edit","path":"m.txt","old":"x1","new":"y1","force":true}\n')
+            f.write('{"op":"edit","path":"m.txt","old":"x2","new":"y2","force":true}\n')
+        env = run(["batch", "--file", "prog2.jsonl"], tmp, 0)
+        check(len(env["results"]) == 1, "batch merged into one unit")
+        check(env["results"][0]["changed"] == {"from": 0, "to": 5}, "batch merged changed")
+
+        with open(os.path.join(tmp, "check.jsonl"), "w") as f:
+            f.write('{"op":"edit","path":"m.txt","old":"y1","new":"z","force":true}\n')
+        env = run(["batch", "--file", "check.jsonl", "--check"], tmp, 0)
+        check(env["valid"] is True and env["errors"] == [], "batch check valid")
+        check(env["results"] == [] and env["rolled_back"] is False, "batch check shapes")
+
+        with open(os.path.join(tmp, "checkbad.jsonl"), "w") as f:
+            f.write('{"op":"edit","path":"m.txt","old":"zzz","new":"q","force":true}\n')
+            f.write('{"op":"edit","path":"m.txt","old":"qqq","new":"r","force":true}\n')
+        env = run(["batch", "--file", "checkbad.jsonl", "--check"], tmp, 2)
+        check(env["valid"] is False, "batch check invalid")
+        check([e["op_index"] for e in env["errors"]] == [0, 1], "batch check op_index")
+        check(env["error"]["code"] == "E_NO_MATCH", "batch check first error")
+
+        with open(os.path.join(tmp, "overlap.jsonl"), "w") as f:
+            f.write('{"op":"edit","path":"m.txt","old":"y1","new":"z","force":true}\n')
+            f.write('{"op":"edit","path":"m.txt","old":"y1","new":"w","force":true}\n')
+        env = run(["batch", "--file", "overlap.jsonl"], tmp, 2)
+        check(env["error"]["code"] == "E_RANGE", "batch overlap")
+
+        with open(os.path.join(tmp, "ra.txt"), "w") as f:
+            f.write("aaa\n")
+        with open(os.path.join(tmp, "rb.txt"), "w") as f:
+            f.write("bbb\n")
+        with open(os.path.join(tmp, "rollback.jsonl"), "w") as f:
+            f.write('{"op":"edit","path":"ra.txt","old":"aaa","new":"XXX","force":true}\n')
+            f.write('{"op":"edit","path":"rb.txt","old":"bbb","new":"YYY",'
+                    '"expect":"stat:1:2:3:4:5"}\n')
+        env = run(["batch", "--file", "rollback.jsonl"], tmp, 2)
+        check(env["ok"] is False and env["rolled_back"] is True, "batch rollback")
+        check(env["results"] == [], "batch rollback results empty")
+        check(env["error"]["code"] == "E_CONFLICT" and env["error"]["op_index"] == 1,
+              "batch rollback error")
+        with open(os.path.join(tmp, "ra.txt")) as f:
+            check(f.read() == "aaa\n", "batch rollback restored")
+
+        p = subprocess.run([os.path.abspath(ED), "batch"], cwd=tmp,
+                           capture_output=True, text=True,
+                           input='{"op":"write","path":"b1.txt","content":"x","force":true}\n')
+        check(json.loads(p.stdout)["error"]["code"] == "E_USAGE",
+              "batch inline content from stdin")
+
+        with open(os.path.join(tmp, "dry.jsonl"), "w") as f:
+            f.write('{"op":"edit","path":"m.txt","old":"y1","new":"Y1","force":true,'
+                    '"dry_run":true}\n')
+        env = run(["batch", "--file", "dry.jsonl"], tmp, 0)
+        r = result(env, tmp)
+        check("rev" not in r and "bytes_written" not in r,
+              "batch dry_run omits rev/bytes_written")
+        check(r["save"] == "clone_pwrite", "batch dry_run predicted method")
+
         # --- outside root --------------------------------------------------
         env = run(["info", "/etc/hosts"], tmp, 2)
         check(env["error"]["code"] == "E_OUTSIDE_ROOT", "outside root")
