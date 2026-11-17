@@ -1,13 +1,12 @@
-# Rust
-/target
-**/*.rs.bk
-Cargo.lock.orig
-
 # Editor swap/backup/temp
 *.sw[po]
 *~
 *.tmp
 .editor/
+
+# Build output
+/build/
+build/
 
 # OS
 .DS_Store

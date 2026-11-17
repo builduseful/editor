@@ -1,6 +1,7 @@
-# editor — Plan (v6.4)
+# editor — Plan (v6.5)
 
-> Name: **editor**. Status: planning. v6.4 — contract contradictions fixed; final refinement pass.
+> Name: **editor**. Status: planning. v6.5 — second refinement pass: save, CLI,
+> batch, and budget contracts made consistent. Scope unchanged.
 > A native macOS text editor for **small, predictable memory, low CPU, and high
 > throughput**, with a **CLI-first** surface so AI agents can drive it
 > deterministically.
@@ -160,9 +161,10 @@ struct Edit {
 
 struct SaveInfo {
   const char* method = "none";     // none|clone_pwrite|clone_pwrite_tail|copy_range|full_rewrite
-  uint64_t bytes_written = 0;
-  uint64_t first_changed = 0;      // raw file offset, BOM included
-  uint64_t last_changed = 0;
+  uint64_t bytes_written = 0;      // bytes pwritten by this call; 0 for "none"
+  uint64_t first_changed = 0;      // [first_changed,last_changed) = union of the spans
+  uint64_t last_changed = 0;       // written, as raw offsets in the NEW file (BOM
+                                   // included); equal (empty) when method="none"
   bool in_place = false;
   bool durable = true;             // false -> Status::SavedButNotDurable
 };
@@ -173,10 +175,11 @@ class Editor {
   virtual ~Editor() = default;
 
   virtual Status open(std::string_view path_utf8) = 0;
-  // Create a new empty file. Existing path -> E_CONFLICT. Never truncates.
-  // The new file becomes the open document (empty, clean); the path must be
-  // absolute. The parent is resolved and the new basename appended, since the
-  // final component does not exist yet. No expected-rev check (nothing existed).
+  // Create a new empty file (mode 0666 & ~umask). Existing path -> E_CONFLICT.
+  // Never truncates. The new file becomes the open document (empty, clean); the
+  // path must be absolute. The parent is resolved and the new basename appended,
+  // since the final component does not exist yet. No expected-rev check
+  // (nothing existed).
   virtual Status create(std::string_view path_utf8) = 0;
   virtual Status info(Info* out) const = 0;
   virtual Rev rev() const = 0;
@@ -186,12 +189,14 @@ class Editor {
   // On success `used`=bytes written, `out_n`=lines read. On BufferTooSmall:
   // no bytes written, `used`=full needed, `out_n`=0. Returns line bytes
   // INCLUDING the terminator. `first >= last`, `first >= line_count`, or
-  // `last <= 0` -> empty/Ok. `last` clamps.
+  // `last == 0` -> empty/Ok; negative `first`/`last` -> `E_RANGE`. `last`
+  // clamps to `line_count`.
   virtual Status read_lines(int64_t first, int64_t last, char* buf, size_t cap,
                             size_t* used, int64_t* out_n) const = 0;
   // buf=nullptr -> size query (`used`=needed); `off >= size` -> empty/Ok;
-  // `len` clamps to EOF. On BufferTooSmall: no bytes written, `used`=needed;
-  // else `used`=bytes read. `read_range` is raw file bytes (BOM included).
+  // negative `off` -> `E_RANGE`; `len` clamps to EOF. On BufferTooSmall: no
+  // bytes written, `used`=needed; else `used`=bytes read. `read_range` is raw
+  // file bytes (BOM included).
   virtual Status read_range(int64_t off, size_t len, char* buf, size_t cap,
                             size_t* used) const = 0;
 
@@ -205,11 +210,14 @@ class Editor {
 
   virtual Status undo() = 0;       // empty stack -> Ok, no change
   virtual Status redo() = 0;       // empty stack -> Ok, no change
-  // save: no-op if clean and expected_rev (if given) matches the current
-  // on-disk Rev; method="none". An expected_rev mismatch, or a changed base
-  // inode/path (§5.5), is E_CONFLICT — save never auto-reloads. Auto-reload of
-  // a clean file after external mutation is check_identity()'s job (§5.6).
-  // in_place writes the original inode; otherwise clone/temp.
+  // save: checks the base identity under the lock. If `lstat(path)` or
+  // `fstat(base fd)` no longer matches the open-time Rev -> E_CONFLICT, clean
+  // or dirty; save never auto-reloads. `expected_rev`, if given, must equal the
+  // base Rev this Editor observed at open/last save/reload; mismatch ->
+  // E_CONFLICT. If clean and the identity is unchanged, no-op with
+  // method="none". Auto-reload of a clean file after external mutation is
+  // check_identity()'s job (§5.6). in_place writes the original inode;
+  // otherwise clone/temp.
   virtual Status save(const Rev* expected_rev = nullptr, bool in_place = false,
                       SaveInfo* out = nullptr) = 0;
   // save_as: no-op if clean and dst is the same file; expected_rev is checked
@@ -220,12 +228,15 @@ class Editor {
   // expected_rev matches dst's identity; if dst does not exist, expected_rev
   // must be null (otherwise E_CONFLICT). On success the open path becomes dst
   // (relative dst resolves against the current dir; the parent is resolved and
-  // the basename appended when dst does not exist yet).
+  // the basename appended when dst does not exist yet). Metadata follows §5.5:
+  // in_place=false preserves the dst's metadata (or uses 0666 & ~umask for a
+  // new dst); in_place=true keeps the dst inode's metadata untouched.
   virtual Status save_as(std::string_view path_utf8,
                          const Rev* expected_rev = nullptr, bool in_place = false,
                          SaveInfo* out = nullptr) = 0;
   virtual Status reload() = 0;
-  // Check the on-disk identity; auto-reload if clean, E_STALE if dirty.
+  // Check the on-disk identity; unchanged -> Ok; changed + clean -> auto-reload;
+  // changed + dirty -> E_STALE.
   virtual Status check_identity() = 0;
 
   using ChangeFn = void (*)(Editor*, const Change&, void*);
@@ -310,8 +321,9 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
   relative `save_as` dst resolves against the current directory first.
 - Core is 0-based. CLI lines are 1-based; CLI `col` and byte offsets are 0-based
   UTF-8 byte offsets unless a command says otherwise.
-- `open`/`create`/`save` use `nofollow=true` and reject non-regular files
-  (`Stat::regular=false` → `E_IO`).
+- `open`/`create` use `nofollow=true` and reject non-regular files
+  (`Stat::regular=false` → `E_IO`). `save`/`save_as` refuse a symlink or
+  non-regular target with `E_CONFLICT` (§5.5).
 - `apply` validates UTF-8 and overlap; violations → `E_INVALID_UTF8`/`E_RANGE`.
 - An `apply` call pushes exactly one undo step.
 - Core never calls the UI; it appends changes and the UI calls `drain()`.
@@ -330,7 +342,7 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
   at `off`, extending the file as needed; a short write is `E_IO`, never
   `BufferTooSmall`.
 - `errmsg` is thread-local and borrowed; no retention.
-- Version tag `kInterfaceVersion`; core is statically linked into GUI/CLI.
+- Version tag is `kInterfaceVersion`.
 - C++20, pinned toolchain; statically link core into GUI/CLI.
 - Hardening: `_GLIBCXX_ASSERTIONS` / `_LIBCPP_HARDENING_MODE`, ASan/UBSan,
   `-Wall -Wextra -Wconversion` (MSVC `/sdl` post-1.0).
@@ -425,13 +437,21 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
 
 ### 5.5 Save path (honest cost model)
 
-v1 targets macOS/APFS; Windows/Linux fallbacks are post-1.0. All paths hold the
-expect-check, write (+ rename), the post-rename identity check, and the post-save
-`open_readonly` reopen under the OS lock. The core resolves the open path once,
-splits it into dir + name, and opens the directory before the rename.
+v1 targets macOS/APFS; Windows/Linux fallbacks are post-1.0. Every mutating path
+holds the expect-check, the write (plus `rename_at` on the clone/copy paths), the
+post-write identity check, and the post-save `open_readonly` reopen under the OS
+lock. The core resolves the open path once, splits it into dir + name, and opens
+the directory before the rename.
 
-- **No-op if clean.** `SaveInfo::method = "none"`. `expected_rev` is still checked
-  (mismatch → `E_CONFLICT`).
+- **Clean save**: the base identity check (below) still runs (`lstat(path)` +
+  `fstat`), then `SaveInfo::method = "none"`, `bytes_written = 0`,
+  `first_changed == last_changed`. A changed base is `E_CONFLICT`, not a silent
+  success; re-stat via `check_identity()`.
+- **New file** (`create`, then `apply`, then `save`): the base is empty, so all
+  bytes are new; write them in full, `method = "full_rewrite"`,
+  `first_changed = 0`, `last_changed = new size`, `bytes_written = new size`
+  (0 for an empty document). If `create` succeeded but the save failed, the
+  0-byte file remains and the error is reported; the CLI does not roll it back.
 - **Same-length edits**: `clone_to_new(dir, &tmp, src_fd, &tmp_fd)` (O(1) on APFS;
   O(file) elsewhere), `pwrite` changed spans into `tmp_fd`, `fsync`, `rename_at`,
   `fsync_dir`. `SaveInfo::method = "clone_pwrite"`.
@@ -450,11 +470,15 @@ splits it into dir + name, and opens the directory before the rename.
   `pread`/`pwrite` into the temp at their new offsets, write the edited span,
   copy metadata (see below), `fsync`, `rename_at`, `fsync_dir`; O(file),
   `method = "copy_range"`. `full_rewrite` writes all bytes from the piece table.
-  Never copy only a prefix and leave the suffix unwritten.
-- **Metadata target**: `save`, and `save_as` to the same inode, preserve that
-  inode's metadata (a clone carries it). `save_as` to a different path uses the
-  copy path: preserve an existing dst's metadata, or use `0666 & ~umask` for a
-  new dst. Never clone the source's metadata onto a different destination.
+  Never copy only a prefix and leave the suffix unwritten. `bytes_written`
+  counts only bytes passed to `pwrite`: the changed spans for the clone paths,
+  the whole new file for `copy_range`/`full_rewrite`.
+- **Metadata target**: for the `in_place=false` paths, `save`, and `save_as` to
+  the same inode, preserve that inode's metadata (a clone carries it). `save_as`
+  to a different path uses the copy path: preserve an existing dst's metadata, or
+  use `0666 & ~umask` for a new dst. Never clone the source's metadata onto a
+  different destination. `in_place=true` rewrites the existing dst inode, so
+  dst's mode/ownership are untouched.
   When copying, `copy_metadata` does `fchown` before `fchmod`; setuid/setgid are
   not preserved. Do **not** call `fchmod` after a clone.
 - **In-place** (`--in-place`): `open_write(path, create=false, truncate=false,
@@ -466,19 +490,25 @@ splits it into dir + name, and opens the directory before the rename.
   — the open-time `Rev` for `save`, `expected_rev` (dst) for `save_as`
   (otherwise `E_CONFLICT`, no write). `pwrite` changed spans
   (or full rewrite), `ftruncate` for length changes, `fsync(original)`, update
-  identity/rev. No temp/rename; `SaveInfo::method` is `copy_range` or
-  `full_rewrite` with `in_place=true`. Expect-check under the lock. A failure may
-  leave a partial file; report `E_IO`. Hardlinks and crash-safety are user opt-in.
+  identity/rev. No temp/rename; `SaveInfo::method` is `clone_pwrite` for a
+  same-length edit (same O(changed) write set, no clone) and `copy_range`/
+  `full_rewrite` otherwise, with `in_place=true`. Expect-check under the lock. A
+  failure may leave a partial file; report `E_IO`. Hardlinks and crash-safety are
+  user opt-in.
 - **Temp**: `create_temp` returns a 0600 path + fd in the same directory; hold the
-  fd from create through rename. On any in-process failure, close and `unlink`
-  the temp. Never leave the temp at 0600. A crash may leave a stale
+  fd from create through rename. Apply the metadata target above to the temp
+  before `rename_at`, so the delivered destination never ends up at 0600. On any
+  in-process failure, close and `unlink` the temp. A crash may leave a stale
   `*.editor-tmp-*`; it is ignored (or swept at startup). A read-only destination
   directory → `E_IO`; `--in-place` is the fallback.
 - **Durability**: `fsync(tmp_fd, full)` → `rename_at` → `fsync_dir(dirfd)`; open
   the directory **before** the rename. If `fsync(full=true)` returns
   `Status::Unsupported`, retry with `full=false` and set `durable=false`. A
-  post-rename failure → `SavedButNotDurable` warning, `ok: true`, `durable=false`;
-  **never blind-retry**. The warning is reported only on the call that produced it.
+  failure **before** the rename is a hard `E_IO` and the temp is unlinked. A
+  post-rename `fsync_dir` failure → `SavedButNotDurable` warning, `ok: true`,
+  `durable=false`; **never blind-retry**. The warning is reported only on the
+  call that produced it. A failed post-save reopen is `E_IO`, not a durability
+  warning (next bullet).
 - **Post-save transition**: with the lock still held, close the pre-save base fd,
   reopen the path with `open_readonly(path, nofollow=true, &fd)`, and verify the
   `fstat` matches the new `Rev`; on mismatch, `E_CONFLICT`. If the reopen itself
@@ -501,9 +531,9 @@ splits it into dir + name, and opens the directory before the rename.
   mapping and must not longjmp across core frames; never hold a `Mapping` across
   a `reload`. Prefer `pread` for at-risk files; mmap is the opt-in fast path.
   Windows `EXCEPTION_IN_PAGE_ERROR` is post-1.0.
-- On mismatch: auto-reload if clean **and the identity differs**; if dirty,
-  `E_STALE` with a reload hint. If the identity matches, do nothing.
-  `reload()`/`check_identity()` on an already-current identity are no-ops (Ok).
+- On identity mismatch: auto-reload if clean; if dirty, `E_STALE` with a reload
+  hint. `reload()`/`check_identity()` on an already-current identity are no-ops
+  (Ok).
   `reload()` discards undo, maps new content, and emits `ChangeKind::Reload`; the
   GUI maps the caret to the nearest valid position. `check_identity()` is the
   explicit trigger for the GUI.
@@ -558,64 +588,84 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
   `--max-bytes` ≥0; violations → `E_USAGE`. The byte axis reports 0-based
   `from`/`to`; the line axis reports 1-based. A line-axis `--from` past EOF, a
   byte-axis `--from-offset` at/past EOF, or a line-axis `--from > --to`, yields
-  empty `content`, `truncated:false`, `ok:true`. `--max-bytes` is the **output
-  cap** (default 256 KiB); if content exceeds it, return the first N **at a UTF-8
-  codepoint boundary** with `truncated:true`. `--max-bytes 0` = unlimited.
+  empty `content`, `truncated:false`, `ok:true`. An empty result reports
+  `to < from` on the line axis (`to` is the requested `to` clamped to
+  `line_count`) and `to == from` on the byte axis (both clamp to file size).
+  `--max-bytes` is the **output cap** (default 256 KiB); if content exceeds it,
+  return the first N **at a UTF-8 codepoint boundary** with `truncated:true`.
+  `--max-bytes 0` = unlimited.
   `--max-bytes` is the read output cap; `--max-file-bytes` is the input cap.
   `content` is always valid UTF-8: a range that starts/ends inside a codepoint or
   contains invalid bytes → `E_INVALID_UTF8` at the first offending byte (use
-  `validate` for a full report). Result: `content`; `from`/`to` use the request
-  axis; `truncated`, `rev`. Line-axis `content` includes the terminator;
-  byte-axis offsets are raw (offset 0 = BOM).
-- `edit`: two mutually exclusive forms. (a) `--old TEXT|@FILE|- --new
-  TEXT|@FILE|-` (literal, case-sensitive search/replace, with `--all`/`--count
-  N`); (b) `--at LINE[:COL] --op insert|replace|delete` (lines 1-based, cols
-  0-based UTF-8 byte offsets; `COL` defaults to 0). `--old -` and `--new -`
-  cannot both be `-` → `E_USAGE`. `--op` is only valid with `--at`; `--at`
-  requires `--op`; combining forms → `E_USAGE`. Fields from the other form
-  (`--text`, `--length`, `--at`, `--op`, `--all`, `--count`) → `E_USAGE`.
-  `--all` and `--count` are mutually exclusive. With neither `--all` nor
-  `--count`, exactly one match is required (multiple → `E_AMBIGUOUS`, zero →
-  `E_NO_MATCH`); `--all` with zero matches → `E_NO_MATCH`; `--count N` replaces
-  exactly the first N matches and requires at least N (fewer → `E_NO_MATCH`);
-  `--count 0` → `E_USAGE`. Matches are non-overlapping, left-to-right. `--op
-  insert|replace` require `--text`; `--op delete` ignores `--text`; `--op
-  replace|delete` require `--length` (bytes, end-exclusive); `--length` with
-  `--op insert` → `E_USAGE`. `--expect` and `--force` are mutually exclusive. On
-  an existing file, `--expect` (or `--force`) is required; missing → `E_USAGE`
-  (exit 3). `--dry-run` reports the planned edit (`changed`, `bytes`,
-  `line_count`, predicted `save` method) plus `rev_before`; it **omits `rev`**
-  and `bytes_written` (always 0). The standard file fields and `bytes_before`
-  (existing target) are still present; `in_place:true` appears only with
-  `--in-place`. `changed = {from, to}` where `from` is the first affected byte
-  and `to = max(old_end, new_end)` over the edited region (same rule as `write`;
-  a pure insert at X of L bytes → `{X, X+L}`, a pure delete of R bytes at X →
-  `{X, X+R}`). Result: `changed`, `rev`, `bytes_before`, `bytes`,
+  `validate` for a full report). Result: `content`; `from`/`to` delimit the
+  **returned** range on the request axis (byte axis: `to` exclusive; line axis:
+  inclusive), so a truncated read reports the shorter range; `truncated`, `rev`.
+  Line-axis `content` includes the terminator; byte-axis offsets are raw (offset
+  0 = BOM).
+- `edit`: requires an existing regular file (`E_NOT_FOUND` otherwise; use
+  `write` to create). Two mutually exclusive forms. (a) `--old TEXT|@FILE|-`
+  `--new TEXT|@FILE|-` (literal, case-sensitive search/replace, with `--all`/
+  `--count N`); (b) `--at LINE[:COL] --op insert|replace|delete` (lines 1-based,
+  cols 0-based UTF-8 byte offsets; `COL` defaults to 0). `--old -` and `--new -`
+  cannot both be `-` → `E_USAGE`. `--old` must be non-empty → `E_USAGE`; it is
+  searched over the document bytes (BOM excluded) while reported offsets stay raw.
+  `--op` is only valid with `--at`; `--at` requires `--op`; combining forms →
+  `E_USAGE`. Form (a) rejects `--at`/`--op`/`--text`/`--length`; form (b) rejects
+  `--old`/`--new`/`--all`/`--count` → `E_USAGE`. `--op` outside
+  `insert|replace|delete` → `E_USAGE`. `--at LINE` must be ≥1 (0 → `E_USAGE`);
+  `LINE = line_count + 1` with `COL = 0` appends at EOF; `LINE > line_count + 1`,
+  `COL < 0`, or `COL` past that line → `E_USAGE` for a negative value and
+  `E_RANGE` for an out-of-file position. `--all` and `--count` are mutually
+  exclusive. With neither `--all` nor `--count`, exactly one match is required
+  (multiple → `E_AMBIGUOUS`, zero → `E_NO_MATCH`); `--all` with zero matches →
+  `E_NO_MATCH`; `--count N` replaces exactly the first N matches and requires at
+  least N (fewer → `E_NO_MATCH`); `--count N` requires N ≥ 1 (`--count 0` →
+  `E_USAGE`). Matches are non-overlapping, left-to-right. `--op insert|replace`
+  require `--text`; `--op delete` ignores `--text`; `--op replace|delete` require
+  `--length` (bytes, end-exclusive) ≥ 0; `--length` with `--op insert` →
+  `E_USAGE`. `@FILE`/`-` read failures → `E_NOT_FOUND`/`E_IO`/`E_USAGE` as
+  applicable. `--expect` and `--force` are mutually exclusive, and one of them is
+  required; missing → `E_USAGE` (exit 3). `--dry-run` reports the planned edit
+  (`changed`, `bytes`, `line_count`, predicted `save` method) plus `rev_before`;
+  `bytes`/`line_count`/`changed` are the predicted post-edit values. It **omits
+  `rev`** and `bytes_written` (always 0). The standard file fields and
+  `bytes_before` (existing target) are still present; `in_place:true` appears
+  only with `--in-place`. `changed = {from, to}` where `from` is the first
+  affected byte and `to = max(old_end, new_end)` over the edited region (same
+  rule as `write`; a pure insert at X of L bytes → `{X, X+L}`, a pure delete of R
+  bytes at X → `{X, X+R}`). Result: `changed`, `rev`, `bytes_before`, `bytes`,
   `bytes_written`, `save`, `in_place` (when set).
-- `write`: a mutation. Exactly one of `--stdin` or `@FILE` supplies the content.
-  If `<path>` exists, `--expect` (or `--force`) is **required**; if it does not
-  exist, neither is required and `--expect` → `E_USAGE`. `--expect` and
-  `--force` are mutually exclusive. Creates the file if missing; otherwise
-  replaces its contents atomically (temp + rename). `--in-place` for hardlinks
-  and requires an existing target (`E_USAGE` otherwise). An existing target must
-  open under the core rules (§5.1), so a UTF-16-BOM or early-NUL target is
-  `E_UNSUPPORTED`/`E_BINARY`; a target with invalid UTF-8 can be replaced because
-  removed bytes need not be valid. Missing `--expect`/`--force` on an existing
-  target → `E_USAGE` (exit 3). Result: `bytes` (resulting size),
-  `bytes_written` (this call; 0 for an identical no-op), `rev`, `save` (the
-  actual method; `full_rewrite` for a new file, `none` for a no-op), `in_place`
-  (when set), `changed` (replacement: `{0, max(bytes_before, bytes)}`; new
-  file: `{0, bytes}`; omitted for a no-op), `bytes_before` (existing target
-  only).
-- `info`: `path`, `bytes`, `line_count`, `eol`, `encoding`, `bom`,
-  `final_newline`, `rev`, `dirty`.
-- `validate`: `errors[]` of `{line, col, byte_offset, code}`; capped at 100 with
-  a top-level `truncated` flag. Codes: `invalid_utf8`, `unsupported`. `ok` is
-  `true` iff `errors[]` is empty; non-empty → `ok:false`, exit **2**, `error` =
-  the first error. Include `rev`.
-- `batch`: default stdin; `--file F` reads from F; `--check` validates only; see
-  §6.4. Result: per-op `results[]` + `rolled_back`; `--check` returns
-  `results: []`, `valid`, `errors[]`, and writes nothing.
+- `write`: a mutation. Exactly one of `--stdin` or `@FILE` supplies the content
+  (both/neither → `E_USAGE`; `@FILE` must be a readable regular file). If
+  `<path>` exists, `--expect` (or `--force`) is **required**; if it does not
+  exist, neither is required and `--expect` → `E_USAGE`. `--expect` and `--force`
+  are mutually exclusive. Creates the file if missing (mode `0666 & ~umask`; an
+  empty payload still creates a 0-byte file and reports `save: "none"`,
+  `bytes_written: 0`, and no `changed`); otherwise replaces its contents
+  atomically (temp + rename). `--in-place` for hardlinks and requires an existing
+  target (`E_USAGE` otherwise). An existing target must open under the core rules
+  (§5.1), so a UTF-16-BOM or early-NUL target is `E_UNSUPPORTED`/`E_BINARY`; a
+  target with invalid UTF-8 can be replaced because removed bytes need not be
+  valid. An existing target's UTF-8 BOM is preserved (`write` replaces document
+  bytes, not raw file bytes); `bytes`/`bytes_before` still count it. An existing
+  target whose document bytes already equal the payload is an explicit no-op:
+  `save: "none"`, `bytes_written: 0`, `changed` omitted, `rev` = `rev_before`.
+  Result: `bytes` (resulting size), `bytes_written` (this call; 0 for a no-op),
+  `rev`, `save` (the actual method; `full_rewrite` for a new non-empty file,
+  `none` for a no-op or an empty new file), `in_place` (when set), `changed`
+  (replacement: `{0, max(bytes_before, bytes)}`; new file: `{0, bytes}`; omitted
+  for a no-op and for a newly created empty file), `bytes_before` (existing
+  target only).
+- `info`: standard file fields plus `dirty` (always `false` for the CLI, which
+  opens fresh).
+- `validate`: standard file fields plus `errors[]` of `{line, col, byte_offset,
+  code}`; capped at 100 with a top-level `truncated` flag. Codes: `invalid_utf8`,
+  `unsupported`. `ok` is `true` iff `errors[]` is empty; non-empty → `ok:false`,
+  exit **2**, `error` = the first error.
+- `batch`: program source is exactly one of stdin (default) or `--file F` (both
+  → `E_USAGE`); `--check` validates only; see §6.4. Result: per-unit `results[]` +
+  `rolled_back`; `--check` returns `results: []`, `valid`, `errors[]`, and writes
+  nothing.
 - `version`: `results[0].version = "0.1.0"`.
 - `schema`: no argument → `results[0].commands[]` for all commands; with
   `COMMAND` → that command only, or `E_NOT_FOUND`.
@@ -656,7 +706,7 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
   `cwd`, `warnings`, `results`, `error`, `meta`. Commands may add conditional
   top-level fields: `truncated` (validate/batch), `valid` + `errors[]`
   (batch `--check`), `rolled_back` (batch). Each element of `results[]` for
-  a **file command** (`read`/`write`/`edit`/`info`/`validate`, and each such op
+  a **file command** (`read`/`write`/`edit`/`info`/`validate`, and each such unit
   of `batch`) always has `path`, `bytes`, `line_count`, `eol`, `encoding`,
   `bom`, `final_newline`, and `rev` (except `edit --dry-run`, §6.1);
   per-command sections list only extras.
@@ -664,25 +714,24 @@ goes to **stderr** and exits 0. `editor --version` is an alias of `version`;
   documented fields (`version`, or `commands[]`) and **omit** the file fields
   (never emit `null`). `batch --check` returns `results: []` plus top-level
   `valid` and `errors[]`.
-- `rev` is stat-only in v1 and present on every file-command result **except
-  `edit --dry-run`**, which reports `rev_before` instead and omits `rev` (§6.1).
-  Each `rev`/`rev_before` field is a **decimal string** (nanosecond fields exceed 2^53):
+- `rev` is stat-only in v1. Each `rev`/`rev_before` field is a **decimal string**
+  (nanosecond fields exceed 2^53):
   `{"dev":"1","ino":"2","size":"4096","mtime_ns":"…","ctime_ns":"…"}`.
   `--expect` accepts `stat:<dev>:<ino>:<size>:<mtime_ns>:<ctime_ns>` and the
   object form with string values. Local/advisory; `--force` overrides.
 - `path` is always the **absolute** path of the target with every existing
   component symlink-resolved; for a new file, the resolved parent plus the new
   basename. It is identical regardless of how it was spelled on argv. Relative
-  paths resolve against `--root` (default cwd).
+  paths resolve against `--root` (default cwd); the CLI resolves and hands core
+  an absolute path (§4).
 - `changed.from`/`to` are **raw file byte offsets** (BOM included); `line_count`
   is logical lines.
 - `rev_before` is present for mutations on an existing target and omitted for
-  new files. `rev` is present except for `edit --dry-run` (§6.1). `bytes_before`
-  is present for existing targets.
-- All `write`/`edit` mutations (and each `batch` write/edit op) always include
+  new files; `bytes_before` likewise.
+- All `write`/`edit` mutations (and each `batch` write/edit unit) always include
   `rev_before` (existing target), `rev`, `bytes_before` (existing target),
   `bytes`, `bytes_written`, `save`, `in_place` (when set), and `changed` (when
-  applicable).
+  applicable) — except `edit --dry-run`, which omits `rev` and `bytes_written`.
 - Deterministic: sort by path, then first byte offset; fixed field order; no
   `unordered_map` iteration; no wall-clock timestamps (file mtime/ctime are in
   `rev`); golden tests normalize `duration_us`/`meta.pid`/abs paths.
@@ -701,9 +750,10 @@ Core `Status` covers document/IO; the CLI adds `E_USAGE`, `E_SCHEMA`, `E_PARSE`,
 `E_OUTSIDE_ROOT`, `E_NO_MATCH`, `E_AMBIGUOUS`. `E_LOCKED` is `Status::Locked`.
 `E_*` = SCREAMING_SNAKE_CASE of the Status name. The top-level `error` object
 carries `code`, `message`, `retryable`, `path`, `hint`, and command-specific
-fields. `E_INVALID_UTF8` includes the byte offset; `E_NO_MATCH`/`E_AMBIGUOUS`
-include at most 20 entries of `{line, col, byte_offset}` (CLI: `line` 1-based;
-`col` and `byte_offset` 0-based).
+fields; `batch` errors add `op_index` (0-based, omitted for a whole-program
+parse failure). `E_INVALID_UTF8` includes the byte offset; `E_NO_MATCH`/
+`E_AMBIGUOUS` include at most 20 entries of `{line, col, byte_offset}` (CLI:
+`line` 1-based; `col` and `byte_offset` 0-based).
 `validate`'s `errors[]` are lightweight findings with lowercase `code`
 (`invalid_utf8`, `unsupported`, §6.1); when the first finding is promoted to the
 top-level `error` (validate, or `batch --check` with failures), `code` is the E_
@@ -748,32 +798,46 @@ first error. `batch --check` with `valid:false` → exit **2**.
 ```
 
 - Ops: `write`, `edit`. `write` uses exactly one of `content`/`content_file`
-  plus `in_place`/`expect`/`force` (`in_place` requires an existing target, else
-  `E_USAGE`). `edit` uses `old`/`new`/`text`/`at`/`op`/
-  `length`/`count`/`all`/`dry_run`/`expect`/`force`; its field rules match the
-  CLI `edit` forms (§6.1). `expect` and `force` are mutually exclusive.
+  (both/neither → `E_USAGE`) plus `in_place`/`expect`/`force` (`in_place`
+  requires an existing target, else `E_USAGE`). `content_file` resolves like
+  `path` (against `--root`) and must be a readable regular file
+  (`E_NOT_FOUND`/`E_IO`/`E_OUTSIDE_ROOT`). `edit` uses `old`/`new`/`text`/`at`/
+  `op`/`length`/`count`/`all`/`dry_run`/`expect`/`force`; its field rules match
+  the CLI `edit` forms (§6.1), except that `dry_run` reports the predicted op
+  result and does not count as a write. `expect` and `force` are mutually
+  exclusive. Each op's result fields, `changed`, and no-op rules match its CLI
+  command (§6.1).
 - **Validation-stage atomicity**: parse/validate every op against the original
   files; any validation failure → no writes. For a non-`in_place` op, stage the
   new contents in a same-dir temp and commit with `rename_at`; for an `in_place`
   write, keep a same-dir backup and rewrite the original inode. On a commit
   failure, restore every changed file from its backup and unlink files created by
   this batch; delete backups on success. `in_place` ops can leave a partial file
-  if rollback itself fails. If rollback fails, return `ok:false`,
-  `rolled_back:false`, and `results[]` for applied ops. Buffer responses until
-  commit. `--check` validates only. **Not crash-atomic.**
+  if rollback itself fails. Buffer responses until commit. `--check` validates
+  only. **Not crash-atomic.**
+- **Result shapes.** Success: `ok:true`, `rolled_back:false`, one `results[]`
+  element per merged write unit (see below). Validation failure: `ok:false`,
+  `rolled_back:false`, `results: []`, `error` = the first failing op's error
+  including `op_index`. Commit failure with a successful rollback: `ok:false`,
+  `rolled_back:true`, `results: []` (nothing from this batch survives), `error` =
+  the first commit error. Rollback failure: `ok:false`, `rolled_back:false`,
+  `results[]` for the units that remain applied.
 - Ops see the original files. A `write` op covers the whole file and overlaps
   every other op on that path. An `edit` op covers the matched `old` range (or
   the `--at`/`--length` range; `--op insert` is a zero-length range at the
   insertion point); overlap is byte-range intersection. Two inserts at the same
   offset overlap (`E_RANGE`), matching `apply`. Same-file ops must not overlap;
-  disjoint edits are merged into one `apply`, and the merged op reports one
-  `changed` range covering all merged edits.
-- `batch` adds `rolled_back` (bool) and per-op `results[]` to the envelope;
+  disjoint edits are merged into one `apply`, and that merged unit yields one
+  `results[]` element whose `changed` covers all merged edits.
+- `batch` adds `rolled_back` (bool) and per-unit `results[]` to the envelope;
   `rolled_back` is `true` only when a commit failure triggered rollback and every
   changed file was restored; it is `false` on success, on validation failure (no
-  writes), and when rollback fails. Results are capped at 1000 with
-  `"truncated": true`. `--check` returns `results: []`, `valid` + `errors[]` and
-  writes nothing; on `valid:false`, `error` is the first error.
+  writes), and when rollback fails. `results[]` follows the §6.2 deterministic
+  order (path, then first byte offset; ties by op index); `results[]` and
+  `--check`'s `errors[]` are capped at 1000 entries with top-level
+  `"truncated": true`. `--check` returns `results: []`,
+  `valid` + `errors[]` (each with `op_index`) and writes nothing; on
+  `valid:false`, `error` is the first error.
 - Mutations require a per-op `expect` on existing files; per-op `force`
   overrides. `write` to a non-existent path needs neither. Mismatch →
   `E_CONFLICT`, exit 2.
@@ -837,7 +901,7 @@ is used internally by `write`. The golden menu test is a code-level check.
 The 1.68 GB row is a naive full-mmap baseline; v1 uses the §5.6 bounded
 windows/`pread` policy.
 
-**Budgets (per-component caps; the loaded-resident row is a separate combined cap)**
+**Budgets (per-component caps; the loaded-resident rows are separate combined caps)**
 
 | Metric | Cap |
 | --- | --- |
@@ -848,11 +912,12 @@ windows/`pread` policy.
 | + sparse line index (5M lines, incl. nodes) | ≤ 2 MB |
 | + sparse line index (25M lines, incl. nodes) | ≤ 10 MB |
 | **Loaded, resident (1 GB file with ≤5M lines, i.e. ≥200 B/line; cache + undo + index + add buffer)** | **≤ 40 MB** |
+| **Loaded, resident (1 GB file with ≤25M lines; same components)** | **≤ 44 MB** |
 
-Spilled undo/add-buffer data is disk, not footprint; the 40 MB cap is resident
-only and assumes ≤5M lines. At 25M lines the index is ~9.4 MB, so the loaded
-total (≈43 MB) exceeds the cap; add a line-count budget or a hard line cap for
-the GUI.
+Spilled undo/add-buffer data is disk, not footprint. Both loaded-resident caps
+are resident only: 12 (baseline) + 6 (cache) + 8 (undo) + 8 (add buffer) = 34 MB,
+plus the index — ~36 MB at 5M lines (cap 40 MB) and ~43.4 MB at 25M lines (cap
+44 MB). Line count is not separately capped.
 Post-1.0, the content-mmap LRU (50–60 MB) is additional.
 
 **Performance**
