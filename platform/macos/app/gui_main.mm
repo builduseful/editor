@@ -129,6 +129,9 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)updateTitle;
 - (void)scrollToLine:(int64_t)line;
 - (void)scrollToX:(double)px;
+// Indexes the whole document (under the discovery cap) and shows the caret, so
+// a snapshot is the final, steady frame rather than a mid-discovery one.
+- (void)finishIndex;
 - (void)discardUntitledTemp;
 // YES if the document may be discarded (clean, or the user saved / chose not to).
 - (BOOL)confirmDiscardChanges;
@@ -663,6 +666,13 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   _view->scroll_x_by(px);
   [self setNeedsDisplay:YES];
 }
+- (void)finishIndex {
+  if (_ed->rev().size <= (64ull << 20)) {  // above the cap the bar stays approximate
+    _view->discover_all();
+    _view->apply_pending_scroll();
+  }
+  [self startBlink];  // the blink phase must not leak into a reference frame
+}
 // First paint stays lazy. Then index small/medium files in bounded steps (one
 // run-loop turn each) so the exact line count and the scrollbar appear without
 // ever blocking the window; huge files stay lazy (a full index of 5 GB is ~8 s).
@@ -811,6 +821,7 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 }
 - (void)runSnapshot:(NSTimer*)timer {
   (void)timer;
+  [self.view finishIndex];  // a steady frame: exact scrollbars, caret on
   if (self.snapshotScrollLine > 0) {
     [self.view scrollToLine:self.snapshotScrollLine];
   }

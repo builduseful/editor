@@ -47,7 +47,7 @@ TEST_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(TEST_SRC))
 FRAMEWORKS := -framework Foundation -framework CoreText -framework CoreGraphics
 APP_FRAMEWORKS := $(FRAMEWORKS) -framework AppKit
 
-.PHONY: all test golden fuzz bench demo app bundle render gui-smoke clean
+.PHONY: all test golden fuzz bench demo app bundle render gui-smoke gui-golden golden-update clean
 
 all: $(BUILD)/editor_tests
 ifneq ($(CORE_SRC),)
@@ -137,9 +137,18 @@ $(BUILD)/render_doc: $(TOOL_OBJ) $(PLATFORM_OBJ) $(PLATFORM_GUI_OBJ) $(BUILD)/li
 
 render: $(BUILD)/render_doc
 
-# GUI smoke test: headless snapshots (both themes) + a normal launch.
-gui-smoke: $(APP_EXEC)
+# GUI smoke test: headless snapshots (both themes) + the pinned golden frames +
+# a normal launch.
+gui-smoke: $(APP_EXEC) gui-golden
 	python3 tests/gui_smoke.py $(APP_BUNDLE)/Contents/MacOS/editor
+
+# Golden frames: the pinned light/dark/small/scrolled snapshots, compared with a
+# pixel tolerance (`golden-update` re-pins them after an intended visual change).
+gui-golden: $(APP_EXEC)
+	python3 tests/gui_golden.py $(APP_BUNDLE)/Contents/MacOS/editor
+
+golden-update: $(APP_EXEC)
+	python3 tests/gui_golden.py --update $(APP_BUNDLE)/Contents/MacOS/editor
 
 clean:
 	rm -rf build build-asan

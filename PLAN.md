@@ -1278,8 +1278,9 @@ horizontal for long lines with wrap off (pan, drag, track paging, command-click)
 — File → New / Open / Save As with a window title and dirty marker, and
 incremental (run-loop dripped) indexing so a medium file never blocks the window. `make test` (plain +
 ASan/UBSan), `make golden`, `make fuzz`, `make bench`, `make demo`, and
-`make gui-smoke` (headless AppKit snapshots in both themes, a real launch, a
-no-file launch, and a Finder-style LaunchServices open) pass; the M1 first-paint
+`make gui-smoke` (headless AppKit snapshots in both themes, pinned golden frames
+in light/dark/small/scrolled, a real launch, a no-file launch, and a Finder-style
+LaunchServices open) pass; the M1 first-paint
 gates (1 GB < 100 ms, 5 GB < 250 ms) pass via `make demo`. **M3.5 (notarization,
 packaging, CI perf gates) is not started** — it needs a signing identity and CI,
 which are out of scope for the local build.
