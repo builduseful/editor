@@ -83,6 +83,14 @@ class ViewCore {
   void set_caret_visible(bool v) { caret_visible_ = v; }
   bool caret_visible() const { return caret_visible_; }
 
+  // Tab stop width in columns (a tab advances to the next multiple).
+  void set_tab_width(int columns) {
+    const int c = columns > 0 ? columns : 1;
+    if (c != tab_width_) invalidate_all();
+    tab_width_ = c;
+  }
+  int tab_width() const { return tab_width_; }
+
   double line_height() const;
   // Number of lines discovered so far. The view grows this lazily as it draws or
   // scrolls, so before the document has been fully traversed it is a lower bound
@@ -174,6 +182,8 @@ class ViewCore {
   int64_t col_at_x(const VisualLine& v, double x) const;
   // Pen x of byte offset `col` within a visual line.
   double x_of_col(const VisualLine& v, int64_t col) const;
+  // Widens '\t' glyphs to the next tab stop (keeps one glyph per codepoint).
+  void apply_tabs(Run& run) const;
   std::string line_text(int64_t line) const;  // logical line, terminator stripped
 
   // Input helpers.
@@ -212,6 +222,7 @@ class ViewCore {
   Color selection_color_{180, 200, 240, 255};  // highlight
   Color caret_color_{26, 26, 26, 255};
   bool caret_visible_ = true;
+  int tab_width_ = 4;
   Selection sel_;
 
   mutable std::map<int64_t, LineEntry> cache_;

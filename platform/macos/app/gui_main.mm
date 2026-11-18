@@ -78,6 +78,7 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
   std::unique_ptr<vc::ViewCore> _view;
   NSTimer* _blink;
   BOOL _blinkOn;
+  double _fontSize;
 }
 
 - (instancetype)initWithEditor:(Editor*)ed {
@@ -87,10 +88,81 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
     _tb = ed::mac::create_coretext_backend();
     _view = std::make_unique<vc::ViewCore>(*ed, *_tb);
     _view->resize(self.bounds.size.width, self.bounds.size.height);
+    [self applySettings];
     _view->set_caret(0, 0);
     [self startBlink];
   }
   return self;
+}
+
+// Font size, tab width, and wrap persist in NSUserDefaults (§11 M2 settings).
+- (void)applySettings {
+  NSUserDefaults* d = [NSUserDefaults standardUserDefaults];
+  const double fs = [d doubleForKey:@"FontSize"];
+  _fontSize = fs > 0 ? fs : 14.0;
+  vc::FontSpec f;
+  f.size = _fontSize;
+  _view->set_font(f);
+  const int tw = static_cast<int>([d integerForKey:@"TabWidth"]);
+  _view->set_tab_width(tw > 0 ? tw : 4);
+  _view->set_wrap([d boolForKey:@"Wrap"]);
+}
+
+- (void)applyFontSize:(double)size {
+  if (size < 6 || size > 96) return;
+  _fontSize = size;
+  vc::FontSpec f = _view->font();
+  f.size = size;
+  _view->set_font(f);
+  [[NSUserDefaults standardUserDefaults] setDouble:size forKey:@"FontSize"];
+  [self setNeedsDisplay:YES];
+}
+
+- (void)increaseFontSize:(id)sender {
+  (void)sender;
+  [self applyFontSize:_fontSize + 1];
+}
+- (void)decreaseFontSize:(id)sender {
+  (void)sender;
+  [self applyFontSize:_fontSize - 1];
+}
+- (void)toggleWrap:(id)sender {
+  (void)sender;
+  const bool on = !_view->wrap();
+  _view->set_wrap(on);
+  [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"Wrap"];
+  [self setNeedsDisplay:YES];
+}
+- (void)undo:(id)sender {
+  (void)sender;
+  if (_ed->undo() == Status::Ok) {
+    _view->document_changed();
+    [self setNeedsDisplay:YES];
+  }
+}
+- (void)redo:(id)sender {
+  (void)sender;
+  if (_ed->redo() == Status::Ok) {
+    _view->document_changed();
+    [self setNeedsDisplay:YES];
+  }
+}
+- (void)selectAll:(id)sender {
+  (void)sender;
+  vc::KeyEvent e;
+  e.key = vc::Key::SelectAll;
+  if (_view->key(e)) [self setNeedsDisplay:YES];
+}
+- (void)saveDocument:(id)sender {
+  (void)sender;
+  if (_ed->save(nullptr, false, nullptr) == Status::Ok) [self setNeedsDisplay:YES];
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem*)item {
+  if (item.action == @selector(toggleWrap:)) {
+    item.state = _view->wrap() ? NSControlStateValueOn : NSControlStateValueOff;
+  }
+  return YES;
 }
 
 - (void)dealloc {
@@ -146,28 +218,6 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 
 - (void)keyDown:(NSEvent*)event {
   [self startBlink];  // solid caret while typing
-  const NSEventModifierFlags m = event.modifierFlags;
-  if (m & NSEventModifierFlagCommand) {
-    NSString* s = event.charactersIgnoringModifiers;
-    if (s.length == 1) {
-      const unichar c = [s characterAtIndex:0];
-      if (c == 'z' || c == 'Z') {
-        const bool redo = (m & NSEventModifierFlagShift) != 0;
-        const Status st = redo ? _ed->redo() : _ed->undo();
-        if (st == Status::Ok) {
-          _view->document_changed();
-          [self setNeedsDisplay:YES];
-        }
-        return;
-      }
-      if (c == 's' || c == 'S') {
-        if (_ed->save(nullptr, false, nullptr) == Status::Ok) {
-          [self setNeedsDisplay:YES];
-        }
-        return;
-      }
-    }
-  }
   std::string text;
   const vc::KeyEvent k = translate_key(event, &text);
   vc::KeyEvent ev = k;
@@ -266,13 +316,59 @@ int main(int argc, char** argv) {
     [app setDelegate:delegate];
 
     NSMenu* menubar = [[NSMenu alloc] init];
+
     NSMenuItem* appItem = [[NSMenuItem alloc] init];
     [menubar addItem:appItem];
-    NSMenu* appMenu = [[NSMenu alloc] init];
+    NSMenu* appMenu = [[NSMenu alloc] initWithTitle:@"editor"];
+    [appMenu addItemWithTitle:@"About editor"
+                       action:@selector(orderFrontStandardAboutPanel:)
+                keyEquivalent:@""];
+    [appMenu addItem:[NSMenuItem separatorItem]];
     [appMenu addItemWithTitle:@"Quit editor"
                        action:@selector(terminate:)
                 keyEquivalent:@"q"];
     [appItem setSubmenu:appMenu];
+
+    NSMenuItem* fileItem = [[NSMenuItem alloc] init];
+    [menubar addItem:fileItem];
+    NSMenu* fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
+    [fileMenu addItemWithTitle:@"Save"
+                        action:@selector(saveDocument:)
+                 keyEquivalent:@"s"];
+    [fileItem setSubmenu:fileMenu];
+
+    NSMenuItem* editItem = [[NSMenuItem alloc] init];
+    [menubar addItem:editItem];
+    NSMenu* editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
+    [editMenu addItemWithTitle:@"Undo"
+                        action:@selector(undo:)
+                 keyEquivalent:@"z"];
+    NSMenuItem* redoItem = [editMenu addItemWithTitle:@"Redo"
+                                               action:@selector(redo:)
+                                        keyEquivalent:@"z"];
+    redoItem.keyEquivalentModifierMask =
+        NSEventModifierFlagCommand | NSEventModifierFlagShift;
+    [editMenu addItem:[NSMenuItem separatorItem]];
+    [editMenu addItemWithTitle:@"Select All"
+                        action:@selector(selectAll:)
+                 keyEquivalent:@"a"];
+    [editItem setSubmenu:editMenu];
+
+    NSMenuItem* viewItem = [[NSMenuItem alloc] init];
+    [menubar addItem:viewItem];
+    NSMenu* viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
+    [viewMenu addItemWithTitle:@"Wrap Lines"
+                        action:@selector(toggleWrap:)
+                 keyEquivalent:@""];
+    [viewMenu addItem:[NSMenuItem separatorItem]];
+    [viewMenu addItemWithTitle:@"Bigger"
+                        action:@selector(increaseFontSize:)
+                 keyEquivalent:@"+"];
+    [viewMenu addItemWithTitle:@"Smaller"
+                        action:@selector(decreaseFontSize:)
+                 keyEquivalent:@"-"];
+    [viewItem setSubmenu:viewMenu];
+
     [app setMainMenu:menubar];
 
     [app activateIgnoringOtherApps:YES];

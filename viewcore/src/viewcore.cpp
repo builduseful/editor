@@ -2,6 +2,7 @@
 #include "viewcore.hpp"
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <span>
 #include <string_view>
@@ -175,6 +176,7 @@ const ViewCore::LineEntry& ViewCore::entry_for(int64_t line) const {
     v.run = tb_->shape(font_, text);
     v.run.logical_line = line;
     v.run.byte_start = 0;
+    apply_tabs(v.run);
     e.bytes = text.size() + v.run.glyphs.size() * sizeof(Glyph) + 96;
     e.visual.push_back(std::move(v));
   } else {
@@ -199,6 +201,7 @@ const ViewCore::LineEntry& ViewCore::entry_for(int64_t line) const {
       v.run = tb_->shape(font_, std::string_view(text).substr(pos, end - pos));
       v.run.logical_line = line;
       v.run.byte_start = pos;
+      apply_tabs(v.run);
       e.bytes = e.bytes + (end - pos) + v.run.glyphs.size() * sizeof(Glyph) + 96;
       e.visual.push_back(std::move(v));
       pos = end;
@@ -303,6 +306,26 @@ double ViewCore::x_of_col(const VisualLine& v, int64_t col) const {
     rel += cp_len(v.run.text, rel);
   }
   return pen;
+}
+
+void ViewCore::apply_tabs(Run& run) const {
+  if (tab_width_ <= 0) return;
+  const double space = tb_->measure(run.font, " ");
+  if (space <= 0) return;
+  const double stop = static_cast<double>(tab_width_) * space;
+  double pen = 0;
+  bool any = false;
+  for (Glyph& g : run.glyphs) {
+    g.x = pen;
+    if (g.codepoint == '\t') {
+      double adv = stop - std::fmod(pen, stop);
+      if (adv <= 0) adv = stop;
+      g.advance = adv;
+      any = true;
+    }
+    pen += g.advance;
+  }
+  if (any) run.width = pen;
 }
 
 Hit ViewCore::hit_test(double x, double y) const {

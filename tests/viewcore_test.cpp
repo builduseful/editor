@@ -406,6 +406,17 @@ TEST(viewcore_caret_blink_toggle) {
   CHECK(!caret);
 }
 
+TEST(viewcore_tab_width_advances_to_stop) {
+  Doc d("a\tb\n");
+  d.view->resize(800, 1000);
+  d.view->set_wrap(false);
+  d.view->set_tab_width(4);
+  CHECK_EQ(d.view->caret_rect(0, 1).x, 8.0);   // at the tab
+  CHECK_EQ(d.view->caret_rect(0, 2).x, 32.0);  // 'b' at column 4
+  d.view->set_tab_width(8);
+  CHECK_EQ(d.view->caret_rect(0, 2).x, 64.0);  // 'b' at column 8
+}
+
 TEST(viewcore_edit_insert_text) {
   Doc d("abc\n");
   d.view->resize(800, 1000);
