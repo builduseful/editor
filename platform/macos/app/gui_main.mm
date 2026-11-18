@@ -64,6 +64,17 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
   return k;
 }
 
+// A private temp file backs an untitled window, so it is a real, editable,
+// savable document from the first paint onward.
+std::string untitled_path(int attempt) {
+  NSString* dir = NSTemporaryDirectory();
+  NSString* name = [NSString
+      stringWithFormat:@"editor-untitled-%d-%llu-%d.txt", getpid(),
+                       (unsigned long long)(NSDate.date.timeIntervalSince1970 * 1000),
+                       attempt];
+  return std::string([[dir stringByAppendingPathComponent:name] UTF8String]);
+}
+
 }  // namespace
 
 NSColor* ns_color(vc::Color c) {
@@ -113,6 +124,8 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)refreshTheme;
 - (BOOL)writeSnapshotTo:(NSString*)path;
 - (BOOL)openPath:(NSString*)path;
+// Replaces the document with a fresh untitled buffer (callers confirm first).
+- (BOOL)startUntitled;
 - (void)updateTitle;
 - (void)scrollToLine:(int64_t)line;
 - (void)discardUntitledTemp;
@@ -403,6 +416,32 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   if (self.untitledTempPath == nil) return;
   std::remove(self.untitledTempPath.UTF8String);
   self.untitledTempPath = nil;
+}
+
+// File > New (and the first launch with no file): a document with no path yet,
+// backed by a temp file so it can be edited, undone, and saved.
+- (BOOL)startUntitled {
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    const std::string tmp = untitled_path(attempt);
+    if (_ed->create(tmp) != Status::Ok) continue;
+    [self discardUntitledTemp];  // the core moved off the previous buffer
+    self.untitledTempPath = [NSString stringWithUTF8String:tmp.c_str()];
+    self.documentPath = nil;
+    _maybeDirty = NO;
+    [self reloadDocument];
+    [self updateTitle];
+    [self beginDiscovery];
+    return YES;
+  }
+  [self showError:@"Could not create a new document."];
+  return NO;
+}
+
+- (void)newDocument:(id)sender {
+  (void)sender;
+  if (![self confirmDiscardChanges]) return;
+  [self startUntitled];
+  [self setNeedsDisplay:YES];
 }
 
 - (void)saveDocument:(id)sender {
@@ -846,17 +885,6 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 
 namespace {
 
-// A private temp file backs an untitled window, so it is a real, editable,
-// savable document from the first paint onward.
-std::string untitled_path(int attempt) {
-  NSString* dir = NSTemporaryDirectory();
-  NSString* name = [NSString
-      stringWithFormat:@"editor-untitled-%d-%llu-%d.txt", getpid(),
-                       (unsigned long long)(NSDate.date.timeIntervalSince1970 * 1000),
-                       attempt];
-  return std::string([[dir stringByAppendingPathComponent:name] UTF8String]);
-}
-
 NSMenuItem* item(NSString* title, SEL action, NSString* key) {
   return [[NSMenuItem alloc] initWithTitle:title
                                     action:action
@@ -898,6 +926,7 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
   saveAs.keyEquivalentModifierMask =
       NSEventModifierFlagCommand | NSEventModifierFlagShift;
   [fileItem setSubmenu:submenu(@"File", @[
+    item(@"New", @selector(newDocument:), @"n"),
     item(@"Open\u2026", @selector(openDocument:), @"o"),
     [NSMenuItem separatorItem],
     item(@"Save", @selector(saveDocument:), @"s"),
