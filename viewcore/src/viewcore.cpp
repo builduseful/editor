@@ -2,6 +2,8 @@
 #include "viewcore.hpp"
 
 #include <algorithm>
+#include <limits>
+#include <span>
 #include <string_view>
 
 namespace vc {
@@ -496,6 +498,13 @@ void ViewCore::ensure_caret_visible() {
 }
 
 bool ViewCore::key(const KeyEvent& e) {
+  switch (e.key) {
+    case Key::Backspace: return backspace();
+    case Key::Delete: return delete_forward();
+    case Key::Enter: return insert_text("\n");
+    case Key::InsertText: return insert_text(e.text);
+    default: break;
+  }
   const Selection before = sel_;
   const int64_t before_first = first_line_;
   const double before_px = scroll_px_;
@@ -520,7 +529,7 @@ bool ViewCore::key(const KeyEvent& e) {
       sel_.anchor_line = sel_.caret_line;
       sel_.anchor_col = sel_.caret_col;
       break;
-    case Key::None: return false;
+    default: return false;
   }
   ensure_caret_visible();
   return !(sel_ == before) || first_line_ != before_first ||
@@ -553,6 +562,146 @@ bool ViewCore::mouse(const MouseEvent& e) {
   }
   return !(sel_ == before) || first_line_ != before_first ||
          scroll_px_ != before_px;
+}
+
+// --- Editing (M2) ----------------------------------------------------------
+
+bool ViewCore::has_selection() const {
+  return sel_.anchor_line != sel_.caret_line ||
+         sel_.anchor_col != sel_.caret_col;
+}
+
+void ViewCore::selection_range(int64_t* sl, int64_t* sc, int64_t* el,
+                               int64_t* ec) const {
+  const bool fwd = sel_.anchor_line < sel_.caret_line ||
+                   (sel_.anchor_line == sel_.caret_line &&
+                    sel_.anchor_col <= sel_.caret_col);
+  *sl = fwd ? sel_.anchor_line : sel_.caret_line;
+  *sc = fwd ? sel_.anchor_col : sel_.caret_col;
+  *el = fwd ? sel_.caret_line : sel_.anchor_line;
+  *ec = fwd ? sel_.caret_col : sel_.anchor_col;
+}
+
+int64_t ViewCore::byte_span(int64_t sl, int64_t sc, int64_t el,
+                            int64_t ec) const {
+  size_t block = 0;
+  int64_t n = 0;
+  ed_->read_lines(sl, el + 1, nullptr, 0, &block, &n);
+  size_t last = 0;
+  ed_->read_lines(el, el + 1, nullptr, 0, &last, &n);
+  return static_cast<int64_t>(block - static_cast<size_t>(sc) -
+                              (last - static_cast<size_t>(ec)));
+}
+
+void ViewCore::refresh_line_count() {
+  size_t need = 0;
+  int64_t n = 0;
+  // read_lines does not trigger the EOL scan, and after an edit the index is
+  // complete, so this is O(log n).
+  ed_->read_lines(0, std::numeric_limits<int64_t>::max(), nullptr, 0, &need, &n);
+  eof_known_ = true;
+  known_lines_ = n;
+}
+
+void ViewCore::document_changed() {
+  invalidate_all();
+  refresh_line_count();
+  sel_.anchor_line = sel_.caret_line;
+  sel_.anchor_col = sel_.caret_col;
+  ensure_caret_visible();
+}
+
+bool ViewCore::delete_range(int64_t sl, int64_t sc, int64_t el, int64_t ec) {
+  const int64_t removed = byte_span(sl, sc, el, ec);
+  if (removed <= 0) return false;
+  Edit e;
+  e.line = sl;
+  e.col = sc;
+  e.removed_len = removed;
+  e.text = std::string_view();
+  const Status s = ed_->apply(std::span<const Edit>(&e, 1));
+  if (s != Status::Ok) return false;
+  sel_.caret_line = sl;
+  sel_.caret_col = sc;
+  document_changed();
+  return true;
+}
+
+bool ViewCore::insert_text(std::string_view text) {
+  if (text.empty()) return false;
+  int64_t sl = 0, sc = 0, el = 0, ec = 0;
+  if (has_selection()) {
+    selection_range(&sl, &sc, &el, &ec);
+  } else {
+    sl = el = sel_.caret_line;
+    sc = ec = sel_.caret_col;
+  }
+  const int64_t removed = byte_span(sl, sc, el, ec);
+  Edit e;
+  e.line = sl;
+  e.col = sc;
+  e.removed_len = removed;
+  e.text = text;
+  const Status s = ed_->apply(std::span<const Edit>(&e, 1));
+  if (s != Status::Ok) return false;
+
+  // The caret lands after the inserted text. Count terminators and the length of
+  // the trailing (terminator-free) segment: normalizing to the file EOL changes
+  // only the terminator bytes, not that segment.
+  int64_t terms = 0;
+  size_t last_term_end = 0;
+  for (size_t i = 0; i < text.size(); ++i) {
+    if (text[i] == '\r') {
+      ++terms;
+      if (i + 1 < text.size() && text[i + 1] == '\n') ++i;
+      last_term_end = i + 1;
+    } else if (text[i] == '\n') {
+      ++terms;
+      last_term_end = i + 1;
+    }
+  }
+  sel_.caret_line = sl + terms;
+  sel_.caret_col = (terms == 0 ? sc : 0) +
+                   static_cast<int64_t>(text.size() - last_term_end);
+  document_changed();
+  return true;
+}
+
+bool ViewCore::backspace() {
+  if (has_selection()) {
+    int64_t sl = 0, sc = 0, el = 0, ec = 0;
+    selection_range(&sl, &sc, &el, &ec);
+    return delete_range(sl, sc, el, ec);
+  }
+  const int64_t line = sel_.caret_line;
+  const int64_t col = sel_.caret_col;
+  if (col == 0 && line == 0) return false;
+  if (col > 0) {
+    const std::string t = line_text(line);
+    size_t p = static_cast<size_t>(col) - 1;
+    while (p > 0 && (static_cast<unsigned char>(t[p]) & 0xC0) == 0x80) --p;
+    return delete_range(line, static_cast<int64_t>(p), line, col);
+  }
+  const int64_t prev = line - 1;
+  return delete_range(prev, line_len(prev), line, 0);
+}
+
+bool ViewCore::delete_forward() {
+  if (has_selection()) {
+    int64_t sl = 0, sc = 0, el = 0, ec = 0;
+    selection_range(&sl, &sc, &el, &ec);
+    return delete_range(sl, sc, el, ec);
+  }
+  const int64_t line = sel_.caret_line;
+  const int64_t col = sel_.caret_col;
+  const std::string t = line_text(line);
+  if (static_cast<size_t>(col) < t.size()) {
+    const int64_t nc =
+        col + static_cast<int64_t>(cp_len(t, static_cast<size_t>(col)));
+    return delete_range(line, col, line, nc);
+  }
+  if (line_exists(line + 1)) return delete_range(line, col, line + 1, 0);
+  return false;
 }
 
 }  // namespace vc

@@ -44,6 +44,22 @@ struct Doc {
     }
     return out;
   }
+
+  // The whole logical document via read_lines (includes terminators).
+  std::string text() {
+    Info in;
+    ed->info(&in);
+    size_t used = 0;
+    int64_t n = 0;
+    ed->read_lines(0, in.line_count, nullptr, 0, &used, &n);
+    std::string s(used, '\0');
+    if (used > 0) {
+      size_t got = 0;
+      ed->read_lines(0, in.line_count, s.data(), s.size(), &got, &n);
+      s.resize(got);
+    }
+    return s;
+  }
 };
 
 // Greedy wrap reference for the fixed-advance monospace backend (ASCII only).
@@ -374,5 +390,81 @@ TEST(viewcore_draw_renders_caret) {
     }
   }
   CHECK(caret);
+}
+
+TEST(viewcore_edit_insert_text) {
+  Doc d("abc\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 1);
+  CHECK(d.view->insert_text("X"));
+  CHECK_EQ(d.text(), std::string("aXbc\n"));
+  CHECK_EQ(d.view->selection().caret_line, 0);
+  CHECK_EQ(d.view->selection().caret_col, 2);
+}
+
+TEST(viewcore_edit_insert_replaces_selection) {
+  Doc d("hello world\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 0);
+  vc::KeyEvent right;
+  right.key = vc::Key::Right;
+  right.shift = true;
+  for (int i = 0; i < 5; ++i) d.view->key(right);  // select "hello"
+  CHECK(d.view->insert_text("bye"));
+  CHECK_EQ(d.text(), std::string("bye world\n"));
+  CHECK_EQ(d.view->selection().caret_col, 3);
+}
+
+TEST(viewcore_edit_enter_splits_line) {
+  Doc d("abcd\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 2);
+  vc::KeyEvent enter;
+  enter.key = vc::Key::Enter;
+  CHECK(d.view->key(enter));
+  CHECK_EQ(d.text(), std::string("ab\ncd\n"));
+  CHECK_EQ(d.view->selection().caret_line, 1);
+  CHECK_EQ(d.view->selection().caret_col, 0);
+}
+
+TEST(viewcore_edit_backspace_merges_lines) {
+  Doc d("ab\ncd\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(1, 0);
+  CHECK(d.view->backspace());
+  CHECK_EQ(d.text(), std::string("abcd\n"));
+  CHECK_EQ(d.view->selection().caret_line, 0);
+  CHECK_EQ(d.view->selection().caret_col, 2);
+}
+
+TEST(viewcore_edit_backspace_deletes_a_codepoint) {
+  Doc d("a\xC3\xA9z\n");  // a, e-acute, z
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 3);  // just past the two-byte e-acute
+  CHECK(d.view->backspace());
+  CHECK_EQ(d.text(), std::string("az\n"));
+  CHECK_EQ(d.view->selection().caret_col, 1);
+}
+
+TEST(viewcore_edit_delete_forward) {
+  Doc d("abc\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 0);
+  CHECK(d.view->delete_forward());
+  CHECK_EQ(d.text(), std::string("bc\n"));
+  CHECK_EQ(d.view->selection().caret_col, 0);
+}
+
+TEST(viewcore_edit_undo_via_document_changed) {
+  Doc d("abc\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 3);
+  CHECK(d.view->insert_text("!"));
+  CHECK_EQ(d.text(), std::string("abc!\n"));
+  CHECK(d.ed->undo() == Status::Ok);
+  d.view->document_changed();
+  CHECK_EQ(d.text(), std::string("abc\n"));
+  CHECK(d.view->line_count_known());
+  CHECK_EQ(d.view->line_count(), 1);
 }
 

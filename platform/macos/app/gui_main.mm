@@ -16,7 +16,7 @@
 
 namespace {
 
-vc::KeyEvent translate_key(NSEvent* e) {
+vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
   vc::KeyEvent k;
   const NSEventModifierFlags m = e.modifierFlags;
   k.shift = (m & NSEventModifierFlagShift) != 0;
@@ -24,24 +24,43 @@ vc::KeyEvent translate_key(NSEvent* e) {
   k.alt = (m & NSEventModifierFlagOption) != 0;
   k.ctrl = (m & NSEventModifierFlagControl) != 0;
   switch (e.keyCode) {
-    case 123: k.key = vc::Key::Left; break;
-    case 124: k.key = vc::Key::Right; break;
-    case 125: k.key = vc::Key::Down; break;
-    case 126: k.key = vc::Key::Up; break;
-    case 115: k.key = vc::Key::Home; break;
-    case 119: k.key = vc::Key::End; break;
-    case 116: k.key = vc::Key::PageUp; break;
-    case 121: k.key = vc::Key::PageDown; break;
-    case 53: k.key = vc::Key::Escape; break;
-    default: {
-      NSString* s = e.charactersIgnoringModifiers;
-      if (k.cmd && s.length == 1 &&
-          ([s characterAtIndex:0] == 'a' || [s characterAtIndex:0] == 'A')) {
-        k.key = vc::Key::SelectAll;
-      } else {
-        k.key = vc::Key::None;
-      }
-    }
+    case 123: k.key = vc::Key::Left; return k;
+    case 124: k.key = vc::Key::Right; return k;
+    case 125: k.key = vc::Key::Down; return k;
+    case 126: k.key = vc::Key::Up; return k;
+    case 115: k.key = vc::Key::Home; return k;
+    case 119: k.key = vc::Key::End; return k;
+    case 116: k.key = vc::Key::PageUp; return k;
+    case 121: k.key = vc::Key::PageDown; return k;
+    case 51: k.key = vc::Key::Backspace; return k;
+    case 117: k.key = vc::Key::Delete; return k;
+    case 36:
+    case 76: k.key = vc::Key::Enter; return k;
+    case 53: k.key = vc::Key::Escape; return k;
+    default: break;
+  }
+  NSString* plain = e.charactersIgnoringModifiers;
+  if (k.cmd && plain.length == 1) {
+    const unichar c = [plain characterAtIndex:0];
+    k.key = (c == 'a' || c == 'A') ? vc::Key::SelectAll : vc::Key::None;
+    return k;
+  }
+  if (k.cmd || k.ctrl) {
+    k.key = vc::Key::None;
+    return k;
+  }
+  NSString* chars = e.characters;
+  const char* u = chars.length > 0 ? [chars UTF8String] : nullptr;
+  if (u == nullptr) {
+    k.key = vc::Key::None;
+    return k;
+  }
+  const unsigned char b = static_cast<unsigned char>(u[0]);
+  if (b >= 0x20 || b == '\t') {
+    text->assign(u);
+    k.key = vc::Key::InsertText;
+  } else {
+    k.key = vc::Key::None;
   }
   return k;
 }
@@ -53,6 +72,7 @@ vc::KeyEvent translate_key(NSEvent* e) {
 @end
 
 @implementation EditorView {
+  Editor* _ed;
   std::unique_ptr<vc::TextBackend> _tb;
   std::unique_ptr<vc::ViewCore> _view;
 }
@@ -60,6 +80,7 @@ vc::KeyEvent translate_key(NSEvent* e) {
 - (instancetype)initWithEditor:(Editor*)ed {
   self = [super initWithFrame:NSMakeRect(0, 0, 900, 700)];
   if (self != nil) {
+    _ed = ed;
     _tb = ed::mac::create_coretext_backend();
     _view = std::make_unique<vc::ViewCore>(*ed, *_tb);
     _view->resize(self.bounds.size.width, self.bounds.size.height);
@@ -91,8 +112,33 @@ vc::KeyEvent translate_key(NSEvent* e) {
 }
 
 - (void)keyDown:(NSEvent*)event {
-  const vc::KeyEvent k = translate_key(event);
-  if (k.key != vc::Key::None && _view->key(k)) [self setNeedsDisplay:YES];
+  const NSEventModifierFlags m = event.modifierFlags;
+  if (m & NSEventModifierFlagCommand) {
+    NSString* s = event.charactersIgnoringModifiers;
+    if (s.length == 1) {
+      const unichar c = [s characterAtIndex:0];
+      if (c == 'z' || c == 'Z') {
+        const bool redo = (m & NSEventModifierFlagShift) != 0;
+        const Status st = redo ? _ed->redo() : _ed->undo();
+        if (st == Status::Ok) {
+          _view->document_changed();
+          [self setNeedsDisplay:YES];
+        }
+        return;
+      }
+      if (c == 's' || c == 'S') {
+        if (_ed->save(nullptr, false, nullptr) == Status::Ok) {
+          [self setNeedsDisplay:YES];
+        }
+        return;
+      }
+    }
+  }
+  std::string text;
+  const vc::KeyEvent k = translate_key(event, &text);
+  vc::KeyEvent ev = k;
+  ev.text = text;  // borrowed for the call
+  if (ev.key != vc::Key::None && _view->key(ev)) [self setNeedsDisplay:YES];
 }
 
 - (void)handleMouse:(NSEvent*)event kind:(vc::MouseEvent::Kind)kind {

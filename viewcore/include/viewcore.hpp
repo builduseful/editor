@@ -9,6 +9,7 @@
 #include <list>
 #include <map>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "canvas.hpp"
@@ -42,11 +43,13 @@ struct Hit {
 
 // Platform-neutral input. The macOS view translates NSEvent into these (§8).
 enum class Key : uint32_t {
-  None, Left, Right, Up, Down, Home, End, PageUp, PageDown, SelectAll, Escape
+  None, Left, Right, Up, Down, Home, End, PageUp, PageDown, SelectAll, Escape,
+  Backspace, Delete, Enter, InsertText
 };
 
 struct KeyEvent {
   Key key = Key::None;
+  std::string_view text;  // for Key::InsertText; borrowed for the call only
   bool shift = false, alt = false, ctrl = false, cmd = false;
 };
 
@@ -113,10 +116,17 @@ class ViewCore {
   // Draw the visible viewport into `c`.
   void draw(Canvas& c) const;
 
-  // Input. Both return true if the view changed (a redraw is needed). M1 is
-  // read-only: movement and selection only.
+  // Input. Both return true if the view changed (a redraw is needed).
   bool key(const KeyEvent& e);
   bool mouse(const MouseEvent& e);
+
+  // Editing (M2). Each returns true if the document changed.
+  bool insert_text(std::string_view utf8);  // replaces the selection, or inserts
+  bool backspace();                         // delete selection / previous codepoint
+  bool delete_forward();                    // delete selection / next codepoint
+  // Call after the document changes outside viewcore (undo/redo/save/reload):
+  // drops the line cache and refreshes the line count.
+  void document_changed();
 
   // Cache statistics (for tests and the footprint gate).
   size_t cache_entries() const { return cache_.size(); }
@@ -163,6 +173,14 @@ class ViewCore {
   void ensure_caret_visible();
   // Visual line within `line`'s entry holding byte `col`, and its x offset.
   void caret_within(const LineEntry& e, int64_t col, size_t* vi, double* x) const;
+
+  // Editing helpers.
+  bool has_selection() const;
+  void selection_range(int64_t* sl, int64_t* sc, int64_t* el,
+                       int64_t* ec) const;
+  int64_t byte_span(int64_t sl, int64_t sc, int64_t el, int64_t ec) const;
+  bool delete_range(int64_t sl, int64_t sc, int64_t el, int64_t ec);
+  void refresh_line_count();
 
   Editor* ed_ = nullptr;
   TextBackend* tb_ = nullptr;
