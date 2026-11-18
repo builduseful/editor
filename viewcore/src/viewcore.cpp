@@ -26,6 +26,39 @@ size_t cp_len(std::string_view s, size_t i) {
   return n;
 }
 
+// Decodes the codepoint starting at s[i] (invalid UTF-8 degrades to a byte).
+uint32_t cp_at(std::string_view s, size_t i) {
+  const unsigned char c = static_cast<unsigned char>(s[i]);
+  const size_t n = cp_len(s, i);
+  if (n == 1) return c;
+  uint32_t v = c & (n == 2 ? 0x1Fu : (n == 3 ? 0x0Fu : 0x07u));
+  for (size_t k = 1; k < n; ++k) {
+    v = (v << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3Fu);
+  }
+  return v;
+}
+
+// Start of the codepoint that ends at s[i].
+size_t prev_cp(std::string_view s, size_t i) {
+  size_t p = i;
+  while (p > 0) {
+    --p;
+    if ((static_cast<unsigned char>(s[p]) & 0xC0) != 0x80) break;
+  }
+  return p;
+}
+
+enum class CharClass : uint32_t { Space, Word, Other };
+
+CharClass char_class(uint32_t cp) {
+  if (cp == ' ' || cp == '\t') return CharClass::Space;
+  if (cp == '_' || (cp >= '0' && cp <= '9') || (cp >= 'A' && cp <= 'Z') ||
+      (cp >= 'a' && cp <= 'z') || cp >= 0x80) {
+    return CharClass::Word;  // non-ASCII counts as a letter (no Unicode tables)
+  }
+  return CharClass::Other;
+}
+
 char lower_ascii(char c) {
   return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
 }
@@ -840,6 +873,96 @@ void ViewCore::move_line_edge(bool to_end, bool extend) {
   set_caret_extend(line, col, extend);
 }
 
+void ViewCore::move_document_edge(bool to_end, bool extend) {
+  int64_t line = 0, col = 0;
+  if (to_end) {
+    discover_all();
+    line = known_lines_ > 0 ? known_lines_ - 1 : 0;
+    col = line_len(line);
+  }
+  v_moving_ = false;
+  set_caret_extend(line, col, extend);
+}
+
+void ViewCore::word_bounds(int64_t line, int64_t col, int64_t* begin,
+                           int64_t* end) const {
+  const std::string text = line_text(line);
+  const int64_t n = static_cast<int64_t>(text.size());
+  *begin = *end = col < 0 ? 0 : std::min(col, n);
+  if (text.empty()) return;
+  // The codepoint under the caret (a caret at the line end uses the last one).
+  size_t at = 0;
+  for (size_t pos = 0; pos < text.size(); pos += cp_len(text, pos)) {
+    at = pos;
+    if (static_cast<int64_t>(pos) >= col) break;
+  }
+  const CharClass cls = char_class(cp_at(text, at));
+  size_t lo = at, hi = at + cp_len(text, at);
+  while (lo > 0) {
+    const size_t p = prev_cp(text, lo);
+    if (char_class(cp_at(text, p)) != cls) break;
+    lo = p;
+  }
+  while (hi < text.size()) {
+    if (char_class(cp_at(text, hi)) != cls) break;
+    hi += cp_len(text, hi);
+  }
+  *begin = static_cast<int64_t>(lo);
+  *end = static_cast<int64_t>(hi);
+}
+
+void ViewCore::move_word(int dir, bool extend) {
+  int64_t line = sel_.caret_line;
+  int64_t col = sel_.caret_col;
+  const std::string text = line_text(line);
+  const int64_t n = static_cast<int64_t>(text.size());
+  if (dir > 0) {
+    if (col >= n) {  // line end: step onto the next line
+      if (!line_exists(line + 1)) return;
+      line += 1;
+      col = 0;
+    } else {
+      while (col < n) {  // cross the space to the next run first
+        if (char_class(cp_at(text, static_cast<size_t>(col))) != CharClass::Space) {
+          break;
+        }
+        col += static_cast<int64_t>(cp_len(text, static_cast<size_t>(col)));
+      }
+      if (col < n) {  // then land at the end of that run (macOS' Option+Right)
+        const CharClass cls =
+            char_class(cp_at(text, static_cast<size_t>(col)));
+        while (col < n) {
+          if (char_class(cp_at(text, static_cast<size_t>(col))) != cls) break;
+          col += static_cast<int64_t>(cp_len(text, static_cast<size_t>(col)));
+        }
+      }
+    }
+  } else {
+    if (col <= 0) {  // line start: step onto the end of the previous line
+      if (line == 0) return;
+      line -= 1;
+      col = line_len(line);
+    } else {
+      while (col > 0) {  // skip the space to the left
+        const size_t p = prev_cp(text, static_cast<size_t>(col));
+        if (char_class(cp_at(text, p)) != CharClass::Space) break;
+        col = static_cast<int64_t>(p);
+      }
+      if (col > 0) {
+        const CharClass cls =
+            char_class(cp_at(text, prev_cp(text, static_cast<size_t>(col))));
+        while (col > 0) {  // then take the whole run
+          const size_t p = prev_cp(text, static_cast<size_t>(col));
+          if (char_class(cp_at(text, p)) != cls) break;
+          col = static_cast<int64_t>(p);
+        }
+      }
+    }
+  }
+  v_moving_ = false;
+  set_caret_extend(line, col, extend);
+}
+
 void ViewCore::page_move(int dir, bool extend) {
   const int64_t lines =
       std::max<int64_t>(1, static_cast<int64_t>(text_height() / line_height()));
@@ -876,8 +999,8 @@ void ViewCore::ensure_caret_visible() {
 
 bool ViewCore::key(const KeyEvent& e) {
   switch (e.key) {
-    case Key::Backspace: return backspace();
-    case Key::Delete: return delete_forward();
+    case Key::Backspace: return backspace(e.alt);
+    case Key::Delete: return delete_forward(e.alt);
     case Key::Enter: return insert_text("\n");
     case Key::InsertText: return insert_text(e.text);
     default: break;
@@ -886,10 +1009,38 @@ bool ViewCore::key(const KeyEvent& e) {
   const int64_t before_first = first_line_;
   const double before_px = scroll_px_;
   switch (e.key) {
-    case Key::Left: move_horizontal(-1, e.shift); break;
-    case Key::Right: move_horizontal(1, e.shift); break;
-    case Key::Up: move_vertical(-1, e.shift); break;
-    case Key::Down: move_vertical(1, e.shift); break;
+    case Key::Left:
+      if (e.cmd) {
+        move_line_edge(false, e.shift);  // Command+Left: line start
+      } else if (e.alt) {
+        move_word(-1, e.shift);  // Option+Left: previous word
+      } else {
+        move_horizontal(-1, e.shift);
+      }
+      break;
+    case Key::Right:
+      if (e.cmd) {
+        move_line_edge(true, e.shift);
+      } else if (e.alt) {
+        move_word(1, e.shift);
+      } else {
+        move_horizontal(1, e.shift);
+      }
+      break;
+    case Key::Up:
+      if (e.cmd) {
+        move_document_edge(false, e.shift);  // Command+Up: document start
+      } else {
+        move_vertical(-1, e.shift);
+      }
+      break;
+    case Key::Down:
+      if (e.cmd) {
+        move_document_edge(true, e.shift);  // Command+Down: document end
+      } else {
+        move_vertical(1, e.shift);
+      }
+      break;
     case Key::Home: move_line_edge(false, e.shift); break;
     case Key::End: move_line_edge(true, e.shift); break;
     case Key::PageUp: page_move(-1, e.shift); break;
@@ -981,6 +1132,21 @@ bool ViewCore::mouse(const MouseEvent& e) {
       v_moving_ = false;
       sel_.anchor_line = sel_.caret_line = h.line;
       sel_.anchor_col = sel_.caret_col = h.col;
+      // Double click selects the word (and its punctuation run), triple click
+      // the whole line; a following drag keeps that granularity.
+      drag_unit_ = DragUnit::Char;
+      drag_anchor_line_ = h.line;
+      if (e.clicks >= 3) {
+        drag_unit_ = DragUnit::Line;
+        sel_.anchor_col = 0;
+        sel_.caret_col = line_len(h.line);
+      } else if (e.clicks == 2) {
+        drag_unit_ = DragUnit::Word;
+        int64_t begin = 0, end = 0;
+        word_bounds(h.line, h.col, &begin, &end);
+        sel_.anchor_col = begin;
+        sel_.caret_col = end;
+      }
       break;
     }
     case MouseEvent::Kind::Drag: {
@@ -1008,6 +1174,27 @@ bool ViewCore::mouse(const MouseEvent& e) {
         break;
       }
       const Hit h = hit_test(e.x, e.y);
+      if (drag_unit_ == DragUnit::Line) {
+        // Grow to the whole span between the anchor line and the pointer, in
+        // whichever direction the drag went.
+        const int64_t lo = std::min(drag_anchor_line_, h.line);
+        const int64_t hi = std::max(drag_anchor_line_, h.line);
+        sel_.anchor_line = lo;
+        sel_.anchor_col = 0;
+        sel_.caret_line = hi;
+        sel_.caret_col = line_len(hi);
+        break;
+      }
+      if (drag_unit_ == DragUnit::Word) {
+        int64_t begin = 0, end = 0;
+        word_bounds(h.line, h.col, &begin, &end);
+        const bool before = h.line < sel_.anchor_line ||
+                            (h.line == sel_.anchor_line &&
+                             h.col < sel_.anchor_col);
+        sel_.caret_line = h.line;
+        sel_.caret_col = before ? begin : end;
+        break;
+      }
       sel_.caret_line = h.line;
       sel_.caret_col = h.col;
       break;
@@ -1133,7 +1320,7 @@ bool ViewCore::insert_text(std::string_view text) {
   return true;
 }
 
-bool ViewCore::backspace() {
+bool ViewCore::backspace(bool by_word) {
   if (has_selection()) {
     int64_t sl = 0, sc = 0, el = 0, ec = 0;
     selection_range(&sl, &sc, &el, &ec);
@@ -1143,10 +1330,17 @@ bool ViewCore::backspace() {
   const int64_t col = sel_.caret_col;
   if (col == 0 && line == 0) return false;
   if (col > 0) {
-    const std::string t = line_text(line);
-    size_t p = static_cast<size_t>(col) - 1;
-    while (p > 0 && (static_cast<unsigned char>(t[p]) & 0xC0) == 0x80) --p;
-    return delete_range(line, static_cast<int64_t>(p), line, col);
+    if (by_word) {  // Option+Delete: back to the start of the previous word
+      move_word(-1, false);
+      const int64_t to_line = sel_.caret_line;
+      const int64_t to_col = sel_.caret_col;
+      set_caret_extend(line, col, false);
+      if (to_line == line) return delete_range(line, to_col, line, col);
+    } else {
+      const std::string t = line_text(line);
+      const size_t p = prev_cp(t, static_cast<size_t>(col));
+      return delete_range(line, static_cast<int64_t>(p), line, col);
+    }
   }
   const int64_t prev = line - 1;
   return delete_range(prev, line_len(prev), line, 0);
@@ -1173,7 +1367,7 @@ std::string ViewCore::selected_text() const {
   return buf.substr(start, end - start);
 }
 
-bool ViewCore::delete_forward() {
+bool ViewCore::delete_forward(bool by_word) {
   if (has_selection()) {
     int64_t sl = 0, sc = 0, el = 0, ec = 0;
     selection_range(&sl, &sc, &el, &ec);
@@ -1183,8 +1377,15 @@ bool ViewCore::delete_forward() {
   const int64_t col = sel_.caret_col;
   const std::string t = line_text(line);
   if (static_cast<size_t>(col) < t.size()) {
-    const int64_t nc =
-        col + static_cast<int64_t>(cp_len(t, static_cast<size_t>(col)));
+    if (by_word) {  // Option+Forward-Delete: through the next word
+      move_word(1, false);
+      const int64_t to_line = sel_.caret_line;
+      const int64_t to_col = sel_.caret_col;
+      set_caret_extend(line, col, false);
+      if (to_line == line) return delete_range(line, col, line, to_col);
+      return delete_range(line, col, to_line, to_col);
+    }
+    const int64_t nc = col + static_cast<int64_t>(cp_len(t, static_cast<size_t>(col)));
     return delete_range(line, col, line, nc);
   }
   if (line_exists(line + 1)) return delete_range(line, col, line + 1, 0);

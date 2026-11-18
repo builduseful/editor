@@ -118,14 +118,20 @@ def read_png(path):
     return w, h, bpp, out
 
 
-def drift(a, b):
-    """Pixels of `b` that differ from `a` by more than the tolerance."""
+def drift(a, b, rows):
+    """Pixels in image rows [rows, h) that differ by more than the tolerance.
+
+    The window's title bar is excluded: it is AppKit's own view, and its label
+    can shift by a subpixel between launches (the content below it is ours and is
+    deterministic).
+    """
     w1, h1, bp1, p1 = a
     w2, h2, bp2, p2 = b
     if (w1, h1, bp1) != (w2, h2, bp2):
         return None
+    start = w1 * bp1 * rows
     bad = 0
-    for i in range(0, len(p1), bp1):
+    for i in range(start, len(p1), bp1):
         for c in range(3):
             if abs(p1[i + c] - p2[i + c]) > TOLERANCE:
                 bad += 1
@@ -188,13 +194,16 @@ def main():
             print("gui_golden: %s: %s" % (name, e))
             failures += 1
             continue
-        bad = drift(want, got)
+        # The snapshot is the window's frame view: content height is the size
+        # that was asked for (retina 2x), everything above it is the title bar.
+        content_h = 2 * int(size.split("x")[1])
+        bad = drift(want, got, max(0, got[1] - content_h))
         if bad is None:
             print("gui_golden: %s: frame size changed (%dx%d -> %dx%d)"
                   % (name, want[0], want[1], got[0], got[1]))
             failures += 1
             continue
-        total = want[0] * want[1]
+        total = want[0] * content_h
         ratio = bad / float(total)
         worst = max(worst, (ratio, name))
         print("  %-8s %dx%d  drift %d px (%.4f%%)"

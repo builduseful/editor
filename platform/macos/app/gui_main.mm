@@ -767,6 +767,8 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   m.y = self.bounds.size.height - p.y;  // AppKit y-up -> viewcore y-down
   m.shift = (event.modifierFlags & NSEventModifierFlagShift) != 0;
   m.cmd = (event.modifierFlags & NSEventModifierFlagCommand) != 0;
+  // Double click selects a word, triple click a line (viewcore widens the drag).
+  m.clicks = static_cast<int>(event.clickCount);
   if (kind == vc::MouseEvent::Kind::Scroll) {
     // Trackpads report pixels; a wheel reports lines, so scale it to the page.
     const double scale =

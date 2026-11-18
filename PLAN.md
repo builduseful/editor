@@ -1161,6 +1161,14 @@ personal data, or proprietary files.
 - The view owns selection, caret, scroll; the core owns bytes and edits.
 - **No IME and no accessibility in v1** — keyboard + mouse only. Both are
   significant platform work and are not needed for a personal editor.
+- **Editing keys (v1, hardcoded).** Arrows, Home/End and Page Up/Down move the
+  caret; Shift extends the selection. Option+Left/Right move by word (to the end
+  of the run, as macOS does) and Option+Backspace/Forward-Delete delete by word.
+  Command+Left/Right go to the line edges, Command+Up/Down to the document
+  edges. Double click selects the word (dragging keeps word granularity), triple
+  click the line; Escape collapses the selection. Command+A select all,
+  Command+Z / Shift+Command+Z undo/redo, Command+X/C/V clipboard, Command+F
+  find/replace.
 - `viewcore` API (sketch): `set_document`, `resize`, `set_wrap`, `set_font`,
   `set_decorations`, `selection`/`set_selection`, `first_visible_line`,
   `scroll_to`, `draw`, `key`, `mouse`. `textbackend`: `measure`, `shape` into

@@ -823,6 +823,168 @@ TEST(viewcore_selected_text) {
   CHECK_EQ(d.view->selected_text(), std::string("world\nsecond"));
 }
 
+// --- Word motion, click granularity, command keys --------------------------
+
+TEST(viewcore_word_motion_stops_at_run_ends) {
+  Doc d("foo bar-baz\nsecond line\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 0);
+  vc::KeyEvent fwd;
+  fwd.key = vc::Key::Right;
+  fwd.alt = true;
+  CHECK(d.view->key(fwd));
+  CHECK_EQ(d.view->selection().caret_col, 3);  // end of "foo", as macOS does
+  d.view->key(fwd);
+  CHECK_EQ(d.view->selection().caret_col, 7);  // end of "bar"
+  d.view->key(fwd);
+  CHECK_EQ(d.view->selection().caret_col, 8);  // the "-" run
+  d.view->key(fwd);
+  CHECK_EQ(d.view->selection().caret_col, 11);  // end of "baz"
+  d.view->key(fwd);  // the line ends: step onto the next line
+  CHECK_EQ(d.view->selection().caret_line, 1);
+  CHECK_EQ(d.view->selection().caret_col, 0);
+
+  vc::KeyEvent back;
+  back.key = vc::Key::Left;
+  back.alt = true;
+  d.view->key(back);
+  CHECK_EQ(d.view->selection().caret_line, 0);
+  CHECK_EQ(d.view->selection().caret_col, 11);  // previous line end
+  d.view->key(back);
+  CHECK_EQ(d.view->selection().caret_col, 8);  // start of "baz"
+  d.view->key(back);
+  CHECK_EQ(d.view->selection().caret_col, 7);  // start of "-"
+  d.view->key(back);
+  CHECK_EQ(d.view->selection().caret_col, 4);  // start of "bar"
+  d.view->key(back);
+  CHECK_EQ(d.view->selection().caret_col, 0);  // start of "foo"
+}
+
+TEST(viewcore_word_motion_extends_a_selection) {
+  Doc d("alpha beta\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 0);
+  vc::KeyEvent fwd;
+  fwd.key = vc::Key::Right;
+  fwd.alt = true;
+  fwd.shift = true;
+  d.view->key(fwd);
+  CHECK_EQ(d.view->selected_text(), std::string("alpha"));
+  d.view->key(fwd);
+  CHECK_EQ(d.view->selected_text(), std::string("alpha beta"));
+}
+
+TEST(viewcore_word_motion_counts_non_ascii_as_letters) {
+  // "héllo wörld": é and ö are two bytes each, so the word ends at byte 6.
+  Doc d("h\xc3\xa9llo w\xc3\xb6rld\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 0);
+  vc::KeyEvent fwd;
+  fwd.key = vc::Key::Right;
+  fwd.alt = true;
+  d.view->key(fwd);
+  CHECK_EQ(d.view->selection().caret_col, 6);
+  d.view->key(fwd);
+  CHECK_EQ(d.view->selection().caret_col, 13);  // end of "wörld"
+  CHECK_EQ(d.view->selected_text(), std::string());
+}
+
+TEST(viewcore_word_delete) {
+  Doc d("foo bar baz\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 7);  // end of "bar"
+  vc::KeyEvent bs;
+  bs.key = vc::Key::Backspace;
+  bs.alt = true;
+  CHECK(d.view->key(bs));
+  CHECK_EQ(d.text(), std::string("foo  baz\n"));
+  CHECK_EQ(d.view->selection().caret_col, 4);
+
+  Doc e("foo bar baz\n");
+  e.view->resize(800, 1000);
+  e.view->set_caret(0, 0);
+  vc::KeyEvent del;
+  del.key = vc::Key::Delete;
+  del.alt = true;
+  CHECK(e.view->key(del));
+  CHECK_EQ(e.text(), std::string(" bar baz\n"));
+  CHECK_EQ(e.view->selection().caret_col, 0);
+}
+
+TEST(viewcore_double_click_selects_the_word_and_drag_keeps_it) {
+  Doc d("alpha beta gamma\n");
+  d.view->resize(800, 1000);
+  vc::MouseEvent down;
+  down.kind = vc::MouseEvent::Kind::Down;
+  down.clicks = 2;
+  down.x = 6 * 8 + 2;  // inside "beta"
+  down.y = 8;
+  d.view->mouse(down);
+  CHECK_EQ(d.view->selected_text(), std::string("beta"));
+
+  vc::MouseEvent drag = down;
+  drag.kind = vc::MouseEvent::Kind::Drag;
+  drag.x = 13 * 8 + 2;  // inside "gamma"
+  d.view->mouse(drag);
+  CHECK_EQ(d.view->selected_text(), std::string("beta gamma"));
+
+  drag.x = 2;  // back over the first word
+  d.view->mouse(drag);
+  CHECK_EQ(d.view->selected_text(), std::string("alpha "));
+}
+
+TEST(viewcore_triple_click_selects_the_line) {
+  Doc d("one\ntwo\nthree\n");
+  d.view->resize(800, 1000);
+  vc::MouseEvent down;
+  down.kind = vc::MouseEvent::Kind::Down;
+  down.clicks = 3;
+  down.x = 8;
+  down.y = 16 + 8;  // the second line
+  d.view->mouse(down);
+  CHECK_EQ(d.view->selected_text(), std::string("two"));
+
+  vc::MouseEvent drag = down;
+  drag.kind = vc::MouseEvent::Kind::Drag;
+  drag.y = 32 + 8;  // onto the third line
+  d.view->mouse(drag);
+  CHECK_EQ(d.view->selected_text(), std::string("two\nthree"));
+
+  drag.y = 8;  // and back up onto the first
+  d.view->mouse(drag);
+  CHECK_EQ(d.view->selected_text(), std::string("one\ntwo"));
+}
+
+TEST(viewcore_command_arrows_reach_the_line_and_document_edges) {
+  Doc d("first\nsecond\nthird\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(1, 3);
+  vc::KeyEvent right;
+  right.key = vc::Key::Right;
+  right.cmd = true;
+  d.view->key(right);
+  CHECK_EQ(d.view->selection().caret_line, 1);
+  CHECK_EQ(d.view->selection().caret_col, 6);  // end of "second"
+  vc::KeyEvent left;
+  left.key = vc::Key::Left;
+  left.cmd = true;
+  d.view->key(left);
+  CHECK_EQ(d.view->selection().caret_col, 0);
+
+  vc::KeyEvent down;
+  down.key = vc::Key::Down;
+  down.cmd = true;
+  d.view->key(down);
+  CHECK_EQ(d.view->selection().caret_line, 2);
+  CHECK_EQ(d.view->selection().caret_col, 5);  // end of the document
+  vc::KeyEvent up;
+  up.key = vc::Key::Up;
+  up.cmd = true;
+  d.view->key(up);
+  CHECK_EQ(d.view->selection().caret_line, 0);
+  CHECK_EQ(d.view->selection().caret_col, 0);
+}
+
 TEST(viewcore_theme_light_and_dark) {
   Doc d("hello\n");
   d.view->resize(800, 1000);

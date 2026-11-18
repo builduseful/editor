@@ -60,6 +60,9 @@ struct MouseEvent {
   double x = 0, y = 0;  // viewport coordinates, y down
   double dy = 0;        // scroll amount (Kind::Scroll), pixels, +down
   double dx = 0;        // horizontal scroll amount (Kind::Scroll), +right
+  // Click count of a Down (1 = caret, 2 = word, 3+ = line), as AppKit reports it
+  // in event.clickCount; the following Drag keeps that granularity.
+  int clicks = 1;
   bool shift = false, cmd = false;
 };
 
@@ -197,8 +200,10 @@ class ViewCore {
 
   // Editing (M2). Each returns true if the document changed.
   bool insert_text(std::string_view utf8);  // replaces the selection, or inserts
-  bool backspace();                         // delete selection / previous codepoint
-  bool delete_forward();                    // delete selection / next codepoint
+  // Delete the selection, else the previous / next codepoint; `by_word` widens
+  // the step to the neighbouring word (Alt+Backspace / Alt+Delete).
+  bool backspace(bool by_word = false);
+  bool delete_forward(bool by_word = false);
   // The selected text (empty when the selection is collapsed).
   std::string selected_text() const;
   // Call after the document changes outside viewcore (undo/redo/save/reload):
@@ -289,6 +294,13 @@ class ViewCore {
   void move_horizontal(int dir, bool extend);
   void move_vertical(int dir, bool extend);
   void move_line_edge(bool to_end, bool extend);
+  // Word-wise caret motion (Alt+arrow): to the start / end of the neighbouring
+  // word or punctuation run.
+  void move_word(int dir, bool extend);
+  // Command+Up / Command+Down: the start or end of the whole document.
+  void move_document_edge(bool to_end, bool extend);
+  // Extent of the space / word / punctuation run holding `col` in `line`.
+  void word_bounds(int64_t line, int64_t col, int64_t* begin, int64_t* end) const;
   void page_move(int dir, bool extend);
   void ensure_caret_visible();
   // Visual line within `line`'s entry holding byte `col`, and its x offset.
@@ -320,6 +332,10 @@ class ViewCore {
   double x_offset_ = 0;           // horizontal pan, wrap off only
   bool hsb_drag_ = false;
   double hsb_grab_ = 0;
+  // Click-drag granularity: a double click extends by words, a triple by lines.
+  enum class DragUnit : uint32_t { Char, Word, Line };
+  DragUnit drag_unit_ = DragUnit::Char;
+  int64_t drag_anchor_line_ = 0;  // the line a triple click started on
   mutable int64_t known_lines_ = 0;  // lines discovered so far (lazy)
   mutable bool eof_known_ = false;   // the whole document has been indexed
   std::vector<Decoration> decorations_;
