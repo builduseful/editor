@@ -79,6 +79,9 @@ class ViewCore {
   // Selection highlight and caret colours.
   void set_selection_color(Color c) { selection_color_ = c; }
   void set_caret_color(Color c) { caret_color_ = c; }
+  // Blink state (the platform drives the timer; viewcore just draws or not).
+  void set_caret_visible(bool v) { caret_visible_ = v; }
+  bool caret_visible() const { return caret_visible_; }
 
   double line_height() const;
   // Number of lines discovered so far. The view grows this lazily as it draws or
@@ -208,6 +211,7 @@ class ViewCore {
   Color text_color_{26, 26, 26, 255};         // ink
   Color selection_color_{180, 200, 240, 255};  // highlight
   Color caret_color_{26, 26, 26, 255};
+  bool caret_visible_ = true;
   Selection sel_;
 
   mutable std::map<int64_t, LineEntry> cache_;

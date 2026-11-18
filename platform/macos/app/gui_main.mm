@@ -76,6 +76,8 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
   Editor* _ed;
   std::unique_ptr<vc::TextBackend> _tb;
   std::unique_ptr<vc::ViewCore> _view;
+  NSTimer* _blink;
+  BOOL _blinkOn;
 }
 
 - (instancetype)initWithEditor:(Editor*)ed {
@@ -86,8 +88,31 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
     _view = std::make_unique<vc::ViewCore>(*ed, *_tb);
     _view->resize(self.bounds.size.width, self.bounds.size.height);
     _view->set_caret(0, 0);
+    [self startBlink];
   }
   return self;
+}
+
+- (void)dealloc {
+  [_blink invalidate];
+}
+
+- (void)startBlink {
+  _blinkOn = YES;
+  _view->set_caret_visible(YES);
+  [_blink invalidate];
+  _blink = [NSTimer scheduledTimerWithTimeInterval:0.5
+                                            target:self
+                                          selector:@selector(toggleCaret:)
+                                          userInfo:nil
+                                           repeats:YES];
+}
+
+- (void)toggleCaret:(NSTimer*)timer {
+  (void)timer;
+  _blinkOn = !_blinkOn;
+  _view->set_caret_visible(_blinkOn);
+  [self setNeedsDisplay:YES];
 }
 
 - (BOOL)isFlipped {
@@ -120,6 +145,7 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 }
 
 - (void)keyDown:(NSEvent*)event {
+  [self startBlink];  // solid caret while typing
   const NSEventModifierFlags m = event.modifierFlags;
   if (m & NSEventModifierFlagCommand) {
     NSString* s = event.charactersIgnoringModifiers;
@@ -150,6 +176,7 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 }
 
 - (void)handleMouse:(NSEvent*)event kind:(vc::MouseEvent::Kind)kind {
+  if (kind != vc::MouseEvent::Kind::Scroll) [self startBlink];
   const NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
   vc::MouseEvent m;
   m.kind = kind;

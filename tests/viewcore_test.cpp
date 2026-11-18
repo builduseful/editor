@@ -392,6 +392,20 @@ TEST(viewcore_draw_renders_caret) {
   CHECK(caret);
 }
 
+TEST(viewcore_caret_blink_toggle) {
+  Doc d("hello\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 3);
+  d.view->set_caret_visible(false);
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);
+  bool caret = false;
+  for (const vc::DrawCmd& cmd : rc.cmds) {
+    if (cmd.kind == vc::DrawCmd::Kind::FillRect && cmd.rect.w == 1.5) caret = true;
+  }
+  CHECK(!caret);
+}
+
 TEST(viewcore_edit_insert_text) {
   Doc d("abc\n");
   d.view->resize(800, 1000);

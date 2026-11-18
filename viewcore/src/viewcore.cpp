@@ -402,7 +402,7 @@ void ViewCore::draw(Canvas& c) const {
     }
   }
 
-  if (caret_x >= 0 && caret_y >= 0 && caret_y < height_) {
+  if (caret_visible_ && caret_x >= 0 && caret_y >= 0 && caret_y < height_) {
     c.fill_rect(Rect{caret_x, caret_y, 1.5, lh}, caret_color_);
   }
 }
