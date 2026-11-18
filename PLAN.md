@@ -1240,6 +1240,15 @@ width + wrap settings, status bar, gutter, decorations, and the CLI (`read`,
 | **M3.5** | Release engineering: notarization, packaging, CI perf gates. | 2–3 wk | Signed `.app`; CI green. |
 | **Post-1.0** | Windows port, Linux port, workspace/tree, project search, syntax, Markdown, git, scripts, `serve`, `move`, diff/restore/patch-apply/gui/tree/search, native-control experiment. | — | — |
 
+**Status (2026-11-18).** M0–M3 code is implemented and committed: `core` + CLI
+(M0), `viewcore` + render oracle + the lazy line index (M0.5/M1), the AppKit view
+with CoreText/CoreGraphics backends, editing, find/replace, and settings (M1/M2),
+and the gutter / status bar / cut-copy-paste polish (M3). `make test` (plain +
+ASan/UBSan), `make golden`, `make fuzz`, `make bench`, and `make demo` pass; the
+M1 first-paint gates (1 GB < 100 ms, 5 GB < 250 ms) pass via `make demo`. **M3.5
+(notarization, packaging, CI perf gates) is not started** — it needs a signing
+identity and CI, which are out of scope for the local build.
+
 **Total:** the table sums to **24–33 weeks of work**. With ~30% overhead that is
 **31–43 weeks full-time (~7–10 months)**; solo at ~75% time, plan on **10–13
 months**; half-time is **14–20 months**.
