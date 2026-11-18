@@ -25,6 +25,32 @@ size_t cp_len(std::string_view s, size_t i) {
   return n;
 }
 
+char lower_ascii(char c) {
+  return (c >= 'A' && c <= 'Z') ? static_cast<char>(c + 32) : c;
+}
+
+bool match_at(std::string_view h, size_t at, std::string_view n, bool cs) {
+  if (at + n.size() > h.size()) return false;
+  for (size_t i = 0; i < n.size(); ++i) {
+    char a = h[at + i];
+    char b = n[i];
+    if (!cs) {
+      a = lower_ascii(a);
+      b = lower_ascii(b);
+    }
+    if (a != b) return false;
+  }
+  return true;
+}
+
+size_t find_in(std::string_view h, std::string_view n, size_t from, bool cs) {
+  if (n.empty() || n.size() > h.size()) return std::string_view::npos;
+  for (size_t i = from; i + n.size() <= h.size(); ++i) {
+    if (match_at(h, i, n, cs)) return i;
+  }
+  return std::string_view::npos;
+}
+
 }  // namespace
 
 ViewCore::ViewCore(Editor& ed, TextBackend& tb) : ed_(&ed), tb_(&tb) {}
@@ -702,6 +728,128 @@ bool ViewCore::delete_forward() {
   }
   if (line_exists(line + 1)) return delete_range(line, col, line + 1, 0);
   return false;
+}
+
+bool ViewCore::find(std::string_view needle, bool forward, bool case_sensitive) {
+  if (needle.empty()) return false;
+  refresh_line_count();
+  const int64_t lc = known_lines_;
+  if (lc == 0) return false;
+  const int64_t cline = std::clamp<int64_t>(sel_.caret_line, 0, lc);
+  const int64_t ccol = sel_.caret_col;
+
+  auto select = [&](int64_t line, size_t pos) {
+    sel_.anchor_line = line;
+    sel_.anchor_col = static_cast<int64_t>(pos);
+    sel_.caret_line = line;
+    sel_.caret_col = static_cast<int64_t>(pos + needle.size());
+    v_moving_ = false;
+    ensure_caret_visible();
+  };
+
+  if (forward) {
+    for (int64_t line = cline; line < lc; ++line) {
+      const std::string t = line_text(line);
+      const size_t from =
+          (line == cline && ccol > 0) ? static_cast<size_t>(ccol) : 0;
+      const size_t p = find_in(t, needle, from, case_sensitive);
+      if (p != std::string_view::npos) {
+        select(line, p);
+        return true;
+      }
+    }
+    for (int64_t line = 0; line <= cline && line < lc; ++line) {
+      const std::string t = line_text(line);
+      const size_t p = find_in(t, needle, 0, case_sensitive);
+      if (p != std::string_view::npos) {
+        select(line, p);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  auto last_in = [&](const std::string& t, size_t limit, size_t* out) {
+    size_t best = std::string_view::npos;
+    size_t i = find_in(t, needle, 0, case_sensitive);
+    while (i != std::string_view::npos && i + needle.size() <= limit) {
+      best = i;
+      i = find_in(t, needle, i + 1, case_sensitive);
+    }
+    if (best == std::string_view::npos) return false;
+    *out = best;
+    return true;
+  };
+  for (int64_t line = cline; line >= 0; --line) {
+    const std::string t = line_text(line);
+    const size_t limit =
+        (line == cline) ? static_cast<size_t>(ccol) : t.size();
+    size_t p = 0;
+    if (last_in(t, limit, &p)) {
+      select(line, p);
+      return true;
+    }
+  }
+  for (int64_t line = lc - 1; line > cline; --line) {
+    const std::string t = line_text(line);
+    size_t p = 0;
+    if (last_in(t, t.size(), &p)) {
+      select(line, p);
+      return true;
+    }
+  }
+  return false;
+}
+
+bool ViewCore::replace_current(std::string_view needle,
+                               std::string_view replacement,
+                               bool case_sensitive) {
+  if (needle.empty()) return false;
+  bool replaced = false;
+  if (has_selection()) {
+    int64_t sl = 0, sc = 0, el = 0, ec = 0;
+    selection_range(&sl, &sc, &el, &ec);
+    if (sl == el) {
+      const std::string t = line_text(sl);
+      const std::string_view sel =
+          std::string_view(t).substr(static_cast<size_t>(sc),
+                                     static_cast<size_t>(ec - sc));
+      if (sel.size() == needle.size() &&
+          match_at(sel, 0, needle, case_sensitive)) {
+        insert_text(replacement);
+        replaced = true;
+      }
+    }
+  }
+  find(needle, true, case_sensitive);
+  return replaced;
+}
+
+int64_t ViewCore::replace_all(std::string_view needle,
+                              std::string_view replacement,
+                              bool case_sensitive) {
+  if (needle.empty()) return 0;
+  refresh_line_count();
+  const int64_t lc = known_lines_;
+  std::vector<Edit> edits;
+  for (int64_t line = 0; line < lc; ++line) {
+    const std::string t = line_text(line);
+    size_t i = find_in(t, needle, 0, case_sensitive);
+    while (i != std::string_view::npos) {
+      Edit e;
+      e.line = line;
+      e.col = static_cast<int64_t>(i);
+      e.removed_len = static_cast<int64_t>(needle.size());
+      e.text = replacement;
+      edits.push_back(e);
+      i = find_in(t, needle, i + needle.size(), case_sensitive);
+    }
+  }
+  if (edits.empty()) return 0;
+  const Status s = ed_->apply(std::span<const Edit>(edits.data(), edits.size()));
+  if (s != Status::Ok) return 0;
+  document_changed();
+  return static_cast<int64_t>(edits.size());
 }
 
 }  // namespace vc

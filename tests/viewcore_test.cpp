@@ -468,3 +468,52 @@ TEST(viewcore_edit_undo_via_document_changed) {
   CHECK_EQ(d.view->line_count(), 1);
 }
 
+TEST(viewcore_find_literal_wraps) {
+  Doc d("alpha beta\ngamma beta\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 0);
+  CHECK(d.view->find("beta", true, true));
+  CHECK_EQ(d.view->selection().anchor_line, 0);
+  CHECK_EQ(d.view->selection().anchor_col, 6);
+  CHECK_EQ(d.view->selection().caret_col, 10);
+  CHECK(d.view->find("beta", true, true));
+  CHECK_EQ(d.view->selection().anchor_line, 1);
+  CHECK_EQ(d.view->selection().anchor_col, 6);
+  CHECK(d.view->find("beta", true, true));  // wraps to the top
+  CHECK_EQ(d.view->selection().anchor_line, 0);
+}
+
+TEST(viewcore_find_case_insensitive) {
+  Doc d("Hello\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 0);
+  CHECK(d.view->find("hello", true, false));
+  CHECK_EQ(d.view->selection().anchor_col, 0);
+  CHECK(!d.view->find("hello", true, true));  // case-sensitive: no match
+}
+
+TEST(viewcore_find_backward) {
+  Doc d("a b a b a\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 9);  // end of the line
+  CHECK(d.view->find("a", false, true));
+  CHECK_EQ(d.view->selection().anchor_col, 8);
+}
+
+TEST(viewcore_replace_current) {
+  Doc d("foo bar foo\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 0);
+  CHECK(d.view->find("foo", true, true));
+  CHECK(d.view->replace_current("foo", "baz", true));
+  CHECK_EQ(d.text(), std::string("baz bar foo\n"));
+  CHECK_EQ(d.view->selection().anchor_col, 8);  // the next match
+}
+
+TEST(viewcore_replace_all) {
+  Doc d("a a a\na a\n");
+  d.view->resize(800, 1000);
+  CHECK_EQ(d.view->replace_all("a", "bb", true), 5);
+  CHECK_EQ(d.text(), std::string("bb bb bb\nbb bb\n"));
+}
+

@@ -128,6 +128,16 @@ class ViewCore {
   // drops the line cache and refreshes the line count.
   void document_changed();
 
+  // Literal find/replace (§9: no regex; scans logical lines via read_lines).
+  // `find` moves the selection to the next match (wrapping) and returns true.
+  bool find(std::string_view needle, bool forward, bool case_sensitive);
+  // Replaces the current selection if it matches, then finds the next match.
+  bool replace_current(std::string_view needle, std::string_view replacement,
+                       bool case_sensitive);
+  // Replaces every match; returns the number replaced.
+  int64_t replace_all(std::string_view needle, std::string_view replacement,
+                      bool case_sensitive);
+
   // Cache statistics (for tests and the footprint gate).
   size_t cache_entries() const { return cache_.size(); }
   size_t cache_bytes() const { return cache_bytes_; }
