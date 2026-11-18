@@ -120,12 +120,44 @@ TEST(viewcore_hit_test_and_caret_round_trip) {
 
 TEST(viewcore_scroll_clamps) {
   Doc d("a\nb\nc\nd\ne\n");
-  d.view->scroll_to_line(3);
-  CHECK_EQ(d.view->first_visible_line(), 3);
-  d.view->scroll_lines(100);
-  CHECK_EQ(d.view->first_visible_line(), 5);  // clamped to line_count
+  d.view->resize(80, 48);  // 3 lines tall
+  d.view->scroll_to_line(1);
+  CHECK_EQ(d.view->first_visible_line(), 1);
+  d.view->scroll_lines(100);  // clamps to the last page (lines 2,3,4)
+  CHECK_EQ(d.view->first_visible_line(), 2);
   d.view->scroll_lines(-100);
   CHECK_EQ(d.view->first_visible_line(), 0);
+}
+
+TEST(viewcore_scroll_never_leaves_blank_space) {
+  // A viewport taller than the document never scrolls: no blank page below the
+  // last line (this used to happen with PageDown / wheel-past-the-end).
+  Doc d("a\nb\nc\n");
+  d.view->scroll_lines(100);
+  CHECK_EQ(d.view->first_visible_line(), 0);
+  vc::KeyEvent page_down;
+  page_down.key = vc::Key::PageDown;
+  d.view->key(page_down);
+  CHECK_EQ(d.view->first_visible_line(), 0);
+}
+
+TEST(viewcore_scroll_clamps_after_the_document_shrinks) {
+  // Scrolled to the end of 60 lines, then the document shrinks to 5.
+  std::string content;
+  for (int i = 0; i < 60; ++i) content += "line\n";
+  Doc d(content);
+  d.view->resize(80, 160);  // 10 lines tall
+  d.view->discover_all();
+  d.view->scroll_to_line(50);
+  CHECK_EQ(d.view->first_visible_line(), 50);
+
+  // Delete everything but the first 5 lines through the core, then notify.
+  std::vector<Edit> edits;
+  edits.push_back(Edit{5, 0, 275, std::string_view()});  // 55 lines of "line\n"
+  CHECK(d.ed->apply(edits) == Status::Ok);
+  d.view->document_changed();
+  CHECK_EQ(d.view->line_count(), 5);
+  CHECK_EQ(d.view->first_visible_line(), 0);  // the whole document now fits
 }
 
 TEST(viewcore_line_cache_stays_bounded) {
@@ -133,6 +165,7 @@ TEST(viewcore_line_cache_stays_bounded) {
   for (int i = 0; i < 3000; ++i) content += "line " + std::to_string(i) + "\n";
   Doc d(content);
   d.view->set_wrap(true);
+  d.view->resize(80, 160);  // keep the viewport small so scrolling is real
   for (int i = 0; i < 3000; ++i) {
     d.view->scroll_to_line(i);
     vc::RecordingCanvas rc;
@@ -196,6 +229,28 @@ TEST(viewcore_first_paint_is_lazy) {
   CHECK_EQ(d.view->line_count(), 100000);
 }
 
+// The window can draw before any document exists: a Finder / "Open With" launch
+// shows the window first and delivers the file as an Apple event afterwards.
+// That frame must be blank, not a crash (it used to dereference the unset
+// document source).
+TEST(viewcore_draws_blank_without_a_document) {
+  ed_test::FakeFileSystem fs;
+  std::unique_ptr<Editor> ed;
+  create_editor(fs, &ed);
+  vc::HeadlessTextBackend tb;
+  vc::ViewCore view(*ed, tb);
+  view.resize(80, 100);
+  vc::RecordingCanvas rc;
+  view.draw(rc);
+  CHECK_EQ(view.line_count(), 0);
+  for (const vc::DrawCmd& d : rc.cmds) {
+    CHECK(d.kind != vc::DrawCmd::Kind::DrawRun);  // no text to draw
+  }
+  vc::KeyEvent k;
+  k.key = vc::Key::Down;
+  (void)view.key(k);  // input is ignored, not a crash
+}
+
 TEST(viewcore_draw_discovers_eof_on_short_document) {
   Doc d("only\n");
   d.view->resize(80, 1000);
@@ -210,7 +265,7 @@ TEST(viewcore_scroll_discovers_eof_and_clamps) {
   d.view->scroll_to_line(1000);
   CHECK(d.view->line_count_known());
   CHECK_EQ(d.view->line_count(), 3);
-  CHECK_EQ(d.view->first_visible_line(), 3);  // clamped past the last line
+  CHECK_EQ(d.view->first_visible_line(), 0);  // the whole document fits
 }
 
 TEST(viewcore_hit_test_is_lazy) {
@@ -222,6 +277,150 @@ TEST(viewcore_hit_test_is_lazy) {
   CHECK_EQ(h.line, 0);
   CHECK(!d.view->line_count_known());
   CHECK(d.view->line_count() <= 64);
+}
+
+TEST(viewcore_discover_step_is_incremental) {
+  std::string content;
+  for (int i = 0; i < 100000; ++i) content += "line " + std::to_string(i) + "\n";
+  Doc d(content);
+  d.view->resize(80, 160);
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);  // lazy first paint
+  CHECK(!d.view->line_count_known());
+  const int64_t before = d.view->line_count();
+
+  CHECK(d.view->discover_step(100));  // more to come
+  CHECK(!d.view->line_count_known());
+  CHECK(d.view->line_count() > before);
+
+  int steps = 0;
+  while (d.view->discover_step(10000)) {
+    CHECK(++steps < 100);  // it must make progress, not loop
+  }
+  CHECK(d.view->line_count_known());
+  CHECK_EQ(d.view->line_count(), 100000);
+  // Once complete, stepping is a cheap no-op.
+  CHECK(!d.view->discover_step(1000));
+}
+
+// --- The overlay scrollbar ------------------------------------------------
+
+namespace {
+std::string n_lines(int n, const std::string& body = "line\n") {
+  std::string s;
+  for (int i = 0; i < n; ++i) s += body;
+  return s;
+}
+}  // namespace
+
+TEST(viewcore_scrollbar_appears_once_the_count_is_known) {
+  Doc d(n_lines(200));
+  d.view->resize(80, 160);  // 10 lines tall
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);  // lazy first paint: the total is unknown
+  CHECK(!d.view->line_count_known());
+  CHECK(!d.view->scrollbar().visible);
+
+  d.view->discover_all();
+  const vc::ViewCore::ScrollBar sb = d.view->scrollbar();
+  CHECK(sb.visible);
+  CHECK_EQ(sb.track_x, 80.0 - vc::ViewCore::kScrollbarWidth);
+  CHECK_EQ(sb.track_w, vc::ViewCore::kScrollbarWidth);
+  CHECK_EQ(sb.thumb_y, 0.0);   // at the top
+  CHECK_EQ(sb.thumb_h, 28.0);  // the minimum: 200 lines far exceed the viewport
+}
+
+TEST(viewcore_scrollbar_hidden_when_the_document_fits) {
+  Doc d(n_lines(5));
+  d.view->resize(80, 160);
+  d.view->discover_all();
+  CHECK(!d.view->scrollbar().visible);
+}
+
+TEST(viewcore_scrollbar_thumb_tracks_the_position) {
+  Doc d(n_lines(200));
+  d.view->resize(80, 160);
+  d.view->discover_all();
+  const double top = d.view->scrollbar().thumb_y;
+  d.view->scroll_to_line(100);
+  const double mid = d.view->scrollbar().thumb_y;
+  d.view->scroll_to_line(200);
+  const double bot = d.view->scrollbar().thumb_y;
+  CHECK_EQ(top, 0.0);
+  CHECK(mid > top);
+  CHECK(bot > mid);
+  CHECK_EQ(bot, 160.0 - 28.0);  // bottom-aligned at the last scroll position
+}
+
+TEST(viewcore_scrollbar_drag_scrolls_the_document) {
+  Doc d(n_lines(200));
+  d.view->resize(80, 160);
+  d.view->discover_all();
+  d.view->set_caret(3, 2);  // a drag must not move the caret
+
+  vc::MouseEvent down;
+  down.kind = vc::MouseEvent::Kind::Down;
+  down.x = 80 - 4;
+  down.y = 5;  // inside the thumb
+  d.view->mouse(down);
+
+  vc::MouseEvent drag;
+  drag.kind = vc::MouseEvent::Kind::Drag;
+  drag.x = down.x;
+  drag.y = 155;  // the bottom of the track
+  CHECK(d.view->mouse(drag));
+  CHECK_EQ(d.view->first_visible_line(), 190);  // the last page (200 - 10 visible)
+  CHECK_EQ(d.view->selection().caret_line, 3);
+
+  // Dragging back up returns to the top.
+  drag.y = 0;
+  d.view->mouse(drag);
+  CHECK_EQ(d.view->first_visible_line(), 0);
+
+  vc::MouseEvent up;
+  up.kind = vc::MouseEvent::Kind::Up;
+  up.x = down.x;
+  up.y = 0;
+  d.view->mouse(up);
+  drag.y = 155;  // after mouse-up a drag is no longer a scrollbar drag
+  d.view->mouse(drag);
+  CHECK_EQ(d.view->first_visible_line(), 0);
+}
+
+TEST(viewcore_scrollbar_track_click_pages) {
+  Doc d(n_lines(200));
+  d.view->resize(80, 160);
+  d.view->discover_all();
+
+  vc::MouseEvent click;
+  click.kind = vc::MouseEvent::Kind::Down;
+  click.x = 80 - 4;
+  click.y = 150;  // below the thumb
+  CHECK(d.view->mouse(click));
+  CHECK_EQ(d.view->first_visible_line(), 9);  // one viewport (10) minus the overlap
+
+  // Command-click jumps toward the pointer instead.
+  click.cmd = true;
+  click.y = 80;
+  d.view->mouse(click);
+  const int64_t jumped = d.view->first_visible_line();
+  CHECK(jumped > 9);
+  CHECK(jumped < 200);
+}
+
+TEST(viewcore_scrollbar_accounts_for_wrap) {
+  std::string content;
+  for (int i = 0; i < 20; ++i) {
+    content += "the quick brown fox jumps over the lazy dog again and again\n";
+  }
+  Doc d(content);
+  d.view->resize(80, 160);  // 10 monospace columns: each line wraps ~3 times
+  d.view->discover_all();
+  const double plain = d.view->scrollbar().thumb_h;
+  d.view->set_wrap(true);
+  const double wrapped = d.view->scrollbar().thumb_h;
+  // Fewer logical lines fit when wrapped, so the thumb is proportionally shorter.
+  CHECK(wrapped < plain);
 }
 
 TEST(viewcore_input_horizontal) {

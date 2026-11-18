@@ -35,25 +35,33 @@ class CgCanvas final : public vc::Canvas {
         nullptr, reinterpret_cast<const UInt8*>(run.text.data()),
         static_cast<CFIndex>(run.text.size()), kCFStringEncodingUTF8, false);
     if (s == nullptr) return;
-    const void* keys[] = {kCTFontAttributeName};
-    const void* vals[] = {font};
+    // CoreText draws with the foreground-colour attribute; without it the text
+    // is black, which is invisible on a dark background. Set it explicitly from
+    // the canvas ink.
+    CGColorRef color = CGColorCreateGenericRGB(ink_.r / 255.0, ink_.g / 255.0,
+                                               ink_.b / 255.0, ink_.a / 255.0);
+    const void* keys[] = {kCTFontAttributeName, kCTForegroundColorAttributeName};
+    const void* vals[] = {font, color};
     CFDictionaryRef attrs =
-        CFDictionaryCreate(nullptr, keys, vals, 1, &kCFTypeDictionaryKeyCallBacks,
+        CFDictionaryCreate(nullptr, keys, vals, 2, &kCFTypeDictionaryKeyCallBacks,
                            &kCFTypeDictionaryValueCallBacks);
     if (attrs == nullptr) {
+      CGColorRelease(color);
       CFRelease(s);
       return;
     }
     CFAttributedStringRef a = CFAttributedStringCreate(nullptr, s, attrs);
     CTLineRef line = a != nullptr ? CTLineCreateWithAttributedString(a) : nullptr;
     if (line != nullptr) {
-      set_fill(ink_);  // CoreText draws with the context's fill colour
+      // Grayscale antialiasing: subpixel smoothing assumes a light background.
+      CGContextSetShouldSmoothFonts(ctx_, false);
       CGContextSetTextPosition(ctx_, x, height_ - y);  // y is the baseline
       CTLineDraw(line, ctx_);
       CFRelease(line);
     }
     if (a != nullptr) CFRelease(a);
     CFRelease(attrs);
+    CGColorRelease(color);
     CFRelease(s);
   }
 

@@ -47,7 +47,7 @@ TEST_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(TEST_SRC))
 FRAMEWORKS := -framework Foundation -framework CoreText -framework CoreGraphics
 APP_FRAMEWORKS := $(FRAMEWORKS) -framework AppKit
 
-.PHONY: all test golden fuzz bench demo app clean
+.PHONY: all test golden fuzz bench demo app bundle render gui-smoke clean
 
 all: $(BUILD)/editor_tests
 ifneq ($(CORE_SRC),)
@@ -136,6 +136,10 @@ $(BUILD)/render_doc: $(TOOL_OBJ) $(PLATFORM_OBJ) $(PLATFORM_GUI_OBJ) $(BUILD)/li
 	$(CXX) $(CXXFLAGS) -o $@ $(TOOL_OBJ) $(PLATFORM_OBJ) $(PLATFORM_GUI_OBJ) $(BUILD)/libviewcore.a $(BUILD)/libcore.a $(APP_FRAMEWORKS) -framework ImageIO
 
 render: $(BUILD)/render_doc
+
+# GUI smoke test: headless snapshots (both themes) + a normal launch.
+gui-smoke: $(APP_EXEC)
+	python3 tests/gui_smoke.py $(APP_BUNDLE)/Contents/MacOS/editor
 
 clean:
 	rm -rf build build-asan

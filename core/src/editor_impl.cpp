@@ -389,6 +389,9 @@ Status EditorImpl::read_lines(int64_t first, int64_t last, char* buf, size_t cap
                               size_t* used, int64_t* out_n) const {
   *used = 0;
   *out_n = 0;
+  // A freshly created editor has no document yet; drawing code may ask before an
+  // open succeeds, so report that instead of touching the unset sources.
+  if (!opened_) return fail(Status::Io, "no document");
   if (first < 0 || last < 0) return fail(Status::Range, "negative line");
   if (first >= last || last == 0) return Status::Ok;
   // First-paint path: index only as far as this request needs. A partial index
@@ -450,6 +453,7 @@ Status EditorImpl::read_range(int64_t off, size_t len, char* buf, size_t cap,
 
 Status EditorImpl::apply(std::span<const Edit> edits) {
   if (needs_reload_) return fail(Status::Stale, "needs reload");
+  if (!opened_) return fail(Status::Io, "no document");
   if (edits.empty()) return Status::Ok;
   Status s = ensure_index();
   if (s != Status::Ok) return fail(s, "index");

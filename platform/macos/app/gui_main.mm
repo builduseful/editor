@@ -7,8 +7,10 @@
 #import <AppKit/AppKit.h>
 
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <string>
+#include <unistd.h>
 
 #include "canvas_cg.hpp"
 #include "editor.hpp"
@@ -93,17 +95,29 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 // A thin bottom status bar (chrome; system UI font, §8).
 @interface StatusBar : NSView
 - (void)setText:(NSString*)text;
-- (void)setPageColor:(vc::Color)c;
+- (void)applyTheme:(vc::Theme)t;
 @end
 
 @interface EditorView : NSView
 @property(nonatomic, assign) FindBar* findBar;
 @property(nonatomic, assign) StatusBar* statusBar;
+// The document's path (nil while untitled). Kept here because the core's
+// `info()` is too expensive to call on every frame just to read the path.
+@property(nonatomic, copy) NSString* documentPath;
+// A temporary file backing an untitled window (nil once it has a real path).
+// Removed when the buffer is replaced or saved somewhere real.
+@property(nonatomic, copy) NSString* untitledTempPath;
 - (instancetype)initWithEditor:(Editor*)ed;
 - (void)reloadDocument;
-- (void)discoverIfSmall;
+- (void)beginDiscovery;
 - (void)refreshTheme;
 - (BOOL)writeSnapshotTo:(NSString*)path;
+- (BOOL)openPath:(NSString*)path;
+- (void)updateTitle;
+- (void)scrollToLine:(int64_t)line;
+- (void)discardUntitledTemp;
+// YES if the document may be discarded (clean, or the user saved / chose not to).
+- (BOOL)confirmDiscardChanges;
 - (void)findText:(NSString*)needle backward:(BOOL)backward;
 - (void)replaceText:(NSString*)needle with:(NSString*)replacement;
 - (void)replaceAllText:(NSString*)needle with:(NSString*)replacement;
@@ -116,8 +130,9 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   self = [super initWithFrame:frame];
   if (self != nil) {
     _label = [NSTextField labelWithString:@""];
+    // Chrome meta type: the system UI face at the small end of the ramp.
+    _label.font = [NSFont systemFontOfSize:11];
     _label.translatesAutoresizingMaskIntoConstraints = NO;
-    _label.textColor = [NSColor secondaryLabelColor];
     [self addSubview:_label];
     [NSLayoutConstraint activateConstraints:@[
       [_label.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:8],
@@ -130,9 +145,10 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)setText:(NSString*)text {
   _label.stringValue = text != nil ? text : @"";
 }
-- (void)setPageColor:(vc::Color)c {
+- (void)applyTheme:(vc::Theme)t {
   self.wantsLayer = YES;
-  self.layer.backgroundColor = ns_color(c).CGColor;
+  self.layer.backgroundColor = ns_color(t.page).CGColor;
+  _label.textColor = ns_color(t.gutter_text);  // color.text-muted
 }
 @end
 
@@ -212,6 +228,8 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   std::unique_ptr<vc::ViewCore> _view;
   NSTimer* _blink;
   BOOL _blinkOn;
+  BOOL _maybeDirty;      // conservative: set on edits, cleared on save/open
+  BOOL _discovering;     // an incremental index pass is in flight
   double _fontSize;
 }
 
@@ -287,7 +305,7 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   const vc::Theme t = [self isDark] ? vc::dark_theme() : vc::light_theme();
   _view->set_theme(t);
   [self.findBar setPageColor:t.page];
-  [self.statusBar setPageColor:t.page];
+  [self.statusBar applyTheme:t];
   [self setNeedsDisplay:YES];
 }
 - (void)refreshTheme {
@@ -327,14 +345,14 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   (void)sender;
   if (_ed->undo() == Status::Ok) {
     _view->document_changed();
-    [self setNeedsDisplay:YES];
+    [self markEdited];
   }
 }
 - (void)redo:(id)sender {
   (void)sender;
   if (_ed->redo() == Status::Ok) {
     _view->document_changed();
-    [self setNeedsDisplay:YES];
+    [self markEdited];
   }
 }
 - (void)selectAll:(id)sender {
@@ -343,9 +361,159 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   e.key = vc::Key::SelectAll;
   if (_view->key(e)) [self setNeedsDisplay:YES];
 }
+
+// --- Files ----------------------------------------------------------------
+
+- (void)openDocument:(id)sender {
+  (void)sender;
+  if (![self confirmDiscardChanges]) return;
+  NSOpenPanel* p = [NSOpenPanel openPanel];
+  p.canChooseFiles = YES;
+  p.canChooseDirectories = NO;
+  p.allowsMultipleSelection = NO;
+  p.resolvesAliases = YES;
+  if ([p runModal] != NSModalResponseOK || p.URL == nil) return;
+  [self openPath:p.URL.path];
+}
+
+// Opens `path` without prompting (the callers confirm first). Returns NO and
+// shows an alert if the core refuses it.
+- (BOOL)openPath:(NSString*)path {
+  if (path == nil) return NO;
+  if (_ed->open(path.UTF8String) != Status::Ok) {
+    [self showError:@"Could not open the file."];
+    return NO;
+  }
+  [self discardUntitledTemp];  // the core moved off the untitled buffer
+  self.documentPath = path;
+  _maybeDirty = NO;
+  [self reloadDocument];
+  // First paint stays lazy; fill in the exact count (and the scrollbar) once the
+  // window has drawn.
+  [self performSelector:@selector(beginDiscovery)
+             withObject:nil
+             afterDelay:0.1];
+  [self updateTitle];
+  return YES;
+}
+
+// An untitled window is backed by a temp file so it is a real, editable document.
+// Remove it once the document has a path of its own (open / Save As) or on quit.
+- (void)discardUntitledTemp {
+  if (self.untitledTempPath == nil) return;
+  std::remove(self.untitledTempPath.UTF8String);
+  self.untitledTempPath = nil;
+}
+
 - (void)saveDocument:(id)sender {
   (void)sender;
-  if (_ed->save(nullptr, false, nullptr) == Status::Ok) [self setNeedsDisplay:YES];
+  (void)[self saveNow];
+  [self setNeedsDisplay:YES];
+}
+
+- (void)saveAsDocument:(id)sender {
+  (void)sender;
+  if ([self saveAsNow]) [self setNeedsDisplay:YES];
+}
+
+// Save in place; an untitled document asks for a destination instead.
+- (BOOL)saveNow {
+  if (self.documentPath == nil) return [self saveAsNow];
+  if (_ed->save(nullptr, false, nullptr) != Status::Ok) {
+    [self showError:@"Could not save the file."];
+    return NO;
+  }
+  _maybeDirty = NO;
+  [self updateTitle];
+  return YES;
+}
+
+// Save under a (possibly new) name. The core needs the destination's current
+// identity to replace an existing file; NSSavePanel has already confirmed the
+// overwrite, so read that identity and pass it as `expected_rev` (otherwise the
+// core refuses to clobber an existing path with E_CONFLICT).
+- (BOOL)saveAsNow {
+  NSSavePanel* p = [NSSavePanel savePanel];
+  p.canCreateDirectories = YES;
+  p.nameFieldStringValue = self.documentPath.lastPathComponent != nil
+                               ? self.documentPath.lastPathComponent
+                               : @"Untitled.txt";
+  if ([p runModal] != NSModalResponseOK || p.URL == nil) return NO;
+
+  std::unique_ptr<FileSystem> fs;
+  create_file_system(&fs);
+  Rev rev{};
+  const Rev* expected = nullptr;
+  Stat st;
+  if (fs != nullptr && fs->lstat(p.URL.path.UTF8String, &st) == Status::Ok) {
+    rev = Rev{st.dev, st.ino, st.size, st.mtime_ns, st.ctime_ns};
+    expected = &rev;
+  }
+  if (_ed->save_as(p.URL.path.UTF8String, expected, false, nullptr) !=
+      Status::Ok) {
+    [self showError:@"Could not save the file."];
+    return NO;
+  }
+  [self discardUntitledTemp];
+  self.documentPath = p.URL.path;
+  _maybeDirty = NO;
+  [self updateTitle];
+  return YES;
+}
+
+// The unsaved-changes prompt (§5.6-ish; the GUI owns it). Used on close and
+// before opening another file.
+- (BOOL)confirmDiscardChanges {
+  if (!_maybeDirty) return YES;  // cheap: no core call on a clean document
+  Info in;
+  if (_ed->info(&in) != Status::Ok || !in.dirty) {
+    _maybeDirty = NO;  // e.g. everything was undone
+    [self updateTitle];
+    return YES;
+  }
+  NSAlert* a = [[NSAlert alloc] init];
+  a.messageText = @"Do you want to save the changes?";
+  a.informativeText = @"Your changes will be lost if you don't save them.";
+  [a addButtonWithTitle:@"Save"];
+  [a addButtonWithTitle:@"Don't Save"];
+  [a addButtonWithTitle:@"Cancel"];
+  const NSModalResponse r = [a runModal];
+  if (r == NSAlertFirstButtonReturn) return [self saveNow];
+  if (r == NSAlertSecondButtonReturn) return YES;
+  return NO;
+}
+
+- (void)showError:(NSString*)message {
+  NSAlert* a = [[NSAlert alloc] init];
+  a.messageText = message;
+  const std::string err(_ed->errmsg());
+  if (!err.empty()) {
+    a.informativeText = [NSString stringWithUTF8String:err.c_str()];
+  }
+  [a addButtonWithTitle:@"OK"];
+  [a runModal];
+}
+
+// Window title + dirty dot. Called after actions that can change the document,
+// never per frame. The dot comes from our own edit tracking rather than
+// `info()`, which would have to finish the index and the EOL scan (seconds on a
+// huge file) just to flip a dot.
+- (void)updateTitle {
+  NSWindow* w = self.window;
+  if (w == nil) return;
+  w.title = self.documentPath != nil ? self.documentPath.lastPathComponent
+                                     : @"Untitled";
+  w.representedURL = self.documentPath != nil
+                         ? [NSURL fileURLWithPath:self.documentPath]
+                         : nil;
+  w.documentEdited = _maybeDirty;
+}
+
+// Records a change to the document and refreshes the title/dot.
+- (void)markEdited {
+  _maybeDirty = YES;
+  [self setNeedsDisplay:YES];
+  [self updateTitle];
 }
 - (void)copy:(id)sender {
   (void)sender;
@@ -358,14 +526,14 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 }
 - (void)cut:(id)sender {
   [self copy:sender];
-  if (_view->backspace()) [self setNeedsDisplay:YES];
+  if (_view->backspace()) [self markEdited];
 }
 - (void)paste:(id)sender {
   (void)sender;
   NSString* s = [[NSPasteboard generalPasteboard]
       stringForType:NSPasteboardTypeString];
   const char* u = s != nil ? s.UTF8String : nullptr;
-  if (u != nullptr && _view->insert_text(u)) [self setNeedsDisplay:YES];
+  if (u != nullptr && _view->insert_text(u)) [self markEdited];
 }
 - (void)showFind:(id)sender {
   (void)sender;
@@ -402,15 +570,12 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)replaceText:(NSString*)needle with:(NSString*)replacement {
   if (needle == nil || needle.length == 0) return;
   const char* rep = replacement != nil ? replacement.UTF8String : "";
-  _view->replace_current(needle.UTF8String, rep, false);
-  [self setNeedsDisplay:YES];
+  if (_view->replace_current(needle.UTF8String, rep, false)) [self markEdited];
 }
 - (void)replaceAllText:(NSString*)needle with:(NSString*)replacement {
   if (needle == nil || needle.length == 0) return;
   const char* rep = replacement != nil ? replacement.UTF8String : "";
-  if (_view->replace_all(needle.UTF8String, rep, false) > 0) {
-    [self setNeedsDisplay:YES];
-  }
+  if (_view->replace_all(needle.UTF8String, rep, false) > 0) [self markEdited];
 }
 
 // --- Blink -----------------------------------------------------------------
@@ -442,20 +607,35 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   return YES;
 }
 - (void)reloadDocument {
+  _discovering = NO;  // a pending discovery step belongs to the old document
   _view->set_document(*_ed);
   _view->resize(self.bounds.size.width, self.bounds.size.height);
   _view->set_caret(0, 0);
   [self setNeedsDisplay:YES];
 }
-// First paint stays lazy; once the window is up, index small/medium files so the
-// scrollbar and the exact line count appear. Huge files stay lazy (the index
-// would block).
-- (void)discoverIfSmall {
+// Scrolls the top of the viewport to `line` (used by the `--scroll` snapshot).
+- (void)scrollToLine:(int64_t)line {
+  _view->scroll_to_line(line);
+  [self setNeedsDisplay:YES];
+}
+// First paint stays lazy. Then index small/medium files in bounded steps (one
+// run-loop turn each) so the exact line count and the scrollbar appear without
+// ever blocking the window; huge files stay lazy (a full index of 5 GB is ~8 s).
+- (void)beginDiscovery {
   const Rev r = _ed->rev();
-  if (r.size > 0 && r.size <= (64ull << 20)) {
-    _view->discover_all();
-    [self setNeedsDisplay:YES];
+  if (_discovering || r.size == 0 || r.size > (64ull << 20)) return;
+  _discovering = YES;
+  [self discoverStep];
+}
+- (void)discoverStep {
+  if (!_discovering) return;
+  if (!_view->discover_step(4096)) {
+    _discovering = NO;
+    [self setNeedsDisplay:YES];  // complete: the scrollbar can draw
+    return;
   }
+  [self setNeedsDisplay:YES];  // the count (and possibly the bar) grows
+  [self performSelector:@selector(discoverStep) withObject:nil afterDelay:0.0];
 }
 // Renders the view exactly as the window does (through AppKit's context) to a
 // PNG. Used by the `--snapshot` smoke test so the GUI can be inspected headless.
@@ -498,7 +678,18 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   const vc::KeyEvent k = translate_key(event, &text);
   vc::KeyEvent ev = k;
   ev.text = text;  // borrowed for the call
-  if (ev.key != vc::Key::None && _view->key(ev)) [self setNeedsDisplay:YES];
+  if (ev.key == vc::Key::None) return;
+  const bool edited = ev.key == vc::Key::InsertText ||
+                      ev.key == vc::Key::Enter ||
+                      ev.key == vc::Key::Backspace ||
+                      ev.key == vc::Key::Delete;
+  if (_view->key(ev)) {
+    if (edited) {
+      [self markEdited];
+    } else {
+      [self setNeedsDisplay:YES];
+    }
+  }
 }
 
 - (void)handleMouse:(NSEvent*)event kind:(vc::MouseEvent::Kind)kind {
@@ -527,18 +718,20 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 }
 @end
 
-@interface AppDelegate : NSObject <NSApplicationDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @property(nonatomic, assign) Editor* editor;
 @property(nonatomic, assign) EditorView* view;
 @property(nonatomic, strong) NSWindow* aboutWindow;
 @property(nonatomic, copy) NSString* snapshotPath;
+@property(nonatomic, assign) int64_t snapshotScrollLine;
 - (void)showAbout:(id)sender;
 @end
 
 @implementation AppDelegate
 - (void)applicationDidFinishLaunching:(NSNotification*)note {
   (void)note;
-  [self.view performSelector:@selector(discoverIfSmall)
+  [self.view updateTitle];
+  [self.view performSelector:@selector(beginDiscovery)
                   withObject:nil
                   afterDelay:0.1];
   if (self.snapshotPath != nil) {
@@ -552,8 +745,13 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 }
 - (void)runSnapshot:(NSTimer*)timer {
   (void)timer;
+  if (self.snapshotScrollLine > 0) {
+    [self.view scrollToLine:self.snapshotScrollLine];
+  }
+  // The window's frame view, so the title bar (file name, dirty dot) is included.
   NSView* content = self.view.window.contentView;
-  const BOOL ok = write_view_png(content != nil ? content : self.view,
+  NSView* frameView = content != nil ? content.superview : nil;
+  const BOOL ok = write_view_png(frameView != nil ? frameView : self.view,
                                  self.snapshotPath);
   std::fprintf(stderr, "[snapshot] %s -> %s\n",
                ok ? "wrote" : "FAILED", self.snapshotPath.UTF8String);
@@ -614,9 +812,8 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 
 - (BOOL)application:(NSApplication*)sender openFile:(NSString*)filename {
   if (self.editor == nullptr || filename == nil) return NO;
-  const Status s = self.editor->open(filename.UTF8String);
-  if (s != Status::Ok) return NO;
-  [self.view reloadDocument];
+  if (![self.view confirmDiscardChanges]) return NO;
+  if (![self.view openPath:filename]) return NO;
   [sender activateIgnoringOtherApps:YES];
   return YES;
 }
@@ -626,35 +823,39 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   return YES;
 }
 
-// Prompt before discarding unsaved edits (§5.6-ish; the GUI owns this).
+- (void)applicationWillTerminate:(NSNotification*)note {
+  (void)note;
+  [self.view discardUntitledTemp];
+}
+
+// Prompt before discarding unsaved edits (§5.6-ish; the GUI owns this). Only the
+// document window matters; the About panel closes freely.
 - (BOOL)windowShouldClose:(NSWindow*)sender {
-  (void)sender;
-  if (self.editor == nullptr) return YES;
-  Info in;
-  if (self.editor->info(&in) != Status::Ok || !in.dirty) return YES;
-  NSAlert* a = [[NSAlert alloc] init];
-  a.messageText = @"Do you want to save the changes?";
-  a.informativeText = @"Your changes will be lost if you don't save them.";
-  [a addButtonWithTitle:@"Save"];
-  [a addButtonWithTitle:@"Don't Save"];
-  [a addButtonWithTitle:@"Cancel"];
-  const NSModalResponse r = [a runModal];
-  if (r == NSAlertFirstButtonReturn) {
-    return self.editor->save(nullptr, false, nullptr) == Status::Ok;
-  }
-  if (r == NSAlertSecondButtonReturn) return YES;
-  return NO;
+  if (sender == self.aboutWindow) return YES;
+  return [self.view confirmDiscardChanges];
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
-  for (NSWindow* w in sender.windows) {
-    if (![self windowShouldClose:w]) return NSTerminateCancel;
+  (void)sender;
+  if (self.view.window != nil && ![self.view confirmDiscardChanges]) {
+    return NSTerminateCancel;
   }
   return NSTerminateNow;
 }
 @end
 
 namespace {
+
+// A private temp file backs an untitled window, so it is a real, editable,
+// savable document from the first paint onward.
+std::string untitled_path(int attempt) {
+  NSString* dir = NSTemporaryDirectory();
+  NSString* name = [NSString
+      stringWithFormat:@"editor-untitled-%d-%llu-%d.txt", getpid(),
+                       (unsigned long long)(NSDate.date.timeIntervalSince1970 * 1000),
+                       attempt];
+  return std::string([[dir stringByAppendingPathComponent:name] UTF8String]);
+}
 
 NSMenuItem* item(NSString* title, SEL action, NSString* key) {
   return [[NSMenuItem alloc] initWithTitle:title
@@ -693,8 +894,16 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
 
   NSMenuItem* fileItem = [[NSMenuItem alloc] init];
   [menubar addItem:fileItem];
+  NSMenuItem* saveAs = item(@"Save As\u2026", @selector(saveAsDocument:), @"s");
+  saveAs.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
   [fileItem setSubmenu:submenu(@"File", @[
+    item(@"Open\u2026", @selector(openDocument:), @"o"),
+    [NSMenuItem separatorItem],
     item(@"Save", @selector(saveDocument:), @"s"),
+    saveAs,
+    [NSMenuItem separatorItem],
+    item(@"Close", @selector(performClose:), @"w"),
   ])];
 
   NSMenuItem* editItem = [[NSMenuItem alloc] init];
@@ -731,6 +940,8 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
 int main(int argc, char** argv) {
   @autoreleasepool {
     std::string path, snapshot;
+    int64_t scroll_line = 0;
+    double win_w = 900, win_h = 700;
     for (int i = 1; i < argc; ++i) {
       const std::string a = argv[i];
       if (a == "--snapshot" && i + 1 < argc) {
@@ -739,21 +950,49 @@ int main(int argc, char** argv) {
         [[NSUserDefaults standardUserDefaults]
             setObject:[NSString stringWithUTF8String:argv[++i]]
                forKey:@"Theme"];
+      } else if (a == "--scroll" && i + 1 < argc) {
+        scroll_line = std::strtoll(argv[++i], nullptr, 10);
+      } else if (a == "--size" && i + 1 < argc) {
+        // WIDTHxHEIGHT in points, e.g. 480x320 (the smoke test's small window).
+        const std::string s = argv[++i];
+        const size_t x = s.find('x');
+        if (x != std::string::npos) {
+          win_w = std::strtod(s.substr(0, x).c_str(), nullptr);
+          win_h = std::strtod(s.substr(x + 1).c_str(), nullptr);
+        }
       } else if (!a.empty() && a[0] != '-') {
         path = a;
       }
     }
+    if (win_w < 200) win_w = 200;
+    if (win_h < 120) win_h = 120;
 
     std::unique_ptr<FileSystem> fs;
     create_file_system(&fs);
     std::unique_ptr<Editor> ed;
     create_editor(*fs, &ed);
+    bool opened = false;
     if (!path.empty()) {
       const Status s = ed->open(path);
       if (s != Status::Ok) {
         std::fprintf(stderr, "editor: cannot open %s (status %d)\n", path.c_str(),
                      static_cast<int>(s));
+      } else {
+        opened = true;
       }
+    }
+    // A Finder / "Open With" launch starts with no argv file and delivers the
+    // document as an Apple event a moment later. Start an untitled buffer so the
+    // window always has a real document to draw and edit (the event then opens
+    // the file over it). The buffer is backed by a private temp file that is
+    // removed once the document gets a path of its own, or on quit.
+    std::string untitled;
+    if (!opened) {
+      for (int attempt = 0; attempt < 3 && !opened; ++attempt) {
+        untitled = untitled_path(attempt);
+        if (ed->create(untitled) == Status::Ok) opened = true;
+      }
+      if (!opened) untitled.clear();
     }
 
     NSApplication* app = [NSApplication sharedApplication];
@@ -763,14 +1002,22 @@ int main(int argc, char** argv) {
                                     NSWindowStyleMaskClosable |
                                     NSWindowStyleMaskResizable |
                                     NSWindowStyleMaskMiniaturizable;
-    NSWindow* win = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 900, 700)
+    NSWindow* win = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, win_w, win_h)
                                                 styleMask:style
                                                   backing:NSBackingStoreBuffered
                                                     defer:NO];
-    [win setTitle:path.empty() ? @"editor"
-                               : [NSString stringWithUTF8String:path.c_str()]];
+    [win setTitle:path.empty() || !opened
+                      ? @"Untitled"
+                      : [[NSString stringWithUTF8String:path.c_str()]
+                            lastPathComponent]];
 
     EditorView* view = [[EditorView alloc] initWithEditor:ed.get()];
+    if (opened && !path.empty()) {
+      view.documentPath = [NSString stringWithUTF8String:path.c_str()];
+    }
+    if (!untitled.empty()) {
+      view.untitledTempPath = [NSString stringWithUTF8String:untitled.c_str()];
+    }
     FindBar* bar = [[FindBar alloc] initWithEditorView:view];
     StatusBar* status = [[StatusBar alloc] initWithFrame:NSMakeRect(0, 0, 900, 22)];
     view.findBar = bar;
@@ -797,10 +1044,12 @@ int main(int argc, char** argv) {
     AppDelegate* delegate = [[AppDelegate alloc] init];
     delegate.editor = ed.get();
     delegate.view = view;
+    delegate.snapshotScrollLine = scroll_line;
     if (!snapshot.empty()) {
       delegate.snapshotPath = [NSString stringWithUTF8String:snapshot.c_str()];
     }
     [app setDelegate:delegate];
+    win.delegate = delegate;  // for the unsaved-changes prompt on close
 
     build_menu_bar(app, delegate);
 

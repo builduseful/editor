@@ -123,6 +123,10 @@ class ViewCore {
   // Extends the line index through the end of the document (an exact count, and
   // the whole-document scan the first-paint path avoids).
   void discover_all() const;
+  // Extends the index by at most `max_lines` more lines; returns true while
+  // there is more to index. The GUI drips this across run-loop turns so a large
+  // file never blocks the window (the index must stay on the document thread).
+  bool discover_step(int64_t max_lines) const;
   bool wrap() const { return wrap_; }
   const FontSpec& font() const { return font_; }
   double viewport_width() const { return width_; }
@@ -133,9 +137,25 @@ class ViewCore {
   void scroll_lines(int64_t n);
   void scroll_by(double dy);
   double scroll_px() const { return scroll_px_; }
-  // Estimated content height (exact without wrap; an upper estimate with wrap,
+  // Estimated content height (exact without wrap; a lower estimate with wrap,
   // since a 5 GB document is not fully measured).
   double content_height() const;
+
+  // The quiet overlay scrollbar on the right edge (custom-drawn, D2). Its
+  // geometry is derived from the known line count and the visible span, so it
+  // accounts for wrap; until the index is complete there is no bar (the total
+  // is unknown). Exposed so the platform can set the mouse cursor and tests
+  // can drive it.
+  struct ScrollBar {
+    bool visible = false;
+    double track_x = 0, track_w = 0;
+    double thumb_y = 0, thumb_h = 0;
+  };
+  static constexpr double kScrollbarWidth = 9.0;
+  ScrollBar scrollbar() const;
+  bool scrollbar_at(double x) const;
+  // Scrolls so the document position `f` (0 = top, 1 = bottom) is at the top.
+  void scroll_to_fraction(double f);
 
   Hit hit_test(double x, double y) const;
   Rect caret_rect(int64_t line, int64_t col) const;
@@ -213,8 +233,13 @@ class ViewCore {
   // width changed with wrap on).
   void update_gutter() const;
   // A quiet overlay scrollbar on the right edge (drawn only once the line count
-  // is known). Not interactive yet.
+  // is known).
   void draw_scrollbar(Canvas& c) const;
+  // Logical lines needed to fill the viewport from `first_line_` (wrap-aware).
+  int64_t visible_logical_lines() const;
+  // Scroll limits: the largest top line that still fills the viewport.
+  int64_t max_first_line() const;
+  void clamp_scroll();
   double text_left() const { return gutter_width_; }
   double text_width() const {
     const double w = width_ - gutter_width_;
@@ -251,6 +276,8 @@ class ViewCore {
   double scroll_px_ = 0;
   double goal_x_ = 0;      // desired x for vertical caret movement
   bool v_moving_ = false;  // a run of vertical moves (keeps goal_x_)
+  bool sb_drag_ = false;   // dragging the scrollbar thumb
+  double sb_grab_ = 0;     // pointer offset inside the thumb at drag start
   mutable int64_t known_lines_ = 0;  // lines discovered so far (lazy)
   mutable bool eof_known_ = false;   // the whole document has been indexed
   std::vector<Decoration> decorations_;

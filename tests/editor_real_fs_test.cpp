@@ -4,6 +4,7 @@
 #include <cstdio>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string>
 #include <vector>
 
@@ -197,6 +198,33 @@ int count_temps(const std::string& dir) {
 
 
 }  // namespace
+
+// A freshly created editor has no document (the GUI always creates one before
+// it draws, but a Finder launch shows its window before the open-document event
+// arrives). Every entry point must report that, not touch the unset sources.
+TEST(editor_without_a_document_reports_errors_instead_of_crashing) {
+  std::unique_ptr<FileSystem> fs;
+  std::unique_ptr<Editor> ed;
+  create_file_system(&fs);
+  create_editor(*fs, &ed);
+  CHECK(ed != nullptr);
+
+  size_t used = 123;
+  int64_t n = 123;
+  CHECK(ed->read_lines(0, 1, nullptr, 0, &used, &n) != Status::Ok);
+  CHECK(used == 0);
+  CHECK(n == 0);
+  CHECK(ed->read_range(0, 1, nullptr, 0, &used) != Status::Ok);
+  CHECK(used == 0);
+  CHECK(ed->apply(std::span<const Edit>{}) != Status::Ok);
+
+  Info in{};
+  CHECK(ed->info(&in) != Status::Ok);
+  CHECK(ed->save(nullptr, false, nullptr) != Status::Ok);
+  CHECK(ed->save_as("/tmp/editor-no-document.txt", nullptr, false, nullptr) !=
+        Status::Ok);
+  CHECK(!ed->errmsg().empty());  // the reason is reported, not just the status
+}
 
 TEST(editor_create_apply_save_reopen) {
   Fixture fx(make_temp_dir());

@@ -1186,6 +1186,28 @@ separate `find` command and no core search API.
   regex), syntax, Markdown preview, git, scripts, `serve`, `move`, native-control
   experiment. Detailed sizing and seams are intentionally unspecified here.
 
+**Sidebar (shape decided 2026-11-18).** The GUI gets a file sidebar, and it is a
+**recursive tree**, not a flat folder list. It stays post-1.0 (v1 is still
+one-file-at-a-time), but the shape is fixed now so the work is not redone:
+
+- **Lazy by construction.** A directory is read only when it is expanded (plus
+  the open file's ancestors, so the tree can reveal it); collapsed subtrees are
+  never walked. No background scanner, no whole-project walk, and no ignore-rule
+  engine in the first cut. Relaxing this needs a measured reason.
+- **Speed is a gate, not a goal.** Reading a folder and laying out its rows stay
+  off the frame path: rows are drawn from a cached, sorted (folders first) list,
+  and a folder with thousands of entries must not affect first paint or scroll
+  cost. Any future rescan is incremental, not a full walk.
+- **Read-only navigation.** Clicking a file opens it through the existing
+  unsaved-changes prompt. No rename/delete/new-file until the workspace work
+  (§2: thousands of files is a workspace goal, not v1).
+- **Custom-drawn** (D2), tokens only: hairline separators, `color.secondary-hover`
+  selection, `color.text`/`color.text-muted` labels in the system UI face. No
+  `NSTableView`/`NSOutlineView` (a native-control hybrid).
+- **Testable like `viewcore`:** the directory reads behind an injectable seam
+  (POSIX `opendir`/`readdir` in the app layer, a fake in tests), so the tree and
+  its layout are covered headlessly rather than only by looking at the window.
+
 ## 10. Testing, CI, build
 
 **Pre-M0.0 decisions**
@@ -1246,14 +1268,31 @@ width + wrap settings, status bar, gutter, decorations, and the CLI (`read`,
 | **M3.5** | Release engineering: notarization, packaging, CI perf gates. | 2–3 wk | Signed `.app`; CI green. |
 | **Post-1.0** | Windows port, Linux port, workspace/tree, project search, syntax, Markdown, git, scripts, `serve`, `move`, diff/restore/patch-apply/gui/tree/search, native-control experiment. | — | — |
 
-**Status (2026-11-18).** M0–M3 code is implemented and committed: `core` + CLI
+**Status (2026-11-18).** M0–M3 code is implemented: `core` + CLI
 (M0), `viewcore` + render oracle + the lazy line index (M0.5/M1), the AppKit view
 with CoreText/CoreGraphics backends, editing, find/replace, and settings (M1/M2),
-and the gutter / status bar / cut-copy-paste polish (M3). `make test` (plain +
-ASan/UBSan), `make golden`, `make fuzz`, `make bench`, and `make demo` pass; the
-M1 first-paint gates (1 GB < 100 ms, 5 GB < 250 ms) pass via `make demo`. **M3.5
-(notarization, packaging, CI perf gates) is not started** — it needs a signing
-identity and CI, which are out of scope for the local build.
+and the gutter / status bar / cut-copy-paste polish (M3). The GUI also has a
+custom-drawn overlay scrollbar (drag, track paging, command-click to jump), File →
+Open / Save As with a window title and dirty marker, and incremental (run-loop
+dripped) indexing so a medium file never blocks the window. `make test` (plain +
+ASan/UBSan), `make golden`, `make fuzz`, `make bench`, `make demo`, and
+`make gui-smoke` (headless AppKit snapshots in both themes, a real launch, a
+no-file launch, and a Finder-style LaunchServices open) pass; the M1 first-paint
+gates (1 GB < 100 ms, 5 GB < 250 ms) pass via `make demo`. **M3.5 (notarization,
+packaging, CI perf gates) is not started** — it needs a signing identity and CI,
+which are out of scope for the local build.
+
+Launch paths: Finder / right-click “Open With” starts the app with no argv file
+and delivers the document as an `odoc` Apple event, *after* the window's first
+draw is already queued. So an untitled window is backed by a private temp file
+(removed on open / Save As / quit) and the core reports `E_IO` for every
+document call while nothing is open, instead of dereferencing an unset source —
+that combination was the launch crash.
+
+Known limits: the scrollbar needs the exact line count, so files above the
+discovery cap (64 MB) show none until indexed; a scrollbar drag with wrap on maps
+logical lines proportionally (approximate, not per-visual-line); the app has no
+app icon yet (the design system's icon assets need an agreed raster step).
 
 **Total:** the table sums to **24–33 weeks of work**. With ~30% overhead that is
 **31–43 weeks full-time (~7–10 months)**; solo at ~75% time, plan on **10–13
