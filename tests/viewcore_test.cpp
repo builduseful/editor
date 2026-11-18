@@ -446,6 +446,25 @@ TEST(viewcore_gutter_hit_test_offsets_x) {
   CHECK_EQ(h.col, 2);
 }
 
+TEST(viewcore_selected_text) {
+  Doc d("hello world\nsecond\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 0);
+  vc::KeyEvent right;
+  right.key = vc::Key::Right;
+  right.shift = true;
+  for (int i = 0; i < 5; ++i) d.view->key(right);
+  CHECK_EQ(d.view->selected_text(), std::string("hello"));
+
+  // Across a line boundary.
+  d.view->set_caret(0, 6);
+  vc::KeyEvent down;
+  down.key = vc::Key::Down;
+  down.shift = true;
+  d.view->key(down);
+  CHECK_EQ(d.view->selected_text(), std::string("world\nsecond"));
+}
+
 TEST(viewcore_edit_insert_text) {
   Doc d("abc\n");
   d.view->resize(800, 1000);

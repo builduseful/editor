@@ -154,6 +154,8 @@ class ViewCore {
   bool insert_text(std::string_view utf8);  // replaces the selection, or inserts
   bool backspace();                         // delete selection / previous codepoint
   bool delete_forward();                    // delete selection / next codepoint
+  // The selected text (empty when the selection is collapsed).
+  std::string selected_text() const;
   // Call after the document changes outside viewcore (undo/redo/save/reload):
   // drops the line cache and refreshes the line count.
   void document_changed();

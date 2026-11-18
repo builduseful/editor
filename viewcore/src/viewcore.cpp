@@ -764,6 +764,27 @@ bool ViewCore::backspace() {
   return delete_range(prev, line_len(prev), line, 0);
 }
 
+std::string ViewCore::selected_text() const {
+  if (!has_selection()) return {};
+  int64_t sl = 0, sc = 0, el = 0, ec = 0;
+  selection_range(&sl, &sc, &el, &ec);
+  size_t block = 0;
+  int64_t n = 0;
+  ed_->read_lines(sl, el + 1, nullptr, 0, &block, &n);
+  std::string buf(block, '\0');
+  if (block > 0) {
+    size_t got = 0;
+    ed_->read_lines(sl, el + 1, buf.data(), buf.size(), &got, &n);
+    buf.resize(got);
+  }
+  size_t last = 0;
+  ed_->read_lines(el, el + 1, nullptr, 0, &last, &n);
+  const size_t start = static_cast<size_t>(sc);
+  const size_t end = buf.size() - (last - static_cast<size_t>(ec));
+  if (end <= start) return {};
+  return buf.substr(start, end - start);
+}
+
 bool ViewCore::delete_forward() {
   if (has_selection()) {
     int64_t sl = 0, sc = 0, el = 0, ec = 0;

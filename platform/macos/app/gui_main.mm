@@ -269,6 +269,26 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
   (void)sender;
   if (_ed->save(nullptr, false, nullptr) == Status::Ok) [self setNeedsDisplay:YES];
 }
+- (void)copy:(id)sender {
+  (void)sender;
+  const std::string sel = _view->selected_text();
+  if (sel.empty()) return;
+  NSPasteboard* pb = [NSPasteboard generalPasteboard];
+  [pb clearContents];
+  [pb setString:[NSString stringWithUTF8String:sel.c_str()]
+        forType:NSPasteboardTypeString];
+}
+- (void)cut:(id)sender {
+  [self copy:sender];
+  if (_view->backspace()) [self setNeedsDisplay:YES];
+}
+- (void)paste:(id)sender {
+  (void)sender;
+  NSString* s = [[NSPasteboard generalPasteboard]
+      stringForType:NSPasteboardTypeString];
+  const char* u = s != nil ? s.UTF8String : nullptr;
+  if (u != nullptr && _view->insert_text(u)) [self setNeedsDisplay:YES];
+}
 - (void)showFind:(id)sender {
   (void)sender;
   if (self.findBar == nil) return;
@@ -413,6 +433,38 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
   [sender activateIgnoringOtherApps:YES];
   return YES;
 }
+
+- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
+  (void)sender;
+  return YES;
+}
+
+// Prompt before discarding unsaved edits (§5.6-ish; the GUI owns this).
+- (BOOL)windowShouldClose:(NSWindow*)sender {
+  (void)sender;
+  if (self.editor == nullptr) return YES;
+  Info in;
+  if (self.editor->info(&in) != Status::Ok || !in.dirty) return YES;
+  NSAlert* a = [[NSAlert alloc] init];
+  a.messageText = @"Do you want to save the changes?";
+  a.informativeText = @"Your changes will be lost if you don't save them.";
+  [a addButtonWithTitle:@"Save"];
+  [a addButtonWithTitle:@"Don't Save"];
+  [a addButtonWithTitle:@"Cancel"];
+  const NSModalResponse r = [a runModal];
+  if (r == NSAlertFirstButtonReturn) {
+    return self.editor->save(nullptr, false, nullptr) == Status::Ok;
+  }
+  if (r == NSAlertSecondButtonReturn) return YES;
+  return NO;
+}
+
+- (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
+  for (NSWindow* w in sender.windows) {
+    if (![self windowShouldClose:w]) return NSTerminateCancel;
+  }
+  return NSTerminateNow;
+}
 @end
 
 namespace {
@@ -455,6 +507,9 @@ void build_menu_bar(NSApplication* app) {
     item(@"Undo", @selector(undo:), @"z"),
     redo,
     [NSMenuItem separatorItem],
+    item(@"Cut", @selector(cut:), @"x"),
+    item(@"Copy", @selector(copy:), @"c"),
+    item(@"Paste", @selector(paste:), @"v"),
     item(@"Select All", @selector(selectAll:), @"a"),
     [NSMenuItem separatorItem],
     item(@"Find\u2026", @selector(showFind:), @"f"),
