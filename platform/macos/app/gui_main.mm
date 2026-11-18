@@ -1,0 +1,180 @@
+// platform/macos/app/gui_main.mm — the M1 AppKit read-only view shell (§3, §8).
+//
+// A real window whose content view is custom-drawn by `viewcore` through the
+// CoreText/CoreGraphics backends. M1 is read-only: scrolling, caret movement,
+// and selection. No native controls, no IME, no accessibility (D2, §8).
+#import <AppKit/AppKit.h>
+
+#include <cstdio>
+#include <memory>
+#include <string>
+
+#include "canvas_cg.hpp"
+#include "editor.hpp"
+#include "text_coretext.hpp"
+#include "viewcore.hpp"
+
+namespace {
+
+vc::KeyEvent translate_key(NSEvent* e) {
+  vc::KeyEvent k;
+  const NSEventModifierFlags m = e.modifierFlags;
+  k.shift = (m & NSEventModifierFlagShift) != 0;
+  k.cmd = (m & NSEventModifierFlagCommand) != 0;
+  k.alt = (m & NSEventModifierFlagOption) != 0;
+  k.ctrl = (m & NSEventModifierFlagControl) != 0;
+  switch (e.keyCode) {
+    case 123: k.key = vc::Key::Left; break;
+    case 124: k.key = vc::Key::Right; break;
+    case 125: k.key = vc::Key::Down; break;
+    case 126: k.key = vc::Key::Up; break;
+    case 115: k.key = vc::Key::Home; break;
+    case 119: k.key = vc::Key::End; break;
+    case 116: k.key = vc::Key::PageUp; break;
+    case 121: k.key = vc::Key::PageDown; break;
+    case 53: k.key = vc::Key::Escape; break;
+    default: {
+      NSString* s = e.charactersIgnoringModifiers;
+      if (k.cmd && s.length == 1 &&
+          ([s characterAtIndex:0] == 'a' || [s characterAtIndex:0] == 'A')) {
+        k.key = vc::Key::SelectAll;
+      } else {
+        k.key = vc::Key::None;
+      }
+    }
+  }
+  return k;
+}
+
+}  // namespace
+
+@interface EditorView : NSView
+- (instancetype)initWithEditor:(Editor*)ed;
+@end
+
+@implementation EditorView {
+  std::unique_ptr<vc::TextBackend> _tb;
+  std::unique_ptr<vc::ViewCore> _view;
+}
+
+- (instancetype)initWithEditor:(Editor*)ed {
+  self = [super initWithFrame:NSMakeRect(0, 0, 900, 700)];
+  if (self != nil) {
+    _tb = ed::mac::create_coretext_backend();
+    _view = std::make_unique<vc::ViewCore>(*ed, *_tb);
+    _view->resize(self.bounds.size.width, self.bounds.size.height);
+    _view->set_caret(0, 0);
+  }
+  return self;
+}
+
+- (BOOL)isFlipped {
+  return NO;  // CoreGraphics native orientation; the canvas converts y.
+}
+
+- (BOOL)acceptsFirstResponder {
+  return YES;
+}
+
+- (void)setFrameSize:(NSSize)newSize {
+  [super setFrameSize:newSize];
+  _view->resize(newSize.width, newSize.height);
+  [self setNeedsDisplay:YES];
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+  (void)dirtyRect;
+  CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
+  auto canvas = ed::mac::create_cg_canvas(ctx, self.bounds.size.width,
+                                          self.bounds.size.height);
+  _view->draw(*canvas);
+}
+
+- (void)keyDown:(NSEvent*)event {
+  const vc::KeyEvent k = translate_key(event);
+  if (k.key != vc::Key::None && _view->key(k)) [self setNeedsDisplay:YES];
+}
+
+- (void)handleMouse:(NSEvent*)event kind:(vc::MouseEvent::Kind)kind {
+  const NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  vc::MouseEvent m;
+  m.kind = kind;
+  m.x = p.x;
+  m.y = self.bounds.size.height - p.y;  // AppKit y-up -> viewcore y-down
+  m.shift = (event.modifierFlags & NSEventModifierFlagShift) != 0;
+  m.cmd = (event.modifierFlags & NSEventModifierFlagCommand) != 0;
+  if (_view->mouse(m)) [self setNeedsDisplay:YES];
+}
+
+- (void)mouseDown:(NSEvent*)event {
+  [self handleMouse:event kind:vc::MouseEvent::Kind::Down];
+}
+- (void)mouseDragged:(NSEvent*)event {
+  [self handleMouse:event kind:vc::MouseEvent::Kind::Drag];
+}
+- (void)mouseUp:(NSEvent*)event {
+  [self handleMouse:event kind:vc::MouseEvent::Kind::Up];
+}
+- (void)scrollWheel:(NSEvent*)event {
+  [self handleMouse:event kind:vc::MouseEvent::Kind::Scroll];
+}
+@end
+
+int main(int argc, char** argv) {
+  @autoreleasepool {
+    std::string path;
+    for (int i = 1; i < argc; ++i) {
+      const std::string a = argv[i];
+      if (!a.empty() && a[0] != '-') {
+        path = a;
+        break;
+      }
+    }
+
+    std::unique_ptr<FileSystem> fs;
+    create_file_system(&fs);
+    std::unique_ptr<Editor> ed;
+    create_editor(*fs, &ed);
+    if (!path.empty()) {
+      const Status s = ed->open(path);
+      if (s != Status::Ok) {
+        std::fprintf(stderr, "editor: cannot open %s (status %d)\n", path.c_str(),
+                     static_cast<int>(s));
+      }
+    }
+
+    NSApplication* app = [NSApplication sharedApplication];
+    [app setActivationPolicy:NSApplicationActivationPolicyRegular];
+
+    const NSWindowStyleMask style = NSWindowStyleMaskTitled |
+                                    NSWindowStyleMaskClosable |
+                                    NSWindowStyleMaskResizable |
+                                    NSWindowStyleMaskMiniaturizable;
+    NSWindow* win = [[NSWindow alloc] initWithContentRect:NSMakeRect(0, 0, 900, 700)
+                                                styleMask:style
+                                                  backing:NSBackingStoreBuffered
+                                                    defer:NO];
+    [win setTitle:path.empty() ? @"editor"
+                               : [NSString stringWithUTF8String:path.c_str()]];
+
+    EditorView* view = [[EditorView alloc] initWithEditor:ed.get()];
+    [win setContentView:view];
+    [win makeFirstResponder:view];
+    [win center];
+    [win makeKeyAndOrderFront:nil];
+
+    NSMenu* menubar = [[NSMenu alloc] init];
+    NSMenuItem* appItem = [[NSMenuItem alloc] init];
+    [menubar addItem:appItem];
+    NSMenu* appMenu = [[NSMenu alloc] init];
+    [appMenu addItemWithTitle:@"Quit editor"
+                       action:@selector(terminate:)
+                keyEquivalent:@"q"];
+    [appItem setSubmenu:appMenu];
+    [app setMainMenu:menubar];
+
+    [app activateIgnoringOtherApps:YES];
+    [app run];
+  }
+  return 0;
+}

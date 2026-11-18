@@ -9,7 +9,7 @@
 CXX      ?= clang++
 CXXFLAGS ?= -std=c++20 -Wall -Wextra -Wconversion -O2 -g \
             -mmacosx-version-min=15.0 -arch arm64
-CPPFLAGS += -Icore/include -Icore/src -Icli/src -Iviewcore/include -Iviewcore/src -Itests
+CPPFLAGS += -Icore/include -Icore/src -Icli/src -Iviewcore/include -Iviewcore/src -Iplatform/macos -Itests
 
 # make SANITIZE=1 -> ASan + UBSan (PLAN.md §10: every PR, lite).
 ifdef SANITIZE
@@ -22,6 +22,8 @@ BUILD := build$(if $(SANITIZE),-asan,)
 
 CORE_SRC := $(wildcard core/src/*.cpp)
 PLATFORM_SRC := $(wildcard platform/macos/*.cpp)
+PLATFORM_GUI_SRC := $(wildcard platform/macos/*.mm)
+APP_SRC := $(wildcard platform/macos/app/*.mm)
 VIEWCORE_SRC := $(wildcard viewcore/src/*.cpp)
 CLI_SRC  := $(wildcard cli/src/*.cpp)
 BENCH_SRC := $(wildcard bench/*.cpp)
@@ -30,13 +32,20 @@ TEST_SRC := $(wildcard tests/*.cpp tests/conformance/*.cpp)
 
 CORE_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(CORE_SRC))
 PLATFORM_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(PLATFORM_SRC))
+PLATFORM_GUI_OBJ := $(patsubst %.mm,$(BUILD)/%.o,$(PLATFORM_GUI_SRC))
+APP_OBJ := $(patsubst %.mm,$(BUILD)/%.o,$(APP_SRC))
 VIEWCORE_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(VIEWCORE_SRC))
 CLI_OBJ  := $(patsubst %.cpp,$(BUILD)/%.o,$(CLI_SRC))
 BENCH_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(BENCH_SRC))
 DEMO_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(DEMO_SRC))
 TEST_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(TEST_SRC))
 
-.PHONY: all test golden fuzz bench demo clean
+# CoreText/CoreGraphics backends (platform/macos/*.mm). The app shell lives in
+# platform/macos/app/ and is built only by `make app`.
+FRAMEWORKS := -framework Foundation -framework CoreText -framework CoreGraphics
+APP_FRAMEWORKS := $(FRAMEWORKS) -framework AppKit
+
+.PHONY: all test golden fuzz bench demo app clean
 
 all: $(BUILD)/editor_tests
 ifneq ($(CORE_SRC),)
@@ -61,15 +70,19 @@ $(BUILD)/editor: $(CLI_OBJ) $(PLATFORM_OBJ) $(BUILD)/libcore.a
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -o $@ $(CLI_OBJ) $(PLATFORM_OBJ) $(BUILD)/libcore.a
 
-$(BUILD)/editor_tests: $(TEST_OBJ) $(PLATFORM_OBJ) $(VIEWCORE_OBJ) $(CORE_OBJ)
+$(BUILD)/editor_tests: $(TEST_OBJ) $(PLATFORM_OBJ) $(PLATFORM_GUI_OBJ) $(VIEWCORE_OBJ) $(CORE_OBJ)
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) -o $@ $(TEST_OBJ) $(PLATFORM_OBJ) $(VIEWCORE_OBJ) $(CORE_OBJ)
+	$(CXX) $(CXXFLAGS) -o $@ $(TEST_OBJ) $(PLATFORM_OBJ) $(PLATFORM_GUI_OBJ) $(VIEWCORE_OBJ) $(CORE_OBJ) $(FRAMEWORKS)
 
 $(BUILD)/%.o: %.cpp
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -MMD -MP -c $< -o $@
 
--include $(CORE_OBJ:.o=.d) $(PLATFORM_OBJ:.o=.d) $(VIEWCORE_OBJ:.o=.d) $(CLI_OBJ:.o=.d) $(BENCH_OBJ:.o=.d) $(DEMO_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
+$(BUILD)/%.o: %.mm
+	@mkdir -p $(@D)
+	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -x objective-c++ -fobjc-arc -MMD -MP -c $< -o $@
+
+-include $(CORE_OBJ:.o=.d) $(PLATFORM_OBJ:.o=.d) $(PLATFORM_GUI_OBJ:.o=.d) $(APP_OBJ:.o=.d) $(VIEWCORE_OBJ:.o=.d) $(CLI_OBJ:.o=.d) $(BENCH_OBJ:.o=.d) $(DEMO_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
 
 test: $(BUILD)/editor_tests
 	$(BUILD)/editor_tests
@@ -96,6 +109,14 @@ $(BUILD)/view_demo: $(DEMO_OBJ) $(PLATFORM_OBJ) $(BUILD)/libviewcore.a $(BUILD)/
 
 demo: $(BUILD)/view_demo
 	$(BUILD)/view_demo
+
+# The M1 AppKit read-only view (platform/macos/app/gui_main.mm). Not an .app
+# bundle yet (M3.5 packaging); run it from a terminal.
+$(BUILD)/editor_gui: $(APP_OBJ) $(PLATFORM_OBJ) $(PLATFORM_GUI_OBJ) $(BUILD)/libviewcore.a $(BUILD)/libcore.a
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $(APP_OBJ) $(PLATFORM_OBJ) $(PLATFORM_GUI_OBJ) $(BUILD)/libviewcore.a $(BUILD)/libcore.a $(APP_FRAMEWORKS)
+
+app: $(BUILD)/editor_gui
 
 clean:
 	rm -rf build build-asan

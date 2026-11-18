@@ -13,6 +13,8 @@ class Canvas {
   virtual ~Canvas() = default;
   virtual void clear(Color c) = 0;
   virtual void fill_rect(const Rect& r, Color c) = 0;
+  // Sets the colour used by subsequent draw_run calls (a run carries no colour).
+  virtual void set_text_color(Color c) = 0;
   virtual void draw_run(const Run& run, double x, double y) = 0;
 };
 

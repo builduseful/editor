@@ -40,6 +40,24 @@ struct Hit {
   int64_t line = 0, col = 0;  // logical line; col = UTF-8 byte offset in the line
 };
 
+// Platform-neutral input. The macOS view translates NSEvent into these (§8).
+enum class Key : uint32_t {
+  None, Left, Right, Up, Down, Home, End, PageUp, PageDown, SelectAll, Escape
+};
+
+struct KeyEvent {
+  Key key = Key::None;
+  bool shift = false, alt = false, ctrl = false, cmd = false;
+};
+
+struct MouseEvent {
+  enum class Kind : uint32_t { Down, Drag, Up, Scroll };
+  Kind kind = Kind::Down;
+  double x = 0, y = 0;  // viewport coordinates, y down
+  double dy = 0;        // scroll amount (Kind::Scroll)
+  bool shift = false, cmd = false;
+};
+
 class ViewCore {
  public:
   ViewCore(Editor& ed, TextBackend& tb);
@@ -52,6 +70,9 @@ class ViewCore {
   void set_wrap(bool on);
   void set_font(const FontSpec& f);
   void set_decorations(std::vector<Decoration> d);
+  // Ink used to draw text (the Canvas sets this before each run).
+  void set_text_color(Color c) { text_color_ = c; }
+  Color text_color() const { return text_color_; }
 
   double line_height() const;
   // Number of lines discovered so far. The view grows this lazily as it draws or
@@ -89,6 +110,11 @@ class ViewCore {
   // Draw the visible viewport into `c`.
   void draw(Canvas& c) const;
 
+  // Input. Both return true if the view changed (a redraw is needed). M1 is
+  // read-only: movement and selection only.
+  bool key(const KeyEvent& e);
+  bool mouse(const MouseEvent& e);
+
   // Cache statistics (for tests and the footprint gate).
   size_t cache_entries() const { return cache_.size(); }
   size_t cache_bytes() const { return cache_bytes_; }
@@ -122,6 +148,17 @@ class ViewCore {
   int64_t col_at_x(const VisualLine& v, double x) const;
   std::string line_text(int64_t line) const;  // logical line, terminator stripped
 
+  // Input helpers.
+  int64_t line_len(int64_t line) const;  // logical line length in bytes
+  void set_caret_extend(int64_t line, int64_t col, bool extend);
+  void move_horizontal(int dir, bool extend);
+  void move_vertical(int dir, bool extend);
+  void move_line_edge(bool to_end, bool extend);
+  void page_move(int dir, bool extend);
+  void ensure_caret_visible();
+  // Visual line within `line`'s entry holding byte `col`, and its x offset.
+  void caret_within(const LineEntry& e, int64_t col, size_t* vi, double* x) const;
+
   Editor* ed_ = nullptr;
   TextBackend* tb_ = nullptr;
   FontSpec font_;
@@ -130,9 +167,12 @@ class ViewCore {
 
   int64_t first_line_ = 0;
   double scroll_px_ = 0;
+  double goal_x_ = 0;      // desired x for vertical caret movement
+  bool v_moving_ = false;  // a run of vertical moves (keeps goal_x_)
   mutable int64_t known_lines_ = 0;  // lines discovered so far (lazy)
   mutable bool eof_known_ = false;   // the whole document has been indexed
   std::vector<Decoration> decorations_;
+  Color text_color_{26, 26, 26, 255};  // ink
   Selection sel_;
 
   mutable std::map<int64_t, LineEntry> cache_;

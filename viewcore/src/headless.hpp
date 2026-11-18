@@ -84,7 +84,7 @@ class HeadlessTextBackend final : public TextBackend {
 };
 
 struct DrawCmd {
-  enum class Kind { Clear, FillRect, DrawRun };
+  enum class Kind { Clear, FillRect, SetTextColor, DrawRun };
   Kind kind = Kind::Clear;
   Color color;
   Rect rect;
@@ -106,6 +106,12 @@ class RecordingCanvas final : public Canvas {
     DrawCmd d;
     d.kind = DrawCmd::Kind::FillRect;
     d.rect = r;
+    d.color = c;
+    cmds.push_back(std::move(d));
+  }
+  void set_text_color(Color c) override {
+    DrawCmd d;
+    d.kind = DrawCmd::Kind::SetTextColor;
     d.color = c;
     cmds.push_back(std::move(d));
   }
@@ -132,6 +138,11 @@ class RecordingCanvas final : public Canvas {
         case DrawCmd::Kind::FillRect:
           std::snprintf(buf, sizeof(buf), "fill %.3f,%.3f,%.3f,%.3f %u,%u,%u,%u\n",
                         d.rect.x, d.rect.y, d.rect.w, d.rect.h, d.color.r,
+                        d.color.g, d.color.b, d.color.a);
+          out += buf;
+          break;
+        case DrawCmd::Kind::SetTextColor:
+          std::snprintf(buf, sizeof(buf), "textcolor %u,%u,%u,%u\n", d.color.r,
                         d.color.g, d.color.b, d.color.a);
           out += buf;
           break;

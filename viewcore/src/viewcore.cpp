@@ -308,6 +308,7 @@ Rect ViewCore::caret_rect(int64_t line, int64_t col) const {
 void ViewCore::draw(Canvas& c) const {
   const double lh = line_height();
   c.clear(Color{255, 255, 255, 255});
+  c.set_text_color(text_color_);
   double y = -scroll_px_;
   for (int64_t line = first_line_; y < height_; ++line) {
     if (!line_exists(line)) break;
@@ -325,6 +326,182 @@ void ViewCore::draw(Canvas& c) const {
       if (y >= height_) break;
     }
   }
+}
+
+// --- Input (M1: read-only movement and selection) --------------------------
+
+int64_t ViewCore::line_len(int64_t line) const {
+  return static_cast<int64_t>(line_text(line).size());
+}
+
+void ViewCore::set_caret_extend(int64_t line, int64_t col, bool extend) {
+  if (extend) {
+    sel_.caret_line = line;
+    sel_.caret_col = col;
+  } else {
+    sel_.anchor_line = sel_.caret_line = line;
+    sel_.anchor_col = sel_.caret_col = col;
+  }
+}
+
+void ViewCore::caret_within(const LineEntry& e, int64_t col, size_t* vi,
+                            double* x) const {
+  for (size_t i = 0; i < e.visual.size(); ++i) {
+    const VisualLine& v = e.visual[i];
+    const int64_t end = (i + 1 < e.visual.size())
+                            ? static_cast<int64_t>(e.visual[i + 1].byte_start)
+                            : static_cast<int64_t>(v.byte_end);
+    if (col >= static_cast<int64_t>(v.byte_start) && col <= end) {
+      double pen = 0;
+      size_t rel = 0;
+      for (const Glyph& g : v.run.glyphs) {
+        if (static_cast<int64_t>(v.byte_start + rel) >= col) break;
+        pen += g.advance;
+        rel += cp_len(v.run.text, rel);
+      }
+      *vi = i;
+      *x = pen;
+      return;
+    }
+  }
+  *vi = e.visual.empty() ? 0 : e.visual.size() - 1;
+  *x = 0;
+}
+
+void ViewCore::move_horizontal(int dir, bool extend) {
+  int64_t line = sel_.caret_line;
+  int64_t col = sel_.caret_col;
+  const std::string text = line_text(line);
+  if (dir > 0) {
+    if (static_cast<size_t>(col) < text.size()) {
+      col += static_cast<int64_t>(cp_len(text, static_cast<size_t>(col)));
+    } else if (line_exists(line + 1)) {
+      line += 1;
+      col = 0;
+    }
+  } else if (col > 0) {
+    size_t p = static_cast<size_t>(col) - 1;
+    while (p > 0 && (static_cast<unsigned char>(text[p]) & 0xC0) == 0x80) --p;
+    col = static_cast<int64_t>(p);
+  } else if (line > 0) {
+    line -= 1;
+    col = line_len(line);
+  }
+  v_moving_ = false;
+  set_caret_extend(line, col, extend);
+}
+
+void ViewCore::move_vertical(int dir, bool extend) {
+  int64_t line = sel_.caret_line;
+  const LineEntry& e = entry_for(line);
+  size_t vi = 0;
+  double x = 0;
+  caret_within(e, sel_.caret_col, &vi, &x);
+  if (!v_moving_) goal_x_ = x;
+  const int64_t nvi = static_cast<int64_t>(vi) + dir;
+  if (nvi >= 0 && nvi < static_cast<int64_t>(e.visual.size())) {
+    sel_.caret_col = col_at_x(e.visual[static_cast<size_t>(nvi)], goal_x_);
+  } else if (dir > 0) {
+    if (!line_exists(line + 1)) return;  // already at the last line
+    line += 1;
+    sel_.caret_col = col_at_x(entry_for(line).visual.front(), goal_x_);
+  } else {
+    if (line <= 0) return;  // already at the first line
+    line -= 1;
+    sel_.caret_col = col_at_x(entry_for(line).visual.back(), goal_x_);
+  }
+  v_moving_ = true;
+  set_caret_extend(line, sel_.caret_col, extend);
+}
+
+void ViewCore::move_line_edge(bool to_end, bool extend) {
+  const int64_t line = sel_.caret_line;
+  const int64_t col = to_end ? line_len(line) : 0;
+  v_moving_ = false;
+  set_caret_extend(line, col, extend);
+}
+
+void ViewCore::page_move(int dir, bool extend) {
+  const int64_t lines =
+      std::max<int64_t>(1, static_cast<int64_t>(height_ / line_height()));
+  scroll_lines(dir * lines);
+  int64_t line = first_line_;
+  if (!line_exists(line)) line = known_lines_ > 0 ? known_lines_ - 1 : 0;
+  const LineEntry& e = entry_for(line);
+  sel_.caret_col = col_at_x(e.visual.front(), goal_x_);
+  v_moving_ = true;
+  set_caret_extend(line, sel_.caret_col, extend);
+}
+
+void ViewCore::ensure_caret_visible() {
+  const int64_t line = sel_.caret_line;
+  if (line < first_line_) {
+    scroll_to_line(line);
+    return;
+  }
+  const int64_t vis =
+      std::max<int64_t>(1, static_cast<int64_t>(height_ / line_height()));
+  if (line >= first_line_ + vis) scroll_to_line(line - vis + 1);
+}
+
+bool ViewCore::key(const KeyEvent& e) {
+  const Selection before = sel_;
+  const int64_t before_first = first_line_;
+  const double before_px = scroll_px_;
+  switch (e.key) {
+    case Key::Left: move_horizontal(-1, e.shift); break;
+    case Key::Right: move_horizontal(1, e.shift); break;
+    case Key::Up: move_vertical(-1, e.shift); break;
+    case Key::Down: move_vertical(1, e.shift); break;
+    case Key::Home: move_line_edge(false, e.shift); break;
+    case Key::End: move_line_edge(true, e.shift); break;
+    case Key::PageUp: page_move(-1, e.shift); break;
+    case Key::PageDown: page_move(1, e.shift); break;
+    case Key::SelectAll:
+      discover_all();
+      sel_.anchor_line = 0;
+      sel_.anchor_col = 0;
+      sel_.caret_line = known_lines_ > 0 ? known_lines_ - 1 : 0;
+      sel_.caret_col = line_len(sel_.caret_line);
+      v_moving_ = false;
+      break;
+    case Key::Escape:
+      sel_.anchor_line = sel_.caret_line;
+      sel_.anchor_col = sel_.caret_col;
+      break;
+    case Key::None: return false;
+  }
+  ensure_caret_visible();
+  return !(sel_ == before) || first_line_ != before_first ||
+         scroll_px_ != before_px;
+}
+
+bool ViewCore::mouse(const MouseEvent& e) {
+  const Selection before = sel_;
+  const int64_t before_first = first_line_;
+  const double before_px = scroll_px_;
+  switch (e.kind) {
+    case MouseEvent::Kind::Scroll:
+      scroll_by(e.dy);
+      break;
+    case MouseEvent::Kind::Down: {
+      const Hit h = hit_test(e.x, e.y);
+      v_moving_ = false;
+      sel_.anchor_line = sel_.caret_line = h.line;
+      sel_.anchor_col = sel_.caret_col = h.col;
+      break;
+    }
+    case MouseEvent::Kind::Drag: {
+      const Hit h = hit_test(e.x, e.y);
+      sel_.caret_line = h.line;
+      sel_.caret_col = h.col;
+      break;
+    }
+    case MouseEvent::Kind::Up:
+      break;
+  }
+  return !(sel_ == before) || first_line_ != before_first ||
+         scroll_px_ != before_px;
 }
 
 }  // namespace vc

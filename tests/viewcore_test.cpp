@@ -208,3 +208,133 @@ TEST(viewcore_hit_test_is_lazy) {
   CHECK(d.view->line_count() <= 64);
 }
 
+TEST(viewcore_input_horizontal) {
+  Doc d("abc\ndef\n");
+  d.view->resize(800, 1000);
+  vc::KeyEvent right;
+  right.key = vc::Key::Right;
+  d.view->set_caret(0, 0);
+  CHECK(d.view->key(right));
+  CHECK_EQ(d.view->selection().caret_line, 0);
+  CHECK_EQ(d.view->selection().caret_col, 1);
+
+  d.view->set_caret(0, 3);  // end of "abc"
+  CHECK(d.view->key(right));
+  CHECK_EQ(d.view->selection().caret_line, 1);
+  CHECK_EQ(d.view->selection().caret_col, 0);
+
+  vc::KeyEvent left;
+  left.key = vc::Key::Left;
+  d.view->set_caret(1, 0);
+  CHECK(d.view->key(left));
+  CHECK_EQ(d.view->selection().caret_line, 0);
+  CHECK_EQ(d.view->selection().caret_col, 3);
+}
+
+TEST(viewcore_input_shift_extends_selection) {
+  Doc d("hello\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 1);
+  vc::KeyEvent right;
+  right.key = vc::Key::Right;
+  right.shift = true;
+  CHECK(d.view->key(right));
+  const vc::Selection s = d.view->selection();
+  CHECK_EQ(s.anchor_line, 0);
+  CHECK_EQ(s.anchor_col, 1);
+  CHECK_EQ(s.caret_line, 0);
+  CHECK_EQ(s.caret_col, 2);
+}
+
+TEST(viewcore_input_vertical_keeps_column) {
+  Doc d("abcdef\nxy\nabcdef\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 4);
+  vc::KeyEvent down;
+  down.key = vc::Key::Down;
+  CHECK(d.view->key(down));
+  CHECK_EQ(d.view->selection().caret_line, 1);
+  CHECK_EQ(d.view->selection().caret_col, 2);  // clamped to the shorter line
+  CHECK(d.view->key(down));
+  CHECK_EQ(d.view->selection().caret_line, 2);
+  CHECK_EQ(d.view->selection().caret_col, 4);  // goal column restored
+}
+
+TEST(viewcore_input_vertical_wraps) {
+  Doc d(std::string(30, 'x') + "\n");  // wraps into 3 visual lines at width 80
+  d.view->set_wrap(true);
+  d.view->resize(80, 1000);
+  d.view->set_caret(0, 0);
+  vc::KeyEvent down;
+  down.key = vc::Key::Down;
+  CHECK(d.view->key(down));
+  CHECK_EQ(d.view->selection().caret_line, 0);  // still the same logical line
+  CHECK_EQ(d.view->selection().caret_col, 10);  // next visual line, same x
+}
+
+TEST(viewcore_input_home_end) {
+  Doc d("hello\nworld\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 3);
+  vc::KeyEvent end;
+  end.key = vc::Key::End;
+  CHECK(d.view->key(end));
+  CHECK_EQ(d.view->selection().caret_col, 5);
+  vc::KeyEvent home;
+  home.key = vc::Key::Home;
+  CHECK(d.view->key(home));
+  CHECK_EQ(d.view->selection().caret_col, 0);
+}
+
+TEST(viewcore_input_mouse_selects) {
+  Doc d("hello world\nsecond\n");
+  d.view->resize(800, 1000);
+  vc::MouseEvent down;
+  down.kind = vc::MouseEvent::Kind::Down;
+  down.x = 8 * 2 + 1;
+  down.y = 8;
+  CHECK(d.view->mouse(down));
+  CHECK_EQ(d.view->selection().caret_line, 0);
+  CHECK_EQ(d.view->selection().caret_col, 2);
+
+  vc::MouseEvent drag;
+  drag.kind = vc::MouseEvent::Kind::Drag;
+  drag.x = 8 * 5 + 1;
+  drag.y = 8;
+  CHECK(d.view->mouse(drag));
+  CHECK_EQ(d.view->selection().anchor_col, 2);
+  CHECK_EQ(d.view->selection().caret_col, 5);
+}
+
+TEST(viewcore_input_mouse_scroll) {
+  std::string content;
+  for (int i = 0; i < 100; ++i) content += "line\n";
+  Doc d(content);
+  d.view->resize(800, 160);  // 10 lines tall
+  vc::MouseEvent scroll;
+  scroll.kind = vc::MouseEvent::Kind::Scroll;
+  scroll.dy = 5 * 16.0;
+  CHECK(d.view->mouse(scroll));
+  CHECK_EQ(d.view->first_visible_line(), 5);
+}
+
+TEST(viewcore_input_select_all) {
+  Doc d("aa\nbbb\ncc\n");
+  d.view->resize(800, 1000);
+  vc::KeyEvent all;
+  all.key = vc::Key::SelectAll;
+  all.cmd = true;
+  CHECK(d.view->key(all));
+  const vc::Selection s = d.view->selection();
+  CHECK_EQ(s.anchor_line, 0);
+  CHECK_EQ(s.anchor_col, 0);
+  CHECK_EQ(s.caret_line, 2);
+  CHECK_EQ(s.caret_col, 2);
+}
+
+TEST(viewcore_input_none_is_noop) {
+  Doc d("x\n");
+  vc::KeyEvent none;
+  CHECK(!d.view->key(none));
+}
+

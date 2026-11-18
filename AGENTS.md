@@ -36,13 +36,15 @@ reference, not a component library.
   (`tests/cli_fuzz.py`); `make bench` builds and runs the §5.5/§7 save-gate
   benchmark (`bench/bench_edit.cpp`); `make demo` builds and runs the M0.5
   read-only view demo / footprint gate — first paint (open→draw) and scroll fps
-  (`demo/view_demo.cpp`, `libviewcore.a`);
+  (`demo/view_demo.cpp`, `libviewcore.a`); `make app` builds `build/editor_gui`,
+  the M1 AppKit read-only view (CoreText + CoreGraphics + `viewcore`);
   `make SANITIZE=1 test` adds ASan+UBSan; `make clean`. Apple clang + make only,
   no third-party tooling. (libFuzzer is not in the Command Line Tools clang, and
   we do not install it, so "fuzzing" here means seeded randomized property tests,
   not a libFuzzer target.) This plain Makefile is a Pre-M0.0 stand-in for the
   `PLAN.md` §10 CMake graph, which wraps the same sources when the GUI/`.app`/
-  notarization work begins; the M0.5 `viewcore` library is already built this way.
+  notarization work begins; the M0.5 `viewcore` library and the M1
+  `platform/macos` ObjC++ backends are already built this way.
 
 ## Repo hygiene
 
