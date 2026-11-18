@@ -28,6 +28,7 @@ VIEWCORE_SRC := $(wildcard viewcore/src/*.cpp)
 CLI_SRC  := $(wildcard cli/src/*.cpp)
 BENCH_SRC := $(wildcard bench/*.cpp)
 DEMO_SRC := $(wildcard demo/*.cpp)
+TOOL_SRC := $(wildcard tools/*.cpp)
 TEST_SRC := $(wildcard tests/*.cpp tests/conformance/*.cpp)
 
 CORE_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(CORE_SRC))
@@ -38,6 +39,7 @@ VIEWCORE_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(VIEWCORE_SRC))
 CLI_OBJ  := $(patsubst %.cpp,$(BUILD)/%.o,$(CLI_SRC))
 BENCH_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(BENCH_SRC))
 DEMO_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(DEMO_SRC))
+TOOL_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(TOOL_SRC))
 TEST_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(TEST_SRC))
 
 # CoreText/CoreGraphics backends (platform/macos/*.mm). The app shell lives in
@@ -82,7 +84,7 @@ $(BUILD)/%.o: %.mm
 	@mkdir -p $(@D)
 	$(CXX) $(CPPFLAGS) $(CXXFLAGS) -x objective-c++ -fobjc-arc -MMD -MP -c $< -o $@
 
--include $(CORE_OBJ:.o=.d) $(PLATFORM_OBJ:.o=.d) $(PLATFORM_GUI_OBJ:.o=.d) $(APP_OBJ:.o=.d) $(VIEWCORE_OBJ:.o=.d) $(CLI_OBJ:.o=.d) $(BENCH_OBJ:.o=.d) $(DEMO_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
+-include $(CORE_OBJ:.o=.d) $(PLATFORM_OBJ:.o=.d) $(PLATFORM_GUI_OBJ:.o=.d) $(APP_OBJ:.o=.d) $(VIEWCORE_OBJ:.o=.d) $(CLI_OBJ:.o=.d) $(BENCH_OBJ:.o=.d) $(DEMO_OBJ:.o=.d) $(TOOL_OBJ:.o=.d) $(TEST_OBJ:.o=.d)
 
 test: $(BUILD)/editor_tests
 	$(BUILD)/editor_tests
@@ -127,6 +129,13 @@ $(APP_EXEC): $(BUILD)/editor_gui platform/macos/app/Info.plist
 app: $(APP_EXEC)
 
 bundle: $(APP_EXEC)
+
+# Dev preview: render a document view to a PNG (tools/render_doc.cpp).
+$(BUILD)/render_doc: $(TOOL_OBJ) $(PLATFORM_OBJ) $(PLATFORM_GUI_OBJ) $(BUILD)/libviewcore.a $(BUILD)/libcore.a
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $(TOOL_OBJ) $(PLATFORM_OBJ) $(PLATFORM_GUI_OBJ) $(BUILD)/libviewcore.a $(BUILD)/libcore.a $(APP_FRAMEWORKS) -framework ImageIO
+
+render: $(BUILD)/render_doc
 
 clean:
 	rm -rf build build-asan

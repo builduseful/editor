@@ -8,7 +8,8 @@
 // Token mapping (design-system name -> field):
 //   color.surface        -> background   (the document ground)
 //   color.text           -> text         (ink)
-//   color.surface-muted  -> selection    ("quiet fills: … selects")
+//   color.secondary-hover-> selection    (a neutral fill that reads as a shape;
+//                                          surface-muted is too faint in light)
 //   color.surface-subtle -> current_line (faintest fill: rows inside a card)
 //   color.page           -> page         (the ground behind the margin)
 //   color.text-muted     -> gutter_text  (supporting text; meets 4.5:1)
@@ -27,6 +28,7 @@ struct Theme {
   Color page;  // color.page: the ground behind the margin / chrome
   Color gutter_text;
   Color gutter_border;
+  Color border_control;  // color.border-control: the scrollbar thumb
 };
 
 Theme light_theme();

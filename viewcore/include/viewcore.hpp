@@ -212,6 +212,9 @@ class ViewCore {
   // Recomputes the gutter width from the known line count (and re-wraps if the
   // width changed with wrap on).
   void update_gutter() const;
+  // A quiet overlay scrollbar on the right edge (drawn only once the line count
+  // is known). Not interactive yet.
+  void draw_scrollbar(Canvas& c) const;
   double text_left() const { return gutter_width_; }
   double text_width() const {
     const double w = width_ - gutter_width_;
@@ -262,6 +265,7 @@ class ViewCore {
   Color gutter_bg_{246, 247, 249, 255};         // color.page
   Color gutter_fg_{98, 106, 118, 255};          // color.text-muted
   Color gutter_border_color_{230, 233, 238, 255};  // color.border-subtle
+  Color border_control_color_{126, 135, 148, 255};  // color.border-control
   Color current_line_color_{0, 0, 0, 0};        // disabled
   Selection sel_;
 

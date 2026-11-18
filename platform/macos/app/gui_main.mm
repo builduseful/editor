@@ -71,6 +71,18 @@ NSColor* ns_color(vc::Color c) {
                              alpha:c.a / 255.0];
 }
 
+// Renders any view through AppKit's own context to a PNG (the `--snapshot`
+// smoke test, so the real GUI output can be inspected without a display).
+static BOOL write_view_png(NSView* v, NSString* path) {
+  if (v == nil || path == nil) return NO;
+  const NSRect b = v.bounds;
+  NSBitmapImageRep* rep = [v bitmapImageRepForCachingDisplayInRect:b];
+  [v cacheDisplayInRect:b toBitmapImageRep:rep];
+  NSData* png = [rep representationUsingType:NSBitmapImageFileTypePNG
+                                  properties:@{}];
+  return [png writeToFile:path atomically:YES];
+}
+
 // The find/replace bar (§9 literal find; no regex, no core search API).
 @interface FindBar : NSView
 - (instancetype)initWithEditorView:(EditorView*)view;
@@ -89,7 +101,9 @@ NSColor* ns_color(vc::Color c) {
 @property(nonatomic, assign) StatusBar* statusBar;
 - (instancetype)initWithEditor:(Editor*)ed;
 - (void)reloadDocument;
+- (void)discoverIfSmall;
 - (void)refreshTheme;
+- (BOOL)writeSnapshotTo:(NSString*)path;
 - (void)findText:(NSString*)needle backward:(BOOL)backward;
 - (void)replaceText:(NSString*)needle with:(NSString*)replacement;
 - (void)replaceAllText:(NSString*)needle with:(NSString*)replacement;
@@ -433,6 +447,21 @@ NSColor* ns_color(vc::Color c) {
   _view->set_caret(0, 0);
   [self setNeedsDisplay:YES];
 }
+// First paint stays lazy; once the window is up, index small/medium files so the
+// scrollbar and the exact line count appear. Huge files stay lazy (the index
+// would block).
+- (void)discoverIfSmall {
+  const Rev r = _ed->rev();
+  if (r.size > 0 && r.size <= (64ull << 20)) {
+    _view->discover_all();
+    [self setNeedsDisplay:YES];
+  }
+}
+// Renders the view exactly as the window does (through AppKit's context) to a
+// PNG. Used by the `--snapshot` smoke test so the GUI can be inspected headless.
+- (BOOL)writeSnapshotTo:(NSString*)path {
+  return write_view_png(self, path);
+}
 - (void)setFrameSize:(NSSize)newSize {
   [super setFrameSize:newSize];
   _view->resize(newSize.width, newSize.height);
@@ -440,9 +469,12 @@ NSColor* ns_color(vc::Color c) {
 }
 - (void)drawRect:(NSRect)dirtyRect {
   (void)dirtyRect;
+  // Keep viewcore's size in step with the view: auto layout may not call
+  // setFrameSize:, which would leave the background under-covered.
+  const NSSize size = self.bounds.size;
+  _view->resize(size.width, size.height);
   CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
-  auto canvas = ed::mac::create_cg_canvas(ctx, self.bounds.size.width,
-                                          self.bounds.size.height);
+  auto canvas = ed::mac::create_cg_canvas(ctx, size.width, size.height);
   _view->draw(*canvas);
   [self updateStatus];
 }
@@ -499,10 +531,34 @@ NSColor* ns_color(vc::Color c) {
 @property(nonatomic, assign) Editor* editor;
 @property(nonatomic, assign) EditorView* view;
 @property(nonatomic, strong) NSWindow* aboutWindow;
+@property(nonatomic, copy) NSString* snapshotPath;
 - (void)showAbout:(id)sender;
 @end
 
 @implementation AppDelegate
+- (void)applicationDidFinishLaunching:(NSNotification*)note {
+  (void)note;
+  [self.view performSelector:@selector(discoverIfSmall)
+                  withObject:nil
+                  afterDelay:0.1];
+  if (self.snapshotPath != nil) {
+    // Let the first frame draw, then snapshot and exit (the `--snapshot` test).
+    [NSTimer scheduledTimerWithTimeInterval:0.5
+                                     target:self
+                                   selector:@selector(runSnapshot:)
+                                   userInfo:nil
+                                    repeats:NO];
+  }
+}
+- (void)runSnapshot:(NSTimer*)timer {
+  (void)timer;
+  NSView* content = self.view.window.contentView;
+  const BOOL ok = write_view_png(content != nil ? content : self.view,
+                                 self.snapshotPath);
+  std::fprintf(stderr, "[snapshot] %s -> %s\n",
+               ok ? "wrote" : "FAILED", self.snapshotPath.UTF8String);
+  [NSApp terminate:nil];
+}
 - (void)showAbout:(id)sender {
   (void)sender;
   if (self.aboutWindow == nil) {
@@ -674,12 +730,17 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
 
 int main(int argc, char** argv) {
   @autoreleasepool {
-    std::string path;
+    std::string path, snapshot;
     for (int i = 1; i < argc; ++i) {
       const std::string a = argv[i];
-      if (!a.empty() && a[0] != '-') {
+      if (a == "--snapshot" && i + 1 < argc) {
+        snapshot = argv[++i];
+      } else if (a == "--theme" && i + 1 < argc) {
+        [[NSUserDefaults standardUserDefaults]
+            setObject:[NSString stringWithUTF8String:argv[++i]]
+               forKey:@"Theme"];
+      } else if (!a.empty() && a[0] != '-') {
         path = a;
-        break;
       }
     }
 
@@ -736,6 +797,9 @@ int main(int argc, char** argv) {
     AppDelegate* delegate = [[AppDelegate alloc] init];
     delegate.editor = ed.get();
     delegate.view = view;
+    if (!snapshot.empty()) {
+      delegate.snapshotPath = [NSString stringWithUTF8String:snapshot.c_str()];
+    }
     [app setDelegate:delegate];
 
     build_menu_bar(app, delegate);

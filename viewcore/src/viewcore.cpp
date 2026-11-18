@@ -68,6 +68,7 @@ void ViewCore::set_theme(const Theme& t) {
   gutter_bg_ = t.page;
   gutter_fg_ = t.gutter_text;
   gutter_border_color_ = t.gutter_border;
+  border_control_color_ = t.border_control;
 }
 
 void ViewCore::set_document(Editor& ed) {
@@ -338,6 +339,26 @@ void ViewCore::update_gutter() const {
   }
 }
 
+void ViewCore::draw_scrollbar(Canvas& c) const {
+  if (!eof_known_) return;  // the total is unknown until the index is complete
+  const double lh = line_height();
+  const double total = static_cast<double>(known_lines_) * lh;
+  if (total <= height_ + 0.5) return;  // nothing to scroll
+
+  const double w = 9.0;
+  const double x = width_ - w;
+  c.fill_rect(Rect{x, 0, w, height_}, gutter_bg_);  // track (color.page)
+  double thumb = height_ * (height_ / total);
+  if (thumb < 28) thumb = 28;
+  if (thumb > height_) thumb = height_;
+  const double max_off = total - height_;
+  double off = static_cast<double>(first_line_) * lh;
+  if (off < 0) off = 0;
+  if (off > max_off) off = max_off;
+  const double y = max_off > 0 ? (off / max_off) * (height_ - thumb) : 0;
+  c.fill_rect(Rect{x + 2, y + 1, w - 4, thumb - 2}, border_control_color_);
+}
+
 void ViewCore::apply_tabs(Run& run) const {
   if (tab_width_ <= 0) return;
   const double space = tb_->measure(run.font, " ");
@@ -471,6 +492,7 @@ void ViewCore::draw(Canvas& c) const {
   if (caret_visible_ && caret_x >= 0 && caret_y >= 0 && caret_y < height_) {
     c.fill_rect(Rect{caret_x, caret_y, 1.5, lh}, caret_color_);
   }
+  draw_scrollbar(c);
 }
 
 // --- Input (M1: read-only movement and selection) --------------------------
