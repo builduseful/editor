@@ -73,6 +73,9 @@ class ViewCore {
   // Ink used to draw text (the Canvas sets this before each run).
   void set_text_color(Color c) { text_color_ = c; }
   Color text_color() const { return text_color_; }
+  // Selection highlight and caret colours.
+  void set_selection_color(Color c) { selection_color_ = c; }
+  void set_caret_color(Color c) { caret_color_ = c; }
 
   double line_height() const;
   // Number of lines discovered so far. The view grows this lazily as it draws or
@@ -146,6 +149,8 @@ class ViewCore {
   bool line_exists(int64_t line) const;
   double block_height(int64_t line) const;
   int64_t col_at_x(const VisualLine& v, double x) const;
+  // Pen x of byte offset `col` within a visual line.
+  double x_of_col(const VisualLine& v, int64_t col) const;
   std::string line_text(int64_t line) const;  // logical line, terminator stripped
 
   // Input helpers.
@@ -172,7 +177,9 @@ class ViewCore {
   mutable int64_t known_lines_ = 0;  // lines discovered so far (lazy)
   mutable bool eof_known_ = false;   // the whole document has been indexed
   std::vector<Decoration> decorations_;
-  Color text_color_{26, 26, 26, 255};  // ink
+  Color text_color_{26, 26, 26, 255};         // ink
+  Color selection_color_{180, 200, 240, 255};  // highlight
+  Color caret_color_{26, 26, 26, 255};
   Selection sel_;
 
   mutable std::map<int64_t, LineEntry> cache_;

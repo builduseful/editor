@@ -338,3 +338,41 @@ TEST(viewcore_input_none_is_noop) {
   CHECK(!d.view->key(none));
 }
 
+TEST(viewcore_draw_renders_selection) {
+  Doc d("hello world\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 2);
+  vc::KeyEvent right;
+  right.key = vc::Key::Right;
+  right.shift = true;
+  d.view->key(right);
+  d.view->key(right);
+  d.view->key(right);  // select bytes [2, 5)
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);
+  bool sel = false;
+  for (const vc::DrawCmd& cmd : rc.cmds) {
+    if (cmd.kind == vc::DrawCmd::Kind::FillRect && cmd.rect.x == 16.0 &&
+        cmd.rect.w == 24.0 && cmd.rect.h == 16.0) {
+      sel = true;
+    }
+  }
+  CHECK(sel);
+}
+
+TEST(viewcore_draw_renders_caret) {
+  Doc d("hello\n");
+  d.view->resize(800, 1000);
+  d.view->set_caret(0, 3);
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);
+  bool caret = false;
+  for (const vc::DrawCmd& cmd : rc.cmds) {
+    if (cmd.kind == vc::DrawCmd::Kind::FillRect && cmd.rect.x == 24.0 &&
+        cmd.rect.w == 1.5 && cmd.rect.h == 16.0) {
+      caret = true;
+    }
+  }
+  CHECK(caret);
+}
+

@@ -266,6 +266,17 @@ int64_t ViewCore::col_at_x(const VisualLine& v, double x) const {
   return static_cast<int64_t>(v.byte_start + rel);
 }
 
+double ViewCore::x_of_col(const VisualLine& v, int64_t col) const {
+  double pen = 0;
+  size_t rel = 0;
+  for (const Glyph& g : v.run.glyphs) {
+    if (static_cast<int64_t>(v.byte_start + rel) >= col) break;
+    pen += g.advance;
+    rel += cp_len(v.run.text, rel);
+  }
+  return pen;
+}
+
 Hit ViewCore::hit_test(double x, double y) const {
   const double lh = line_height();
   double top = -scroll_px_;
@@ -309,22 +320,62 @@ void ViewCore::draw(Canvas& c) const {
   const double lh = line_height();
   c.clear(Color{255, 255, 255, 255});
   c.set_text_color(text_color_);
+
+  const bool has_sel = sel_.anchor_line != sel_.caret_line ||
+                       sel_.anchor_col != sel_.caret_col;
+  int64_t sline = 0, scol = 0, eline = 0, ecol = 0;
+  if (has_sel) {
+    const bool fwd = sel_.anchor_line < sel_.caret_line ||
+                     (sel_.anchor_line == sel_.caret_line &&
+                      sel_.anchor_col <= sel_.caret_col);
+    sline = fwd ? sel_.anchor_line : sel_.caret_line;
+    scol = fwd ? sel_.anchor_col : sel_.caret_col;
+    eline = fwd ? sel_.caret_line : sel_.anchor_line;
+    ecol = fwd ? sel_.caret_col : sel_.anchor_col;
+  }
+
+  double caret_x = -1, caret_y = 0;
   double y = -scroll_px_;
   for (int64_t line = first_line_; y < height_; ++line) {
     if (!line_exists(line)) break;
     const LineEntry& e = entry_for(line);
+    const int64_t line_content = static_cast<int64_t>(e.visual.back().byte_end);
+    const bool line_sel = has_sel && line >= sline && line <= eline;
     for (const VisualLine& v : e.visual) {
       if (y + lh > 0) {
         for (const Decoration& d : decorations_) {
-          if (d.line == line) {
-            c.fill_rect(Rect{0, y, width_, lh}, d.color);
+          if (d.line == line) c.fill_rect(Rect{0, y, width_, lh}, d.color);
+        }
+        if (line_sel) {
+          int64_t lo = line == sline ? scol : 0;
+          int64_t hi = line == eline ? ecol : line_content;
+          if (lo < static_cast<int64_t>(v.byte_start)) {
+            lo = static_cast<int64_t>(v.byte_start);
           }
+          if (hi > static_cast<int64_t>(v.byte_end)) {
+            hi = static_cast<int64_t>(v.byte_end);
+          }
+          if (hi > lo) {
+            const double x0 = x_of_col(v, lo);
+            const double x1 = x_of_col(v, hi);
+            c.fill_rect(Rect{x0, y, x1 - x0, lh}, selection_color_);
+          }
+        }
+        if (!has_sel && line == sel_.caret_line &&
+            sel_.caret_col >= static_cast<int64_t>(v.byte_start) &&
+            sel_.caret_col <= static_cast<int64_t>(v.byte_end)) {
+          caret_x = x_of_col(v, sel_.caret_col);
+          caret_y = y;
         }
         c.draw_run(v.run, 0, y + v.run.ascent);
       }
       y += lh;
       if (y >= height_) break;
     }
+  }
+
+  if (caret_x >= 0 && caret_y >= 0 && caret_y < height_) {
+    c.fill_rect(Rect{caret_x, caret_y, 1.5, lh}, caret_color_);
   }
 }
 
