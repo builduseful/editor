@@ -69,6 +69,7 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 
 @interface EditorView : NSView
 - (instancetype)initWithEditor:(Editor*)ed;
+- (void)reloadDocument;
 @end
 
 @implementation EditorView {
@@ -95,6 +96,13 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 
 - (BOOL)acceptsFirstResponder {
   return YES;
+}
+
+- (void)reloadDocument {
+  _view->set_document(*_ed);
+  _view->resize(self.bounds.size.width, self.bounds.size.height);
+  _view->set_caret(0, 0);
+  [self setNeedsDisplay:YES];
 }
 
 - (void)setFrameSize:(NSSize)newSize {
@@ -166,6 +174,22 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 }
 @end
 
+@interface AppDelegate : NSObject <NSApplicationDelegate>
+@property(nonatomic, assign) Editor* editor;
+@property(nonatomic, assign) EditorView* view;
+@end
+
+@implementation AppDelegate
+- (BOOL)application:(NSApplication*)sender openFile:(NSString*)filename {
+  if (self.editor == nullptr || filename == nil) return NO;
+  const Status s = self.editor->open(filename.UTF8String);
+  if (s != Status::Ok) return NO;
+  [self.view reloadDocument];
+  [sender activateIgnoringOtherApps:YES];
+  return YES;
+}
+@end
+
 int main(int argc, char** argv) {
   @autoreleasepool {
     std::string path;
@@ -208,6 +232,11 @@ int main(int argc, char** argv) {
     [win makeFirstResponder:view];
     [win center];
     [win makeKeyAndOrderFront:nil];
+
+    AppDelegate* delegate = [[AppDelegate alloc] init];
+    delegate.editor = ed.get();
+    delegate.view = view;
+    [app setDelegate:delegate];
 
     NSMenu* menubar = [[NSMenu alloc] init];
     NSMenuItem* appItem = [[NSMenuItem alloc] init];

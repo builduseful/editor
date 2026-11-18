@@ -110,13 +110,23 @@ $(BUILD)/view_demo: $(DEMO_OBJ) $(PLATFORM_OBJ) $(BUILD)/libviewcore.a $(BUILD)/
 demo: $(BUILD)/view_demo
 	$(BUILD)/view_demo
 
-# The M1 AppKit read-only view (platform/macos/app/gui_main.mm). Not an .app
-# bundle yet (M3.5 packaging); run it from a terminal.
+# The M1 AppKit read-only view (platform/macos/app/gui_main.mm).
 $(BUILD)/editor_gui: $(APP_OBJ) $(PLATFORM_OBJ) $(PLATFORM_GUI_OBJ) $(BUILD)/libviewcore.a $(BUILD)/libcore.a
 	@mkdir -p $(@D)
 	$(CXX) $(CXXFLAGS) -o $@ $(APP_OBJ) $(PLATFORM_OBJ) $(PLATFORM_GUI_OBJ) $(BUILD)/libviewcore.a $(BUILD)/libcore.a $(APP_FRAMEWORKS)
 
-app: $(BUILD)/editor_gui
+# The launchable .app bundle (notarization/packaging proper is M3.5).
+APP_BUNDLE := $(BUILD)/editor.app
+APP_EXEC := $(APP_BUNDLE)/Contents/MacOS/editor
+
+$(APP_EXEC): $(BUILD)/editor_gui platform/macos/app/Info.plist
+	@mkdir -p $(APP_BUNDLE)/Contents/MacOS
+	cp $(BUILD)/editor_gui $@
+	cp platform/macos/app/Info.plist $(APP_BUNDLE)/Contents/Info.plist
+
+app: $(APP_EXEC)
+
+bundle: $(APP_EXEC)
 
 clean:
 	rm -rf build build-asan
