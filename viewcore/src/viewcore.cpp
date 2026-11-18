@@ -54,8 +54,21 @@ size_t find_in(std::string_view h, std::string_view n, size_t from, bool cs) {
 
 }  // namespace
 
-ViewCore::ViewCore(Editor& ed, TextBackend& tb) : ed_(&ed), tb_(&tb) {}
+ViewCore::ViewCore(Editor& ed, TextBackend& tb) : ed_(&ed), tb_(&tb) {
+  set_theme(light_theme());
+}
 ViewCore::~ViewCore() = default;
+
+void ViewCore::set_theme(const Theme& t) {
+  background_color_ = t.background;
+  text_color_ = t.text;
+  caret_color_ = t.text;
+  selection_color_ = t.selection;
+  current_line_color_ = t.current_line;
+  gutter_bg_ = t.page;
+  gutter_fg_ = t.gutter_text;
+  gutter_border_color_ = t.gutter_border;
+}
 
 void ViewCore::set_document(Editor& ed) {
   ed_ = &ed;
@@ -385,9 +398,10 @@ void ViewCore::draw(Canvas& c) const {
   update_gutter();
   const double lh = line_height();
   const double left = text_left();
-  c.clear(Color{255, 255, 255, 255});
+  c.clear(background_color_);
   if (gutter_width_ > 0) {
     c.fill_rect(Rect{0, 0, gutter_width_, height_}, gutter_bg_);
+    c.fill_rect(Rect{gutter_width_ - 1, 0, 1, height_}, gutter_border_color_);
   }
 
   const bool has_sel = sel_.anchor_line != sel_.caret_line ||

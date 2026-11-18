@@ -15,6 +15,7 @@
 #include "canvas.hpp"
 #include "editor.hpp"
 #include "textbackend.hpp"
+#include "theme.hpp"
 #include "types.hpp"
 
 namespace vc {
@@ -73,6 +74,9 @@ class ViewCore {
   void set_wrap(bool on);
   void set_font(const FontSpec& f);
   void set_decorations(std::vector<Decoration> d);
+  // Applies a Build Useful theme (all colours at once). The platform picks
+  // light/dark from the system appearance and calls this.
+  void set_theme(const Theme& t);
   // Ink used to draw text (the Canvas sets this before each run).
   void set_text_color(Color c) { text_color_ = c; }
   Color text_color() const { return text_color_; }
@@ -247,16 +251,18 @@ class ViewCore {
   mutable int64_t known_lines_ = 0;  // lines discovered so far (lazy)
   mutable bool eof_known_ = false;   // the whole document has been indexed
   std::vector<Decoration> decorations_;
-  Color text_color_{26, 26, 26, 255};         // ink
-  Color selection_color_{180, 200, 240, 255};  // highlight
-  Color caret_color_{26, 26, 26, 255};
+  Color background_color_{255, 255, 255, 255};  // color.surface
+  Color text_color_{23, 26, 31, 255};           // color.text (ink)
+  Color selection_color_{238, 241, 244, 255};   // color.surface-muted
+  Color caret_color_{23, 26, 31, 255};
   bool caret_visible_ = true;
   int tab_width_ = 4;
   bool gutter_ = false;
   mutable double gutter_width_ = 0;
-  Color gutter_bg_{246, 246, 246, 255};
-  Color gutter_fg_{150, 150, 150, 255};
-  Color current_line_color_{0, 0, 0, 0};  // disabled
+  Color gutter_bg_{246, 247, 249, 255};         // color.page
+  Color gutter_fg_{98, 106, 118, 255};          // color.text-muted
+  Color gutter_border_color_{230, 233, 238, 255};  // color.border-subtle
+  Color current_line_color_{0, 0, 0, 0};        // disabled
   Selection sel_;
 
   mutable std::map<int64_t, LineEntry> cache_;

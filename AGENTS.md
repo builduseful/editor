@@ -17,10 +17,16 @@ reference, not a component library.
   the look natively with AppKit/CoreText.
 - Use its tokens as the reference: ink and grey palette, light/dark themes, spacing
   scale, type ramp, subtle borders, minimal chrome. No accent hue.
+- The resolved colour tokens live in one place: `viewcore/include/theme.hpp` /
+  `viewcore/src/theme.cpp` (`light_theme()` / `dark_theme()`). Keep them in sync with
+  the design system's colour tokens; never hard-code a colour elsewhere. The app
+  offers System / Light / Dark and applies the matching theme.
 - Use the system UI font for chrome; monospace only for the document and technical
   values.
 - Ask the user for the current design-system location/access before UI work. Never
   commit local paths, personal data, or proprietary design-system files.
+- `LICENSE` follows the design system's app-licence template (the system is used
+  under its own licence, not vendored). The About panel carries the same notice.
 
 ## Engineering
 

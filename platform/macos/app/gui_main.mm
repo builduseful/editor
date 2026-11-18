@@ -64,15 +64,24 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 
 }  // namespace
 
+NSColor* ns_color(vc::Color c) {
+  return [NSColor colorWithSRGBRed:c.r / 255.0
+                             green:c.g / 255.0
+                              blue:c.b / 255.0
+                             alpha:c.a / 255.0];
+}
+
 // The find/replace bar (§9 literal find; no regex, no core search API).
 @interface FindBar : NSView
 - (instancetype)initWithEditorView:(EditorView*)view;
 - (void)focusField;
+- (void)setPageColor:(vc::Color)c;
 @end
 
 // A thin bottom status bar (chrome; system UI font, §8).
 @interface StatusBar : NSView
 - (void)setText:(NSString*)text;
+- (void)setPageColor:(vc::Color)c;
 @end
 
 @interface EditorView : NSView
@@ -80,6 +89,7 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 @property(nonatomic, assign) StatusBar* statusBar;
 - (instancetype)initWithEditor:(Editor*)ed;
 - (void)reloadDocument;
+- (void)refreshTheme;
 - (void)findText:(NSString*)needle backward:(BOOL)backward;
 - (void)replaceText:(NSString*)needle with:(NSString*)replacement;
 - (void)replaceAllText:(NSString*)needle with:(NSString*)replacement;
@@ -105,6 +115,10 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 }
 - (void)setText:(NSString*)text {
   _label.stringValue = text != nil ? text : @"";
+}
+- (void)setPageColor:(vc::Color)c {
+  self.wantsLayer = YES;
+  self.layer.backgroundColor = ns_color(c).CGColor;
 }
 @end
 
@@ -156,6 +170,10 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 - (void)focusField {
   [self.window makeFirstResponder:_find];
 }
+- (void)setPageColor:(vc::Color)c {
+  self.wantsLayer = YES;
+  self.layer.backgroundColor = ns_color(c).CGColor;
+}
 - (void)findNext:(id)sender {
   (void)sender;
   [_editorView findText:_find.stringValue backward:NO];
@@ -192,7 +210,7 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
     _view->resize(self.bounds.size.width, self.bounds.size.height);
     [self applySettings];
     _view->set_gutter(true);
-    _view->set_current_line_color(vc::Color{247, 247, 247, 255});
+    [self refreshTheme];
     _view->set_caret(0, 0);
     [self startBlink];
   }
@@ -241,6 +259,52 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
   _view->set_wrap(on);
   [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"Wrap"];
   [self setNeedsDisplay:YES];
+}
+
+// --- Theme (Build Useful tokens; System / Light / Dark, §8) ----------------
+
+- (BOOL)isDark {
+  NSAppearanceName name = [self.effectiveAppearance
+      bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua,
+                                           NSAppearanceNameDarkAqua ]];
+  return [name isEqualToString:NSAppearanceNameDarkAqua];
+}
+- (void)applyThemeColors {
+  const vc::Theme t = [self isDark] ? vc::dark_theme() : vc::light_theme();
+  _view->set_theme(t);
+  [self.findBar setPageColor:t.page];
+  [self.statusBar setPageColor:t.page];
+  [self setNeedsDisplay:YES];
+}
+- (void)refreshTheme {
+  NSString* pref = [[NSUserDefaults standardUserDefaults] stringForKey:@"Theme"];
+  NSAppearance* ap = nil;
+  if ([pref isEqualToString:@"light"]) {
+    ap = [NSAppearance appearanceNamed:NSAppearanceNameAqua];
+  } else if ([pref isEqualToString:@"dark"]) {
+    ap = [NSAppearance appearanceNamed:NSAppearanceNameDarkAqua];
+  }
+  NSApp.appearance = ap;  // nil follows the system
+  [self applyThemeColors];
+}
+- (void)viewDidChangeEffectiveAppearance {
+  [super viewDidChangeEffectiveAppearance];
+  [self applyThemeColors];
+}
+- (void)setThemeSystem:(id)sender {
+  (void)sender;
+  [[NSUserDefaults standardUserDefaults] setObject:@"system" forKey:@"Theme"];
+  [self refreshTheme];
+}
+- (void)setThemeLight:(id)sender {
+  (void)sender;
+  [[NSUserDefaults standardUserDefaults] setObject:@"light" forKey:@"Theme"];
+  [self refreshTheme];
+}
+- (void)setThemeDark:(id)sender {
+  (void)sender;
+  [[NSUserDefaults standardUserDefaults] setObject:@"dark" forKey:@"Theme"];
+  [self refreshTheme];
 }
 
 // --- Commands --------------------------------------------------------------
@@ -299,6 +363,18 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 - (BOOL)validateMenuItem:(NSMenuItem*)item {
   if (item.action == @selector(toggleWrap:)) {
     item.state = _view->wrap() ? NSControlStateValueOn : NSControlStateValueOff;
+  } else if (item.action == @selector(setThemeSystem:) ||
+             item.action == @selector(setThemeLight:) ||
+             item.action == @selector(setThemeDark:)) {
+    NSString* pref =
+        [[NSUserDefaults standardUserDefaults] stringForKey:@"Theme"];
+    if (pref == nil) pref = @"system";
+    NSString* want = item.action == @selector(setThemeLight:)
+                         ? @"light"
+                         : (item.action == @selector(setThemeDark:) ? @"dark"
+                                                                    : @"system");
+    item.state = [pref isEqualToString:want] ? NSControlStateValueOn
+                                             : NSControlStateValueOff;
   }
   return YES;
 }
@@ -422,9 +498,64 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 @interface AppDelegate : NSObject <NSApplicationDelegate>
 @property(nonatomic, assign) Editor* editor;
 @property(nonatomic, assign) EditorView* view;
+@property(nonatomic, strong) NSWindow* aboutWindow;
+- (void)showAbout:(id)sender;
 @end
 
 @implementation AppDelegate
+- (void)showAbout:(id)sender {
+  (void)sender;
+  if (self.aboutWindow == nil) {
+    NSWindow* w = [[NSWindow alloc]
+        initWithContentRect:NSMakeRect(0, 0, 420, 300)
+                  styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                    backing:NSBackingStoreBuffered
+                      defer:NO];
+    w.title = @"About editor";
+
+    NSStackView* s = [[NSStackView alloc] init];
+    s.orientation = NSUserInterfaceLayoutOrientationVertical;
+    s.alignment = NSLayoutAttributeLeading;
+    s.edgeInsets = NSEdgeInsetsMake(20, 20, 20, 20);
+    s.spacing = 8;
+    s.translatesAutoresizingMaskIntoConstraints = NO;
+    [w.contentView addSubview:s];
+    [NSLayoutConstraint activateConstraints:@[
+      [s.leadingAnchor constraintEqualToAnchor:w.contentView.leadingAnchor],
+      [s.trailingAnchor constraintEqualToAnchor:w.contentView.trailingAnchor],
+      [s.topAnchor constraintEqualToAnchor:w.contentView.topAnchor],
+      [s.bottomAnchor constraintLessThanOrEqualToAnchor:w.contentView.bottomAnchor],
+    ]];
+
+    NSTextField* name = [NSTextField labelWithString:@"editor"];
+    name.font = [NSFont systemFontOfSize:20 weight:NSFontWeightBold];
+    [s addArrangedSubview:name];
+    [s addArrangedSubview:[NSTextField labelWithString:@"Version 0.1"]];
+
+    NSTextField* licence = [NSTextField
+        wrappingLabelWithString:
+            @"Copyright © 2026 James de Klerk, trading as Build Useful. All "
+            @"rights reserved.\n\nBuilt with the Build Useful design system, used "
+            @"under its own licence. The Build Useful name and logo, and the "
+            @"\u201Ceditor by Build Useful\u201D name, logo and app icons, "
+            @"aren\u2019t licensed for other use."];
+    licence.preferredMaxLayoutWidth = 380;
+    [s addArrangedSubview:licence];
+
+    NSTextField* third = [NSTextField labelWithString:@"Third-party software"];
+    third.font = [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold];
+    [s addArrangedSubview:third];
+    [s addArrangedSubview:[NSTextField
+                            wrappingLabelWithString:@"None. editor uses only the "
+                                                    @"macOS system frameworks."]];
+
+    w.releasedWhenClosed = NO;
+    self.aboutWindow = w;
+  }
+  [self.aboutWindow center];
+  [self.aboutWindow makeKeyAndOrderFront:nil];
+}
+
 - (BOOL)application:(NSApplication*)sender openFile:(NSString*)filename {
   if (self.editor == nullptr || filename == nil) return NO;
   const Status s = self.editor->open(filename.UTF8String);
@@ -481,13 +612,25 @@ NSMenu* submenu(NSString* title, NSArray<NSMenuItem*>* items) {
   return m;
 }
 
-void build_menu_bar(NSApplication* app) {
+void build_menu_bar(NSApplication* app, id aboutTarget) {
   NSMenu* menubar = [[NSMenu alloc] init];
 
   NSMenuItem* appItem = [[NSMenuItem alloc] init];
   [menubar addItem:appItem];
+  NSMenuItem* about = item(@"About editor", @selector(showAbout:), @"");
+  about.target = aboutTarget;
+  NSMenuItem* themeItem = [[NSMenuItem alloc] initWithTitle:@"Theme"
+                                                     action:nil
+                                              keyEquivalent:@""];
+  [themeItem setSubmenu:submenu(@"Theme", @[
+    item(@"System", @selector(setThemeSystem:), @""),
+    item(@"Light", @selector(setThemeLight:), @""),
+    item(@"Dark", @selector(setThemeDark:), @""),
+  ])];
   [appItem setSubmenu:submenu(@"editor", @[
-    item(@"About editor", @selector(orderFrontStandardAboutPanel:), @""),
+    about,
+    [NSMenuItem separatorItem],
+    themeItem,
     [NSMenuItem separatorItem],
     item(@"Quit editor", @selector(terminate:), @"q"),
   ])];
@@ -572,6 +715,7 @@ int main(int argc, char** argv) {
     view.findBar = bar;
     view.statusBar = status;
     bar.hidden = YES;
+    [view refreshTheme];  // give the chrome its page colour now the bars exist
 
     NSStackView* stack = [NSStackView stackViewWithViews:@[ bar, view, status ]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -594,7 +738,7 @@ int main(int argc, char** argv) {
     delegate.view = view;
     [app setDelegate:delegate];
 
-    build_menu_bar(app);
+    build_menu_bar(app, delegate);
 
     [app activateIgnoringOtherApps:YES];
     [app run];

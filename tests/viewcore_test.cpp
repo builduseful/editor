@@ -465,6 +465,25 @@ TEST(viewcore_selected_text) {
   CHECK_EQ(d.view->selected_text(), std::string("world\nsecond"));
 }
 
+TEST(viewcore_theme_light_and_dark) {
+  Doc d("hello\n");
+  d.view->resize(800, 1000);
+  d.view->set_theme(vc::light_theme());
+  vc::RecordingCanvas lc;
+  d.view->draw(lc);
+  CHECK(!lc.cmds.empty());
+  CHECK(lc.cmds.front().kind == vc::DrawCmd::Kind::Clear);
+  CHECK_EQ(lc.cmds.front().color.r, 255);  // light surface #ffffff
+  CHECK_EQ(lc.cmds.front().color.g, 255);
+
+  d.view->set_theme(vc::dark_theme());
+  vc::RecordingCanvas dc;
+  d.view->draw(dc);
+  CHECK_EQ(dc.cmds.front().color.r, 27);  // dark surface #1b1b1b
+  CHECK_EQ(dc.cmds.front().color.g, 27);
+  CHECK_EQ(dc.cmds.front().color.b, 27);
+}
+
 TEST(viewcore_edit_insert_text) {
   Doc d("abc\n");
   d.view->resize(800, 1000);

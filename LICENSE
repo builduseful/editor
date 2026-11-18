@@ -1,0 +1,29 @@
+Copyright (c) 2026 James de Klerk, trading as Build Useful. All rights reserved.
+
+This is editor: its source code, interface, documentation and tooling.
+
+It may be read, but no licence is granted to use, copy, modify, merge,
+publish, distribute, sublicense or sell any part of it, in whole or in part,
+for any purpose, without the copyright holder's written permission. Making
+it visible, for example in a public repository, does not grant any such
+licence.
+
+The Build Useful design system
+
+editor's interface follows the Build Useful design system, used under its own
+licence. The design system is not vendored into this repository: its colour,
+type, space, shape and motion tokens are implemented natively (see
+viewcore/include/theme.hpp), as the design system's web CSS/JS is not copied
+into a native app (PLAN.md D13).
+
+Third-party software
+
+Third-party software that editor uses stays under its own licence, and nothing
+here restricts it. The notices are listed on the app's About page and in the
+notices files that ship with it.
+
+Name and brand
+
+"Build Useful", its logo, and "editor by Build Useful" with its logo and app
+icons identify the copyright holder's products. This notice grants no right to
+use them. It claims no rights in the ordinary word "editor".

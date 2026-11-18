@@ -1152,6 +1152,12 @@ personal data, or proprietary files.
 
 - **Custom view only** on macOS in v1, driven by `viewcore` + `textbackend`
   (CoreText). No native-control hybrid; native control is a post-1.0 experiment.
+- **Colour tokens are implemented natively** in `viewcore/include/theme.hpp`
+  (`light_theme()` / `dark_theme()`), resolved from the design system's semantic
+  colour tokens: surface/text, surface-muted (selection), surface-subtle
+  (current line), page (gutter), text-muted (line numbers), border-subtle. The
+  app offers System / Light / Dark and defaults to System. The design system's
+  web CSS/JS is never vendored (D13).
 - The view owns selection, caret, scroll; the core owns bytes and edits.
 - **No IME and no accessibility in v1** — keyboard + mouse only. Both are
   significant platform work and are not needed for a personal editor.
