@@ -180,7 +180,7 @@ const ViewCore::LineEntry& ViewCore::entry_for(int64_t line) const {
     e.bytes = text.size() + v.run.glyphs.size() * sizeof(Glyph) + 96;
     e.visual.push_back(std::move(v));
   } else {
-    const double maxw = width_;
+    const double maxw = text_width();
     size_t pos = 0;
     while (pos < text.size()) {
       if (e.visual.size() >= kMaxVisualPerLine) {
@@ -308,6 +308,23 @@ double ViewCore::x_of_col(const VisualLine& v, int64_t col) const {
   return pen;
 }
 
+void ViewCore::update_gutter() const {
+  double w = 0;
+  if (gutter_) {
+    int64_t n = known_lines_ > 0 ? known_lines_ : 1;
+    int digits = 1;
+    while (n >= 10) {
+      n /= 10;
+      ++digits;
+    }
+    w = static_cast<double>(digits) * tb_->measure(font_, "0") + 16.0;
+  }
+  if (std::abs(w - gutter_width_) > 0.01) {
+    gutter_width_ = w;
+    if (wrap_) invalidate_all();
+  }
+}
+
 void ViewCore::apply_tabs(Run& run) const {
   if (tab_width_ <= 0) return;
   const double space = tb_->measure(run.font, " ");
@@ -329,6 +346,9 @@ void ViewCore::apply_tabs(Run& run) const {
 }
 
 Hit ViewCore::hit_test(double x, double y) const {
+  update_gutter();
+  x -= text_left();
+  if (x < 0) x = 0;
   const double lh = line_height();
   double top = -scroll_px_;
   for (int64_t line = first_line_;; ++line) {
@@ -343,6 +363,7 @@ Hit ViewCore::hit_test(double x, double y) const {
 }
 
 Rect ViewCore::caret_rect(int64_t line, int64_t col) const {
+  update_gutter();
   const double lh = line_height();
   if (line < first_line_) return Rect{0, -1e9, 1, lh};  // above the viewport
   if (!line_exists(line)) return Rect{0, 0, 1, lh};
@@ -353,24 +374,21 @@ Rect ViewCore::caret_rect(int64_t line, int64_t col) const {
   for (const VisualLine& v : e.visual) {
     if (col >= static_cast<int64_t>(v.byte_start) &&
         col <= static_cast<int64_t>(v.byte_end)) {
-      double pen = 0;
-      size_t rel = 0;
-      for (const Glyph& g : v.run.glyphs) {
-        if (static_cast<int64_t>(v.byte_start + rel) >= col) break;
-        pen += g.advance;
-        rel += cp_len(v.run.text, rel);
-      }
-      return Rect{pen, y, 1, lh};
+      return Rect{x_of_col(v, col) + text_left(), y, 1, lh};
     }
     y += lh;
   }
-  return Rect{0, y, 1, lh};
+  return Rect{text_left(), y, 1, lh};
 }
 
 void ViewCore::draw(Canvas& c) const {
+  update_gutter();
   const double lh = line_height();
+  const double left = text_left();
   c.clear(Color{255, 255, 255, 255});
-  c.set_text_color(text_color_);
+  if (gutter_width_ > 0) {
+    c.fill_rect(Rect{0, 0, gutter_width_, height_}, gutter_bg_);
+  }
 
   const bool has_sel = sel_.anchor_line != sel_.caret_line ||
                        sel_.anchor_col != sel_.caret_col;
@@ -392,8 +410,12 @@ void ViewCore::draw(Canvas& c) const {
     const LineEntry& e = entry_for(line);
     const int64_t line_content = static_cast<int64_t>(e.visual.back().byte_end);
     const bool line_sel = has_sel && line >= sline && line <= eline;
+    bool first_visual = true;
     for (const VisualLine& v : e.visual) {
       if (y + lh > 0) {
+        if (current_line_color_.a != 0 && line == sel_.caret_line) {
+          c.fill_rect(Rect{left, y, text_width(), lh}, current_line_color_);
+        }
         for (const Decoration& d : decorations_) {
           if (d.line == line) c.fill_rect(Rect{0, y, width_, lh}, d.color);
         }
@@ -407,19 +429,26 @@ void ViewCore::draw(Canvas& c) const {
             hi = static_cast<int64_t>(v.byte_end);
           }
           if (hi > lo) {
-            const double x0 = x_of_col(v, lo);
-            const double x1 = x_of_col(v, hi);
+            const double x0 = x_of_col(v, lo) + left;
+            const double x1 = x_of_col(v, hi) + left;
             c.fill_rect(Rect{x0, y, x1 - x0, lh}, selection_color_);
           }
         }
         if (!has_sel && line == sel_.caret_line &&
             sel_.caret_col >= static_cast<int64_t>(v.byte_start) &&
             sel_.caret_col <= static_cast<int64_t>(v.byte_end)) {
-          caret_x = x_of_col(v, sel_.caret_col);
+          caret_x = x_of_col(v, sel_.caret_col) + left;
           caret_y = y;
         }
-        c.draw_run(v.run, 0, y + v.run.ascent);
+        c.set_text_color(text_color_);
+        c.draw_run(v.run, left, y + v.run.ascent);
+        if (gutter_width_ > 0 && first_visual) {
+          const Run num = tb_->shape(font_, std::to_string(line + 1));
+          c.set_text_color(gutter_fg_);
+          c.draw_run(num, gutter_width_ - 8 - num.width, y + num.ascent);
+        }
       }
+      first_visual = false;
       y += lh;
       if (y >= height_) break;
     }

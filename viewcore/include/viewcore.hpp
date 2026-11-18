@@ -91,6 +91,25 @@ class ViewCore {
   }
   int tab_width() const { return tab_width_; }
 
+  // Gutter (line numbers) — M3. When on, text is drawn to the right of it.
+  void set_gutter(bool on) {
+    if (on != gutter_) {
+      if (wrap_) invalidate_all();
+      gutter_ = on;
+    }
+  }
+  bool gutter() const { return gutter_; }
+  double gutter_width() const {
+    update_gutter();
+    return gutter_width_;
+  }
+  void set_gutter_colors(Color bg, Color fg) {
+    gutter_bg_ = bg;
+    gutter_fg_ = fg;
+  }
+  // Current-line highlight; alpha 0 disables it.
+  void set_current_line_color(Color c) { current_line_color_ = c; }
+
   double line_height() const;
   // Number of lines discovered so far. The view grows this lazily as it draws or
   // scrolls, so before the document has been fully traversed it is a lower bound
@@ -184,6 +203,14 @@ class ViewCore {
   double x_of_col(const VisualLine& v, int64_t col) const;
   // Widens '\t' glyphs to the next tab stop (keeps one glyph per codepoint).
   void apply_tabs(Run& run) const;
+  // Recomputes the gutter width from the known line count (and re-wraps if the
+  // width changed with wrap on).
+  void update_gutter() const;
+  double text_left() const { return gutter_width_; }
+  double text_width() const {
+    const double w = width_ - gutter_width_;
+    return w > 1.0 ? w : 1.0;
+  }
   std::string line_text(int64_t line) const;  // logical line, terminator stripped
 
   // Input helpers.
@@ -223,6 +250,11 @@ class ViewCore {
   Color caret_color_{26, 26, 26, 255};
   bool caret_visible_ = true;
   int tab_width_ = 4;
+  bool gutter_ = false;
+  mutable double gutter_width_ = 0;
+  Color gutter_bg_{246, 246, 246, 255};
+  Color gutter_fg_{150, 150, 150, 255};
+  Color current_line_color_{0, 0, 0, 0};  // disabled
   Selection sel_;
 
   mutable std::map<int64_t, LineEntry> cache_;

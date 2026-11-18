@@ -417,6 +417,35 @@ TEST(viewcore_tab_width_advances_to_stop) {
   CHECK_EQ(d.view->caret_rect(0, 2).x, 64.0);  // 'b' at column 8
 }
 
+TEST(viewcore_gutter_draws_line_numbers_and_offsets_text) {
+  Doc d("a\nb\nc\n");
+  d.view->resize(800, 1000);
+  d.view->set_gutter(true);
+  const double gw = d.view->gutter_width();
+  CHECK(gw > 0);
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);
+  int numbers = 0;
+  bool text_offset = false;
+  for (const vc::DrawCmd& cmd : rc.cmds) {
+    if (cmd.kind != vc::DrawCmd::Kind::DrawRun) continue;
+    if (cmd.text == "1" || cmd.text == "2" || cmd.text == "3") ++numbers;
+    if (cmd.text == "a" && cmd.x == gw) text_offset = true;
+  }
+  CHECK_EQ(numbers, 3);
+  CHECK(text_offset);
+}
+
+TEST(viewcore_gutter_hit_test_offsets_x) {
+  Doc d("hello\n");
+  d.view->resize(800, 1000);
+  d.view->set_gutter(true);
+  const double gw = d.view->gutter_width();
+  const vc::Hit h = d.view->hit_test(gw + 8 * 2 + 1, 8);
+  CHECK_EQ(h.line, 0);
+  CHECK_EQ(h.col, 2);
+}
+
 TEST(viewcore_edit_insert_text) {
   Doc d("abc\n");
   d.view->resize(800, 1000);

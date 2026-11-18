@@ -1,8 +1,9 @@
-// platform/macos/app/gui_main.mm — the M1 AppKit read-only view shell (§3, §8).
+// platform/macos/app/gui_main.mm — the macOS app shell (§3, §8, M1/M2).
 //
 // A real window whose content view is custom-drawn by `viewcore` through the
-// CoreText/CoreGraphics backends. M1 is read-only: scrolling, caret movement,
-// and selection. No native controls, no IME, no accessibility (D2, §8).
+// CoreText/CoreGraphics backends. Editing, undo/redo, save, a literal find bar,
+// and settings (font size / tab width / wrap) are wired here; the document model
+// lives in `core`. No native text control, no IME, no accessibility (D2, §8).
 #import <AppKit/AppKit.h>
 
 #include <cstdio>
@@ -13,6 +14,8 @@
 #include "editor.hpp"
 #include "text_coretext.hpp"
 #include "viewcore.hpp"
+
+@class EditorView;
 
 namespace {
 
@@ -39,13 +42,7 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
     case 53: k.key = vc::Key::Escape; return k;
     default: break;
   }
-  NSString* plain = e.charactersIgnoringModifiers;
-  if (k.cmd && plain.length == 1) {
-    const unichar c = [plain characterAtIndex:0];
-    k.key = (c == 'a' || c == 'A') ? vc::Key::SelectAll : vc::Key::None;
-    return k;
-  }
-  if (k.cmd || k.ctrl) {
+  if (k.cmd || k.ctrl) {  // command keys are menu items
     k.key = vc::Key::None;
     return k;
   }
@@ -67,9 +64,114 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 
 }  // namespace
 
+// The find/replace bar (§9 literal find; no regex, no core search API).
+@interface FindBar : NSView
+- (instancetype)initWithEditorView:(EditorView*)view;
+- (void)focusField;
+@end
+
+// A thin bottom status bar (chrome; system UI font, §8).
+@interface StatusBar : NSView
+- (void)setText:(NSString*)text;
+@end
+
 @interface EditorView : NSView
+@property(nonatomic, assign) FindBar* findBar;
+@property(nonatomic, assign) StatusBar* statusBar;
 - (instancetype)initWithEditor:(Editor*)ed;
 - (void)reloadDocument;
+- (void)findText:(NSString*)needle backward:(BOOL)backward;
+- (void)replaceText:(NSString*)needle with:(NSString*)replacement;
+- (void)replaceAllText:(NSString*)needle with:(NSString*)replacement;
+@end
+
+@implementation StatusBar {
+  NSTextField* _label;
+}
+- (instancetype)initWithFrame:(NSRect)frame {
+  self = [super initWithFrame:frame];
+  if (self != nil) {
+    _label = [NSTextField labelWithString:@""];
+    _label.translatesAutoresizingMaskIntoConstraints = NO;
+    _label.textColor = [NSColor secondaryLabelColor];
+    [self addSubview:_label];
+    [NSLayoutConstraint activateConstraints:@[
+      [_label.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:8],
+      [_label.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+      [self.heightAnchor constraintEqualToConstant:22],
+    ]];
+  }
+  return self;
+}
+- (void)setText:(NSString*)text {
+  _label.stringValue = text != nil ? text : @"";
+}
+@end
+
+@implementation FindBar {
+  NSSearchField* _find;
+  NSTextField* _replace;
+  EditorView* _editorView;  // not retained (the stack owns both)
+}
+
+- (instancetype)initWithEditorView:(EditorView*)view {
+  self = [super initWithFrame:NSMakeRect(0, 0, 900, 34)];
+  if (self != nil) {
+    _editorView = view;
+    _find = [[NSSearchField alloc] init];
+    _find.placeholderString = @"Find";
+    _find.sendsSearchStringImmediately = NO;
+    _find.target = self;
+    _find.action = @selector(findNext:);
+    _replace = [[NSTextField alloc] init];
+    _replace.placeholderString = @"Replace";
+    NSButton* prev =
+        [NSButton buttonWithTitle:@"Prev" target:self action:@selector(findPrev:)];
+    NSButton* next =
+        [NSButton buttonWithTitle:@"Next" target:self action:@selector(findNext:)];
+    NSButton* rep =
+        [NSButton buttonWithTitle:@"Replace" target:self action:@selector(replaceOne:)];
+    NSButton* repAll =
+        [NSButton buttonWithTitle:@"All" target:self action:@selector(replaceAll:)];
+    NSStackView* row =
+        [NSStackView stackViewWithViews:@[_find, _replace, prev, next, rep, repAll]];
+    row.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    [self addSubview:row];
+    _find.translatesAutoresizingMaskIntoConstraints = NO;
+    _replace.translatesAutoresizingMaskIntoConstraints = NO;
+    [NSLayoutConstraint activateConstraints:@[
+      [row.leadingAnchor constraintEqualToAnchor:self.leadingAnchor constant:8],
+      [row.trailingAnchor constraintLessThanOrEqualToAnchor:self.trailingAnchor
+                                                   constant:-8],
+      [row.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+      [self.heightAnchor constraintEqualToConstant:34],
+      [_find.widthAnchor constraintGreaterThanOrEqualToConstant:180],
+      [_replace.widthAnchor constraintGreaterThanOrEqualToConstant:180],
+    ]];
+  }
+  return self;
+}
+
+- (void)focusField {
+  [self.window makeFirstResponder:_find];
+}
+- (void)findNext:(id)sender {
+  (void)sender;
+  [_editorView findText:_find.stringValue backward:NO];
+}
+- (void)findPrev:(id)sender {
+  (void)sender;
+  [_editorView findText:_find.stringValue backward:YES];
+}
+- (void)replaceOne:(id)sender {
+  (void)sender;
+  [_editorView replaceText:_find.stringValue with:_replace.stringValue];
+}
+- (void)replaceAll:(id)sender {
+  (void)sender;
+  [_editorView replaceAllText:_find.stringValue with:_replace.stringValue];
+}
 @end
 
 @implementation EditorView {
@@ -89,13 +191,20 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
     _view = std::make_unique<vc::ViewCore>(*ed, *_tb);
     _view->resize(self.bounds.size.width, self.bounds.size.height);
     [self applySettings];
+    _view->set_gutter(true);
+    _view->set_current_line_color(vc::Color{247, 247, 247, 255});
     _view->set_caret(0, 0);
     [self startBlink];
   }
   return self;
 }
 
-// Font size, tab width, and wrap persist in NSUserDefaults (§11 M2 settings).
+- (void)dealloc {
+  [_blink invalidate];
+}
+
+// --- Settings (§11 M2: font size, tab width, wrap via NSUserDefaults) ------
+
 - (void)applySettings {
   NSUserDefaults* d = [NSUserDefaults standardUserDefaults];
   const double fs = [d doubleForKey:@"FontSize"];
@@ -133,6 +242,9 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
   [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"Wrap"];
   [self setNeedsDisplay:YES];
 }
+
+// --- Commands --------------------------------------------------------------
+
 - (void)undo:(id)sender {
   (void)sender;
   if (_ed->undo() == Status::Ok) {
@@ -157,6 +269,12 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
   (void)sender;
   if (_ed->save(nullptr, false, nullptr) == Status::Ok) [self setNeedsDisplay:YES];
 }
+- (void)showFind:(id)sender {
+  (void)sender;
+  if (self.findBar == nil) return;
+  self.findBar.hidden = !self.findBar.hidden;
+  if (!self.findBar.hidden) [self.findBar focusField];
+}
 
 - (BOOL)validateMenuItem:(NSMenuItem*)item {
   if (item.action == @selector(toggleWrap:)) {
@@ -165,9 +283,27 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
   return YES;
 }
 
-- (void)dealloc {
-  [_blink invalidate];
+// --- Find/replace ----------------------------------------------------------
+
+- (void)findText:(NSString*)needle backward:(BOOL)backward {
+  if (needle == nil || needle.length == 0) return;
+  if (_view->find(needle.UTF8String, !backward, false)) [self setNeedsDisplay:YES];
 }
+- (void)replaceText:(NSString*)needle with:(NSString*)replacement {
+  if (needle == nil || needle.length == 0) return;
+  const char* rep = replacement != nil ? replacement.UTF8String : "";
+  _view->replace_current(needle.UTF8String, rep, false);
+  [self setNeedsDisplay:YES];
+}
+- (void)replaceAllText:(NSString*)needle with:(NSString*)replacement {
+  if (needle == nil || needle.length == 0) return;
+  const char* rep = replacement != nil ? replacement.UTF8String : "";
+  if (_view->replace_all(needle.UTF8String, rep, false) > 0) {
+    [self setNeedsDisplay:YES];
+  }
+}
+
+// --- Blink -----------------------------------------------------------------
 
 - (void)startBlink {
   _blinkOn = YES;
@@ -187,33 +323,45 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
   [self setNeedsDisplay:YES];
 }
 
+// --- View ------------------------------------------------------------------
+
 - (BOOL)isFlipped {
   return NO;  // CoreGraphics native orientation; the canvas converts y.
 }
-
 - (BOOL)acceptsFirstResponder {
   return YES;
 }
-
 - (void)reloadDocument {
   _view->set_document(*_ed);
   _view->resize(self.bounds.size.width, self.bounds.size.height);
   _view->set_caret(0, 0);
   [self setNeedsDisplay:YES];
 }
-
 - (void)setFrameSize:(NSSize)newSize {
   [super setFrameSize:newSize];
   _view->resize(newSize.width, newSize.height);
   [self setNeedsDisplay:YES];
 }
-
 - (void)drawRect:(NSRect)dirtyRect {
   (void)dirtyRect;
   CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
   auto canvas = ed::mac::create_cg_canvas(ctx, self.bounds.size.width,
                                           self.bounds.size.height);
   _view->draw(*canvas);
+  [self updateStatus];
+}
+
+- (void)updateStatus {
+  if (self.statusBar == nil) return;
+  const vc::Selection s = _view->selection();
+  const int64_t lines = _view->line_count();
+  NSString* text = [NSString
+      stringWithFormat:@"Ln %lld, Col %lld    %lld lines%@",
+                       static_cast<long long>(s.caret_line + 1),
+                       static_cast<long long>(s.caret_col + 1),
+                       static_cast<long long>(lines),
+                       _view->line_count_known() ? @"" : @"+"];
+  [self.statusBar setText:text];
 }
 
 - (void)keyDown:(NSEvent*)event {
@@ -267,6 +415,65 @@ vc::KeyEvent translate_key(NSEvent* e, std::string* text) {
 }
 @end
 
+namespace {
+
+NSMenuItem* item(NSString* title, SEL action, NSString* key) {
+  return [[NSMenuItem alloc] initWithTitle:title
+                                    action:action
+                             keyEquivalent:key];
+}
+
+NSMenu* submenu(NSString* title, NSArray<NSMenuItem*>* items) {
+  NSMenu* m = [[NSMenu alloc] initWithTitle:title];
+  for (NSMenuItem* it in items) [m addItem:it];
+  return m;
+}
+
+void build_menu_bar(NSApplication* app) {
+  NSMenu* menubar = [[NSMenu alloc] init];
+
+  NSMenuItem* appItem = [[NSMenuItem alloc] init];
+  [menubar addItem:appItem];
+  [appItem setSubmenu:submenu(@"editor", @[
+    item(@"About editor", @selector(orderFrontStandardAboutPanel:), @""),
+    [NSMenuItem separatorItem],
+    item(@"Quit editor", @selector(terminate:), @"q"),
+  ])];
+
+  NSMenuItem* fileItem = [[NSMenuItem alloc] init];
+  [menubar addItem:fileItem];
+  [fileItem setSubmenu:submenu(@"File", @[
+    item(@"Save", @selector(saveDocument:), @"s"),
+  ])];
+
+  NSMenuItem* editItem = [[NSMenuItem alloc] init];
+  [menubar addItem:editItem];
+  NSMenuItem* redo = item(@"Redo", @selector(redo:), @"z");
+  redo.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
+  [editItem setSubmenu:submenu(@"Edit", @[
+    item(@"Undo", @selector(undo:), @"z"),
+    redo,
+    [NSMenuItem separatorItem],
+    item(@"Select All", @selector(selectAll:), @"a"),
+    [NSMenuItem separatorItem],
+    item(@"Find\u2026", @selector(showFind:), @"f"),
+  ])];
+
+  NSMenuItem* viewItem = [[NSMenuItem alloc] init];
+  [menubar addItem:viewItem];
+  [viewItem setSubmenu:submenu(@"View", @[
+    item(@"Wrap Lines", @selector(toggleWrap:), @""),
+    [NSMenuItem separatorItem],
+    item(@"Bigger", @selector(increaseFontSize:), @"+"),
+    item(@"Smaller", @selector(decreaseFontSize:), @"-"),
+  ])];
+
+  [app setMainMenu:menubar];
+}
+
+}  // namespace
+
 int main(int argc, char** argv) {
   @autoreleasepool {
     std::string path;
@@ -305,7 +512,24 @@ int main(int argc, char** argv) {
                                : [NSString stringWithUTF8String:path.c_str()]];
 
     EditorView* view = [[EditorView alloc] initWithEditor:ed.get()];
-    [win setContentView:view];
+    FindBar* bar = [[FindBar alloc] initWithEditorView:view];
+    StatusBar* status = [[StatusBar alloc] initWithFrame:NSMakeRect(0, 0, 900, 22)];
+    view.findBar = bar;
+    view.statusBar = status;
+    bar.hidden = YES;
+
+    NSStackView* stack = [NSStackView stackViewWithViews:@[ bar, view, status ]];
+    stack.orientation = NSUserInterfaceLayoutOrientationVertical;
+    stack.distribution = NSStackViewDistributionFill;
+    stack.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [bar setContentHuggingPriority:NSLayoutPriorityRequired
+                    forOrientation:NSLayoutConstraintOrientationVertical];
+    [status setContentHuggingPriority:NSLayoutPriorityRequired
+                       forOrientation:NSLayoutConstraintOrientationVertical];
+    [view setContentHuggingPriority:NSLayoutPriorityDefaultLow
+                     forOrientation:NSLayoutConstraintOrientationVertical];
+
+    [win setContentView:stack];
     [win makeFirstResponder:view];
     [win center];
     [win makeKeyAndOrderFront:nil];
@@ -315,61 +539,7 @@ int main(int argc, char** argv) {
     delegate.view = view;
     [app setDelegate:delegate];
 
-    NSMenu* menubar = [[NSMenu alloc] init];
-
-    NSMenuItem* appItem = [[NSMenuItem alloc] init];
-    [menubar addItem:appItem];
-    NSMenu* appMenu = [[NSMenu alloc] initWithTitle:@"editor"];
-    [appMenu addItemWithTitle:@"About editor"
-                       action:@selector(orderFrontStandardAboutPanel:)
-                keyEquivalent:@""];
-    [appMenu addItem:[NSMenuItem separatorItem]];
-    [appMenu addItemWithTitle:@"Quit editor"
-                       action:@selector(terminate:)
-                keyEquivalent:@"q"];
-    [appItem setSubmenu:appMenu];
-
-    NSMenuItem* fileItem = [[NSMenuItem alloc] init];
-    [menubar addItem:fileItem];
-    NSMenu* fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
-    [fileMenu addItemWithTitle:@"Save"
-                        action:@selector(saveDocument:)
-                 keyEquivalent:@"s"];
-    [fileItem setSubmenu:fileMenu];
-
-    NSMenuItem* editItem = [[NSMenuItem alloc] init];
-    [menubar addItem:editItem];
-    NSMenu* editMenu = [[NSMenu alloc] initWithTitle:@"Edit"];
-    [editMenu addItemWithTitle:@"Undo"
-                        action:@selector(undo:)
-                 keyEquivalent:@"z"];
-    NSMenuItem* redoItem = [editMenu addItemWithTitle:@"Redo"
-                                               action:@selector(redo:)
-                                        keyEquivalent:@"z"];
-    redoItem.keyEquivalentModifierMask =
-        NSEventModifierFlagCommand | NSEventModifierFlagShift;
-    [editMenu addItem:[NSMenuItem separatorItem]];
-    [editMenu addItemWithTitle:@"Select All"
-                        action:@selector(selectAll:)
-                 keyEquivalent:@"a"];
-    [editItem setSubmenu:editMenu];
-
-    NSMenuItem* viewItem = [[NSMenuItem alloc] init];
-    [menubar addItem:viewItem];
-    NSMenu* viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
-    [viewMenu addItemWithTitle:@"Wrap Lines"
-                        action:@selector(toggleWrap:)
-                 keyEquivalent:@""];
-    [viewMenu addItem:[NSMenuItem separatorItem]];
-    [viewMenu addItemWithTitle:@"Bigger"
-                        action:@selector(increaseFontSize:)
-                 keyEquivalent:@"+"];
-    [viewMenu addItemWithTitle:@"Smaller"
-                        action:@selector(decreaseFontSize:)
-                 keyEquivalent:@"-"];
-    [viewItem setSubmenu:viewMenu];
-
-    [app setMainMenu:menubar];
+    build_menu_bar(app);
 
     [app activateIgnoringOtherApps:YES];
     [app run];
