@@ -130,6 +130,13 @@ TEST(cg_canvas_fill_rect_paints_the_right_pixels) {
   CHECK(bm.count_red() > 50);  // ~100 px of the 10x10 rect
 }
 
+TEST(cg_canvas_renders_a_dark_background) {
+  Bitmap bm(32, 32);
+  auto canvas = ed::mac::create_cg_canvas(bm.ctx, 32, 32);
+  canvas->clear(vc::Color{27, 27, 27, 255});  // dark surface #1b1b1b
+  CHECK(bm.px[0] < 60 && bm.px[1] < 60 && bm.px[2] < 60);
+}
+
 TEST(cg_canvas_draws_a_run) {
   Bitmap bm(200, 40);
   auto tb = ed::mac::create_coretext_backend();
