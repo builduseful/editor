@@ -128,6 +128,7 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (BOOL)startUntitled;
 - (void)updateTitle;
 - (void)scrollToLine:(int64_t)line;
+- (void)scrollToX:(double)px;
 - (void)discardUntitledTemp;
 // YES if the document may be discarded (clean, or the user saved / chose not to).
 - (BOOL)confirmDiscardChanges;
@@ -657,20 +658,36 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   _view->scroll_to_line(line);
   [self setNeedsDisplay:YES];
 }
+// Pans horizontally (used by the `--xscroll` snapshot of the bottom bar).
+- (void)scrollToX:(double)px {
+  _view->scroll_x_by(px);
+  [self setNeedsDisplay:YES];
+}
 // First paint stays lazy. Then index small/medium files in bounded steps (one
 // run-loop turn each) so the exact line count and the scrollbar appear without
 // ever blocking the window; huge files stay lazy (a full index of 5 GB is ~8 s).
 - (void)beginDiscovery {
   const Rev r = _ed->rev();
-  if (_discovering || r.size == 0 || r.size > (64ull << 20)) return;
+  if (_discovering) return;
+  // A scrollbar jump in a huge document must index toward its target, even
+  // though the background drip deliberately skips such files.
+  const bool pending = _view->has_pending_scroll();
+  if (!pending && (r.size == 0 || r.size > (64ull << 20))) return;
   _discovering = YES;
   [self discoverStep];
 }
 - (void)discoverStep {
   if (!_discovering) return;
-  if (!_view->discover_step(4096)) {
+  const int64_t step = _view->has_pending_scroll() ? 32768 : 4096;
+  const bool more = _view->discover_step(step);
+  if (_view->apply_pending_scroll()) {  // the jump target is known: land it
     _discovering = NO;
-    [self setNeedsDisplay:YES];  // complete: the scrollbar can draw
+    [self setNeedsDisplay:YES];
+    return;
+  }
+  if (!more) {
+    _discovering = NO;
+    [self setNeedsDisplay:YES];  // complete: the scrollbar is exact now
     return;
   }
   [self setNeedsDisplay:YES];  // the count (and possibly the bar) grows
@@ -740,7 +757,16 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   m.y = self.bounds.size.height - p.y;  // AppKit y-up -> viewcore y-down
   m.shift = (event.modifierFlags & NSEventModifierFlagShift) != 0;
   m.cmd = (event.modifierFlags & NSEventModifierFlagCommand) != 0;
+  if (kind == vc::MouseEvent::Kind::Scroll) {
+    // Trackpads report pixels; a wheel reports lines, so scale it to the page.
+    const double scale =
+        event.hasPreciseScrollingDeltas ? 1.0 : 3.0 * _view->line_height();
+    m.dy = -event.scrollingDeltaY * scale;  // natural: swipe up shows later lines
+    m.dx = -event.scrollingDeltaX * scale;
+  }
   if (_view->mouse(m)) [self setNeedsDisplay:YES];
+  // A drag released on an approximate scrollbar leaves a target to index to.
+  if (_view->has_pending_scroll() && !_discovering) [self beginDiscovery];
 }
 
 - (void)mouseDown:(NSEvent*)event {
@@ -763,6 +789,7 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 @property(nonatomic, strong) NSWindow* aboutWindow;
 @property(nonatomic, copy) NSString* snapshotPath;
 @property(nonatomic, assign) int64_t snapshotScrollLine;
+@property(nonatomic, assign) double snapshotScrollX;
 - (void)showAbout:(id)sender;
 @end
 
@@ -786,6 +813,9 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   (void)timer;
   if (self.snapshotScrollLine > 0) {
     [self.view scrollToLine:self.snapshotScrollLine];
+  }
+  if (self.snapshotScrollX > 0) {
+    [self.view scrollToX:self.snapshotScrollX];
   }
   // The window's frame view, so the title bar (file name, dirty dot) is included.
   NSView* content = self.view.window.contentView;
@@ -970,6 +1000,7 @@ int main(int argc, char** argv) {
   @autoreleasepool {
     std::string path, snapshot;
     int64_t scroll_line = 0;
+    double scroll_x = 0;
     double win_w = 900, win_h = 700;
     for (int i = 1; i < argc; ++i) {
       const std::string a = argv[i];
@@ -981,6 +1012,8 @@ int main(int argc, char** argv) {
                forKey:@"Theme"];
       } else if (a == "--scroll" && i + 1 < argc) {
         scroll_line = std::strtoll(argv[++i], nullptr, 10);
+      } else if (a == "--xscroll" && i + 1 < argc) {
+        scroll_x = std::strtod(argv[++i], nullptr);
       } else if (a == "--size" && i + 1 < argc) {
         // WIDTHxHEIGHT in points, e.g. 480x320 (the smoke test's small window).
         const std::string s = argv[++i];
@@ -1057,6 +1090,9 @@ int main(int argc, char** argv) {
     NSStackView* stack = [NSStackView stackViewWithViews:@[ bar, view, status ]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.distribution = NSStackViewDistributionFill;
+    // Flush bands: the editor's bottom strip (the horizontal bar) sits right on
+    // the status bar, with no stack spacing showing as a blank gap.
+    stack.spacing = 0;
     stack.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
     [bar setContentHuggingPriority:NSLayoutPriorityRequired
                     forOrientation:NSLayoutConstraintOrientationVertical];
@@ -1074,6 +1110,7 @@ int main(int argc, char** argv) {
     delegate.editor = ed.get();
     delegate.view = view;
     delegate.snapshotScrollLine = scroll_line;
+    delegate.snapshotScrollX = scroll_x;
     if (!snapshot.empty()) {
       delegate.snapshotPath = [NSString stringWithUTF8String:snapshot.c_str()];
     }

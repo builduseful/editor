@@ -51,8 +51,13 @@ own tokens rather than inventing a value.
   §8 — note the exception where it bites.)
 - **Never add a pattern only because the guide has one.** Use a component where it
   fits the screen; otherwise compose from the same tokens.
-- **Document-view controls are custom-drawn** (D2), including the scrollbar — no
-  native-control hybrid.
+- **Document-view controls are custom-drawn** (D2), including the scrollbars —
+  no native-control hybrid. Both are quiet overlay thumbs (no track band): the
+  vertical one reserves no width, and the horizontal one reserves a 9 pt strip at
+  the bottom that text is clipped against.
+- **Text never runs under a control.** The horizontal bar's strip is cut out of
+  the text viewport (`text_height()`), and drawing is clipped there (a partially
+  scrolled last row is cut, not moved), so a row and the bar never overlap.
 
 ## Engineering
 
@@ -77,7 +82,7 @@ own tokens rather than inventing a value.
   (and `build/editor_gui`), the AppKit view (CoreText + CoreGraphics +
   `viewcore`); `make gui-smoke` runs the GUI smoke test (`tests/gui_smoke.py`):
   headless AppKit snapshots (`--snapshot PATH --theme light|dark --size WxH
-  --scroll LINE`), a real launch, a no-file launch, and a Finder-style
+  --scroll LINE --xscroll PX`), a real launch, a no-file launch, and a Finder-style
   LaunchServices open (`tests/render_smoke_test.cpp` covers the same render path
   with pixel assertions); `make render` renders a document to a
   PNG for inspection (`tools/render_doc.cpp`);

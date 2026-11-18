@@ -319,15 +319,90 @@ TEST(viewcore_scrollbar_appears_once_the_count_is_known) {
   vc::RecordingCanvas rc;
   d.view->draw(rc);  // lazy first paint: the total is unknown
   CHECK(!d.view->line_count_known());
-  CHECK(!d.view->scrollbar().visible);
+  // ... but the bar is already there, driven by byte progress, so a big file can
+  // be navigated before the index finishes.
+  const vc::ViewCore::ScrollBar approx = d.view->scrollbar();
+  CHECK(approx.visible);
+  CHECK(approx.approximate);
+  CHECK_EQ(approx.thumb_y, 0.0);   // at the top
+  CHECK_EQ(approx.thumb_h, 28.0);  // the minimum thumb
 
   d.view->discover_all();
   const vc::ViewCore::ScrollBar sb = d.view->scrollbar();
   CHECK(sb.visible);
+  CHECK(!sb.approximate);  // exact line count now
   CHECK_EQ(sb.track_x, 80.0 - vc::ViewCore::kScrollbarWidth);
   CHECK_EQ(sb.track_w, vc::ViewCore::kScrollbarWidth);
   CHECK_EQ(sb.thumb_y, 0.0);   // at the top
   CHECK_EQ(sb.thumb_h, 28.0);  // the minimum: 200 lines far exceed the viewport
+}
+
+// A drag on an approximate bar (unknown line count) previews the thumb and
+// commits one target on release; the caller's discovery loop indexes to it.
+TEST(viewcore_approximate_scrollbar_jumps_once_indexed) {
+  Doc d(n_lines(2000));
+  d.view->resize(80, 160);
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);
+  CHECK(!d.view->line_count_known());
+  const vc::ViewCore::ScrollBar sb = d.view->scrollbar();
+  CHECK(sb.visible);
+  CHECK(sb.approximate);
+
+  vc::MouseEvent down;
+  down.kind = vc::MouseEvent::Kind::Down;
+  down.x = 76;  // over the right-edge bar
+  down.y = sb.thumb_y + sb.thumb_h / 2;
+  d.view->mouse(down);
+  vc::MouseEvent drag = down;
+  drag.kind = vc::MouseEvent::Kind::Drag;
+  drag.y = 80;  // halfway down the track
+  d.view->mouse(drag);
+  CHECK_EQ(d.view->first_visible_line(), 0);  // preview only: nothing jumped yet
+
+  vc::MouseEvent up = drag;
+  up.kind = vc::MouseEvent::Kind::Up;
+  d.view->mouse(up);
+  CHECK(d.view->has_pending_scroll());
+
+  int guard = 0;
+  while (d.view->has_pending_scroll() && guard++ < 100000) {
+    d.view->discover_step(256);
+    d.view->apply_pending_scroll();
+  }
+  CHECK(!d.view->has_pending_scroll());
+  CHECK(d.view->first_visible_line() > 300);  // landed in the middle
+}
+
+// A queued jump belongs to the drag that made it: scrolling (or any direct
+// scroll) while the index is still catching up drops it, so the view never
+// yanks itself somewhere the user has already scrolled away from.
+TEST(viewcore_pending_jump_is_dropped_when_the_user_scrolls) {
+  Doc d(n_lines(2000));
+  d.view->resize(80, 160);
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);
+  const vc::ViewCore::ScrollBar sb = d.view->scrollbar();
+  vc::MouseEvent down;
+  down.kind = vc::MouseEvent::Kind::Down;
+  down.x = 76;
+  down.y = sb.thumb_y + sb.thumb_h / 2;
+  d.view->mouse(down);
+  vc::MouseEvent drag = down;
+  drag.kind = vc::MouseEvent::Kind::Drag;
+  drag.y = 80;
+  d.view->mouse(drag);
+  vc::MouseEvent up = drag;
+  up.kind = vc::MouseEvent::Kind::Up;
+  d.view->mouse(up);
+  CHECK(d.view->has_pending_scroll());
+
+  vc::MouseEvent wheel;
+  wheel.kind = vc::MouseEvent::Kind::Scroll;
+  wheel.dy = 40;
+  d.view->mouse(wheel);
+  CHECK(!d.view->has_pending_scroll());
+  CHECK(!d.view->apply_pending_scroll());
 }
 
 TEST(viewcore_scrollbar_hidden_when_the_document_fits) {
@@ -421,6 +496,90 @@ TEST(viewcore_scrollbar_accounts_for_wrap) {
   const double wrapped = d.view->scrollbar().thumb_h;
   // Fewer logical lines fit when wrapped, so the thumb is proportionally shorter.
   CHECK(wrapped < plain);
+}
+
+// --- Horizontal scrolling (wrap off) --------------------------------------
+
+TEST(viewcore_horizontal_bar_appears_for_a_long_line) {
+  Doc d("0123456789abcdefghij0123456789abcdefghij\n");  // 40 chars = 320 px
+  d.view->resize(80, 160);                              // 10 characters wide
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);
+  const vc::ViewCore::HScrollBar hb = d.view->hscrollbar();
+  CHECK(hb.visible);
+  CHECK_EQ(d.view->x_offset(), 0.0);
+  CHECK_EQ(hb.track_y, 160.0 - vc::ViewCore::kScrollbarWidth);
+  CHECK_EQ(hb.track_h, vc::ViewCore::kScrollbarWidth);
+  CHECK_EQ(hb.thumb_x, 0.0);   // text_left() == 0 (no gutter)
+  CHECK_EQ(hb.thumb_w, 28.0);  // minimum thumb
+
+  d.view->scroll_x_by(40);
+  CHECK_EQ(d.view->x_offset(), 40.0);
+  d.view->scroll_x_by(1e6);
+  CHECK(d.view->x_offset() > 200.0);  // content 320 + pad 24 - viewport 80
+  const vc::ViewCore::HScrollBar end = d.view->hscrollbar();
+  CHECK_EQ(end.thumb_x + end.thumb_w, 80.0);  // pinned to the right edge
+  d.view->scroll_x_by(-1e6);
+  CHECK_EQ(d.view->x_offset(), 0.0);
+}
+
+TEST(viewcore_horizontal_pan_shifts_text_and_hit_test) {
+  Doc d("0123456789abcdefghij\n");
+  d.view->resize(80, 100);
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);         // measure the line: 20 chars = 160 px
+  d.view->scroll_x_by(40);  // pan by five characters
+  CHECK_EQ(d.view->x_offset(), 40.0);
+
+  const vc::Hit h = d.view->hit_test(0, 2);
+  CHECK_EQ(h.line, 0);
+  CHECK_EQ(h.col, 5);  // the fifth character now sits at the left edge
+
+  const vc::Rect r = d.view->caret_rect(0, 5);
+  CHECK_EQ(r.x, 0.0);
+
+  vc::RecordingCanvas panned;
+  d.view->draw(panned);
+  bool saw_run = false;
+  for (const vc::DrawCmd& c : panned.cmds) {
+    if (c.kind == vc::DrawCmd::Kind::DrawRun &&
+        c.text == "0123456789abcdefghij") {
+      CHECK_EQ(c.x, -40.0);  // the run starts one pan to the left
+      saw_run = true;
+    }
+  }
+  CHECK(saw_run);
+}
+
+// An edit re-measures the lines; that must not snap a panned view back to the
+// left edge (the horizontal range is a running maximum, not rebuilt per key).
+TEST(viewcore_horizontal_pan_survives_typing) {
+  Doc d("0123456789abcdefghij\n");
+  d.view->resize(80, 100);
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);
+  vc::KeyEvent right;
+  right.key = vc::Key::Right;
+  for (int i = 0; i < 6; ++i) d.view->key(right);  // caret to column 6
+  d.view->scroll_x_by(40);
+  CHECK_EQ(d.view->x_offset(), 40.0);
+  CHECK(d.view->hscrollbar().visible);
+
+  CHECK(d.view->insert_text("Z"));
+  CHECK_EQ(d.view->x_offset(), 40.0);
+  CHECK(d.view->hscrollbar().visible);
+}
+
+TEST(viewcore_wrap_turns_horizontal_scrolling_off) {
+  Doc d("0123456789abcdefghij0123456789abcdefghij\n");
+  d.view->resize(80, 160);
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);  // measures the line, so there is something to pan
+  d.view->scroll_x_by(50);
+  CHECK(d.view->hscrollbar().visible);
+  d.view->set_wrap(true);
+  CHECK_EQ(d.view->x_offset(), 0.0);
+  CHECK(!d.view->hscrollbar().visible);
 }
 
 TEST(viewcore_input_horizontal) {

@@ -78,6 +78,11 @@ void ViewCore::set_document(Editor& ed) {
   known_lines_ = 0;
   eof_known_ = false;
   sb_drag_ = false;
+  sb_drag_f_ = -1;
+  pending_line_ = -1;
+  content_w_ = 0;
+  x_offset_ = 0;
+  hsb_drag_ = false;
   invalidate_all();
 }
 
@@ -86,11 +91,13 @@ void ViewCore::resize(double width, double height) {
   width_ = std::max(1.0, width);
   height_ = std::max(1.0, height);
   clamp_scroll();  // a taller viewport may need to pull the top line back
+  clamp_x();       // a wider viewport may leave nothing to pan
 }
 
 void ViewCore::set_wrap(bool on) {
   if (on != wrap_) invalidate_all();
   wrap_ = on;
+  if (wrap_) x_offset_ = 0;  // wrapped text always starts at the left edge
 }
 
 void ViewCore::set_font(const FontSpec& f) {
@@ -186,6 +193,7 @@ const ViewCore::LineEntry& ViewCore::entry_for(int64_t line) const {
   auto it = cache_.find(line);
   if (it != cache_.end()) {
     touch(line);
+    update_content_width(it->second);
     return it->second;
   }
 
@@ -242,8 +250,15 @@ const ViewCore::LineEntry& ViewCore::entry_for(int64_t line) const {
   auto res = cache_.emplace(line, std::move(e));
   lru_.push_front(line);
   cache_bytes_ += res.first->second.bytes;
+  update_content_width(res.first->second);
   evict_if_needed();
   return res.first->second;
+}
+
+void ViewCore::update_content_width(const LineEntry& e) const {
+  for (const VisualLine& v : e.visual) {
+    if (v.run.width > content_w_) content_w_ = v.run.width;
+  }
 }
 
 void ViewCore::touch(int64_t line) const {
@@ -276,6 +291,7 @@ double ViewCore::block_height(int64_t line) const {
 
 void ViewCore::scroll_to_line(int64_t line) {
   if (line < 0) line = 0;
+  pending_line_ = -1;  // a direct scroll supersedes a queued jump
   grow_to(line + 1);
   // If the document ended before `line`, clamp to the last line; otherwise the
   // requested line is known to exist.
@@ -287,6 +303,7 @@ void ViewCore::scroll_to_line(int64_t line) {
 void ViewCore::scroll_lines(int64_t n) { scroll_to_line(first_line_ + n); }
 
 void ViewCore::scroll_by(double dy) {
+  pending_line_ = -1;  // the user scrolled: abandon a queued jump
   if (known_lines_ == 0 && eof_known_) {
     first_line_ = 0;
     scroll_px_ = 0;
@@ -313,7 +330,7 @@ int64_t ViewCore::max_first_line() const {
   if (!eof_known_ || known_lines_ <= 0) return 0;
   double h = 0;
   int64_t first = known_lines_;
-  while (first > 0 && h < height_) {
+  while (first > 0 && h < text_height()) {
     --first;
     h += block_height(first);
   }
@@ -331,7 +348,7 @@ void ViewCore::clamp_scroll() {
   // content is taller than the viewport: nothing to clamp.
   const double lh = line_height();
   if (lh > 0 && static_cast<double>(known_lines_ - first_line_) * lh >
-                    2.0 * height_) {
+                    2.0 * text_height()) {
     return;
   }
   const int64_t max_first = max_first_line();
@@ -402,7 +419,7 @@ int64_t ViewCore::visible_logical_lines() const {
   if (scroll_px_ < 0) return fallback;
   double y = -scroll_px_;
   int64_t n = 0;
-  for (int64_t line = first_line_; y < height_; ++line) {
+  for (int64_t line = first_line_; y < text_height(); ++line) {
     if (!line_exists(line)) break;
     y += block_height(line);
     ++n;
@@ -414,19 +431,49 @@ int64_t ViewCore::visible_logical_lines() const {
 
 ViewCore::ScrollBar ViewCore::scrollbar() const {
   ScrollBar sb;
-  if (!eof_known_ || known_lines_ <= 0) return sb;  // total unknown / empty
+  sb.track_w = kScrollbarWidth;
+  sb.track_x = width_ - sb.track_w;
+  const double track_h = height_ - (hbar_visible() ? kScrollbarWidth : 0.0);
+  if (track_h <= 0) return sb;
+
+  if (!eof_known_) {
+    // Above the discovery cap the line count is unknown, so the bar is driven by
+    // byte progress: where the top line starts, and how many bytes the viewport
+    // covers. It becomes exact once the drip index completes.
+    const uint64_t total = ed_->rev().size;
+    if (total == 0 || known_lines_ <= 0) return sb;
+    size_t top = 0, vis_bytes = 0;
+    int64_t n = 0;
+    ed_->read_lines(0, first_line_, nullptr, 0, &top, &n);
+    ed_->read_lines(first_line_, first_line_ + visible_logical_lines(), nullptr,
+                    0, &vis_bytes, &n);
+    if (vis_bytes == 0 || vis_bytes >= total) return sb;
+    const double span = static_cast<double>(total - vis_bytes);
+    sb.visible = true;
+    sb.approximate = true;
+    double f = static_cast<double>(top) / span;
+    if (sb_drag_f_ >= 0) f = sb_drag_f_;  // preview while dragging
+    if (f < 0) f = 0;
+    if (f > 1) f = 1;
+    sb.thumb_h = track_h * static_cast<double>(vis_bytes) /
+                 static_cast<double>(total);
+    if (sb.thumb_h < 28) sb.thumb_h = 28;
+    if (sb.thumb_h > track_h) sb.thumb_h = track_h;
+    sb.thumb_y = f * (track_h - sb.thumb_h);
+    return sb;
+  }
+
+  if (known_lines_ <= 0) return sb;  // empty document
   const int64_t vis = visible_logical_lines();
   const int64_t max_first = max_first_line();
   if (max_first <= 0) return sb;  // the whole document fits
 
   sb.visible = true;
-  sb.track_w = kScrollbarWidth;
-  sb.track_x = width_ - sb.track_w;
-  sb.thumb_h =
-      height_ * static_cast<double>(vis) / static_cast<double>(known_lines_);
+  sb.thumb_h = track_h * static_cast<double>(vis) /
+               static_cast<double>(known_lines_);
   if (sb.thumb_h < 28) sb.thumb_h = 28;
-  if (sb.thumb_h > height_) sb.thumb_h = height_;
-  const double travel = height_ - sb.thumb_h;
+  if (sb.thumb_h > track_h) sb.thumb_h = track_h;
+  const double travel = track_h - sb.thumb_h;
   double f = static_cast<double>(first_line_) / static_cast<double>(max_first);
   if (f < 0) f = 0;
   if (f > 1) f = 1;
@@ -434,15 +481,105 @@ ViewCore::ScrollBar ViewCore::scrollbar() const {
   return sb;
 }
 
-bool ViewCore::scrollbar_at(double x) const {
-  return scrollbar().visible && x >= width_ - kScrollbarWidth && x <= width_;
-}
-
 void ViewCore::scroll_to_fraction(double f) {
   if (f < 0) f = 0;
   if (f > 1) f = 1;
-  scroll_to_line(static_cast<int64_t>(
-      std::llround(f * static_cast<double>(max_first_line()))));
+  if (eof_known_) {
+    scroll_to_line(static_cast<int64_t>(
+        std::llround(f * static_cast<double>(max_first_line()))));
+    return;
+  }
+  // The line count is unknown: estimate it from the bytes-per-line of the
+  // indexed prefix and let the caller's discovery loop reach that line (the
+  // index work of one jump, not a full build).
+  const uint64_t total = ed_->rev().size;
+  if (total == 0) return;
+  size_t head_bytes = 0;
+  int64_t n = 0;
+  ed_->read_lines(0, known_lines_, nullptr, 0, &head_bytes, &n);
+  double est = 0;
+  if (known_lines_ > 0 && head_bytes > 0) {
+    const double avg =
+        static_cast<double>(head_bytes) / static_cast<double>(known_lines_);
+    est = static_cast<double>(total) / avg;
+  }
+  pending_line_ = static_cast<int64_t>(std::llround(f * est));
+  if (pending_line_ < 0) pending_line_ = 0;
+}
+
+bool ViewCore::apply_pending_scroll() {
+  if (pending_line_ < 0) return false;
+  if (eof_known_ && known_lines_ > 0 && pending_line_ > known_lines_ - 1) {
+    pending_line_ = known_lines_ - 1;  // the estimate overshot the real end
+  }
+  if (pending_line_ >= known_lines_) return false;  // still indexing toward it
+  const int64_t target = pending_line_;
+  pending_line_ = -1;
+  scroll_to_line(target);
+  return true;
+}
+
+// --- Horizontal scrolling --------------------------------------------------
+
+double ViewCore::max_x_offset() const {
+  const double pad = 24.0;  // breathing room past the last glyph
+  const double need = content_w_ + pad - text_width();
+  return need > 0 ? need : 0.0;
+}
+
+void ViewCore::clamp_x() {
+  if (wrap_) {
+    x_offset_ = 0;
+    return;
+  }
+  const double max = max_x_offset();
+  if (x_offset_ > max) x_offset_ = max;
+  if (x_offset_ < 0) x_offset_ = 0;
+}
+
+void ViewCore::scroll_x_by(double dx) {
+  if (wrap_) return;
+  x_offset_ += dx;
+  clamp_x();
+}
+
+ViewCore::HScrollBar ViewCore::hscrollbar() const {
+  HScrollBar hb;
+  if (!hbar_visible()) return hb;
+  const double avail = text_width();
+  const double max = max_x_offset();
+  hb.visible = true;
+  hb.track_h = kScrollbarWidth;
+  hb.track_y = height_ - kScrollbarWidth;
+  // thumb / track = visible / (visible + scrollable)
+  hb.thumb_w = avail * avail / (avail + max);
+  if (hb.thumb_w < 28) hb.thumb_w = 28;
+  if (hb.thumb_w > avail) hb.thumb_w = avail;
+  const double travel = avail - hb.thumb_w;
+  double f = max > 0 ? x_offset_ / max : 0;
+  if (f < 0) f = 0;
+  if (f > 1) f = 1;
+  hb.thumb_x = text_left() + f * travel;
+  return hb;
+}
+
+void ViewCore::scroll_x_to_fraction(double f) {
+  if (f < 0) f = 0;
+  if (f > 1) f = 1;
+  if (!hbar_visible()) return;
+  const double avail = text_width();
+  const double travel = avail - hscrollbar().thumb_w;
+  if (travel <= 0) return;
+  x_offset_ = f * max_x_offset();
+  clamp_x();
+}
+
+void ViewCore::draw_hscrollbar(Canvas& c) const {
+  const HScrollBar hb = hscrollbar();
+  if (!hb.visible) return;
+  c.fill_rect(Rect{hb.thumb_x + 1, hb.track_y + 2, hb.thumb_w - 2,
+                   hb.track_h - 4},
+              border_control_color_);
 }
 
 void ViewCore::apply_tabs(Run& run) const {
@@ -467,7 +604,8 @@ void ViewCore::apply_tabs(Run& run) const {
 
 Hit ViewCore::hit_test(double x, double y) const {
   update_gutter();
-  x -= text_left();
+  if (x < text_left()) x = text_left();  // a click in the gutter is column 0
+  x -= text_left() - x_offset_;          // undo the horizontal pan
   if (x < 0) x = 0;
   const double lh = line_height();
   double top = -scroll_px_;
@@ -490,15 +628,16 @@ Rect ViewCore::caret_rect(int64_t line, int64_t col) const {
   double top = -scroll_px_;
   for (int64_t l = first_line_; l < line; ++l) top += block_height(l);
   const LineEntry& e = entry_for(line);
+  const double pan = text_left() - x_offset_;
   double y = top;
   for (const VisualLine& v : e.visual) {
     if (col >= static_cast<int64_t>(v.byte_start) &&
         col <= static_cast<int64_t>(v.byte_end)) {
-      return Rect{x_of_col(v, col) + text_left(), y, 1, lh};
+      return Rect{x_of_col(v, col) + pan, y, 1, lh};
     }
     y += lh;
   }
-  return Rect{text_left(), y, 1, lh};
+  return Rect{text_left() - x_offset_, y, 1, lh};
 }
 
 void ViewCore::draw(Canvas& c) const {
@@ -526,7 +665,17 @@ void ViewCore::draw(Canvas& c) const {
 
   double caret_x = -1, caret_y = 0;
   double y = -scroll_px_;
-  for (int64_t line = first_line_; y < height_; ++line) {
+  // Freeze the text viewport for the whole pass: laying out lines widens
+  // content_w_, which can bring the horizontal bar in mid-draw, and the rows and
+  // the clip must agree on where the text area ends.
+  const double text_h = text_height();
+  const double pan = left - x_offset_;  // text is panned; the gutter is not
+  std::vector<std::pair<int64_t, double>> numbers;  // gutter labels, drawn last
+  // Text lives in the area above the horizontal bar. Clipping (rather than
+  // hiding the last row) cuts a partially scrolled row at that boundary, so it
+  // never paints under the bar or past the view.
+  c.push_clip(Rect{0, 0, width_, text_h});
+  for (int64_t line = first_line_; y < text_h; ++line) {
     if (!line_exists(line)) break;
     const LineEntry& e = entry_for(line);
     const int64_t line_content = static_cast<int64_t>(e.visual.back().byte_end);
@@ -550,35 +699,52 @@ void ViewCore::draw(Canvas& c) const {
             hi = static_cast<int64_t>(v.byte_end);
           }
           if (hi > lo) {
-            const double x0 = x_of_col(v, lo) + left;
-            const double x1 = x_of_col(v, hi) + left;
+            const double x0 = x_of_col(v, lo) + pan;
+            const double x1 = x_of_col(v, hi) + pan;
             c.fill_rect(Rect{x0, y, x1 - x0, lh}, selection_color_);
           }
         }
         if (!has_sel && line == sel_.caret_line &&
             sel_.caret_col >= static_cast<int64_t>(v.byte_start) &&
             sel_.caret_col <= static_cast<int64_t>(v.byte_end)) {
-          caret_x = x_of_col(v, sel_.caret_col) + left;
+          caret_x = x_of_col(v, sel_.caret_col) + pan;
           caret_y = y;
         }
         c.set_text_color(text_color_);
-        c.draw_run(v.run, left, y + v.run.ascent);
+        c.draw_run(v.run, pan, y + v.run.ascent);
         if (gutter_width_ > 0 && first_visual) {
-          const Run num = tb_->shape(font_, std::to_string(line + 1));
-          c.set_text_color(gutter_fg_);
-          c.draw_run(num, gutter_width_ - 8 - num.width, y + num.ascent);
+          numbers.emplace_back(line, y);
         }
       }
       first_visual = false;
       y += lh;
-      if (y >= height_) break;
+      if (y >= text_h) break;
     }
   }
 
-  if (caret_visible_ && caret_x >= 0 && caret_y >= 0 && caret_y < height_) {
+  if (caret_visible_ && caret_x >= 0 && caret_y >= 0 && caret_y < text_h) {
     c.fill_rect(Rect{caret_x, caret_y, 1.5, lh}, caret_color_);
   }
+  c.pop_clip();
+
+  // The gutter is painted over the panned text (it is a fixed column, not part
+  // of the scrolled surface), then its labels go on top.
+  if (gutter_width_ > 0) {
+    c.fill_rect(Rect{0, 0, gutter_width_, height_}, gutter_bg_);
+    c.fill_rect(Rect{gutter_width_ - 1, 0, 1, height_}, gutter_border_color_);
+    // The numbers belong to the text viewport too: a partly scrolled last row
+    // must not drop its number into the reserved strip.
+    c.push_clip(Rect{0, 0, gutter_width_, text_h});
+    c.set_text_color(gutter_fg_);
+    for (const auto& n : numbers) {
+      const Run num = tb_->shape(font_, std::to_string(n.first + 1));
+      c.draw_run(num, gutter_width_ - 8 - num.width, n.second + num.ascent);
+    }
+    c.pop_clip();
+  }
+
   draw_scrollbar(c);
+  draw_hscrollbar(c);
 }
 
 // --- Input (M1: read-only movement and selection) --------------------------
@@ -676,7 +842,7 @@ void ViewCore::move_line_edge(bool to_end, bool extend) {
 
 void ViewCore::page_move(int dir, bool extend) {
   const int64_t lines =
-      std::max<int64_t>(1, static_cast<int64_t>(height_ / line_height()));
+      std::max<int64_t>(1, static_cast<int64_t>(text_height() / line_height()));
   scroll_lines(dir * lines);
   int64_t line = first_line_;
   if (!line_exists(line)) line = known_lines_ > 0 ? known_lines_ - 1 : 0;
@@ -690,11 +856,22 @@ void ViewCore::ensure_caret_visible() {
   const int64_t line = sel_.caret_line;
   if (line < first_line_) {
     scroll_to_line(line);
-    return;
+  } else {
+    const int64_t vis =
+        std::max<int64_t>(1, static_cast<int64_t>(text_height() / line_height()));
+    if (line >= first_line_ + vis) scroll_to_line(line - vis + 1);
   }
-  const int64_t vis =
-      std::max<int64_t>(1, static_cast<int64_t>(height_ / line_height()));
-  if (line >= first_line_ + vis) scroll_to_line(line - vis + 1);
+  // Keep the caret inside the text area horizontally (wrap off), clear of the
+  // overlay scrollbar down the right edge.
+  if (wrap_) return;
+  const Rect cr = caret_rect(sel_.caret_line, sel_.caret_col);
+  const double left = text_left();
+  const double right = width_ - kScrollbarWidth - 2;
+  if (cr.x < left) {
+    scroll_x_by(cr.x - left);
+  } else if (cr.x > right) {
+    scroll_x_by(cr.x - right);
+  }
 }
 
 bool ViewCore::key(const KeyEvent& e) {
@@ -736,23 +913,57 @@ bool ViewCore::key(const KeyEvent& e) {
          scroll_px_ != before_px;
 }
 
+// Height of the vertical scrollbar's track (shorter when the horizontal bar is
+// showing along the bottom edge).
+double ViewCore::text_height() const {
+  const double h = height_ - (hbar_visible() ? kScrollbarWidth : 0.0);
+  const double lh = line_height();
+  return h > lh ? h : lh;
+}
+
 bool ViewCore::mouse(const MouseEvent& e) {
   const Selection before = sel_;
   const int64_t before_first = first_line_;
   const double before_px = scroll_px_;
+  const double before_x = x_offset_;
+  const double before_f = sb_drag_f_;
   switch (e.kind) {
     case MouseEvent::Kind::Scroll:
-      scroll_by(e.dy);
+      if (e.dy != 0) scroll_by(e.dy);
+      if (e.dx != 0) scroll_x_by(e.dx);
       break;
     case MouseEvent::Kind::Down: {
+      const HScrollBar hb = hscrollbar();
+      if (hb.visible && e.y >= hb.track_y && e.x >= text_left()) {
+        v_moving_ = false;
+        sb_drag_ = false;
+        const double travel = text_width() - hb.thumb_w;
+        if (e.x >= hb.thumb_x && e.x < hb.thumb_x + hb.thumb_w) {
+          hsb_drag_ = true;  // grab the thumb
+          hsb_grab_ = e.x - hb.thumb_x;
+        } else if (e.cmd && travel > 0) {
+          // Command-click jumps so the thumb centres on the pointer.
+          scroll_x_to_fraction(
+              (e.x - text_left() - hb.thumb_w / 2) / travel);
+        } else {
+          // A plain track click pages toward the click.
+          scroll_x_by(e.x < hb.thumb_x ? -text_width() : text_width());
+        }
+        break;
+      }
+      hsb_drag_ = false;
       const ScrollBar sb = scrollbar();
       if (sb.visible && e.x >= width_ - kScrollbarWidth) {
         v_moving_ = false;
         if (e.y >= sb.thumb_y && e.y < sb.thumb_y + sb.thumb_h) {
           sb_drag_ = true;  // grab the thumb and drag it
           sb_grab_ = e.y - sb.thumb_y;
+          if (sb.approximate) {
+            const double travel = text_height() - sb.thumb_h;
+            sb_drag_f_ = travel > 0 ? sb.thumb_y / travel : 0;
+          }
         } else {
-          const double travel = height_ - sb.thumb_h;
+          const double travel = text_height() - sb.thumb_h;
           if (e.cmd && travel > 0) {
             // Command-click jumps so the thumb centres on the pointer.
             scroll_to_fraction((e.y - sb.thumb_h / 2) / travel);
@@ -773,10 +984,27 @@ bool ViewCore::mouse(const MouseEvent& e) {
       break;
     }
     case MouseEvent::Kind::Drag: {
+      if (hsb_drag_) {
+        const HScrollBar hb = hscrollbar();
+        const double travel = text_width() - hb.thumb_w;
+        if (travel > 0) {
+          scroll_x_to_fraction((e.x - hsb_grab_ - text_left()) / travel);
+        }
+        break;
+      }
       if (sb_drag_) {
         const ScrollBar sb = scrollbar();
-        const double travel = height_ - sb.thumb_h;
-        if (travel > 0) scroll_to_fraction((e.y - sb_grab_) / travel);
+        const double travel = text_height() - sb.thumb_h;
+        if (travel > 0) {
+          double f = (e.y - sb_grab_) / travel;
+          if (f < 0) f = 0;
+          if (f > 1) f = 1;
+          if (eof_known_) {
+            scroll_to_fraction(f);
+          } else {
+            sb_drag_f_ = f;  // unknown total: preview, commit on release
+          }
+        }
         break;
       }
       const Hit h = hit_test(e.x, e.y);
@@ -785,11 +1013,15 @@ bool ViewCore::mouse(const MouseEvent& e) {
       break;
     }
     case MouseEvent::Kind::Up:
+      if (sb_drag_ && sb_drag_f_ >= 0) scroll_to_fraction(sb_drag_f_);
       sb_drag_ = false;
+      sb_drag_f_ = -1;
+      hsb_drag_ = false;
       break;
   }
   return !(sel_ == before) || first_line_ != before_first ||
-         scroll_px_ != before_px;
+         scroll_px_ != before_px || x_offset_ != before_x ||
+         sb_drag_f_ != before_f;
 }
 
 // --- Editing (M2) ----------------------------------------------------------
@@ -833,10 +1065,15 @@ void ViewCore::refresh_line_count() {
 
 void ViewCore::document_changed() {
   invalidate_all();
+  // content_w_ is deliberately kept: it is a running maximum, so re-measuring
+  // from zero would snap a panned view back to the left edge on every keystroke.
+  // It resets when a new document replaces this one (set_document).
+  pending_line_ = -1;
   refresh_line_count();
   sel_.anchor_line = sel_.caret_line;
   sel_.anchor_col = sel_.caret_col;
   clamp_scroll();  // the document may have shrunk under the viewport
+  clamp_x();
   ensure_caret_visible();
 }
 

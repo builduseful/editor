@@ -28,6 +28,13 @@ class CgCanvas final : public vc::Canvas {
 
   void set_text_color(vc::Color c) override { ink_ = c; }
 
+  void push_clip(const vc::Rect& r) override {
+    CGContextSaveGState(ctx_);
+    // viewcore y-down -> CoreGraphics y-up.
+    CGContextClipToRect(ctx_, CGRectMake(r.x, height_ - r.y - r.h, r.w, r.h));
+  }
+  void pop_clip() override { CGContextRestoreGState(ctx_); }
+
   void draw_run(const vc::Run& run, double x, double y) override {
     CTFontRef font = ct_font(run.font);
     if (font == nullptr) return;

@@ -1271,10 +1271,12 @@ width + wrap settings, status bar, gutter, decorations, and the CLI (`read`,
 **Status (2026-11-18).** M0–M3 code is implemented: `core` + CLI
 (M0), `viewcore` + render oracle + the lazy line index (M0.5/M1), the AppKit view
 with CoreText/CoreGraphics backends, editing, find/replace, and settings (M1/M2),
-and the gutter / status bar / cut-copy-paste polish (M3). The GUI also has a
-custom-drawn overlay scrollbar (drag, track paging, command-click to jump), File →
-Open / Save As with a window title and dirty marker, and incremental (run-loop
-dripped) indexing so a medium file never blocks the window. `make test` (plain +
+and the gutter / status bar / cut-copy-paste polish (M3). The GUI also has
+custom-drawn overlay scrollbars — vertical (drag, track paging, command-click to
+jump; drawn from byte progress while the line count is still unknown) and
+horizontal for long lines with wrap off (pan, drag, track paging, command-click)
+— File → New / Open / Save As with a window title and dirty marker, and
+incremental (run-loop dripped) indexing so a medium file never blocks the window. `make test` (plain +
 ASan/UBSan), `make golden`, `make fuzz`, `make bench`, `make demo`, and
 `make gui-smoke` (headless AppKit snapshots in both themes, a real launch, a
 no-file launch, and a Finder-style LaunchServices open) pass; the M1 first-paint
@@ -1289,9 +1291,13 @@ draw is already queued. So an untitled window is backed by a private temp file
 document call while nothing is open, instead of dereferencing an unset source —
 that combination was the launch crash.
 
-Known limits: the scrollbar needs the exact line count, so files above the
-discovery cap (64 MB) show none until indexed; a scrollbar drag with wrap on maps
-logical lines proportionally (approximate, not per-visual-line); the app has no
+Known limits: for files above the discovery cap (64 MB) the vertical bar is
+approximate — its thumb is sized and placed from byte progress, a drag only
+previews until it is released, and the release then indexes up to the target
+line (a jump to 90% of a 5 GB file does that much index work); a vertical drag
+with wrap on maps logical lines proportionally (approximate, not per-visual-line).
+The horizontal range is the widest line measured so far, so it grows as you
+scroll and does not shrink again until another document opens. The app has no
 app icon yet (the design system's icon assets need an agreed raster step).
 
 **Total:** the table sums to **24–33 weeks of work**. With ~30% overhead that is

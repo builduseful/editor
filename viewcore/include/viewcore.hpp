@@ -58,7 +58,8 @@ struct MouseEvent {
   enum class Kind : uint32_t { Down, Drag, Up, Scroll };
   Kind kind = Kind::Down;
   double x = 0, y = 0;  // viewport coordinates, y down
-  double dy = 0;        // scroll amount (Kind::Scroll)
+  double dy = 0;        // scroll amount (Kind::Scroll), pixels, +down
+  double dx = 0;        // horizontal scroll amount (Kind::Scroll), +right
   bool shift = false, cmd = false;
 };
 
@@ -150,12 +151,32 @@ class ViewCore {
     bool visible = false;
     double track_x = 0, track_w = 0;
     double thumb_y = 0, thumb_h = 0;
+    // True when the line count is not known yet (a document above the discovery
+    // cap): the thumb is drawn from byte progress and a drag only previews its
+    // position until it is released.
+    bool approximate = false;
   };
   static constexpr double kScrollbarWidth = 9.0;
   ScrollBar scrollbar() const;
-  bool scrollbar_at(double x) const;
   // Scrolls so the document position `f` (0 = top, 1 = bottom) is at the top.
+  // With an unknown line count this becomes a target that the caller's
+  // discovery loop reaches (see has_pending_scroll/apply_pending_scroll).
   void scroll_to_fraction(double f);
+  bool has_pending_scroll() const { return pending_line_ >= 0; }
+  // Scrolls to the pending target once its line is known; returns true then.
+  bool apply_pending_scroll();
+
+  // Horizontal scrolling (only with wrap off). The document is panned by
+  // x_offset(); the gutter and both scrollbars stay put.
+  double x_offset() const { return x_offset_; }
+  void scroll_x_by(double dx);
+  struct HScrollBar {
+    bool visible = false;
+    double track_y = 0, track_h = 0;
+    double thumb_x = 0, thumb_w = 0;
+  };
+  HScrollBar hscrollbar() const;
+  void scroll_x_to_fraction(double f);
 
   Hit hit_test(double x, double y) const;
   Rect caret_rect(int64_t line, int64_t col) const;
@@ -218,6 +239,10 @@ class ViewCore {
   void touch(int64_t line) const;
   void evict_if_needed() const;
   void invalidate_all() const;
+  // Remembers the widest visual line seen, which is the horizontal scroll range
+  // (an estimate until every line has been measured; reset when a new document
+  // replaces this one).
+  void update_content_width(const LineEntry& e) const;
   // Ensures at least `min_lines` lines are known (extends the core index),
   // recording EOF once reached.
   void grow_to(int64_t min_lines) const;
@@ -232,15 +257,26 @@ class ViewCore {
   // Recomputes the gutter width from the known line count (and re-wraps if the
   // width changed with wrap on).
   void update_gutter() const;
-  // A quiet overlay scrollbar on the right edge (drawn only once the line count
-  // is known).
+  // A quiet overlay scrollbar on the right edge (approximate, from byte
+  // progress, until the line count is known).
   void draw_scrollbar(Canvas& c) const;
+  // The horizontal overlay scrollbar along the bottom edge (wrap off, long
+  // line). Same quiet treatment as the vertical thumb.
+  void draw_hscrollbar(Canvas& c) const;
   // Logical lines needed to fill the viewport from `first_line_` (wrap-aware).
   int64_t visible_logical_lines() const;
   // Scroll limits: the largest top line that still fills the viewport.
   int64_t max_first_line() const;
   void clamp_scroll();
+  // Horizontal limits: the widest measured line, and the largest pan that still
+  // leaves text in view.
+  double max_x_offset() const;
+  bool hbar_visible() const { return !wrap_ && max_x_offset() > 0.5; }
+  void clamp_x();
   double text_left() const { return gutter_width_; }
+  // Height of the text viewport: the last strip is reserved for the horizontal
+  // bar when it is showing, so text never scrolls under it.
+  double text_height() const;
   double text_width() const {
     const double w = width_ - gutter_width_;
     return w > 1.0 ? w : 1.0;
@@ -278,6 +314,12 @@ class ViewCore {
   bool v_moving_ = false;  // a run of vertical moves (keeps goal_x_)
   bool sb_drag_ = false;   // dragging the scrollbar thumb
   double sb_grab_ = 0;     // pointer offset inside the thumb at drag start
+  double sb_drag_f_ = -1;  // previewed fraction while dragging an approximate bar
+  int64_t pending_line_ = -1;  // index this line, then scroll to it (-1 = none)
+  mutable double content_w_ = 0;  // widest measured visual line (wrap off)
+  double x_offset_ = 0;           // horizontal pan, wrap off only
+  bool hsb_drag_ = false;
+  double hsb_grab_ = 0;
   mutable int64_t known_lines_ = 0;  // lines discovered so far (lazy)
   mutable bool eof_known_ = false;   // the whole document has been indexed
   std::vector<Decoration> decorations_;
