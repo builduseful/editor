@@ -164,3 +164,47 @@ TEST(viewcore_invalidates_on_font_and_width_change) {
   const std::vector<std::string> after = d.drawn_runs();
   CHECK(after.size() < before.size());
 }
+
+TEST(viewcore_first_paint_is_lazy) {
+  // First paint must discover only the visible lines, not the whole document.
+  std::string content;
+  for (int i = 0; i < 100000; ++i) content += "line " + std::to_string(i) + "\n";
+  Doc d(content);
+  d.view->resize(80, 160);  // 10 monospace lines tall
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);
+  CHECK(!d.view->line_count_known());
+  CHECK(d.view->line_count() <= 64);  // a viewport, not 100k lines
+  d.view->discover_all();
+  CHECK(d.view->line_count_known());
+  CHECK_EQ(d.view->line_count(), 100000);
+}
+
+TEST(viewcore_draw_discovers_eof_on_short_document) {
+  Doc d("only\n");
+  d.view->resize(80, 1000);
+  vc::RecordingCanvas rc;
+  d.view->draw(rc);
+  CHECK(d.view->line_count_known());
+  CHECK_EQ(d.view->line_count(), 1);
+}
+
+TEST(viewcore_scroll_discovers_eof_and_clamps) {
+  Doc d("a\nb\nc\n");
+  d.view->scroll_to_line(1000);
+  CHECK(d.view->line_count_known());
+  CHECK_EQ(d.view->line_count(), 3);
+  CHECK_EQ(d.view->first_visible_line(), 3);  // clamped past the last line
+}
+
+TEST(viewcore_hit_test_is_lazy) {
+  std::string content;
+  for (int i = 0; i < 50000; ++i) content += "row " + std::to_string(i) + "\n";
+  Doc d(content);
+  d.view->resize(80, 160);
+  const vc::Hit h = d.view->hit_test(0, 8);  // first visual line
+  CHECK_EQ(h.line, 0);
+  CHECK(!d.view->line_count_known());
+  CHECK(d.view->line_count() <= 64);
+}
+

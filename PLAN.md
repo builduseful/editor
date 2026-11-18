@@ -474,6 +474,13 @@ failure the caller closes it. `Editor::open` closes its fd on every failing path
 - Chunk descriptors (12 B each) are resident for the whole file; the in-chunk
   scan reads the mapping/add buffer on demand. "Lazy" means the index is not
   built until the first line query/edit, not that descriptors are evicted.
+- **Incremental (first-paint) build.** A line query only needs the lines up to
+  its `last`: `read_lines(0,K)` extends the index just far enough, and the
+  prefix grows geometrically so a sequence of queries stays O(n) overall.
+  `info`/`apply` still force the exact, complete build. This is what lets first
+  paint show the first viewport without scanning the whole file (the M1 gate:
+  open 1 GB/5 GB to first paint). "Lazy" therefore means both "not built until
+  the first query" and "built only as far as queried".
 - Node layout: 63-way B-tree — 62 chunk descriptors + 63 subtree sums per node:
   62 × 12 B + 63 × 16 B = 1752 B per node, i.e. **≈28 B per chunk**. (Each
   subtree sum is a line-count + byte-length pair, so 16 B each.) Chunks are split

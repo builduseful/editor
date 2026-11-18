@@ -14,6 +14,14 @@ LineIndex::LineIndex() {
 
 LineIndex::~LineIndex() = default;
 
+void LineIndex::reset() {
+  root_ = std::make_unique<Node>();
+  root_->leaf = true;
+  total_lines_ = 0;
+  total_bytes_ = 0;
+  complete_ = false;
+}
+
 LineIndex::Sum LineIndex::node_sum(const Node* n) const {
   Sum s;
   if (n->leaf) {
@@ -91,7 +99,12 @@ Status LineIndex::build(const Source& doc) {
   std::vector<LineChunk> flat;
   Status s = rescan(doc, 0, doc.size(), &flat);
   if (s != Status::Ok) return s;
+  build_from_flat(std::move(flat));
+  complete_ = true;
+  return Status::Ok;
+}
 
+void LineIndex::build_from_flat(std::vector<LineChunk> flat) {
   std::vector<std::unique_ptr<Node>> level;
   for (size_t i = 0; i < flat.size(); i += kMaxChunks) {
     auto leaf = std::make_unique<Node>();
@@ -102,6 +115,56 @@ Status LineIndex::build(const Source& doc) {
     level.push_back(std::move(leaf));
   }
   adopt_root(std::move(level));
+}
+
+void LineIndex::collect_chunks(const Node* n, std::vector<LineChunk>* out) {
+  if (n->leaf) {
+    out->insert(out->end(), n->chunks.begin(), n->chunks.end());
+    return;
+  }
+  for (const std::unique_ptr<Node>& k : n->kids) collect_chunks(k.get(), out);
+}
+
+Status LineIndex::extend(const Source& doc, int64_t min_lines) {
+  if (complete_) return Status::Ok;
+  if (min_lines <= 0) return Status::Ok;
+  if (static_cast<uint64_t>(min_lines) <= total_lines_) return Status::Ok;
+
+  // Grow the prefix geometrically so a long sequence of small requests (the
+  // first-paint path asks for one more line at a time) stays O(n) in total,
+  // never O(n^2). The overscan is bounded by 2x the lines actually needed.
+  uint64_t target = static_cast<uint64_t>(min_lines);
+  const uint64_t doubled = total_lines_ * 2 + 1;
+  if (doubled > target) target = doubled;
+
+  std::vector<LineChunk> flat;
+  collect_chunks(root_.get(), &flat);
+
+  const uint64_t end = doc.size();
+  uint64_t pos = total_bytes_;
+  uint64_t lines = total_lines_;
+  LineChunk cur;
+  LineStream ls(doc, pos);
+  while (pos < end && lines < target) {
+    bool has_line = false;
+    uint64_t line_bytes = 0;
+    bool has_term = false;
+    Status s = ls.next(&has_line, &line_bytes, &has_term);
+    if (s != Status::Ok) return s;
+    if (!has_line) break;
+    cur.lines += 1;
+    cur.bytes += line_bytes;
+    pos += line_bytes;
+    lines += 1;
+    if (cur.lines == kChunkLines) {
+      flat.push_back(cur);
+      cur = LineChunk{};
+    }
+  }
+  if (cur.lines > 0) flat.push_back(cur);
+
+  build_from_flat(std::move(flat));
+  if (pos >= end) complete_ = true;
   return Status::Ok;
 }
 

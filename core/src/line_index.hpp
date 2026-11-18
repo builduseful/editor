@@ -33,8 +33,24 @@ class LineIndex {
   LineIndex(const LineIndex&) = delete;
   LineIndex& operator=(const LineIndex&) = delete;
 
-  // Builds the index by scanning `doc` from the start.
+  // Builds the index by scanning `doc` from the start (the exact, full build).
   Status build(const Source& doc);
+
+  // Lazily extends the index so it covers at least `min_lines` lines, or the
+  // whole document if it is shorter (§5.3, first-paint). Scans only the bytes
+  // after the current prefix; the prefix grows geometrically, so a sequence of
+  // extends costs O(n) in total. After the call `line_count()` is the number of
+  // lines known so far and `complete()` says whether that is the whole document.
+  // A complete index is unaffected. Cheap when the request is already covered.
+  Status extend(const Source& doc, int64_t min_lines);
+
+  // True once the whole document has been indexed (via build() or extend()).
+  bool complete() const { return complete_; }
+
+  // Discards all built state, as after a fresh construction. Call whenever the
+  // underlying document changes, so a later extend() does not resume scanning
+  // at a stale prefix offset.
+  void reset();
 
   int64_t line_count() const { return static_cast<int64_t>(total_lines_); }
   uint64_t byte_count() const { return total_bytes_; }
@@ -84,6 +100,10 @@ class LineIndex {
 
   Status rescan(const Source& doc, uint64_t start, uint64_t end,
                 std::vector<LineChunk>* out) const;
+  // Builds the tree from a flat chunk list (one leaf per kMaxChunks chunks).
+  void build_from_flat(std::vector<LineChunk> flat);
+  // Appends every leaf's chunks, in order, to `out`.
+  static void collect_chunks(const Node* n, std::vector<LineChunk>* out);
   void locate_byte(uint64_t off, Loc* out) const;
   Status line_start_in(const Source& doc, uint64_t within, uint64_t start_byte,
                        uint64_t* out) const;
@@ -103,6 +123,7 @@ class LineIndex {
   std::unique_ptr<Node> root_;
   uint64_t total_lines_ = 0;
   uint64_t total_bytes_ = 0;
+  bool complete_ = false;  // the whole document is indexed
 };
 
 }  // namespace ed

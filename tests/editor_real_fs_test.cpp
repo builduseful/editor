@@ -339,6 +339,55 @@ TEST(editor_read_lines_and_range_semantics) {
   CHECK(fx.ed->read_range(-1, 5, nullptr, 0, &need) == Status::Range);
 }
 
+TEST(editor_reopen_resets_lazy_index) {
+  // A partial (lazy) index must not survive into a different document: the
+  // next extend() would resume scanning at the old prefix offset.
+  Fixture fx(make_temp_dir());
+  const std::string a = fx.path("a.txt");
+  const std::string b = fx.path("b.txt");
+  std::string big_a;
+  for (int i = 0; i < 500; ++i) big_a += "A" + std::to_string(i) + "\n";
+  write_file(a, big_a);
+  write_file(b, "one\ntwo\nthree\n");
+
+  CHECK(fx.ed->open(a) == Status::Ok);
+  size_t used = 0;
+  int64_t n = 0;
+  CHECK(fx.ed->read_lines(0, 2, nullptr, 0, &used, &n) == Status::Ok);
+  CHECK_EQ(n, 2);
+
+  CHECK(fx.ed->open(b) == Status::Ok);
+  CHECK(fx.ed->read_lines(0, 3, nullptr, 0, &used, &n) == Status::Ok);
+  CHECK_EQ(n, 3);
+  std::string got(used, '\0');
+  CHECK(fx.ed->read_lines(0, 3, got.data(), got.size(), &used, &n) == Status::Ok);
+  got.resize(used);
+  CHECK_EQ(got, std::string("one\ntwo\nthree\n"));
+}
+
+TEST(editor_reload_resets_lazy_index) {
+  Fixture fx(make_temp_dir());
+  const std::string p = fx.path("r.txt");
+  std::string big;
+  for (int i = 0; i < 500; ++i) big += "old" + std::to_string(i) + "\n";
+  write_file(p, big);
+  CHECK(fx.ed->open(p) == Status::Ok);
+
+  size_t used = 0;
+  int64_t n = 0;
+  CHECK(fx.ed->read_lines(0, 2, nullptr, 0, &used, &n) == Status::Ok);
+  CHECK_EQ(n, 2);
+
+  write_file(p, "new1\nnew2\n");
+  CHECK(fx.ed->reload() == Status::Ok);
+  CHECK(fx.ed->read_lines(0, 2, nullptr, 0, &used, &n) == Status::Ok);
+  CHECK_EQ(n, 2);
+  std::string got(used, '\0');
+  CHECK(fx.ed->read_lines(0, 2, got.data(), got.size(), &used, &n) == Status::Ok);
+  got.resize(used);
+  CHECK_EQ(got, std::string("new1\nnew2\n"));
+}
+
 TEST(editor_apply_validation) {
   Fixture fx(make_temp_dir());
   const std::string p = fx.path("validate.txt");

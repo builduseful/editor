@@ -46,6 +46,11 @@ class EditorImpl final : public Editor {
   Status fail(Status s, std::string msg) const;
   Status install_fd(int fd, const Stat& st, const std::string& path);
   Status ensure_index() const;
+  // Ensures the line index covers at least `min_lines` lines (or the whole
+  // document, if shorter). Unlike ensure_index() this may leave a partial index,
+  // so line_count()/byte_count() are lower bounds until complete(). Used by
+  // read_lines for first-paint; info()/apply() still force the exact build.
+  Status ensure_index_through(int64_t min_lines) const;
   Status ensure_eol() const;
   Status scan_eol_counts() const;
   Eol eol_from_counts() const;

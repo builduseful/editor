@@ -32,6 +32,8 @@ void ViewCore::set_document(Editor& ed) {
   ed_ = &ed;
   first_line_ = 0;
   scroll_px_ = 0;
+  known_lines_ = 0;
+  eof_known_ = false;
   invalidate_all();
 }
 
@@ -57,16 +59,38 @@ void ViewCore::set_decorations(std::vector<Decoration> d) {
 
 double ViewCore::line_height() const { return tb_->line_height(font_); }
 
-int64_t ViewCore::line_count() const {
+// The lazy discovery path. `grow_to` asks the core for one more line than the
+// caller needs; read_lines extends the line index only that far (or to EOF) and
+// reports how many lines exist, so first paint never scans the whole document.
+void ViewCore::grow_to(int64_t min_lines) const {
+  if (eof_known_ || min_lines <= known_lines_) return;
+  size_t need = 0;
+  int64_t n = 0;
+  ed_->read_lines(0, min_lines, nullptr, 0, &need, &n);
+  if (n < min_lines) {
+    eof_known_ = true;
+    known_lines_ = n;
+  } else {
+    known_lines_ = min_lines;
+  }
+}
+
+bool ViewCore::line_exists(int64_t line) const {
+  if (line < 0) return false;
+  grow_to(line + 1);
+  return line < known_lines_;
+}
+
+void ViewCore::discover_all() const {
+  if (eof_known_) return;
   Info in;
-  ed_->info(&in);
-  return in.line_count;
+  ed_->info(&in);  // the exact line count (full index build)
+  eof_known_ = true;
+  known_lines_ = in.line_count;
 }
 
 std::string ViewCore::line_text(int64_t line) const {
-  Info in;
-  ed_->info(&in);
-  if (line < 0 || line >= in.line_count) return {};
+  if (!line_exists(line)) return {};
   size_t need = 0;
   int64_t n = 0;
   ed_->read_lines(line, line + 1, nullptr, 0, &need, &n);
@@ -197,31 +221,30 @@ double ViewCore::block_height(int64_t line) const {
 }
 
 void ViewCore::scroll_to_line(int64_t line) {
-  const int64_t lc = line_count();
-  first_line_ = std::clamp<int64_t>(line, 0, lc);
+  if (line < 0) line = 0;
+  grow_to(line + 1);
+  // If the document ended before `line`, clamp to the last line; otherwise the
+  // requested line is known to exist.
+  first_line_ = eof_known_ ? std::min<int64_t>(line, known_lines_) : line;
   scroll_px_ = 0;
 }
 
-void ViewCore::scroll_lines(int64_t n) {
-  const int64_t lc = line_count();
-  first_line_ = std::clamp<int64_t>(first_line_ + n, 0, lc);
-  scroll_px_ = 0;
-}
+void ViewCore::scroll_lines(int64_t n) { scroll_to_line(first_line_ + n); }
 
 void ViewCore::scroll_by(double dy) {
-  const int64_t lc = line_count();
+  if (known_lines_ == 0 && eof_known_) {
+    first_line_ = 0;
+    scroll_px_ = 0;
+    return;
+  }
   scroll_px_ += dy;
-  while (first_line_ < lc && scroll_px_ >= block_height(first_line_)) {
+  while (scroll_px_ >= block_height(first_line_) && line_exists(first_line_ + 1)) {
     scroll_px_ -= block_height(first_line_);
     first_line_ += 1;
   }
   while (first_line_ > 0 && scroll_px_ < 0) {
     first_line_ -= 1;
     scroll_px_ += block_height(first_line_);
-  }
-  if (first_line_ >= lc) {
-    first_line_ = lc > 0 ? lc - 1 : 0;
-    scroll_px_ = 0;
   }
   if (scroll_px_ < 0) scroll_px_ = 0;
 }
@@ -244,22 +267,23 @@ int64_t ViewCore::col_at_x(const VisualLine& v, double x) const {
 }
 
 Hit ViewCore::hit_test(double x, double y) const {
-  const int64_t lc = line_count();
   const double lh = line_height();
   double top = -scroll_px_;
-  for (int64_t line = first_line_; line < lc; ++line) {
+  for (int64_t line = first_line_;; ++line) {
+    if (!line_exists(line)) break;
     const LineEntry& e = entry_for(line);
     for (const VisualLine& v : e.visual) {
       if (y < top + lh) return Hit{line, col_at_x(v, x)};
       top += lh;
     }
   }
-  return Hit{lc > 0 ? lc - 1 : 0, 0};
+  return Hit{known_lines_ > 0 ? known_lines_ - 1 : 0, 0};
 }
 
 Rect ViewCore::caret_rect(int64_t line, int64_t col) const {
   const double lh = line_height();
   if (line < first_line_) return Rect{0, -1e9, 1, lh};  // above the viewport
+  if (!line_exists(line)) return Rect{0, 0, 1, lh};
   double top = -scroll_px_;
   for (int64_t l = first_line_; l < line; ++l) top += block_height(l);
   const LineEntry& e = entry_for(line);
@@ -282,11 +306,11 @@ Rect ViewCore::caret_rect(int64_t line, int64_t col) const {
 }
 
 void ViewCore::draw(Canvas& c) const {
-  const int64_t lc = line_count();
   const double lh = line_height();
   c.clear(Color{255, 255, 255, 255});
   double y = -scroll_px_;
-  for (int64_t line = first_line_; line < lc; ++line) {
+  for (int64_t line = first_line_; y < height_; ++line) {
+    if (!line_exists(line)) break;
     const LineEntry& e = entry_for(line);
     for (const VisualLine& v : e.visual) {
       if (y + lh > 0) {
@@ -300,7 +324,6 @@ void ViewCore::draw(Canvas& c) const {
       y += lh;
       if (y >= height_) break;
     }
-    if (y >= height_) break;
   }
 }
 

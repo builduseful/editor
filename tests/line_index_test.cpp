@@ -27,7 +27,97 @@ void expect_matches(const LineIndex& idx, const std::string& s) {
   }
 }
 
+// Like expect_matches, but for a possibly-partial prefix index: the known lines
+// must agree with the naive model and byte_count() must be the prefix end.
+void expect_prefix(const LineIndex& idx, const std::string& s) {
+  CHECK(idx.validate_tree());
+  const std::vector<uint64_t> starts = ed_test::naive_line_starts(s);
+  const size_t known = static_cast<size_t>(idx.line_count());
+  CHECK(known < starts.size());
+  CHECK_EQ(idx.byte_count(), starts[known]);
+  MemSource src(s);
+  for (int64_t L = 0; L <= idx.line_count(); ++L) {
+    uint64_t off = 0;
+    Status st = idx.line_start(src, L, &off);
+    CHECK(st == Status::Ok);
+    CHECK_EQ(off, starts[static_cast<size_t>(L)]);
+  }
+}
+
 }  // namespace
+
+TEST(line_index_extend_is_incremental_and_exact) {
+  std::string s;
+  for (int i = 0; i < 5000; ++i) s += "line " + std::to_string(i) + "\n";
+  MemSource src(s);
+  LineIndex idx;
+  CHECK(!idx.complete());
+  CHECK_EQ(idx.line_count(), 0);
+
+  // One request at a time; the prefix must stay valid and consistent.
+  for (int64_t want = 1; want <= 5000; want += 7) {
+    CHECK(idx.extend(src, want) == Status::Ok);
+    CHECK(idx.line_count() >= want);
+    expect_prefix(idx, s);
+  }
+  // A request past EOF completes the index and clamps the count.
+  CHECK(idx.extend(src, 100000) == Status::Ok);
+  CHECK(idx.complete());
+  CHECK_EQ(idx.line_count(), 5000);
+  expect_matches(idx, s);
+  // A completed index ignores further extends.
+  CHECK(idx.extend(src, 1) == Status::Ok);
+  CHECK_EQ(idx.line_count(), 5000);
+}
+
+TEST(line_index_extend_empty_document) {
+  std::string s;
+  MemSource src(s);
+  LineIndex idx;
+  CHECK(idx.extend(src, 10) == Status::Ok);
+  CHECK(idx.complete());
+  CHECK_EQ(idx.line_count(), 0);
+  CHECK_EQ(idx.byte_count(), static_cast<uint64_t>(0));
+  CHECK(idx.validate_tree());
+}
+
+TEST(line_index_extend_past_eof_clamps) {
+  const std::string s = "a\nb\nc\n";
+  MemSource src(s);
+  LineIndex idx;
+  CHECK(idx.extend(src, 1000) == Status::Ok);
+  CHECK(idx.complete());
+  CHECK_EQ(idx.line_count(), 3);
+  expect_matches(idx, s);
+}
+
+TEST(line_index_extend_matches_build_random) {
+  ed_test::Prng rng(0x5EED1234);
+  for (int trial = 0; trial < 40; ++trial) {
+    std::string s;
+    const int n = static_cast<int>(rng.below(400));
+    for (int i = 0; i < n; ++i) {
+      s += "l";
+      s += (rng.below(3) == 0) ? "\r\n" : "\n";
+    }
+    MemSource src(s);
+    LineIndex inc;
+    for (int k = 0; k < 25; ++k) {
+      const int64_t want = static_cast<int64_t>(rng.below(static_cast<uint64_t>(n) + 5));
+      CHECK(inc.extend(src, want) == Status::Ok);
+      expect_prefix(inc, s);
+    }
+    CHECK(inc.extend(src, n + 1) == Status::Ok);
+    CHECK(inc.complete());
+
+    LineIndex full;
+    CHECK(full.build(src) == Status::Ok);
+    CHECK_EQ(inc.line_count(), full.line_count());
+    CHECK_EQ(inc.byte_count(), full.byte_count());
+    CHECK(inc.validate_tree());
+    expect_matches(inc, s);
+  }
+}
 
 TEST(line_index_conventions) {
   const char* cases[] = {"",         "a",     "a\n",    "a\n\n", "\n",

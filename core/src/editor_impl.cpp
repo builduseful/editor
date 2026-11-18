@@ -71,6 +71,7 @@ Status EditorImpl::install_fd(int fd, const Stat& st, const std::string& path) {
   pieces_.reset(&base_src_, &add_, st.size);
   logical_src_.reset(&pieces_, bom_len_);
   index_built_ = false;
+  index_.reset();
   eol_known_ = false;
   dirty_ = false;
   opened_ = true;
@@ -151,6 +152,14 @@ Status EditorImpl::ensure_index() const {
   Status s = index_.build(logical_src_);
   if (s != Status::Ok) return s;
   index_built_ = true;
+  return Status::Ok;
+}
+
+Status EditorImpl::ensure_index_through(int64_t min_lines) const {
+  if (index_built_) return Status::Ok;
+  Status s = index_.extend(logical_src_, min_lines);
+  if (s != Status::Ok) return s;
+  if (index_.complete()) index_built_ = true;
   return Status::Ok;
 }
 
@@ -381,10 +390,14 @@ Status EditorImpl::read_lines(int64_t first, int64_t last, char* buf, size_t cap
   *used = 0;
   *out_n = 0;
   if (first < 0 || last < 0) return fail(Status::Range, "negative line");
-  Status s = ensure_index();
+  if (first >= last || last == 0) return Status::Ok;
+  // First-paint path: index only as far as this request needs. A partial index
+  // always covers at least `last` lines (or reached EOF), so the clamp below is
+  // exact when it applies.
+  Status s = ensure_index_through(last);
   if (s != Status::Ok) return fail(s, "index");
   const int64_t lc = index_.line_count();
-  if (first >= last || first >= lc || last == 0) return Status::Ok;
+  if (first >= lc) return Status::Ok;
   if (last > lc) last = lc;
   uint64_t a = 0, b = 0;
   s = index_.line_start(logical_src_, first, &a);
@@ -1374,6 +1387,7 @@ Status EditorImpl::reload() {
   logical_src_.reset(&pieces_, bom_len_);
   base_size_ = st.size;
   index_built_ = false;
+  index_.reset();
   eol_known_ = false;
   dirty_ = false;
   needs_reload_ = false;

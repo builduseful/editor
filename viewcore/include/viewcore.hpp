@@ -54,7 +54,14 @@ class ViewCore {
   void set_decorations(std::vector<Decoration> d);
 
   double line_height() const;
-  int64_t line_count() const;
+  // Number of lines discovered so far. The view grows this lazily as it draws or
+  // scrolls, so before the document has been fully traversed it is a lower bound
+  // on the true line count (call `discover_all()` to force the exact count).
+  int64_t line_count() const { return known_lines_; }
+  bool line_count_known() const { return eof_known_; }
+  // Extends the line index through the end of the document (an exact count, and
+  // the whole-document scan the first-paint path avoids).
+  void discover_all() const;
   bool wrap() const { return wrap_; }
   const FontSpec& font() const { return font_; }
   double viewport_width() const { return width_; }
@@ -106,6 +113,11 @@ class ViewCore {
   void touch(int64_t line) const;
   void evict_if_needed() const;
   void invalidate_all() const;
+  // Ensures at least `min_lines` lines are known (extends the core index),
+  // recording EOF once reached.
+  void grow_to(int64_t min_lines) const;
+  // True if `line` exists; grows the index as needed.
+  bool line_exists(int64_t line) const;
   double block_height(int64_t line) const;
   int64_t col_at_x(const VisualLine& v, double x) const;
   std::string line_text(int64_t line) const;  // logical line, terminator stripped
@@ -118,6 +130,8 @@ class ViewCore {
 
   int64_t first_line_ = 0;
   double scroll_px_ = 0;
+  mutable int64_t known_lines_ = 0;  // lines discovered so far (lazy)
+  mutable bool eof_known_ = false;   // the whole document has been indexed
   std::vector<Decoration> decorations_;
   Selection sel_;
 
