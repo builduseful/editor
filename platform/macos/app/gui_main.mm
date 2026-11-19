@@ -107,6 +107,21 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   return [png writeToFile:path atomically:YES];
 }
 
+// The About panel's content view: closes the panel on Escape, so the panel
+// behaves like a sheet rather than a window you must click away from.
+@interface AboutPanelView : NSView
+@end
+
+@implementation AboutPanelView
+- (BOOL)acceptsFirstResponder {
+  return YES;
+}
+- (void)cancelOperation:(id)sender {
+  (void)sender;
+  [self.window close];
+}
+@end
+
 // The find/replace bar (§9 literal find; no regex, no core search API).
 @interface FindBar : NSView <NSSearchFieldDelegate>
 - (instancetype)initWithEditorView:(EditorView*)view;
@@ -1226,12 +1241,20 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)showAbout:(id)sender {
   (void)sender;
   if (self.aboutWindow == nil) {
-    NSWindow* w = [[NSWindow alloc]
+    // A panel, not a window: it floats over the document without taking focus
+    // or appearing in the Window menu, and Escape closes it.
+    NSPanel* w = [[NSPanel alloc]
         initWithContentRect:NSMakeRect(0, 0, 420, 300)
-                  styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable)
+                  styleMask:(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable |
+                             NSWindowStyleMaskUtilityWindow)
                     backing:NSBackingStoreBuffered
                       defer:NO];
     w.title = @"About editor";
+    w.level = NSFloatingWindowLevel;
+    w.hidesOnDeactivate = NO;
+    w.becomesKeyOnlyIfNeeded = YES;
+    w.collectionBehavior = NSWindowCollectionBehaviorCanJoinAllSpaces |
+                           NSWindowCollectionBehaviorFullScreenAuxiliary;
 
     NSStackView* s = [[NSStackView alloc] init];
     s.orientation = NSUserInterfaceLayoutOrientationVertical;
@@ -1239,12 +1262,15 @@ static BOOL write_view_png(NSView* v, NSString* path) {
     s.edgeInsets = NSEdgeInsetsMake(20, 20, 20, 20);
     s.spacing = 8;
     s.translatesAutoresizingMaskIntoConstraints = NO;
-    [w.contentView addSubview:s];
+    AboutPanelView* content = [[AboutPanelView alloc]
+        initWithFrame:NSMakeRect(0, 0, 420, 300)];
+    w.contentView = content;
+    [content addSubview:s];
     [NSLayoutConstraint activateConstraints:@[
-      [s.leadingAnchor constraintEqualToAnchor:w.contentView.leadingAnchor],
-      [s.trailingAnchor constraintEqualToAnchor:w.contentView.trailingAnchor],
-      [s.topAnchor constraintEqualToAnchor:w.contentView.topAnchor],
-      [s.bottomAnchor constraintLessThanOrEqualToAnchor:w.contentView.bottomAnchor],
+      [s.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+      [s.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+      [s.topAnchor constraintEqualToAnchor:content.topAnchor],
+      [s.bottomAnchor constraintLessThanOrEqualToAnchor:content.bottomAnchor],
     ]];
 
     NSTextField* name = [NSTextField labelWithString:@"editor"];
@@ -1274,6 +1300,7 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   }
   [self.aboutWindow center];
   [self.aboutWindow makeKeyAndOrderFront:nil];
+  [self.aboutWindow makeFirstResponder:self.aboutWindow.contentView];
 }
 
 // The document window became key: the user was in another app (Finder, say),
@@ -1306,6 +1333,13 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (BOOL)windowShouldClose:(NSWindow*)sender {
   if (sender == self.aboutWindow) return YES;
   return [self.view confirmDiscardChanges];
+}
+
+// Escape in the About panel closes it (the panel is otherwise key only for the
+// panel itself).
+- (void)windowWillClose:(NSNotification*)note {
+  (void)note;
+  if (note.object == self.aboutWindow) [self.view.window makeKeyAndOrderFront:nil];
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication*)sender {
