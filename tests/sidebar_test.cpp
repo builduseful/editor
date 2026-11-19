@@ -503,4 +503,112 @@ TEST(sidebar_revealing_the_first_row_does_not_scroll) {
   CHECK_EQ(side.scroll_y(), 0.0);
 }
 
+// --- Refresh after the directory changed on disk ----------------------------
+
+TEST(sidebar_refresh_picks_up_a_new_file_and_stays_expanded) {
+  FakeDir src;
+  src.add("/r", "a.txt", false);
+  src.add("/r", "sub", true);
+  src.add("/r/sub", "old.txt", false);
+  vc::HeadlessTextBackend tb;
+  vc::Sidebar side(src, tb);
+  side.set_root("/r");
+  const vc::SidebarNode* sub = nullptr;
+  for (const vc::Sidebar::Row& r : side.rows()) {
+    if (r.node->name == "sub") sub = r.node;
+  }
+  side.toggle(sub);  // expand
+  CHECK(side.rows().size() == 3);
+
+  // Someone creates a file while the sidebar is open.
+  src.add("/r/sub", "new.txt", false);
+  (void)side.refresh("/r/sub");
+
+  bool expanded = false, saw_new = false;
+  for (const vc::Sidebar::Row& r : side.rows()) {
+    if (r.node->name == "sub") expanded = r.node->expanded;
+    if (r.node->name == "new.txt") saw_new = true;
+  }
+  CHECK(expanded);  // a refresh is not a collapse
+  CHECK(saw_new);
+}
+
+TEST(sidebar_refresh_drops_a_deleted_file) {
+  FakeDir src;
+  src.add("/r", "a.txt", false);
+  src.add("/r", "gone.txt", false);
+  vc::HeadlessTextBackend tb;
+  vc::Sidebar side(src, tb);
+  side.set_root("/r");
+  CHECK(side.rows().size() == 2);
+
+  src.dirs["/r"].erase(
+      std::remove_if(src.dirs["/r"].begin(), src.dirs["/r"].end(),
+                     [](const vc::DirEntry& e) { return e.name == "gone.txt"; }),
+      src.dirs["/r"].end());
+  (void)side.refresh("/r");
+  bool still = false;
+  for (const vc::Sidebar::Row& r : side.rows()) {
+    if (r.node->name == "gone.txt") still = true;
+  }
+  CHECK(!still);
+}
+
+TEST(sidebar_refresh_keeps_the_selection_when_it_survives) {
+  FakeDir src;
+  src.add("/r", "a.txt", false);
+  src.add("/r", "b.txt", false);
+  vc::HeadlessTextBackend tb;
+  vc::Sidebar side(src, tb);
+  side.set_root("/r");
+  const std::string target = "/r/b.txt";
+  (void)side.reveal(target);
+  CHECK(side.selected_path() != nullptr && *side.selected_path() == target);
+
+  src.add("/r", "c.txt", false);
+  (void)side.refresh("/r");
+  CHECK(side.selected_path() != nullptr && *side.selected_path() == target);
+}
+
+TEST(sidebar_refresh_falls_back_when_the_selected_file_vanished) {
+  FakeDir src;
+  src.add("/r", "a.txt", false);
+  vc::HeadlessTextBackend tb;
+  vc::Sidebar side(src, tb);
+  side.set_root("/r");
+  const vc::SidebarNode* a = side.rows()[0].node;
+  side.set_selected(a);
+
+  src.dirs["/r"].clear();
+  (void)side.refresh("/r");
+  // The file is gone: the selection falls back to the (still valid) root.
+  CHECK(side.selected_path() == nullptr || side.selected() != a);
+}
+
+TEST(sidebar_refresh_of_the_root_re_reads_it) {
+  // The root is not one of its own rows, so a refresh has to reach it directly.
+  FakeDir src;
+  src.add("/r", "a.txt", false);
+  vc::HeadlessTextBackend tb;
+  vc::Sidebar side(src, tb);
+  side.set_root("/r");
+  CHECK(side.rows().size() == 1);
+
+  src.add("/r", "b.txt", false);
+  (void)side.refresh("/r");
+  bool saw_b = false;
+  for (const vc::Sidebar::Row& r : side.rows()) {
+    if (r.node->name == "b.txt") saw_b = true;
+  }
+  CHECK(saw_b);
+}
+
+TEST(sidebar_refresh_of_an_unloaded_path_is_a_noop) {
+  Fixture f;
+  f.side->set_root("/src");
+  const size_t before = f.src.reads.size();
+  CHECK(!f.side->refresh("/src/beta"));  // beta is collapsed: not loaded
+  CHECK(f.src.reads.size() == before);
+}
+
 }  // namespace

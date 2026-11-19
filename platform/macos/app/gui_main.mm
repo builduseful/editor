@@ -136,6 +136,10 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)applyTheme:(vc::Theme)t;
 - (void)setRootPath:(NSString*)path;
 - (NSString*)rootPath;
+// Re-reads a loaded directory (its contents changed on disk).
+- (void)refreshPath:(NSString*)path;
+// The visible rows (for a caller that wants to refresh every loaded directory).
+- (const std::vector<vc::Sidebar::Row>&)rows;
 // Reveals `path` (expands its ancestors) and selects it.
 - (void)revealPath:(NSString*)path;
 @end
@@ -182,6 +186,8 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)revertDocument:(id)sender;
 // View → Show Sidebar (hidden on a narrow window; the default is shown).
 - (void)toggleSidebar:(id)sender;
+// Re-reads the sidebar's open directories from disk (the window became key).
+- (void)refreshSidebarFromDisk;
 @end
 
 @implementation StatusBar {
@@ -254,6 +260,15 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (NSString*)rootPath {
   const std::string& root = _sidebar->root();
   return root.empty() ? nil : [NSString stringWithUTF8String:root.c_str()];
+}
+
+- (void)refreshPath:(NSString*)path {
+  if (path == nil) return;
+  if (_sidebar->refresh(path.UTF8String)) [self setNeedsDisplay:YES];
+}
+
+- (const std::vector<vc::Sidebar::Row>&)rows {
+  return _sidebar->rows();
 }
 
 - (void)revealPath:(NSString*)path {
@@ -489,6 +504,18 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"Wrap"];
   [self setNeedsDisplay:YES];
 }
+// The window became key: the user has been elsewhere (another app, Finder), so
+// the files may have changed. Re-read the open directories — incremental, not a
+// whole-tree walk, and it happens off the frame path.
+- (void)refreshSidebarFromDisk {
+  if (self.sidebar == nil) return;
+  for (const vc::Sidebar::Row& r : self.sidebar.rows) {
+    if (r.node != nullptr && r.node->is_dir && r.node->loaded) {
+      [self.sidebar refreshPath:[NSString stringWithUTF8String:r.node->path.c_str()]];
+    }
+  }
+}
+
 // The sidebar is a column in the window's top-level stack; hiding it is a
 // layout change, not a document one.
 - (void)toggleSidebar:(id)sender {
@@ -612,10 +639,14 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   const std::string path = self.documentPath.UTF8String;
   const std::string parent = parent_dir(path);
   if (parent.empty()) return;
-  // Re-rooting collapses the tree, so only do it when the folder changed.
+  // Re-rooting collapses the tree, so only do it when the folder changed. When
+  // it did not (Save As inside the same folder, say) the file may still be new
+  // on disk, so re-read the directory rather than leaving a stale row set.
   NSString* root = [NSString stringWithUTF8String:parent.c_str()];
   if (![root isEqualToString:self.sidebar.rootPath]) {
     [self.sidebar setRootPath:root];
+  } else {
+    [self.sidebar refreshPath:root];
   }
   [self.sidebar revealPath:self.documentPath];
 }
@@ -720,6 +751,7 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   self.documentPath = p.URL.path;
   _maybeDirty = NO;
   [self updateTitle];
+  [self syncSidebarToDocument];  // the document may have moved folder
   return YES;
 }
 
@@ -1195,6 +1227,13 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   }
   [self.aboutWindow center];
   [self.aboutWindow makeKeyAndOrderFront:nil];
+}
+
+// The document window became key: the user was in another app (Finder, say),
+// so re-read the sidebar's open folders.
+- (void)windowDidBecomeKey:(NSNotification*)note {
+  (void)note;
+  [self.view refreshSidebarFromDisk];
 }
 
 - (BOOL)application:(NSApplication*)sender openFile:(NSString*)filename {

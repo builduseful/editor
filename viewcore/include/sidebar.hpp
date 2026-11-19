@@ -70,6 +70,10 @@ class Sidebar {
   // Points the tree at `root_path`, an existing directory. Collapses everything
   // and selects the root. Returns false if the root itself cannot be read.
   bool set_root(std::string_view root_path);
+  // Re-reads a directory that has already been loaded (its children changed on
+  // disk), keeping it expanded and the selection. Returns true if the rows
+  // changed. Used after a save-as that created the open file.
+  bool refresh(const std::string& path);
 
   const std::string& root() const { return root_; }
   bool loaded_root() const { return root_loaded_; }

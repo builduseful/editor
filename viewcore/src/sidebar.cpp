@@ -113,6 +113,34 @@ const std::vector<Sidebar::Row>& Sidebar::rows() const {
   return rows_;
 }
 
+bool Sidebar::refresh(const std::string& path) {
+  // The root is not one of its own rows, so `find` cannot reach it.
+  SidebarNode* dir = (root_node_ != nullptr && root_node_->path == path)
+                         ? root_node_.get()
+                         : find(path);
+  if (dir == nullptr || !dir->is_dir) return false;
+  if (!dir->loaded) return false;  // collapsed: nothing to refresh yet
+  // Re-read, keeping the node and its expanded state: a refresh is not a
+  // collapse. Children that vanished disappear; new ones appear.
+  dir->loaded = false;
+  dir->children.clear();
+  load(dir);
+  // Invalidate before looking at the rows, or the stale cache is returned.
+  rows_valid_ = false;
+  (void)rows();  // rebuild now, so the selection check sees the new rows
+  // The selection may have referred to a row that is gone (the file was
+  // deleted under us); fall back to the directory itself.
+  if (selected_ != nullptr) {
+    bool still_there = false;
+    for (const Row& r : rows()) {
+      if (r.node == selected_) still_there = true;
+    }
+    if (!still_there) selected_ = dir;
+  }
+  scroll_selection_into_view();
+  return true;
+}
+
 bool Sidebar::toggle(const SidebarNode* n) {
   if (n == nullptr || !n->is_dir || n->is_symlink) return false;
   SidebarNode* mut = find(n->path);
