@@ -60,6 +60,20 @@ own tokens rather than inventing a value.
   last row is cut, not moved), so a row and the bar never overlap. The vertical
   bar overlays the last few points of long lines instead, like the system's
   overlay scrollers.
+- **The file sidebar is custom-drawn too** (D2): a plain column with `color.page`
+  as its ground, a hairline on its right edge, folder chevrons, and
+  `color.secondary-hover` for the selection. No `NSOutlineView`. It is chrome,
+  so its labels use the **system UI face** (`FontSpec.ui`), not the document's
+  mono face — that is the one place `FontSpec.ui` is set.
+- **The sidebar is lazy by construction** (PLAN.md §9). A directory is read only
+  when it is expanded, plus the open file's ancestors so it can be revealed;
+  collapsed subtrees are never walked. Keep directory reads behind `DirSource`
+  (`platform/macos` uses `opendir`/`readdir`) so the tree, its layout and its
+  hit-testing stay headless-testable. The sidebar's selection is held **by path**,
+  never by node pointer: re-reading a directory frees its child nodes.
+- **The sidebar never discards edits silently.** Clicking a file goes through
+  `confirmDiscardChanges`, exactly as File → Open does (§9 "read-only
+  navigation"). Directories toggle; symlinks are leaves and are never followed.
 
 ## Engineering
 

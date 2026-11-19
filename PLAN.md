@@ -1169,6 +1169,12 @@ personal data, or proprietary files.
   click the line; Escape collapses the selection. Command+A select all,
   Command+Z / Shift+Command+Z undo/redo, Command+X/C/V clipboard, Command+F
   find/replace.
+- **Sidebar keys (v1, hardcoded).** With the sidebar focused: Up/Down move by
+  row, Right opens a closed directory and then steps into its first child, Left
+  closes an open directory and then steps out to its parent, Return activates
+  (a directory toggles, a file opens). Clicking the sidebar gives it focus. The
+  selection is held by **path**, not by node pointer (re-reading a directory
+  frees its nodes), and each move scrolls the selection into view.
 - `viewcore` API (sketch): `set_document`, `resize`, `set_wrap`, `set_font`,
   `set_decorations`, `selection`/`set_selection`, `first_visible_line`,
   `scroll_to`, `draw`, `key`, `mouse`. `textbackend`: `measure`, `shape` into
@@ -1308,6 +1314,13 @@ with wrap on maps logical lines proportionally (approximate, not per-visual-line
 The horizontal range is the widest line measured so far, so it grows as you
 scroll and does not shrink again until another document opens. The app has no
 app icon yet (the design system's icon assets need an agreed raster step).
+
+The sidebar is a v1 implementation of the §9 shape: rooted at the open
+document's folder (v1 is one file at a time, so there is no workspace root),
+read-only, with no rename/delete/new-file, no project-wide search, and no
+icon/type badges. It refreshes when the window becomes key and after a save-as,
+not continuously. Above the discovery cap the vertical scrollbar is approximate;
+a sidebar drag is irrelevant there (the sidebar does not scroll the document).
 
 **Total:** the table sums to **24–33 weeks of work**. With ~30% overhead that is
 **31–43 weeks full-time (~7–10 months)**; solo at ~75% time, plan on **10–13
