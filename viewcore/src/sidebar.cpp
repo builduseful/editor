@@ -31,6 +31,20 @@ Sidebar::Sidebar(DirSource& src, TextBackend& tb) : src_(src), tb_(tb) {
   font_.ui = true;  // chrome, not document text (§8)
 }
 
+const SidebarNode* Sidebar::selected() const {
+  if (selected_path_.empty()) return nullptr;
+  if (root_node_ != nullptr && root_node_->path == selected_path_) {
+    return root_node_.get();
+  }
+  const std::vector<Row>& r = rows();
+  for (const Row& row : r) {
+    if (row.node != nullptr && row.node->path == selected_path_) {
+      return row.node;
+    }
+  }
+  return nullptr;
+}
+
 bool Sidebar::set_root(std::string_view root_path) {
   root_ = std::string(root_path);
   root_node_ = std::make_unique<SidebarNode>();
@@ -38,7 +52,7 @@ bool Sidebar::set_root(std::string_view root_path) {
   root_node_->path = root_;
   root_node_->is_dir = true;
   root_node_->expanded = true;
-  selected_ = root_node_.get();
+  selected_path_ = root_node_->path;
   root_loaded_ = load(root_node_.get());
   rows_valid_ = false;
   scroll_to(0);  // a new root starts at the top
@@ -120,6 +134,9 @@ bool Sidebar::refresh(const std::string& path) {
                          : find(path);
   if (dir == nullptr || !dir->is_dir) return false;
   if (!dir->loaded) return false;  // collapsed: nothing to refresh yet
+  // Re-reading destroys the child nodes, so keep the selection by path (it is
+  // stored that way) and re-resolve it against the new rows below.
+  const std::string wanted = selected_path_;
   // Re-read, keeping the node and its expanded state: a refresh is not a
   // collapse. Children that vanished disappear; new ones appear.
   dir->loaded = false;
@@ -128,15 +145,9 @@ bool Sidebar::refresh(const std::string& path) {
   // Invalidate before looking at the rows, or the stale cache is returned.
   rows_valid_ = false;
   (void)rows();  // rebuild now, so the selection check sees the new rows
-  // The selection may have referred to a row that is gone (the file was
-  // deleted under us); fall back to the directory itself.
-  if (selected_ != nullptr) {
-    bool still_there = false;
-    for (const Row& r : rows()) {
-      if (r.node == selected_) still_there = true;
-    }
-    if (!still_there) selected_ = dir;
-  }
+  // The file is gone under us only if no row carries its path; then the
+  // selection falls back to the directory itself.
+  if (!wanted.empty() && selected() == nullptr) selected_path_ = dir->path;
   scroll_selection_into_view();
   return true;
 }
@@ -148,7 +159,7 @@ bool Sidebar::toggle(const SidebarNode* n) {
   mut->expanded = !mut->expanded;
   if (mut->expanded) load(mut);
   rows_valid_ = false;
-  selected_ = mut;
+  selected_path_ = mut->path;
   return true;
 }
 
@@ -156,7 +167,7 @@ bool Sidebar::reveal(std::string_view path) {
   if (root_node_ == nullptr) return false;
   const std::string target(path);
   if (target == root_) {
-    selected_ = root_node_.get();
+    selected_path_ = root_node_->path;
     return false;
   }
   // The components below the root, outermost first: <a>/<b>/file.txt.
@@ -208,7 +219,7 @@ bool Sidebar::reveal(std::string_view path) {
     }
     cur = next;
   }
-  selected_ = cur;
+  selected_path_ = cur->path;
   rows_valid_ = false;
   scroll_selection_into_view();
   return changed;
@@ -227,11 +238,12 @@ SidebarNode* Sidebar::find(std::string_view path) {
 }
 
 void Sidebar::scroll_selection_into_view() {
-  if (selected_ == nullptr) return;
+  const SidebarNode* sel = selected();
+  if (sel == nullptr) return;
   const std::vector<Row>& r = rows();
   int index = -1;
   for (size_t i = 0; i < r.size(); ++i) {
-    if (r[i].node == selected_) {
+    if (r[i].node == sel) {
       index = static_cast<int>(i);
       break;
     }
@@ -278,6 +290,16 @@ void Sidebar::draw(Canvas& c, const Theme& t) const {
 
   const double row_h = kRowHeight;
   const std::vector<Row>& vis = rows();
+  if (vis.empty()) {
+    // Nothing to show: a directory that could not be read, or an empty one.
+    // Say so rather than leaving a blank column (the row set is empty, so
+    // there is nothing to select and nothing to open).
+    const Run note = tb_.shape(font_, root_loaded_ ? "No files" : "Unreadable");
+    c.set_text_color(t.gutter_text);
+    c.draw_run(note, kPadLeft,
+               (row_h - note.ascent - note.descent) * 0.5 + note.ascent);
+    return;
+  }
   // Rows are drawn from the top of the content, panned by the scroll offset.
   // Only the rows that can touch the viewport are considered, so a folder with
   // thousands of entries still costs only what is visible.
@@ -292,7 +314,7 @@ void Sidebar::draw(Canvas& c, const Theme& t) const {
     if (n == nullptr) continue;
     const double y = static_cast<double>(i) * row_h - scroll_y_;
 
-    if (n == selected_) {
+    if (n == selected()) {
       c.fill_rect(Rect{0, y, w, row_h}, t.selection);
     }
 

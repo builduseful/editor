@@ -88,12 +88,16 @@ class Sidebar {
   };
   const std::vector<Row>& rows() const;
 
-  // The selected node (nullptr when nothing is selected).
-  const SidebarNode* selected() const { return selected_; }
-  const std::string* selected_path() const {
-    return selected_ != nullptr ? &selected_->path : nullptr;
+  // The selected node (nullptr when nothing is selected). The selection is held
+  // by path, not by pointer: re-reading a directory destroys its child nodes,
+  // so a stored pointer would dangle. `selected()` looks the node up each time.
+  const SidebarNode* selected() const;
+  // The selected node's path (empty when nothing is selected).
+  const std::string& selected_path() const { return selected_path_; }
+  void set_selected(const SidebarNode* n) {
+    selected_path_ = n != nullptr ? n->path : std::string();
   }
-  void set_selected(const SidebarNode* n) { selected_ = n; }
+  void set_selected_path(std::string_view path) { selected_path_ = path; }
 
   // Opens/closes a directory: reads it on the first expansion. Returns true if
   // the tree changed (a redraw is needed). A file (or a symlink) is a no-op.
@@ -150,7 +154,7 @@ class Sidebar {
   std::string root_;
   bool root_loaded_ = false;
   std::unique_ptr<SidebarNode> root_node_;
-  const SidebarNode* selected_ = nullptr;
+  std::string selected_path_;  // the selection, by path (see `selected()`)
   mutable std::vector<Row> rows_;
   mutable bool rows_valid_ = false;
   double height_ = 600.0;

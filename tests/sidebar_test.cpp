@@ -188,8 +188,7 @@ TEST(sidebar_reveal_expands_ancestors_and_selects_the_file) {
   Fixture f;
   f.side->set_root("/src");
   CHECK(f.side->reveal("/src/beta/deeper/deep.txt"));
-  const std::string* sel = f.side->selected_path();
-  CHECK(sel != nullptr && *sel == "/src/beta/deeper/deep.txt");
+  CHECK(f.side->selected_path() == "/src/beta/deeper/deep.txt");
   // The chain is on screen now, in order.
   const std::vector<std::string> want = {"beta", "deeper", "deep.txt",
                                          "inner.txt", "alpha.txt", "zeta.txt"};
@@ -208,21 +207,21 @@ TEST(sidebar_reveal_is_idempotent) {
   const size_t reads_after_first = f.src.reads.size();
   CHECK(!f.side->reveal("/src/beta/deeper/deep.txt"));  // nothing changed
   CHECK(f.src.reads.size() == reads_after_first);
-  CHECK(f.side->selected_path() != nullptr);
+  CHECK(!f.side->selected_path().empty());
 }
 
 TEST(sidebar_reveal_rejects_a_path_outside_the_root) {
   Fixture f;
   f.side->set_root("/src");
   CHECK(!f.side->reveal("/etc/passwd"));
-  CHECK(f.side->selected_path() != nullptr);  // selection unchanged (the root)
+  CHECK(!f.side->selected_path().empty());  // selection unchanged (the root)
 }
 
 TEST(sidebar_reveal_of_the_root_selects_the_root) {
   Fixture f;
   f.side->set_root("/src");
   CHECK(!f.side->reveal("/src"));
-  CHECK(f.side->selected_path() != nullptr);
+  CHECK(!f.side->selected_path().empty());
 }
 
 // --- Hit-testing ------------------------------------------------------------
@@ -300,6 +299,41 @@ TEST(sidebar_drawing_uses_the_theme_ground_and_a_hairline) {
   }
   CHECK(ground);
   CHECK(hairline);
+}
+
+TEST(sidebar_empty_directory_says_so_instead_of_drawing_a_blank_column) {
+  FakeDir src;
+  src.dirs["/empty"] = {};  // readable, no children
+  vc::HeadlessTextBackend tb;
+  vc::Sidebar side(src, tb);
+  CHECK(side.set_root("/empty"));
+  CHECK(side.rows().empty());
+  vc::RecordingCanvas rc;
+  side.draw(rc, vc::light_theme());
+  bool has_note = false;
+  for (const vc::DrawCmd& d : rc.cmds) {
+    if (d.kind == vc::DrawCmd::Kind::DrawRun && d.text == "No files") {
+      has_note = true;
+    }
+  }
+  CHECK(has_note);
+}
+
+TEST(sidebar_unreadable_root_says_so) {
+  FakeDir src;  // no directories at all: every read fails
+  vc::HeadlessTextBackend tb;
+  vc::Sidebar side(src, tb);
+  CHECK(!side.set_root("/nope"));
+  CHECK(side.rows().empty());
+  vc::RecordingCanvas rc;
+  side.draw(rc, vc::light_theme());
+  bool has_note = false;
+  for (const vc::DrawCmd& d : rc.cmds) {
+    if (d.kind == vc::DrawCmd::Kind::DrawRun && d.text == "Unreadable") {
+      has_note = true;
+    }
+  }
+  CHECK(has_note);
 }
 
 TEST(sidebar_selected_row_is_highlighted) {
@@ -448,8 +482,7 @@ TEST(sidebar_reveal_walks_a_real_subdirectory) {
   vc::Sidebar side(src, tb);
   side.set_root("/foo");
   (void)side.reveal("/foo/bar/b.txt");
-  CHECK(side.selected_path() != nullptr &&
-        *side.selected_path() == "/foo/bar/b.txt");
+  CHECK(side.selected_path() == "/foo/bar/b.txt");
   // The intermediate directory is on screen and expanded.
   bool saw_bar = false, saw_file = false;
   for (const vc::Sidebar::Row& r : side.rows()) {
@@ -476,7 +509,7 @@ TEST(sidebar_reveal_scrolls_the_selected_row_into_view) {
   // The lexicographically last entry of the 60 (file-9.txt, after file-59).
   const std::string target = "/many/file-9.txt";
   (void)side.reveal(target);  // the return is "changed", not "found"
-  CHECK(side.selected_path() != nullptr && *side.selected_path() == target);
+  CHECK(side.selected_path() == target);
   // Its row is now fully inside the viewport.
   const std::vector<vc::Sidebar::Row>& rows = side.rows();
   int index = -1;
@@ -498,8 +531,7 @@ TEST(sidebar_revealing_the_first_row_does_not_scroll) {
   side.set_root("/r");
   side.set_height(10 * vc::Sidebar::kRowHeight);
   (void)side.reveal("/r/a.txt");
-  CHECK(side.selected_path() != nullptr &&
-        *side.selected_path() == "/r/a.txt");
+  CHECK(side.selected_path() == "/r/a.txt");
   CHECK_EQ(side.scroll_y(), 0.0);
 }
 
@@ -563,11 +595,11 @@ TEST(sidebar_refresh_keeps_the_selection_when_it_survives) {
   side.set_root("/r");
   const std::string target = "/r/b.txt";
   (void)side.reveal(target);
-  CHECK(side.selected_path() != nullptr && *side.selected_path() == target);
+  CHECK(side.selected_path() == target);
 
   src.add("/r", "c.txt", false);
   (void)side.refresh("/r");
-  CHECK(side.selected_path() != nullptr && *side.selected_path() == target);
+  CHECK(side.selected_path() == target);
 }
 
 TEST(sidebar_refresh_falls_back_when_the_selected_file_vanished) {
@@ -581,8 +613,9 @@ TEST(sidebar_refresh_falls_back_when_the_selected_file_vanished) {
 
   src.dirs["/r"].clear();
   (void)side.refresh("/r");
-  // The file is gone: the selection falls back to the (still valid) root.
-  CHECK(side.selected_path() == nullptr || side.selected() != a);
+  // The file is gone: the selection falls back to the directory itself.
+  CHECK(side.selected() != a);
+  CHECK(side.selected_path() == "/r");
 }
 
 TEST(sidebar_refresh_of_the_root_re_reads_it) {
