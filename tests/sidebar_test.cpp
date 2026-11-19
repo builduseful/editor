@@ -644,4 +644,126 @@ TEST(sidebar_refresh_of_an_unloaded_path_is_a_noop) {
   CHECK(f.src.reads.size() == before);
 }
 
+// --- Keyboard navigation ----------------------------------------------------
+
+TEST(sidebar_arrow_keys_walk_the_visible_rows) {
+  Fixture f;
+  f.side->set_root("/src");
+  // Rows: beta, alpha.txt, zeta.txt (folders first).
+  const std::string first = f.side->selected_path();
+  CHECK(!first.empty());
+
+  CHECK(f.side->move_down());
+  CHECK(f.side->selected_path() == "/src/alpha.txt");
+  CHECK(f.side->move_down());
+  CHECK(f.side->selected_path() == "/src/zeta.txt");
+  CHECK(!f.side->move_down());  // already at the last row
+
+  CHECK(f.side->move_up());
+  CHECK(f.side->selected_path() == "/src/alpha.txt");
+  CHECK(f.side->move_up());
+  CHECK(f.side->selected_path() == "/src/beta");
+  CHECK(!f.side->move_up());  // already at the first row
+}
+
+TEST(sidebar_right_opens_a_directory_then_steps_into_it) {
+  Fixture f;
+  f.side->set_root("/src");
+  // set_root selects the first row, which is beta (folders first).
+  const vc::SidebarNode* beta = f.side->selected();
+  CHECK(beta != nullptr && beta->name == "beta");
+  CHECK(f.side->move_right());  // expands
+  CHECK(f.side->selected_path() == "/src/beta");  // selection stays on it
+  // Open now: Right moves to the first child (deeper, folders first).
+  CHECK(f.side->move_right());
+  CHECK(f.side->selected_path() == "/src/beta/deeper");
+}
+
+TEST(sidebar_left_closes_then_steps_out) {
+  Fixture f;
+  f.side->set_root("/src");
+  f.side->reveal("/src/beta/deeper/deep.txt");
+  CHECK(f.side->selected_path() == "/src/beta/deeper/deep.txt");
+
+  // Left on an open directory closes it and keeps the selection there; Left on
+  // a closed one (or a file) steps out to its parent. So the walk out from a
+  // file two levels down is: close deeper, step to beta, close beta, step to the
+  // root. Assert the invariant (each press is legal and ends at the root) rather
+  // than counting presses, which is brittle to read.
+  int presses = 0;
+  while (f.side->selected_path() != "/src") {
+    CHECK(presses < 8);  // it must terminate
+    if (presses >= 8) break;
+    CHECK(f.side->move_left());
+    ++presses;
+  }
+  CHECK(f.side->selected_path() == "/src");
+  CHECK(presses > 0);
+  CHECK(!f.side->move_left());  // the root has no parent
+  CHECK(f.side->selected_path() == "/src");
+}
+TEST(sidebar_left_from_a_file_one_level_down) {
+  Fixture f;
+  f.side->set_root("/src");
+  f.side->reveal("/src/beta/inner.txt");
+  CHECK(f.side->selected_path() == "/src/beta/inner.txt");
+  // One level down: select the parent, close it, then step out to the root.
+  CHECK(f.side->move_left());  // the file's parent
+  CHECK(f.side->selected_path() == "/src/beta");
+  CHECK(f.side->move_left());  // close beta
+  CHECK(f.side->selected_path() == "/src/beta");
+  CHECK(f.side->move_left());  // step out to the root
+  CHECK(f.side->selected_path() == "/src");
+  CHECK(!f.side->move_left());  // the root has no parent
+}
+
+
+TEST(sidebar_left_on_the_root_is_a_noop) {
+  Fixture f;
+  f.side->set_root("/src");
+  f.side->set_selected_path("/src");
+  CHECK(!f.side->move_left());  // the root has no parent
+  CHECK(f.side->selected_path() == "/src");
+}
+
+TEST(sidebar_activate_toggles_a_directory_and_returns_a_file_path) {
+  Fixture f;
+  f.side->set_root("/src");
+
+  f.side->set_selected_path("/src/beta");
+  const std::string* path = nullptr;
+  CHECK(f.side->activate(&path));
+  CHECK(path == nullptr);  // a directory: no file to open
+  CHECK(f.side->selected_path() == "/src/beta");
+
+  f.side->set_selected_path("/src/alpha.txt");
+  path = nullptr;
+  CHECK(f.side->activate(&path));
+  CHECK(path != nullptr && *path == "/src/alpha.txt");
+}
+
+TEST(sidebar_keyboard_navigation_scrolls_the_selection_into_view) {
+  FakeDir src;
+  for (int i = 0; i < 40; ++i) {
+    src.add("/many", "f-" + std::to_string(i) + ".txt", false);
+  }
+  vc::HeadlessTextBackend tb;
+  vc::Sidebar side(src, tb);
+  side.set_root("/many");
+  side.set_height(3 * vc::Sidebar::kRowHeight);
+  // Walk down past the bottom; the selection must stay visible.
+  for (int i = 0; i < 10; ++i) side.move_down();
+  const vc::SidebarNode* sel = side.selected();
+  CHECK(sel != nullptr);
+  int index = -1;
+  const std::vector<vc::Sidebar::Row>& rows = side.rows();
+  for (size_t i = 0; i < rows.size(); ++i) {
+    if (rows[i].node == sel) index = static_cast<int>(i);
+  }
+  CHECK(index >= 0);
+  const double top = index * vc::Sidebar::kRowHeight;
+  CHECK(top >= side.scroll_y());
+  CHECK(top + vc::Sidebar::kRowHeight <= side.scroll_y() + side.height() + 0.01);
+}
+
 }  // namespace

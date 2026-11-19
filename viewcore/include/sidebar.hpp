@@ -88,6 +88,22 @@ class Sidebar {
   };
   const std::vector<Row>& rows() const;
 
+  // Keyboard navigation over the visible rows. Each returns true if the
+  // selection or expansion changed (a redraw is needed).
+  //
+  //   Down / Up       move the selection by one row
+  //   Right           expand a closed directory, else move into its first child
+  //   Left            close an open directory, else move to its parent
+  //   Return          open a file / toggle a directory (the caller decides what
+  //                   "open" means; this only moves/expands)
+  bool move_down();
+  bool move_up();
+  bool move_right();
+  bool move_left();
+  // Activates the selected row: a directory is toggled, a file is returned by
+  // path through `out_path` (nullptr when the row is a directory or empty).
+  bool activate(const std::string** out_path);
+
   // The selected node (nullptr when nothing is selected). The selection is held
   // by path, not by pointer: re-reading a directory destroys its child nodes,
   // so a stored pointer would dangle. `selected()` looks the node up each time.

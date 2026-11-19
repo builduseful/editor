@@ -246,6 +246,21 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   return NO;  // CoreGraphics native orientation; the canvas converts y
 }
 
+- (BOOL)acceptsFirstResponder {
+  return YES;
+}
+
+// Arrow keys, Return and Escape drive the tree (the document view has its own
+// key handling, so this only runs while the sidebar is focused).
+- (void)keyDown:(NSEvent*)event {
+  const bool changed = [self handleKey:event];
+  if (changed) [self setNeedsDisplay:YES];
+  if (event.keyCode == 36 || event.keyCode == 76) {
+    // Return / keypad Enter: activate the row.
+    [self activateSelected];
+  }
+}
+
 - (void)applyTheme:(vc::Theme)t {
   _theme = t;
   self.layer.backgroundColor = ns_color(t.page).CGColor;
@@ -286,6 +301,37 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   _sidebar->draw(*canvas, _theme);
 }
 
+// Returns true if the tree changed (a redraw is needed).
+- (BOOL)handleKey:(NSEvent*)event {
+  switch (event.keyCode) {
+    case 125: return _sidebar->move_down();   // Down
+    case 126: return _sidebar->move_up();     // Up
+    case 123: return _sidebar->move_left();   // Left
+    case 124: return _sidebar->move_right();  // Right
+    default: return NO;
+  }
+}
+
+// Return on a directory toggles it; on a file it opens through the same
+// confirm-then-open path a click uses.
+- (void)activateSelected {
+  const std::string* path = nullptr;
+  if (!_sidebar->activate(&path)) {
+    [self setNeedsDisplay:YES];
+    return;
+  }
+  if (path == nullptr) {
+    [self setNeedsDisplay:YES];  // a directory was toggled
+    return;
+  }
+  if (self.editorView == nil) return;
+  if (![self.editorView confirmDiscardChanges]) return;
+  if (![self.editorView openPath:[NSString stringWithUTF8String:path->c_str()]]) {
+    [self.editorView.sidebar revealPath:self.editorView.documentPath];
+  }
+  [self setNeedsDisplay:YES];
+}
+
 // The sidebar scrolls independently of the document.
 - (void)scrollWheel:(NSEvent*)event {
   const double scale =
@@ -296,6 +342,7 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 
 // A click selects the row, opens a file, or toggles a directory.
 - (void)mouseDown:(NSEvent*)event {
+  [self.window makeFirstResponder:self];  // the arrow keys follow the click
   const NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
   const double y = self.bounds.size.height - p.y;  // AppKit y-up -> viewcore y-down
   const int row = _sidebar->row_at(p.x, y);

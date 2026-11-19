@@ -24,6 +24,14 @@ bool name_less(const std::string& a, const std::string& b) {
   return a < b;
 }
 
+// The parent of `path` (everything before the last '/'), or "" for a root.
+std::string parent_of(const std::string& path) {
+  const size_t slash = path.find_last_of('/');
+  if (slash == std::string::npos) return std::string();
+  if (slash == 0) return std::string("/");
+  return path.substr(0, slash);
+}
+
 }  // namespace
 
 Sidebar::Sidebar(DirSource& src, TextBackend& tb) : src_(src), tb_(tb) {
@@ -52,10 +60,15 @@ bool Sidebar::set_root(std::string_view root_path) {
   root_node_->path = root_;
   root_node_->is_dir = true;
   root_node_->expanded = true;
-  selected_path_ = root_node_->path;
   root_loaded_ = load(root_node_.get());
   rows_valid_ = false;
   scroll_to(0);  // a new root starts at the top
+  // The root itself is not one of its own rows, so a selection on it would be
+  // invisible and the arrow keys would have nothing to move from. Select the
+  // first row instead (nothing, for an empty or unreadable directory).
+  selected_path_.clear();
+  const std::vector<Row>& r = rows();
+  if (!r.empty() && r[0].node != nullptr) selected_path_ = r[0].node->path;
   return root_loaded_;
 }
 
@@ -257,6 +270,94 @@ void Sidebar::scroll_selection_into_view() {
   } else if (bottom > scroll_y_ + height_) {
     scroll_to(bottom - height_);
   }
+}
+
+bool Sidebar::move_down() {
+  const std::vector<Row>& r = rows();
+  if (r.empty()) return false;
+  int index = -1;
+  const SidebarNode* sel = selected();
+  for (size_t i = 0; i < r.size(); ++i) {
+    if (r[i].node == sel) index = static_cast<int>(i);
+  }
+  if (index + 1 >= static_cast<int>(r.size())) return false;  // already last
+  selected_path_ = r[static_cast<size_t>(index + 1)].node->path;
+  scroll_selection_into_view();
+  return true;
+}
+
+bool Sidebar::move_up() {
+  const std::vector<Row>& r = rows();
+  if (r.empty()) return false;
+  int index = -1;
+  const SidebarNode* sel = selected();
+  for (size_t i = 0; i < r.size(); ++i) {
+    if (r[i].node == sel) index = static_cast<int>(i);
+  }
+  if (index <= 0) return false;  // nothing selected, or already first
+  selected_path_ = r[static_cast<size_t>(index - 1)].node->path;
+  scroll_selection_into_view();
+  return true;
+}
+
+bool Sidebar::move_right() {
+  const SidebarNode* sel = selected();
+  if (sel == nullptr || !sel->is_dir || sel->is_symlink) return false;
+  SidebarNode* mut = find(sel->path);
+  if (mut == nullptr) return false;
+  if (!mut->expanded) {
+    // Closed: open it, keeping the selection on the directory.
+    return toggle(mut);
+  }
+  // Open: move to its first child, if any.
+  rows_valid_ = false;
+  const std::vector<Row>& r = rows();
+  for (size_t i = 0; i < r.size(); ++i) {
+    if (r[i].node == mut && i + 1 < r.size()) {
+      const SidebarNode* child = r[i + 1].node;
+      if (child != nullptr) {
+        selected_path_ = child->path;
+        scroll_selection_into_view();
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+bool Sidebar::move_left() {
+  const SidebarNode* sel = selected();
+  if (sel == nullptr) return false;
+  SidebarNode* mut = find(sel->path);
+  if (mut == nullptr) return false;
+  if (mut->is_dir && mut->expanded) {
+    // Open: close it, keeping the selection on the directory.
+    return toggle(mut);
+  }
+  // Closed (or a file): move to the parent directory.
+  if (mut == root_node_.get()) return false;  // the root has no parent here
+  const std::string parent = parent_of(mut->path);
+  if (parent.empty()) return false;
+  const SidebarNode* p = (root_node_ != nullptr && root_node_->path == parent)
+                             ? root_node_.get()
+                             : find(parent);
+  if (p == nullptr) return false;
+  selected_path_ = p->path;
+  scroll_selection_into_view();
+  return true;
+}
+
+bool Sidebar::activate(const std::string** out_path) {
+  if (out_path != nullptr) *out_path = nullptr;
+  const SidebarNode* sel = selected();
+  if (sel == nullptr) return false;
+  if (sel->is_dir && !sel->is_symlink) {
+    SidebarNode* mut = find(sel->path);
+    if (mut == nullptr) return false;
+    return toggle(mut);
+  }
+  if (out_path != nullptr) *out_path = &sel->path;
+  return true;
 }
 
 double Sidebar::max_scroll() const {
