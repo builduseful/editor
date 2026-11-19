@@ -201,6 +201,8 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)revertDocument:(id)sender;
 // View → Show Sidebar (hidden on a narrow window; the default is shown).
 - (void)toggleSidebar:(id)sender;
+// View > Tab Width: the sender's tag is the width in columns.
+- (void)setTabWidth:(id)sender;
 // Re-reads the sidebar's open directories from disk (the window became key).
 - (void)refreshSidebarFromDisk;
 @end
@@ -566,6 +568,15 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"Wrap"];
   [self setNeedsDisplay:YES];
 }
+
+// View > Tab Width submenu: each item carries its width in the tag.
+- (void)setTabWidth:(id)sender {
+  const NSInteger width = [sender tag];
+  if (width < 1 || width > 8) return;
+  _view->set_tab_width(static_cast<int>(width));
+  [[NSUserDefaults standardUserDefaults] setInteger:width forKey:@"TabWidth"];
+  [self setNeedsDisplay:YES];
+}
 // The window became key: the user has been elsewhere (another app, Finder), so
 // the files may have changed. Re-read the open directories — incremental, not a
 // whole-tree walk, and it happens off the frame path.
@@ -927,6 +938,10 @@ static BOOL write_view_png(NSView* v, NSString* path) {
                                              : NSControlStateValueOff;
   } else if (item.action == @selector(revertDocument:)) {
     item.enabled = self.documentPath != nil;  // untitled has no saved version
+  } else if (item.action == @selector(setTabWidth:)) {
+    item.state = (static_cast<int>(item.tag) == _view->tab_width())
+                     ? NSControlStateValueOn
+                     : NSControlStateValueOff;
   } else if (item.action == @selector(toggleSidebar:)) {
     item.state = (self.sidebar != nil && !self.sidebar.isHidden)
                      ? NSControlStateValueOn
@@ -1428,12 +1443,28 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
 
   NSMenuItem* viewItem = [[NSMenuItem alloc] init];
   [menubar addItem:viewItem];
+
+  // Tab width: a small submenu, one item per width (tag = columns).
+  NSMenuItem* tabItem = [[NSMenuItem alloc] initWithTitle:@"Tab Width"
+                                                   action:nil
+                                            keyEquivalent:@""];
+  NSMutableArray<NSMenuItem*>* widths = [NSMutableArray array];
+  for (NSInteger w = 2; w <= 8; w += 2) {
+    NSMenuItem* it = item([NSString stringWithFormat:@"%ld", (long)w],
+                          @selector(setTabWidth:), @"");
+    it.tag = w;
+    [widths addObject:it];
+  }
+  [tabItem setSubmenu:submenu(@"Tab Width", widths)];
+
   [viewItem setSubmenu:submenu(@"View", @[
     item(@"Show Sidebar", @selector(toggleSidebar:), @""),
     item(@"Wrap Lines", @selector(toggleWrap:), @""),
     [NSMenuItem separatorItem],
     item(@"Bigger", @selector(increaseFontSize:), @"+"),
     item(@"Smaller", @selector(decreaseFontSize:), @"-"),
+    [NSMenuItem separatorItem],
+    tabItem,
   ])];
 
   [app setMainMenu:menubar];
