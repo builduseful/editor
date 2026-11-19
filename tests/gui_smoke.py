@@ -36,12 +36,17 @@ def png_size(path):
     return struct.unpack(">II", head[16:24])
 
 
-def snapshot(app, src, out, theme="light", size=None, scroll=None):
+def snapshot(app, src, out, theme="light", size=None, scroll=None, wheel=None,
+             xscroll=None):
     cmd = [app, "--theme", theme, "--snapshot", out]
     if size is not None:
         cmd += ["--size", size]
     if scroll is not None:
         cmd += ["--scroll", str(scroll)]
+    if xscroll is not None:
+        cmd += ["--xscroll", str(xscroll)]
+    if wheel is not None:
+        cmd += ["--wheel", wheel]
     cmd.append(src)
     return subprocess.run(cmd, capture_output=True, text=True, timeout=60)
 
@@ -105,6 +110,54 @@ def main():
     dims = png_size(small)
     big = png_size(os.path.join(tmpdir, "snap-light.png"))
     check(dims[1] < big[1], "the small snapshot is shorter than the default one")
+
+    # The mouse/trackpad scroll path. These drive the app's own wheel handling
+    # (the same entry point scrollWheel: reaches) and pin the result, so a
+    # regression in scrolling cannot pass unnoticed. It also covers a real crash
+    # this found: reading clickCount on a scroll-wheel event raises an
+    # NSInternalInconsistencyException, which used to kill the app on every
+    # scroll, so every wheel frame here must both render and differ from rest.
+    #
+    # Horizontal scrolling needs a line wider than the window AND wrap off, so
+    # the sideways cases use a long-line document below; `sample` only exercises
+    # the vertical axis.
+    rest = os.path.join(tmpdir, "wheel-rest.png")
+    proc = snapshot(app, sample, rest, size="700x400", wheel="0,0")
+    check(proc.returncode == 0, "wheel at rest exits 0\n" + proc.stderr)
+    check(os.path.exists(rest), "wheel at rest wrote a frame")
+    rest_bytes = bytes_of(rest)
+
+    # Scrolling down a notch must render and change the frame; a scroll that
+    # silently does nothing is the old bug.
+    for label, wheel in (("down", "1,0"), ("diagonal", "3,0")):
+        out = os.path.join(tmpdir, "wheel-%s.png" % label)
+        proc = snapshot(app, sample, out, size="700x400", wheel=wheel)
+        check(proc.returncode == 0,
+              "wheel %s (%s) exits 0\n%s" % (label, wheel, proc.stderr))
+        check(os.path.exists(out), "wheel %s wrote a frame" % label)
+        check(bytes_of(out) != rest_bytes,
+              "wheel %s (%s) changes the frame" % (label, wheel))
+
+    # Scrolling back up must render cleanly too (no crash, no drift check).
+    out = os.path.join(tmpdir, "wheel-up.png")
+    proc = snapshot(app, sample, out, size="700x400", wheel="-1,0")
+    check(proc.returncode == 0, "wheel up exits 0\n" + proc.stderr)
+    check(os.path.exists(out), "wheel up wrote a frame")
+
+    # Horizontal: a long line, which only scrolls sideways with wrap off.
+    wide = os.path.join(tmpdir, "wide.txt")
+    with open(wide, "w") as f:
+        for i in range(80):
+            f.write("line %02d %s\n" % (i, "x" * 120))
+    wide_rest = os.path.join(tmpdir, "wheel-wide-rest.png")
+    proc = snapshot(app, wide, wide_rest, size="700x400", wheel="0,0")
+    check(proc.returncode == 0, "wide at rest exits 0\n" + proc.stderr)
+    wide_rest_bytes = bytes_of(wide_rest)
+    wide_right = os.path.join(tmpdir, "wheel-wide-right.png")
+    proc = snapshot(app, wide, wide_right, size="700x400", wheel="0,1")
+    check(proc.returncode == 0, "wheel right exits 0\n" + proc.stderr)
+    check(bytes_of(wide_right) != wide_rest_bytes,
+          "wheel right pans a long line sideways")
 
     # Normal: launch the app and check it starts and survives, then stop it.
     proc = subprocess.Popen([app, sample],

@@ -125,6 +125,10 @@ $(APP_EXEC): $(BUILD)/editor_gui platform/macos/app/Info.plist
 	@mkdir -p $(APP_BUNDLE)/Contents/MacOS
 	cp $(BUILD)/editor_gui $@
 	cp platform/macos/app/Info.plist $(APP_BUNDLE)/Contents/Info.plist
+	# Ad-hoc sign with the bundle identifier from Info.plist. Without this the
+	# product is "signed without an identifier" while the plist names one, and
+	# the codesigning gate kills it on launch (SIGKILL, Code Signature Invalid).
+	codesign --force --sign - --identifier dev.editor.app $@
 
 app: $(APP_EXEC)
 

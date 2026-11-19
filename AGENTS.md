@@ -84,9 +84,10 @@ own tokens rather than inventing a value.
   (and `build/editor_gui`), the AppKit view (CoreText + CoreGraphics +
   `viewcore`); `make gui-smoke` runs the GUI smoke test (`tests/gui_smoke.py`):
   headless AppKit snapshots (`--snapshot PATH --theme light|dark --size WxH
-  --scroll LINE --xscroll PX`), a real launch, a no-file launch, and a Finder-style
-  LaunchServices open (`tests/render_smoke_test.cpp` covers the same render path
-  with pixel assertions); the same target runs `tests/gui_golden.py`, which pins
+  --scroll LINE --xscroll PX --wheel DY,DX`), a real launch, a no-file launch,
+  and a Finder-style LaunchServices open (`tests/render_smoke_test.cpp` covers the
+  same render path with pixel assertions); the same target runs
+  `tests/gui_golden.py`, which pins
   four frames (light, dark, small, scrolled-and-panned) in `tests/golden/` and
   compares them within a small pixel tolerance — `make gui-golden` alone checks
   them and `make golden-update` re-pins after an intended visual change; snapshots

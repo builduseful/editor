@@ -5,6 +5,7 @@
 // and settings (font size / tab width / wrap) are wired here; the document model
 // lives in `core`. No native text control, no IME, no accessibility (D2, §8).
 #import <AppKit/AppKit.h>
+#import <CoreGraphics/CoreGraphics.h>
 
 #include <cstdio>
 #include <cstdlib>
@@ -97,10 +98,17 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 }
 
 // The find/replace bar (§9 literal find; no regex, no core search API).
-@interface FindBar : NSView
+@interface FindBar : NSView <NSSearchFieldDelegate>
 - (instancetype)initWithEditorView:(EditorView*)view;
 - (void)focusField;
 - (void)setPageColor:(vc::Color)c;
+- (NSString*)needle;
+// Menu actions, forwarded to the editor view. They are repeated here because a
+// menu item with no target travels the responder chain, and while the field is
+// focused that chain runs through this bar, not through the editor view.
+- (void)findNextMatch:(id)sender;
+- (void)findPreviousMatch:(id)sender;
+- (void)hideFind:(id)sender;
 @end
 
 // A thin bottom status bar (chrome; system UI font, §8).
@@ -129,6 +137,8 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)updateTitle;
 - (void)scrollToLine:(int64_t)line;
 - (void)scrollToX:(double)px;
+- (vc::ViewCore*)core;
+- (void)handleMouse:(NSEvent*)event kind:(vc::MouseEvent::Kind)kind;
 // Indexes the whole document (under the discovery cap) and shows the caret, so
 // a snapshot is the final, steady frame rather than a mid-discovery one.
 - (void)finishIndex;
@@ -138,6 +148,13 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)findText:(NSString*)needle backward:(BOOL)backward;
 - (void)replaceText:(NSString*)needle with:(NSString*)replacement;
 - (void)replaceAllText:(NSString*)needle with:(NSString*)replacement;
+// ⌘G / ⇧⌘G: search for the bar's needle, else the find pasteboard's, wrapping.
+- (void)findNextMatch:(id)sender;
+- (void)findPreviousMatch:(id)sender;
+// Escape: close the bar and give the document the keyboard back.
+- (void)hideFind:(id)sender;
+// File → Revert to Saved (asks first if there are unsaved changes).
+- (void)revertDocument:(id)sender;
 @end
 
 @implementation StatusBar {
@@ -184,6 +201,7 @@ static BOOL write_view_png(NSView* v, NSString* path) {
     _find.sendsSearchStringImmediately = NO;
     _find.target = self;
     _find.action = @selector(findNext:);
+    _find.delegate = self;  // Escape / Shift+Return, below
     _replace = [[NSTextField alloc] init];
     _replace.placeholderString = @"Replace";
     NSButton* prev =
@@ -215,7 +233,48 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 }
 
 - (void)focusField {
+  // Start from the last needle (the find pasteboard), so ⌘F after a search with
+  // the bar closed picks up where the search left off.
+  if (_find.stringValue.length == 0) {
+    NSString* last = [[NSPasteboard pasteboardWithName:NSPasteboardNameFind]
+        stringForType:NSPasteboardTypeString];
+    if (last.length > 0) _find.stringValue = last;
+  }
   [self.window makeFirstResponder:_find];
+}
+- (NSString*)needle {
+  return _find.stringValue;
+}
+// Shift+Return searches backward; plain Return returns NO so the field's own
+// action (findNext:) runs once, as it always has. Escape closes the bar and
+// hands the keyboard back to the document. Everything else (arrows, delete,
+// copy/paste) stays the field's own business.
+- (BOOL)control:(NSControl*)control
+              textView:(NSTextView*)textView
+    doCommandBySelector:(SEL)command {
+  (void)control;
+  if (command == @selector(cancelOperation:)) {
+    [_editorView hideFind:nil];
+    return YES;
+  }
+  if (command == @selector(insertNewline:)) {
+    const BOOL shift =
+        ([NSApp currentEvent].modifierFlags & NSEventModifierFlagShift) != 0;
+    if (!shift) return NO;  // the field's action searches forward
+    NSString* needle = textView.string;
+    if (needle.length > 0) [_editorView findText:needle backward:YES];
+    return YES;
+  }
+  return NO;
+}
+- (void)findNextMatch:(id)sender {
+  [_editorView findNextMatch:sender];
+}
+- (void)findPreviousMatch:(id)sender {
+  [_editorView findPreviousMatch:sender];
+}
+- (void)hideFind:(id)sender {
+  [_editorView hideFind:sender];
 }
 - (void)setPageColor:(vc::Color)c {
   self.wantsLayer = YES;
@@ -459,6 +518,19 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   if ([self saveAsNow]) [self setNeedsDisplay:YES];
 }
 
+// Discard everything since the last save and reopen the file from disk. Only
+// named documents have something to revert to; the user is warned first, since
+// this throws away unsaved edits.
+- (void)revertDocument:(id)sender {
+  (void)sender;
+  if (self.documentPath == nil) return;
+  if (![self confirmDiscardChanges]) return;
+  if (![self openPath:self.documentPath]) return;
+  _maybeDirty = NO;
+  [self updateTitle];
+  [self setNeedsDisplay:YES];
+}
+
 // Save in place; an untitled document asks for a destination instead.
 - (BOOL)saveNow {
   if (self.documentPath == nil) return [self saveAsNow];
@@ -582,7 +654,19 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   (void)sender;
   if (self.findBar == nil) return;
   self.findBar.hidden = !self.findBar.hidden;
-  if (!self.findBar.hidden) [self.findBar focusField];
+  if (!self.findBar.hidden) {
+    [self.findBar focusField];
+  } else {
+    [self.window makeFirstResponder:self];  // Escape's exit: the document again
+  }
+}
+
+// Escape: close the find bar and give the document the keyboard back.
+- (void)hideFind:(id)sender {
+  (void)sender;
+  if (self.findBar != nil) self.findBar.hidden = YES;
+  [self.window makeFirstResponder:self];
+  [self setNeedsDisplay:YES];
 }
 
 - (BOOL)validateMenuItem:(NSMenuItem*)item {
@@ -600,15 +684,46 @@ static BOOL write_view_png(NSView* v, NSString* path) {
                                                                     : @"system");
     item.state = [pref isEqualToString:want] ? NSControlStateValueOn
                                              : NSControlStateValueOff;
+  } else if (item.action == @selector(revertDocument:)) {
+    item.enabled = self.documentPath != nil;  // untitled has no saved version
   }
   return YES;
 }
 
 // --- Find/replace ----------------------------------------------------------
 
+// ⌘G / ⇧⌘G. Uses the bar's field when the find bar has a needle; otherwise the
+// last search (the find pasteboard). A failed search beeps rather than silently
+// doing nothing, as the system's Find does.
+- (void)findNextMatch:(id)sender {
+  NSString* needle = self.findBar != nil ? [self.findBar needle] : nil;
+  if (needle == nil || needle.length == 0) {
+    needle = [[NSPasteboard pasteboardWithName:NSPasteboardNameFind]
+        stringForType:NSPasteboardTypeString];
+  }
+  if (needle == nil || needle.length == 0) return;
+  [self findText:needle backward:NO];
+}
+- (void)findPreviousMatch:(id)sender {
+  NSString* needle = self.findBar != nil ? [self.findBar needle] : nil;
+  if (needle == nil || needle.length == 0) {
+    needle = [[NSPasteboard pasteboardWithName:NSPasteboardNameFind]
+        stringForType:NSPasteboardTypeString];
+  }
+  if (needle == nil || needle.length == 0) return;
+  [self findText:needle backward:YES];
+}
 - (void)findText:(NSString*)needle backward:(BOOL)backward {
   if (needle == nil || needle.length == 0) return;
-  if (_view->find(needle.UTF8String, !backward, false)) [self setNeedsDisplay:YES];
+  // Remember it, so ⌘F and ⌘G pick up where the search left off.
+  NSPasteboard* find = [NSPasteboard pasteboardWithName:NSPasteboardNameFind];
+  [find clearContents];
+  [find setString:needle forType:NSPasteboardTypeString];
+  if (_view->find(needle.UTF8String, !backward, false)) {
+    [self setNeedsDisplay:YES];
+  } else {
+    NSBeep();  // wrapped all the way round: nothing found
+  }
 }
 - (void)replaceText:(NSString*)needle with:(NSString*)replacement {
   if (needle == nil || needle.length == 0) return;
@@ -665,6 +780,9 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)scrollToX:(double)px {
   _view->scroll_x_by(px);
   [self setNeedsDisplay:YES];
+}
+- (vc::ViewCore*)core {
+  return _view.get();
 }
 - (void)finishIndex {
   if (_ed->rev().size <= (64ull << 20)) {  // above the cap the bar stays approximate
@@ -760,7 +878,12 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 
 - (void)handleMouse:(NSEvent*)event kind:(vc::MouseEvent::Kind)kind {
   if (kind != vc::MouseEvent::Kind::Scroll) [self startBlink];
-  const NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  // Scroll deltas do not depend on the pointer, and a synthetic event (tests)
+  // has no window for convertPoint: — fall back to the view's own centre.
+  NSPoint p = NSMakePoint(NSMidX(self.bounds), NSMidY(self.bounds));
+  if (event.window != nil) {
+    p = [self convertPoint:event.locationInWindow fromView:nil];
+  }
   vc::MouseEvent m;
   m.kind = kind;
   m.x = p.x;
@@ -768,13 +891,19 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   m.shift = (event.modifierFlags & NSEventModifierFlagShift) != 0;
   m.cmd = (event.modifierFlags & NSEventModifierFlagCommand) != 0;
   // Double click selects a word, triple click a line (viewcore widens the drag).
-  m.clicks = static_cast<int>(event.clickCount);
+  // clickCount is only defined for mouse events; asking a scroll-wheel event for
+  // it raises an exception, so read it only where it means something.
+  if (kind != vc::MouseEvent::Kind::Scroll) {
+    m.clicks = static_cast<int>(event.clickCount);
+  }
   if (kind == vc::MouseEvent::Kind::Scroll) {
-    // Trackpads report pixels; a wheel reports lines, so scale it to the page.
+    // Trackpads and recent mice report pixels (scroll in points); a classic
+    // wheel reports lines, so scale it to the page. AppKit has already applied
+    // the user's "natural scrolling" preference to these deltas.
     const double scale =
         event.hasPreciseScrollingDeltas ? 1.0 : 3.0 * _view->line_height();
-    m.dy = -event.scrollingDeltaY * scale;  // natural: swipe up shows later lines
-    m.dx = -event.scrollingDeltaX * scale;
+    m.dy = -event.scrollingDeltaY * scale;  // + is down: later lines
+    m.dx = -event.scrollingDeltaX * scale;  // + is right: later columns
   }
   if (_view->mouse(m)) [self setNeedsDisplay:YES];
   // A drag released on an approximate scrollbar leaves a target to index to.
@@ -802,6 +931,11 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 @property(nonatomic, copy) NSString* snapshotPath;
 @property(nonatomic, assign) int64_t snapshotScrollLine;
 @property(nonatomic, assign) double snapshotScrollX;
+// Test hook: "DY,DX" wheel notches (line units) fed through the app's own
+// scroll path before the snapshot, so `--snapshot` can pin the result of a
+// real scroll without needing a display.
+@property(nonatomic, copy) NSString* wheelNotches;
+- (void)postWheelNotchesY:(int)dy x:(int)dx;
 - (void)showAbout:(id)sender;
 @end
 
@@ -821,6 +955,19 @@ static BOOL write_view_png(NSView* v, NSString* path) {
                                     repeats:NO];
   }
 }
+
+// Test hook: scroll by whole wheel notches through the same viewcore entry
+// point scrollWheel: uses. A classic wheel reports lines, so one notch is
+// `kWheelLine` points; a trackpad reports points directly.
+- (void)postWheelNotchesY:(int)dy x:(int)dx {
+  static constexpr double kWheelLine = 48.9;  // 3 lines at a 16.3 pt line height
+  vc::MouseEvent m;
+  m.kind = vc::MouseEvent::Kind::Scroll;
+  m.dy = static_cast<double>(dy) * kWheelLine;
+  m.dx = static_cast<double>(dx) * kWheelLine;
+  if ([self.view core]->mouse(m)) [self.view setNeedsDisplay:YES];
+}
+
 - (void)runSnapshot:(NSTimer*)timer {
   (void)timer;
   [self.view finishIndex];  // a steady frame: exact scrollbars, caret on
@@ -829,6 +976,13 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   }
   if (self.snapshotScrollX > 0) {
     [self.view scrollToX:self.snapshotScrollX];
+  }
+  if (self.wheelNotches.length > 0) {
+    NSArray<NSString*>* parts = [self.wheelNotches
+        componentsSeparatedByString:@","];
+    const int dy = parts.count > 0 ? parts[0].intValue : 0;
+    const int dx = parts.count > 1 ? parts[1].intValue : 0;
+    [self postWheelNotchesY:dy x:dx];
   }
   // The window's frame view, so the title bar (file name, dirty dot) is included.
   NSView* content = self.view.window.contentView;
@@ -974,6 +1128,7 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
     [NSMenuItem separatorItem],
     item(@"Save", @selector(saveDocument:), @"s"),
     saveAs,
+    item(@"Revert to Saved", @selector(revertDocument:), @""),
     [NSMenuItem separatorItem],
     item(@"Close", @selector(performClose:), @"w"),
   ])];
@@ -982,6 +1137,9 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
   [menubar addItem:editItem];
   NSMenuItem* redo = item(@"Redo", @selector(redo:), @"z");
   redo.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
+  NSMenuItem* findPrev = item(@"Find Previous", @selector(findPreviousMatch:), @"g");
+  findPrev.keyEquivalentModifierMask =
       NSEventModifierFlagCommand | NSEventModifierFlagShift;
   [editItem setSubmenu:submenu(@"Edit", @[
     item(@"Undo", @selector(undo:), @"z"),
@@ -993,6 +1151,8 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
     item(@"Select All", @selector(selectAll:), @"a"),
     [NSMenuItem separatorItem],
     item(@"Find\u2026", @selector(showFind:), @"f"),
+    item(@"Find Next", @selector(findNextMatch:), @"g"),
+    findPrev,
   ])];
 
   NSMenuItem* viewItem = [[NSMenuItem alloc] init];
@@ -1011,7 +1171,7 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
 
 int main(int argc, char** argv) {
   @autoreleasepool {
-    std::string path, snapshot;
+    std::string path, snapshot, wheel_notches;
     int64_t scroll_line = 0;
     double scroll_x = 0;
     double win_w = 900, win_h = 700;
@@ -1027,6 +1187,8 @@ int main(int argc, char** argv) {
         scroll_line = std::strtoll(argv[++i], nullptr, 10);
       } else if (a == "--xscroll" && i + 1 < argc) {
         scroll_x = std::strtod(argv[++i], nullptr);
+      } else if (a == "--wheel" && i + 1 < argc) {
+        wheel_notches = argv[++i];
       } else if (a == "--size" && i + 1 < argc) {
         // WIDTHxHEIGHT in points, e.g. 480x320 (the smoke test's small window).
         const std::string s = argv[++i];
@@ -1116,14 +1278,25 @@ int main(int argc, char** argv) {
 
     [win setContentView:stack];
     [win makeFirstResponder:view];
-    [win center];
-    [win makeKeyAndOrderFront:nil];
+    // Remember the window's frame between launches. Skipped for a snapshot:
+    // there the requested size is authoritative (a restored frame would undo
+    // `--size` and shift the goldens).
+    if (snapshot.empty()) {
+      [win setFrameAutosaveName:@"EditorWindow"];
+      if (![win setFrameUsingName:@"EditorWindow"]) [win center];
+    } else {
+      [win center];
+    }
 
     AppDelegate* delegate = [[AppDelegate alloc] init];
     delegate.editor = ed.get();
     delegate.view = view;
     delegate.snapshotScrollLine = scroll_line;
     delegate.snapshotScrollX = scroll_x;
+    if (!wheel_notches.empty()) {
+      delegate.wheelNotches =
+          [NSString stringWithUTF8String:wheel_notches.c_str()];
+    }
     if (!snapshot.empty()) {
       delegate.snapshotPath = [NSString stringWithUTF8String:snapshot.c_str()];
     }
@@ -1132,7 +1305,11 @@ int main(int argc, char** argv) {
 
     build_menu_bar(app, delegate);
 
+    // Activate before ordering the window front: a window ordered front while
+    // another app is active does not become key, and AppKit then routes key and
+    // wheel events elsewhere (the editor appeared but would not scroll).
     [app activateIgnoringOtherApps:YES];
+    [win makeKeyAndOrderFront:nil];
     [app run];
   }
   return 0;
