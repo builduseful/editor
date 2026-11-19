@@ -16,6 +16,7 @@
 #include "canvas_cg.hpp"
 #include "editor.hpp"
 #include "text_coretext.hpp"
+#include "dir_source_posix.hpp"
 #include "viewcore.hpp"
 
 @class EditorView;
@@ -85,6 +86,15 @@ NSColor* ns_color(vc::Color c) {
                              alpha:c.a / 255.0];
 }
 
+// The directory holding `path` (everything before the last '/'), or "" if it
+// has none. Used to root the sidebar at the open document's folder.
+static std::string parent_dir(const std::string& path) {
+  const size_t slash = path.find_last_of('/');
+  if (slash == std::string::npos) return std::string();
+  if (slash == 0) return std::string("/");
+  return path.substr(0, slash);
+}
+
 // Renders any view through AppKit's own context to a PNG (the `--snapshot`
 // smoke test, so the real GUI output can be inspected without a display).
 static BOOL write_view_png(NSView* v, NSString* path) {
@@ -117,9 +127,24 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)applyTheme:(vc::Theme)t;
 @end
 
+// The file sidebar (§9). A recursive, lazily-read tree, custom-drawn (D2) from
+// the same tokens as the document view — no NSOutlineView, no native control.
+// The tree itself lives in viewcore (headless-tested); this is its AppKit shell.
+@interface SidebarView : NSView
+// The document view to open a clicked file through (not retained).
+@property(nonatomic, assign) EditorView* editorView;
+- (void)applyTheme:(vc::Theme)t;
+- (void)setRootPath:(NSString*)path;
+- (NSString*)rootPath;
+// Reveals `path` (expands its ancestors) and selects it.
+- (void)revealPath:(NSString*)path;
+@end
+
 @interface EditorView : NSView
 @property(nonatomic, assign) FindBar* findBar;
 @property(nonatomic, assign) StatusBar* statusBar;
+// The file sidebar (§9); nil until the window is built.
+@property(nonatomic, assign) SidebarView* sidebar;
 // The document's path (nil while untitled). Kept here because the core's
 // `info()` is too expensive to call on every frame just to read the path.
 @property(nonatomic, copy) NSString* documentPath;
@@ -155,6 +180,8 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)hideFind:(id)sender;
 // File → Revert to Saved (asks first if there are unsaved changes).
 - (void)revertDocument:(id)sender;
+// View → Show Sidebar (hidden on a narrow window; the default is shown).
+- (void)toggleSidebar:(id)sender;
 @end
 
 @implementation StatusBar {
@@ -183,6 +210,100 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   self.wantsLayer = YES;
   self.layer.backgroundColor = ns_color(t.page).CGColor;
   _label.textColor = ns_color(t.gutter_text);  // color.text-muted
+}
+@end
+
+@implementation SidebarView {
+  ed::mac::PosixDirSource _src;
+  std::unique_ptr<vc::TextBackend> _tb;
+  std::unique_ptr<vc::Sidebar> _sidebar;
+  vc::Theme _theme;
+  BOOL _hasRoot;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+  self = [super initWithFrame:frame];
+  if (self != nil) {
+    _tb = ed::mac::create_coretext_backend();
+    _sidebar = std::make_unique<vc::Sidebar>(_src, *_tb);
+    vc::FontSpec f;
+    f.size = 13.0;
+    f.ui = true;  // chrome, not document text
+    _sidebar->set_font(f);
+    _theme = vc::light_theme();
+    self.wantsLayer = YES;
+  }
+  return self;
+}
+
+- (BOOL)isFlipped {
+  return NO;  // CoreGraphics native orientation; the canvas converts y
+}
+
+- (void)applyTheme:(vc::Theme)t {
+  _theme = t;
+  self.layer.backgroundColor = ns_color(t.page).CGColor;
+  [self setNeedsDisplay:YES];
+}
+
+- (void)setRootPath:(NSString*)path {
+  _hasRoot = _sidebar->set_root(path != nil ? path.UTF8String : "");
+  [self setNeedsDisplay:YES];
+}
+
+- (NSString*)rootPath {
+  const std::string& root = _sidebar->root();
+  return root.empty() ? nil : [NSString stringWithUTF8String:root.c_str()];
+}
+
+- (void)revealPath:(NSString*)path {
+  if (path == nil) return;
+  _sidebar->reveal(path.UTF8String);
+  [self setNeedsDisplay:YES];
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+  (void)dirtyRect;
+  const NSSize size = self.bounds.size;
+  _sidebar->set_height(size.height);
+  CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
+  auto canvas = ed::mac::create_cg_canvas(ctx, size.width, size.height);
+  _sidebar->draw(*canvas, _theme);
+}
+
+// The sidebar scrolls independently of the document.
+- (void)scrollWheel:(NSEvent*)event {
+  const double scale =
+      event.hasPreciseScrollingDeltas ? 1.0 : 3.0 * vc::Sidebar::kRowHeight;
+  _sidebar->scroll_by(-event.scrollingDeltaY * scale);
+  [self setNeedsDisplay:YES];
+}
+
+// A click selects the row, opens a file, or toggles a directory.
+- (void)mouseDown:(NSEvent*)event {
+  const NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  const double y = self.bounds.size.height - p.y;  // AppKit y-up -> viewcore y-down
+  const int row = _sidebar->row_at(p.x, y);
+  if (row < 0) return;
+  const std::vector<vc::Sidebar::Row>& rows = _sidebar->rows();
+  if (static_cast<size_t>(row) >= rows.size()) return;
+  const vc::SidebarNode* node = rows[static_cast<size_t>(row)].node;
+  if (node == nullptr) return;
+  if (node->is_dir && !node->is_symlink) {
+    if (_sidebar->toggle(node)) [self setNeedsDisplay:YES];
+    return;
+  }
+  // Opening a file replaces the document, so the user is warned about unsaved
+  // edits first — the same prompt File > Open gets (§9 "read-only navigation").
+  if (self.editorView == nil) return;
+  if (![self.editorView confirmDiscardChanges]) return;
+  _sidebar->set_selected(node);
+  [self setNeedsDisplay:YES];
+  if (![self.editorView openPath:[NSString stringWithUTF8String:node->path.c_str()]]) {
+    // The open failed (a race with the file being removed, say): put the
+    // selection back on the document that is still open.
+    [self.editorView.sidebar revealPath:self.editorView.documentPath];
+  }
 }
 @end
 
@@ -368,6 +489,15 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"Wrap"];
   [self setNeedsDisplay:YES];
 }
+// The sidebar is a column in the window's top-level stack; hiding it is a
+// layout change, not a document one.
+- (void)toggleSidebar:(id)sender {
+  (void)sender;
+  if (self.sidebar == nil) return;
+  const BOOL show = !self.sidebar.isHidden;
+  self.sidebar.hidden = show;
+  [[NSUserDefaults standardUserDefaults] setBool:!show forKey:@"ShowSidebar"];
+}
 
 // --- Theme (Build Useful tokens; System / Light / Dark, §8) ----------------
 
@@ -382,6 +512,7 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   _view->set_theme(t);
   [self.findBar setPageColor:t.page];
   [self.statusBar applyTheme:t];
+  if (self.sidebar != nil) [self.sidebar applyTheme:t];
   [self setNeedsDisplay:YES];
 }
 - (void)refreshTheme {
@@ -464,6 +595,7 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   self.documentPath = path;
   _maybeDirty = NO;
   [self reloadDocument];
+  [self syncSidebarToDocument];
   // First paint stays lazy; fill in the exact count (and the scrollbar) once the
   // window has drawn.
   [self performSelector:@selector(beginDiscovery)
@@ -471,6 +603,21 @@ static BOOL write_view_png(NSView* v, NSString* path) {
              afterDelay:0.1];
   [self updateTitle];
   return YES;
+}
+
+// Points the sidebar at the open file's folder and reveals the file. Called
+// after a document is opened (open, Revert to Saved, a click in the sidebar).
+- (void)syncSidebarToDocument {
+  if (self.sidebar == nil || self.documentPath == nil) return;
+  const std::string path = self.documentPath.UTF8String;
+  const std::string parent = parent_dir(path);
+  if (parent.empty()) return;
+  // Re-rooting collapses the tree, so only do it when the folder changed.
+  NSString* root = [NSString stringWithUTF8String:parent.c_str()];
+  if (![root isEqualToString:self.sidebar.rootPath]) {
+    [self.sidebar setRootPath:root];
+  }
+  [self.sidebar revealPath:self.documentPath];
 }
 
 // An untitled window is backed by a temp file so it is a real, editable document.
@@ -686,6 +833,10 @@ static BOOL write_view_png(NSView* v, NSString* path) {
                                              : NSControlStateValueOff;
   } else if (item.action == @selector(revertDocument:)) {
     item.enabled = self.documentPath != nil;  // untitled has no saved version
+  } else if (item.action == @selector(toggleSidebar:)) {
+    item.state = (self.sidebar != nil && !self.sidebar.isHidden)
+                     ? NSControlStateValueOn
+                     : NSControlStateValueOff;
   }
   return YES;
 }
@@ -1158,6 +1309,7 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
   NSMenuItem* viewItem = [[NSMenuItem alloc] init];
   [menubar addItem:viewItem];
   [viewItem setSubmenu:submenu(@"View", @[
+    item(@"Show Sidebar", @selector(toggleSidebar:), @""),
     item(@"Wrap Lines", @selector(toggleWrap:), @""),
     [NSMenuItem separatorItem],
     item(@"Bigger", @selector(increaseFontSize:), @"+"),
@@ -1260,8 +1412,34 @@ int main(int argc, char** argv) {
     view.findBar = bar;
     view.statusBar = status;
     bar.hidden = YES;
+    // The file sidebar: a directory tree to the left of the document. Rooted at
+    // the open file's folder (v1: one folder, not a workspace).
+    SidebarView* sidebar = [[SidebarView alloc]
+        initWithFrame:NSMakeRect(0, 0, vc::Sidebar::kDefaultWidth, 700)];
+    sidebar.editorView = view;
+    if (opened && !path.empty()) {
+      const std::string parent = parent_dir(std::string(path.c_str()));
+      if (!parent.empty()) {
+        [sidebar setRootPath:[NSString stringWithUTF8String:parent.c_str()]];
+        // Reveal the open file: expand its ancestors and select its row.
+        [sidebar revealPath:[NSString stringWithUTF8String:path.c_str()]];
+      }
+    } else if (untitled.size() > 0) {
+      const std::string parent = parent_dir(untitled);
+      if (!parent.empty()) {
+        [sidebar setRootPath:[NSString stringWithUTF8String:parent.c_str()]];
+      }
+    }
+    // The saved preference (default: shown). A narrow window starts without it.
+    const BOOL wantSidebar =
+        [[NSUserDefaults standardUserDefaults] objectForKey:@"ShowSidebar"] == nil
+            ? YES
+            : [[NSUserDefaults standardUserDefaults] boolForKey:@"ShowSidebar"];
+    sidebar.hidden = !wantSidebar;
+    view.sidebar = sidebar;  // so the theme reaches it
     [view refreshTheme];  // give the chrome its page colour now the bars exist
 
+    // The editor's own column: find bar, document, status bar.
     NSStackView* stack = [NSStackView stackViewWithViews:@[ bar, view, status ]];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.distribution = NSStackViewDistributionFill;
@@ -1276,7 +1454,19 @@ int main(int argc, char** argv) {
     [view setContentHuggingPriority:NSLayoutPriorityDefaultLow
                      forOrientation:NSLayoutConstraintOrientationVertical];
 
-    [win setContentView:stack];
+    // Sidebar | editor column, in one row. The sidebar is a fixed-width column
+    // with a hairline; the editor takes the rest.
+    NSStackView* root = [NSStackView stackViewWithViews:@[ sidebar, stack ]];
+    root.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    root.distribution = NSStackViewDistributionFill;
+    root.spacing = 0;
+    root.translatesAutoresizingMaskIntoConstraints = NO;
+    [sidebar setContentHuggingPriority:NSLayoutPriorityRequired
+                     forOrientation:NSLayoutConstraintOrientationHorizontal];
+    [sidebar.widthAnchor constraintEqualToConstant:vc::Sidebar::kDefaultWidth]
+        .active = YES;
+
+    [win setContentView:root];
     [win makeFirstResponder:view];
     // Remember the window's frame between launches. Skipped for a snapshot:
     // there the requested size is authoritative (a restored frame would undo

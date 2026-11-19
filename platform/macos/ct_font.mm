@@ -11,6 +11,7 @@ namespace {
 
 std::string key_of(const vc::FontSpec& f) {
   std::string k = f.family;
+  k.push_back(f.ui ? 'U' : 'M');
   k.push_back('\x1f');
   k += std::to_string(f.size);
   k += f.bold ? 'B' : '-';
@@ -31,7 +32,10 @@ CTFontRef ct_font(const vc::FontSpec& f) {
 
   const double size = f.size > 0 ? f.size : 14.0;
   CTFontRef font = nullptr;
-  if (f.family.empty()) {
+  if (f.ui) {
+    // Chrome (the sidebar, labels): the system UI face (§8).
+    font = CTFontCreateUIFontForLanguage(kCTFontUIFontSystem, size, nullptr);
+  } else if (f.family.empty()) {
     // The design system's mono stack (ui-monospace …) resolves to the system
     // fixed-pitch face; use it rather than naming Menlo.
     font = CTFontCreateUIFontForLanguage(kCTFontUIFontUserFixedPitch, size,

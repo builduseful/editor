@@ -22,10 +22,14 @@ struct FontSpec {
   double size = 14.0;
   bool bold = false;
   bool italic = false;
+  // The system UI face, for chrome (the sidebar, labels). Ignored by the
+  // headless backend; CoreText resolves it to the system UI font. The document
+  // and technical values stay on the mono face (family == "").
+  bool ui = false;
 
   bool operator==(const FontSpec& o) const {
     return family == o.family && size == o.size && bold == o.bold &&
-           italic == o.italic;
+           italic == o.italic && ui == o.ui;
   }
   bool operator!=(const FontSpec& o) const { return !(*this == o); }
 };
