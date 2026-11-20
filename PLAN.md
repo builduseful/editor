@@ -1232,6 +1232,13 @@ one-file-at-a-time), but the shape is fixed now so the work is not redone:
   160 to 480 pt by dragging its right edge (the hairline is the affordance, the
   cursor the hint); the width persists across launches, and the window has a
   minimum content size so a wide sidebar cannot squeeze the document away.
+- **Root is explicit, not guessed.** The column is rooted at the open file's
+  folder by default, and **File → Open Folder…** (⇧⌘O) roots it at a folder the
+  user picks without touching the document. While that folder is the root, files
+  opened inside it keep it — the v1 stand-in for a workspace — and opening a file
+  outside it drops the pin and re-roots. Walking up for `.git` was considered and
+  rejected for v1: it guesses a boundary, and with no ignore engine (above) the
+  tree would fill with `build/` and `.git/`.
 
 ## 10. Testing, CI, build
 
@@ -1300,8 +1307,12 @@ and the gutter / status bar / cut-copy-paste polish (M3). The GUI also has
 custom-drawn overlay scrollbars — vertical (drag, track paging, command-click to
 jump; drawn from byte progress while the line count is still unknown) and
 horizontal for long lines with wrap off (pan, drag, track paging, command-click)
-— File → New / Open / Save As with a window title and dirty marker, and
-incremental (run-loop dripped) indexing so a medium file never blocks the window. `make test` (plain +
+— File → New / Open / Open Folder… / Save As with a window title and dirty marker, and
+incremental (run-loop dripped) indexing so a medium file never blocks the window. The
+sidebar is custom-drawn (D2), lazily read, resizable by dragging its edge, and
+rooted either at the open file's folder or at a folder chosen with
+File → Open Folder… (`--sidebar-root` roots it the same way for snapshots).
+`make test` (plain +
 ASan/UBSan), `make golden`, `make fuzz`, `make bench`, `make demo`, and
 `make gui-smoke` (headless AppKit snapshots in both themes, pinned golden frames
 in light/dark/small/scrolled, a real launch, a no-file launch, and a Finder-style
@@ -1331,11 +1342,12 @@ scroll and does not shrink again until another document opens. The app has no
 app icon yet (the design system's icon assets need an agreed raster step).
 
 The sidebar is a v1 implementation of the §9 shape: rooted at the open
-document's folder (v1 is one file at a time, so there is no workspace root),
-read-only, with no rename/delete/new-file, no project-wide search, and no
-icon/type badges. It refreshes when the window becomes key and after a save-as,
-not continuously. Above the discovery cap the vertical scrollbar is approximate;
-a sidebar drag is irrelevant there (the sidebar does not scroll the document).
+document's folder, or at a folder chosen with File → Open Folder… (which pins
+it while files inside it are opened), read-only, with no rename/delete/new-file,
+no project-wide search, and no icon/type badges. It refreshes when the window
+becomes key and after a save-as, not continuously. Above the discovery cap the
+vertical scrollbar is approximate; a sidebar drag is irrelevant there (the
+sidebar does not scroll the document).
 
 **Total:** the table sums to **24–33 weeks of work**. With ~30% overhead that is
 **31–43 weeks full-time (~7–10 months)**; solo at ~75% time, plan on **10–13

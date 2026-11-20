@@ -74,6 +74,12 @@ own tokens rather than inventing a value.
 - **The sidebar never discards edits silently.** Clicking a file goes through
   `confirmDiscardChanges`, exactly as File → Open does (§9 "read-only
   navigation"). Directories toggle; symlinks are leaves and are never followed.
+- **The sidebar's root is explicit, not guessed.** Default: the open file's
+  folder. File → Open Folder… (⇧⌘O) pins a folder the user chose; files opened
+  inside it keep that root, and opening one outside drops the pin. Do not add a
+  "walk up for `.git`" heuristic — it guesses, and with no ignore engine it
+  fills the tree with `build/` and `.git/`. The path test lives in one place,
+  `Sidebar::is_under_root`, which `reveal()` also uses.
 - **The sidebar's width belongs to the user.** It is resizable by dragging its
   right edge, clamped in one place (`Sidebar::set_width`, 160–480 pt), and
   persisted under `SidebarWidth`. The view holds the AppKit width constraint and
@@ -104,7 +110,8 @@ own tokens rather than inventing a value.
   (and `build/editor_gui`), the AppKit view (CoreText + CoreGraphics +
   `viewcore`); `make gui-smoke` runs the GUI smoke test (`tests/gui_smoke.py`):
   headless AppKit snapshots (`--snapshot PATH --theme light|dark --size WxH
-  --scroll LINE --xscroll PX --wheel DY,DX`), a real launch, a no-file launch,
+  --scroll LINE --xscroll PX --wheel DY,DX --sidebar-root DIR`), a real launch, a
+  no-file launch,
   and a Finder-style LaunchServices open (`tests/render_smoke_test.cpp` covers the
   same render path with pixel assertions); the same target runs
   `tests/gui_golden.py`, which pins

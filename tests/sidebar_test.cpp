@@ -810,4 +810,35 @@ TEST(sidebar_width_does_not_move_the_selection_or_the_scroll) {
   CHECK_EQ(f.side->scroll_y(), scroll);
 }
 
+// --- is_under_root ----------------------------------------------------------
+
+TEST(sidebar_is_under_root_is_a_path_test_not_a_string_test) {
+  Fixture f;
+  f.side->set_root("/src");
+  CHECK(f.side->is_under_root("/src"));
+  CHECK(f.side->is_under_root("/src/beta/deep.txt"));
+  // A sibling whose name merely starts with the root is not under it.
+  CHECK(!f.side->is_under_root("/src-other"));
+  CHECK(!f.side->is_under_root("/src2/file.txt"));
+  CHECK(!f.side->is_under_root("/other/src/file.txt"));
+}
+
+TEST(sidebar_is_under_root_is_false_with_no_root) {
+  FakeDir src;
+  vc::HeadlessTextBackend tb;
+  vc::Sidebar side(src, tb);
+  CHECK(!side.is_under_root("/anything"));
+  CHECK(!side.is_under_root(""));
+}
+
+TEST(sidebar_reveal_agrees_with_is_under_root) {
+  // reveal() uses the same rule, so the two can never disagree.
+  Fixture f;
+  f.side->set_root("/src");
+  CHECK(f.side->is_under_root("/src/beta/inner.txt"));
+  (void)f.side->reveal("/src/beta/inner.txt");
+  CHECK(f.side->selected_path() == "/src/beta/inner.txt");
+  CHECK(!f.side->is_under_root("/src-other/x.txt"));
+}
+
 }  // namespace

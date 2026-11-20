@@ -159,6 +159,8 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (const std::vector<vc::Sidebar::Row>&)rows;
 // Reveals `path` (expands its ancestors) and selects it.
 - (void)revealPath:(NSString*)path;
+// YES if `path` is the root or lies under it ("/foo" is not under "/foobar").
+- (BOOL)isUnderPath:(NSString*)path;
 @end
 
 @interface EditorView : NSView
@@ -201,6 +203,10 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)hideFind:(id)sender;
 // File → Revert to Saved (asks first if there are unsaved changes).
 - (void)revertDocument:(id)sender;
+// File → Open Folder…: roots the sidebar at a chosen folder, document untouched.
+- (void)openFolder:(id)sender;
+// Roots the sidebar at `path` and keeps it there for files opened inside it.
+- (void)pinSidebarRoot:(NSString*)path;
 // View → Show Sidebar (hidden on a narrow window; the default is shown).
 - (void)toggleSidebar:(id)sender;
 // View > Tab Width: the sender's tag is the width in columns.
@@ -312,6 +318,11 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   if (path == nil) return;
   _sidebar->reveal(path.UTF8String);
   [self setNeedsDisplay:YES];
+}
+
+- (BOOL)isUnderPath:(NSString*)path {
+  if (path == nil) return NO;
+  return _sidebar->is_under_root(path.UTF8String);
 }
 
 - (void)drawRect:(NSRect)dirtyRect {
@@ -564,6 +575,10 @@ static constexpr double kSidebarGrip = 6.0;
   BOOL _maybeDirty;      // conservative: set on edits, cleared on save/open
   BOOL _discovering;     // an incremental index pass is in flight
   double _fontSize;
+  // A folder the user chose with File > Open Folder…: the sidebar stays rooted
+  // there while files inside it are opened (the v1 stand-in for a workspace).
+  // Cleared by opening a file outside it.
+  BOOL _sidebarPinned;
 }
 
 - (instancetype)initWithEditor:(Editor*)ed {
@@ -764,9 +779,25 @@ static constexpr double kSidebarGrip = 6.0;
 
 // Points the sidebar at the open file's folder and reveals the file. Called
 // after a document is opened (open, Revert to Saved, a click in the sidebar).
+//
+// A folder chosen with File > Open Folder… is the root while the open file is
+// inside it: that is the v1 "workspace", and it is what makes the tree worth
+// having (otherwise every file open re-roots the column at its own folder).
+// Opening a file outside the pinned folder drops the pin and re-roots.
 - (void)syncSidebarToDocument {
   if (self.sidebar == nil || self.documentPath == nil) return;
   const std::string path = self.documentPath.UTF8String;
+  if (_sidebarPinned && [self.sidebar isUnderPath:self.documentPath]) {
+    // Keep the chosen root. The file may still be new on disk (Save As), so
+    // re-read the folder it went into rather than leaving a stale row set.
+    const std::string parent = parent_dir(path);
+    if (!parent.empty()) {
+      [self.sidebar refreshPath:[NSString stringWithUTF8String:parent.c_str()]];
+    }
+    [self.sidebar revealPath:self.documentPath];
+    return;
+  }
+  _sidebarPinned = NO;
   const std::string parent = parent_dir(path);
   if (parent.empty()) return;
   // Re-rooting collapses the tree, so only do it when the folder changed. When
@@ -779,6 +810,39 @@ static constexpr double kSidebarGrip = 6.0;
     [self.sidebar refreshPath:root];
   }
   [self.sidebar revealPath:self.documentPath];
+}
+
+// File → Open Folder…: choose the folder the sidebar is rooted at, without
+// touching the open document. This is the explicit answer to "where does the
+// tree start?" — no heuristic, and no build/.git noise the user did not ask for.
+- (void)openFolder:(id)sender {
+  (void)sender;
+  NSOpenPanel* p = [NSOpenPanel openPanel];
+  p.canChooseFiles = NO;
+  p.canChooseDirectories = YES;
+  p.allowsMultipleSelection = NO;
+  p.resolvesAliases = YES;
+  p.prompt = @"Open";
+  if ([p runModal] != NSModalResponseOK || p.URL == nil) return;
+  if (self.sidebar == nil) return;
+  // Choosing a folder is a request to look at it: reveal the column if the user
+  // had hidden it.
+  self.sidebar.hidden = NO;
+  [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"ShowSidebar"];
+  [self pinSidebarRoot:p.URL.path];
+}
+
+// Roots the sidebar at `path` and keeps it there while files inside it are
+// opened. Reveals the open document when it lies under the new root. This is
+// the one place the pin is set, so File > Open Folder… and the
+// `--sidebar-root` snapshot flag cannot drift apart.
+- (void)pinSidebarRoot:(NSString*)path {
+  if (self.sidebar == nil || path == nil) return;
+  [self.sidebar setRootPath:path];
+  _sidebarPinned = YES;
+  if (self.documentPath != nil) {
+    [self.sidebar revealPath:self.documentPath];
+  }
 }
 
 // An untitled window is backed by a temp file so it is a real, editable document.
@@ -1003,6 +1067,9 @@ static constexpr double kSidebarGrip = 6.0;
     item.state = (self.sidebar != nil && !self.sidebar.isHidden)
                      ? NSControlStateValueOn
                      : NSControlStateValueOff;
+  } else if (item.action == @selector(openFolder:)) {
+    // Open Folder… only means something once there is a sidebar to root.
+    item.enabled = self.sidebar != nil;
   }
   return YES;
 }
@@ -1465,9 +1532,15 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
   NSMenuItem* saveAs = item(@"Save As\u2026", @selector(saveAsDocument:), @"s");
   saveAs.keyEquivalentModifierMask =
       NSEventModifierFlagCommand | NSEventModifierFlagShift;
+  // Open Folder…: ⇧⌘O, the usual "open a folder" command, so it does not
+  // collide with Open… (⌘O) and reads as a variation of it.
+  NSMenuItem* openFolderItem = item(@"Open Folder\u2026", @selector(openFolder:), @"o");
+  openFolderItem.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
   [fileItem setSubmenu:submenu(@"File", @[
     item(@"New", @selector(newDocument:), @"n"),
     item(@"Open\u2026", @selector(openDocument:), @"o"),
+    openFolderItem,
     [NSMenuItem separatorItem],
     item(@"Save", @selector(saveDocument:), @"s"),
     saveAs,
@@ -1529,6 +1602,15 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
 
 }  // namespace
 
+// The value of `--name VALUE`, or "" when it is absent. Used for the snapshot
+// flags, which are test surface and not a general argument parser.
+static std::string arg_value(int argc, char** argv, const char* name) {
+  for (int i = 1; i + 1 < argc; ++i) {
+    if (std::string(argv[i]) == name) return argv[i + 1];
+  }
+  return std::string();
+}
+
 int main(int argc, char** argv) {
   @autoreleasepool {
     std::string path, snapshot, wheel_notches;
@@ -1549,6 +1631,8 @@ int main(int argc, char** argv) {
         scroll_x = std::strtod(argv[++i], nullptr);
       } else if (a == "--wheel" && i + 1 < argc) {
         wheel_notches = argv[++i];
+      } else if (a == "--sidebar-root" && i + 1 < argc) {
+        ++i;  // consumed above via arg_value(); do not treat it as the document
       } else if (a == "--size" && i + 1 < argc) {
         // WIDTHxHEIGHT in points, e.g. 480x320 (the smoke test's small window).
         const std::string s = argv[++i];
@@ -1649,6 +1733,13 @@ int main(int argc, char** argv) {
             : [[NSUserDefaults standardUserDefaults] boolForKey:@"ShowSidebar"];
     sidebar.hidden = !wantSidebar;
     view.sidebar = sidebar;  // so the theme reaches it
+    // `--sidebar-root DIR` roots the column at a chosen folder, exactly as
+    // File > Open Folder… does, so the folder-rooted tree is inspectable
+    // headlessly (tests and snapshots) rather than only by driving the UI.
+    const std::string sidebar_root = arg_value(argc, argv, "--sidebar-root");
+    if (!sidebar_root.empty()) {
+      [view pinSidebarRoot:[NSString stringWithUTF8String:sidebar_root.c_str()]];
+    }
     [view refreshTheme];  // give the chrome its page colour now the bars exist
 
     // The editor's own column: find bar, document, status bar.

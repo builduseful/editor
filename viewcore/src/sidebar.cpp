@@ -176,6 +176,15 @@ bool Sidebar::toggle(const SidebarNode* n) {
   return true;
 }
 
+bool Sidebar::is_under_root(std::string_view path) const {
+  if (root_.empty()) return false;
+  if (path == root_) return true;
+  // The root must be a *path* prefix: "/foo" is not a prefix of "/foobar".
+  return path.size() > root_.size() &&
+         path.compare(0, root_.size(), root_) == 0 &&
+         path[root_.size()] == '/';
+}
+
 bool Sidebar::reveal(std::string_view path) {
   if (root_node_ == nullptr) return false;
   const std::string target(path);
@@ -187,12 +196,7 @@ bool Sidebar::reveal(std::string_view path) {
   // Walking in that order is what lets each step find its children — the parent
   // must be loaded before the child can be looked up.
   std::vector<std::string> parts;
-  // The root must be a *path* prefix: "/foo" is not a prefix of "/foobar".
-  const bool under_root =
-      target.size() > root_.size() &&
-      target.compare(0, root_.size(), root_) == 0 &&
-      target[root_.size()] == '/';
-  if (under_root) {
+  if (is_under_root(target)) {
     std::string rel = target.substr(root_.size());
     while (!rel.empty() && rel.front() == '/') rel.erase(rel.begin());
     size_t pos = 0;

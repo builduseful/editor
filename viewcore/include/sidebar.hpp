@@ -121,6 +121,8 @@ class Sidebar {
   // Expands every ancestor of `path` and selects the node itself, so the tree
   // reveals the open file. Returns false if the path is not under the root.
   bool reveal(std::string_view path);
+  // True if `path` is the root or lies under it ("/foo" is not under "/foobar").
+  bool is_under_root(std::string_view path) const;
 
   // --- Layout ---------------------------------------------------------------
   // A fixed-width column (chrome), but the width is the user's: drag its right
