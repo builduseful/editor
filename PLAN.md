@@ -1237,13 +1237,23 @@ one-file-at-a-time), but the shape is fixed now so the work is not redone:
   160 to 480 pt by dragging its right edge (the hairline is the affordance, the
   cursor the hint); the width persists across launches, and the window has a
   minimum content size so a wide sidebar cannot squeeze the document away.
-- **Root is explicit, not guessed.** The column is rooted at the open file's
-  folder by default, and **File → Open Folder…** (⇧⌘O) roots it at a folder the
-  user picks without touching the document. While that folder is the root, files
-  opened inside it keep it — the v1 stand-in for a workspace — and opening a file
-  outside it drops the pin and re-roots. Walking up for `.git` was considered and
-  rejected for v1: it guesses a boundary, and with no ignore engine (above) the
-  tree would fill with `build/` and `.git/`.
+- **The root is set once, not per file.** Opening a file must not move the
+  column: the old behaviour re-rooted at each file's own folder, so opening a file
+  elsewhere collapsed the tree and threw away wherever the user had navigated.
+  The column starts at the open file's folder and stays there.
+- **Navigate, don't re-root.** Each directory row has an *enter* affordance
+  (a chevron at the right edge) that makes that folder the view — one level at a
+  time, like Finder's column view. That is separate from the disclosure chevron
+  on the left, which still expands a folder inline in the tree. Navigating reads
+  only that folder, leaves the tree's expansions alone, and keeps the selection
+  by path, so going back out returns to exactly where the user was.
+- **The breadcrumb is the way back.** A strip at the top shows the current
+  folder and every ancestor; each is a button that jumps to it. Right/Left arrow
+  navigate in and out.
+- **Walking up for `.git` was considered and rejected for v1**: it guesses a
+  boundary, and with no ignore engine (above) the tree would fill with `build/`
+  and `.git/`. A folder can still be chosen explicitly with **File → Open
+  Folder…** (⇧⌘O), or by dropping one on the app.
 
 ## 10. Testing, CI, build
 

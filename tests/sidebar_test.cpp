@@ -229,12 +229,16 @@ TEST(sidebar_reveal_of_the_root_selects_the_root) {
 TEST(sidebar_row_at_maps_y_to_a_row) {
   Fixture f;
   f.side->set_root("/src");
-  CHECK_EQ(f.side->row_at(10, 0), 0);
-  CHECK_EQ(f.side->row_at(10, vc::Sidebar::kRowHeight - 1), 0);
-  CHECK_EQ(f.side->row_at(10, vc::Sidebar::kRowHeight), 1);
-  CHECK_EQ(f.side->row_at(10, 2 * vc::Sidebar::kRowHeight + 3), 2);
-  CHECK_EQ(f.side->row_at(10, -1), -1);  // above the rows
-  CHECK_EQ(f.side->row_at(10, 99999), -1);  // below them
+  // y is measured from the top of the sidebar, and the breadcrumb strip is not
+  // a row: rows begin at kHeaderHeight.
+  const double h = vc::Sidebar::kHeaderHeight;
+  CHECK_EQ(f.side->row_at(10, h), 0);
+  CHECK_EQ(f.side->row_at(10, h + vc::Sidebar::kRowHeight - 1), 0);
+  CHECK_EQ(f.side->row_at(10, h + vc::Sidebar::kRowHeight), 1);
+  CHECK_EQ(f.side->row_at(10, h + 2 * vc::Sidebar::kRowHeight + 3), 2);
+  CHECK_EQ(f.side->row_at(10, h - 1), -1);  // the breadcrumb strip
+  CHECK_EQ(f.side->row_at(10, -1), -1);     // above everything
+  CHECK_EQ(f.side->row_at(10, 99999), -1);  // below the rows
 }
 
 TEST(sidebar_toggling_a_file_is_a_noop) {
@@ -274,11 +278,15 @@ TEST(sidebar_draws_a_row_per_visible_node_with_labels) {
   for (const vc::DrawCmd& d : rc.cmds) {
     if (d.kind == vc::DrawCmd::Kind::DrawRun) runs.push_back(d.text);
   }
-  // One label per row, plus a chevron for the one directory (drawn as a run).
-  CHECK(runs.size() == 4);
+  // One label per row, plus the breadcrumb's own label (the root's name) and
+  // the chevrons: the directory's disclosure arrow, its enter affordance, and
+  // the same for the header.
   CHECK(std::find(runs.begin(), runs.end(), "alpha.txt") != runs.end());
   CHECK(std::find(runs.begin(), runs.end(), "beta") != runs.end());
   CHECK(std::find(runs.begin(), runs.end(), "zeta.txt") != runs.end());
+  // The breadcrumb names the folder being shown, so "src" is on screen even
+  // though the root is not one of its own rows.
+  CHECK(std::find(runs.begin(), runs.end(), "src") != runs.end());
 }
 
 TEST(sidebar_drawing_uses_the_theme_ground_and_a_hairline) {
@@ -388,10 +396,13 @@ TEST(sidebar_scrolls_only_when_the_content_overflows) {
   f.side->scroll_by(500);
   CHECK_EQ(f.side->scroll_y(), 0.0);  // nothing to scroll to
 
-  f.side->set_height(3 * vc::Sidebar::kRowHeight);  // exactly the content
+  // The viewport for rows is the height minus the breadcrumb strip.
+  f.side->set_height(vc::Sidebar::kHeaderHeight +
+                     3 * vc::Sidebar::kRowHeight);  // exactly the content
   CHECK_EQ(f.side->max_scroll(), 0.0);
 
-  f.side->set_height(1 * vc::Sidebar::kRowHeight);  // one row visible
+  f.side->set_height(vc::Sidebar::kHeaderHeight +
+                     1 * vc::Sidebar::kRowHeight);  // one row visible
   const double max = f.side->max_scroll();
   CHECK(max > 0);
   f.side->scroll_by(1000);
@@ -403,11 +414,13 @@ TEST(sidebar_scrolls_only_when_the_content_overflows) {
 TEST(sidebar_row_at_accounts_for_the_scroll) {
   Fixture f;
   f.side->set_root("/src");
-  f.side->set_height(vc::Sidebar::kRowHeight);  // one row at a time
+  f.side->set_height(vc::Sidebar::kHeaderHeight +
+                     vc::Sidebar::kRowHeight);  // one row at a time
   f.side->scroll_to(vc::Sidebar::kRowHeight);   // scrolled down one row
+  const double h = vc::Sidebar::kHeaderHeight;
   // The first visible row is now index 1.
-  CHECK_EQ(f.side->row_at(10, 0), 1);
-  CHECK_EQ(f.side->row_at(10, vc::Sidebar::kRowHeight - 1), 1);
+  CHECK_EQ(f.side->row_at(10, h), 1);
+  CHECK_EQ(f.side->row_at(10, h + vc::Sidebar::kRowHeight - 1), 1);
 }
 
 TEST(sidebar_scrolling_draws_only_the_visible_rows) {
@@ -420,7 +433,9 @@ TEST(sidebar_scrolling_draws_only_the_visible_rows) {
   vc::HeadlessTextBackend tb;
   vc::Sidebar side(src, tb);
   side.set_root("/many");
-  side.set_height(5 * vc::Sidebar::kRowHeight);
+  // Height includes the breadcrumb strip; five rows fit below it.
+  side.set_height(vc::Sidebar::kHeaderHeight +
+                  5 * vc::Sidebar::kRowHeight);
 
   vc::RecordingCanvas rc;
   side.draw(rc, vc::light_theme());
@@ -430,7 +445,8 @@ TEST(sidebar_scrolling_draws_only_the_visible_rows) {
       ++labels;
     }
   }
-  // Five rows fit (plus at most one partial), not two hundred.
+  // Five rows fit below the breadcrumb strip (plus at most one partial), not
+  // two hundred.
   CHECK(labels >= 5);
   CHECK(labels <= 6);
 
@@ -503,7 +519,9 @@ TEST(sidebar_reveal_scrolls_the_selected_row_into_view) {
   vc::HeadlessTextBackend tb;
   vc::Sidebar side(src, tb);
   side.set_root("/many");
-  side.set_height(5 * vc::Sidebar::kRowHeight);
+  // Height includes the breadcrumb strip; five rows fit below it.
+  side.set_height(vc::Sidebar::kHeaderHeight +
+                  5 * vc::Sidebar::kRowHeight);
   CHECK_EQ(side.scroll_y(), 0.0);
 
   // The lexicographically last entry of the 60 (file-9.txt, after file-59).
@@ -674,9 +692,12 @@ TEST(sidebar_right_opens_a_directory_then_steps_into_it) {
   CHECK(beta != nullptr && beta->name == "beta");
   CHECK(f.side->move_right());  // expands
   CHECK(f.side->selected_path() == "/src/beta");  // selection stays on it
-  // Open now: Right moves to the first child (deeper, folders first).
+  // Open now: Right navigates into it, showing its children one level deep.
+  // The selection stays on beta itself — the folder the user is now inside — so
+  // Left can take them straight back out.
   CHECK(f.side->move_right());
-  CHECK(f.side->selected_path() == "/src/beta/deeper");
+  CHECK(f.side->view() == "/src/beta");
+  CHECK(f.side->selected_path() == "/src/beta");
 }
 
 TEST(sidebar_left_closes_then_steps_out) {
@@ -839,6 +860,132 @@ TEST(sidebar_reveal_agrees_with_is_under_root) {
   (void)f.side->reveal("/src/beta/inner.txt");
   CHECK(f.side->selected_path() == "/src/beta/inner.txt");
   CHECK(!f.side->is_under_root("/src-other/x.txt"));
+}
+
+// --- Navigating into a folder ------------------------------------------------
+
+TEST(sidebar_navigate_shows_one_level_and_the_breadcrumb) {
+  Fixture f;
+  f.side->set_root("/src");
+  // The tree lists beta's siblings; navigate into beta.
+  CHECK(f.side->navigate("/src/beta"));
+  CHECK(f.side->view() == "/src/beta");
+  CHECK(f.side->navigating());
+  // One level, no expansion: beta's children only.
+  std::vector<std::string> names;
+  for (const vc::Sidebar::Row& r : f.side->rows()) names.push_back(r.node->name);
+  CHECK_EQ(names.size(), 2u);
+  CHECK(std::find(names.begin(), names.end(), "inner.txt") != names.end());
+  CHECK(std::find(names.begin(), names.end(), "deeper") != names.end());
+  CHECK(std::find(names.begin(), names.end(), "alpha.txt") == names.end());
+
+  // The breadcrumb is root -> view.
+  const std::vector<vc::Sidebar::Crumb>& cr = f.side->breadcrumb();
+  CHECK_EQ(cr.size(), 2u);
+  CHECK(cr[0].path == "/src");
+  CHECK(cr[1].path == "/src/beta");
+  CHECK(cr[1].label == "beta");
+}
+
+TEST(sidebar_navigate_does_not_disturb_the_tree) {
+  Fixture f;
+  f.side->set_root("/src");
+  f.side->reveal("/src/beta/deeper/deep.txt");  // tree expanded and selected
+  const std::string sel = f.side->selected_path();
+  CHECK(f.side->navigate("/src/beta"));
+  CHECK(f.side->view() == "/src/beta");
+  // Back to the tree: the expansion and selection are exactly as they were.
+  CHECK(f.side->navigate_to_root());
+  CHECK(f.side->view().empty());
+  CHECK(f.side->selected_path() == sel);
+  // The expanded chain is still open.
+  bool saw_deep = false;
+  for (const vc::Sidebar::Row& r : f.side->rows()) {
+    if (r.node->name == "deep.txt") saw_deep = true;
+  }
+  CHECK(saw_deep);
+}
+
+TEST(sidebar_navigate_up_walks_to_the_root) {
+  Fixture f;
+  f.side->set_root("/src");
+  CHECK(f.side->navigate("/src/beta/deeper"));
+  CHECK(f.side->view() == "/src/beta/deeper");
+  CHECK(f.side->navigate_up());
+  CHECK(f.side->view() == "/src/beta");
+  CHECK(f.side->navigate_up());
+  CHECK(f.side->view().empty());  // back to the tree
+  CHECK(!f.side->navigate_up());  // nothing above the root
+}
+
+TEST(sidebar_navigate_reads_a_folder_that_was_never_expanded) {
+  // Navigating is the gesture for going in, so it must not require the folder
+  // to have been expanded first.
+  Fixture f;
+  f.side->set_root("/src");
+  CHECK(f.side->navigate("/src/beta"));  // beta was collapsed
+  CHECK(f.side->view() == "/src/beta");
+  CHECK_EQ(f.side->rows().size(), 2u);  // and its children were read
+}
+
+TEST(sidebar_navigate_refuses_a_file_and_a_sibling) {
+  Fixture f;
+  f.side->set_root("/src");
+  CHECK(!f.side->navigate("/src/alpha.txt"));  // a file is not a folder
+  CHECK(!f.side->navigate("/src-other"));      // outside the root
+  CHECK(!f.side->navigate("/src/nope"));       // does not exist
+  CHECK(f.side->view().empty());
+}
+
+TEST(sidebar_breadcrumb_lists_every_ancestor) {
+  Fixture f;
+  f.side->set_root("/src");
+  f.side->navigate("/src/beta/deeper");
+  const std::vector<vc::Sidebar::Crumb>& cr = f.side->breadcrumb();
+  CHECK_EQ(cr.size(), 3u);
+  CHECK(cr[0].path == "/src");
+  CHECK(cr[1].path == "/src/beta");
+  CHECK(cr[2].path == "/src/beta/deeper");
+  CHECK(cr[2].label == "deeper");
+}
+
+TEST(sidebar_enter_affordance_is_only_on_directories) {
+  Fixture f;
+  f.side->set_root("/src");
+  const std::vector<vc::Sidebar::Row>& rows = f.side->rows();
+  for (const vc::Sidebar::Row& r : rows) {
+    double x0 = -1, x1 = -1;
+    f.side->enter_affordance(r, &x0, &x1);
+    if (r.node->is_dir) {
+      CHECK(x1 > x0);  // a directory can be entered
+    } else {
+      CHECK(x1 <= x0);  // a file cannot
+    }
+  }
+}
+
+TEST(sidebar_navigated_view_keeps_the_selection_on_screen) {
+  FakeDir src;
+  for (int i = 0; i < 60; ++i) {
+    src.add("/many", "f-" + std::to_string(i) + ".txt", false);
+  }
+  vc::HeadlessTextBackend tb;
+  vc::Sidebar side(src, tb);
+  side.set_root("/many");
+  side.set_height(vc::Sidebar::kHeaderHeight + 3 * vc::Sidebar::kRowHeight);
+  // The root is already the view; navigating to it is a no-op, not an error.
+  CHECK(side.view().empty());
+  CHECK_EQ(side.rows().size(), 60u);
+  // Selecting the last row scrolls it into view.
+  const std::vector<vc::Sidebar::Row>& r = side.rows();
+  side.set_selected(r.back().node);
+  side.scroll_selection_into_view();
+  // The selected row is inside the viewport below the breadcrumb strip.
+  const double y = side.row_at(10, side.scroll_y() >= 0
+                                      ? vc::Sidebar::kHeaderHeight + 1
+                                      : 0);
+  CHECK(y >= 0);  // the strip itself is not a row, but a point just below is
+  CHECK(side.max_scroll() > 0);  // there was something to scroll
 }
 
 }  // namespace

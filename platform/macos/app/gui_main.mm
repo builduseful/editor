@@ -431,12 +431,38 @@ static constexpr double kSidebarGrip = 6.0;
     return;
   }
   const double y = self.bounds.size.height - p.y;  // AppKit y-up -> viewcore y-down
+
+  // The breadcrumb strip: a click on a crumb jumps to that folder.
+  if (y <= vc::Sidebar::kHeaderHeight) {
+    const int crumb = _sidebar->crumb_at(p.x, y);
+    if (crumb >= 0) {
+      const std::vector<vc::Sidebar::Crumb>& crumbs = _sidebar->breadcrumb();
+      if (static_cast<size_t>(crumb) < crumbs.size()) {
+        _sidebar->navigate(crumbs[static_cast<size_t>(crumb)].path);
+        [self setNeedsDisplay:YES];
+      }
+    }
+    return;
+  }
+
   const int row = _sidebar->row_at(p.x, y);
   if (row < 0) return;
   const std::vector<vc::Sidebar::Row>& rows = _sidebar->rows();
   if (static_cast<size_t>(row) >= rows.size()) return;
   const vc::SidebarNode* node = rows[static_cast<size_t>(row)].node;
   if (node == nullptr) return;
+
+  // The enter affordance on a directory: navigate into it (show just its
+  // contents), which is a different thing from the disclosure chevron on the
+  // left, which expands it in place.
+  double ax0 = 0, ax1 = 0;
+  _sidebar->enter_affordance(rows[static_cast<size_t>(row)], &ax0, &ax1);
+  if (ax1 > ax0 && p.x >= ax0 && p.x < ax1 && node->is_dir &&
+      !node->is_symlink) {
+    if (_sidebar->navigate(node->path)) [self setNeedsDisplay:YES];
+    return;
+  }
+
   if (node->is_dir && !node->is_symlink) {
     if (_sidebar->toggle(node)) [self setNeedsDisplay:YES];
     return;
@@ -576,10 +602,6 @@ static constexpr double kSidebarGrip = 6.0;
   BOOL _maybeDirty;      // conservative: set on edits, cleared on save/open
   BOOL _discovering;     // an incremental index pass is in flight
   double _fontSize;
-  // A folder the user chose with File > Open Folder…: the sidebar stays rooted
-  // there while files inside it are opened (the v1 stand-in for a workspace).
-  // Cleared by opening a file outside it.
-  BOOL _sidebarPinned;
 }
 
 - (instancetype)initWithEditor:(Editor*)ed {
@@ -805,39 +827,27 @@ static constexpr double kSidebarGrip = 6.0;
   return YES;
 }
 
-// Points the sidebar at the open file's folder and reveals the file. Called
-// after a document is opened (open, Revert to Saved, a click in the sidebar).
+// Called after a document is opened (open, Revert to Saved, a click in the
+// sidebar, Save As).
 //
-// A folder chosen with File > Open Folder… is the root while the open file is
-// inside it: that is the v1 "workspace", and it is what makes the tree worth
-// having (otherwise every file open re-roots the column at its own folder).
-// Opening a file outside the pinned folder drops the pin and re-roots.
+// This deliberately does NOT move the sidebar. The old behaviour re-rooted the
+// column at each file's own folder, so opening a file in another directory
+// collapsed the tree and threw away wherever the user had navigated. The
+// sidebar is now a place the user navigates deliberately; opening a file only
+// reveals it when it happens to be under the current view.
 - (void)syncSidebarToDocument {
   if (self.sidebar == nil || self.documentPath == nil) return;
-  const std::string path = self.documentPath.UTF8String;
-  if (_sidebarPinned && [self.sidebar isUnderPath:self.documentPath]) {
-    // Keep the chosen root. The file may still be new on disk (Save As), so
-    // re-read the folder it went into rather than leaving a stale row set.
-    const std::string parent = parent_dir(path);
-    if (!parent.empty()) {
-      [self.sidebar refreshPath:[NSString stringWithUTF8String:parent.c_str()]];
-    }
+  // A file may be new on disk (Save As wrote it): re-read the folder holding it
+  // so its row appears, but leave the view and the expansion alone.
+  const std::string parent = parent_dir(self.documentPath.UTF8String);
+  if (!parent.empty()) {
+    [self.sidebar refreshPath:[NSString stringWithUTF8String:parent.c_str()]];
+  }
+  // Reveal only when the file is inside what the sidebar is showing; otherwise
+  // revealing would navigate away from where the user put themselves.
+  if ([self.sidebar isUnderPath:self.documentPath]) {
     [self.sidebar revealPath:self.documentPath];
-    return;
   }
-  _sidebarPinned = NO;
-  const std::string parent = parent_dir(path);
-  if (parent.empty()) return;
-  // Re-rooting collapses the tree, so only do it when the folder changed. When
-  // it did not (Save As inside the same folder, say) the file may still be new
-  // on disk, so re-read the directory rather than leaving a stale row set.
-  NSString* root = [NSString stringWithUTF8String:parent.c_str()];
-  if (![root isEqualToString:self.sidebar.rootPath]) {
-    [self.sidebar setRootPath:root];
-  } else {
-    [self.sidebar refreshPath:root];
-  }
-  [self.sidebar revealPath:self.documentPath];
 }
 
 // File → Open Folder…: choose the folder the sidebar is rooted at, without
@@ -860,14 +870,15 @@ static constexpr double kSidebarGrip = 6.0;
   [self pinSidebarRoot:p.URL.path];
 }
 
-// Roots the sidebar at `path` and keeps it there while files inside it are
-// opened. Reveals the open document when it lies under the new root. This is
-// the one place the pin is set, so File > Open Folder… and the
-// `--sidebar-root` snapshot flag cannot drift apart.
+// Roots the sidebar at `path`. Opening files afterwards does not move it, so
+// this is the deliberate "start browsing here" gesture behind File > Open
+// Folder…, a folder dropped on the app, and the `--sidebar-root` snapshot flag
+// (which is why they cannot drift apart).
 - (void)pinSidebarRoot:(NSString*)path {
   if (self.sidebar == nil || path == nil) return;
   [self.sidebar setRootPath:path];
-  _sidebarPinned = YES;
+  // Start on the open document when it is inside the folder just chosen, so the
+  // tree shows where the user is.
   if (self.documentPath != nil) {
     [self.sidebar revealPath:self.documentPath];
   }

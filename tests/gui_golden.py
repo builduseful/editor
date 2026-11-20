@@ -169,7 +169,16 @@ def main():
 
     if update:
         os.makedirs(GOLDEN_DIR, exist_ok=True)
-    tmpdir = tempfile.mkdtemp(prefix="editor_gui_golden_")
+    # The frames have to be reproducible, so the fixture directory is fixed and
+    # emptied. It used to be a fresh mkdtemp each run, which meant the sidebar
+    # (it lists the open file's folder) drew a different random directory every
+    # time, so no frame could ever match its reference.
+    tmpdir = os.path.join(tempfile.gettempdir(), "editor_gui_golden_fixture")
+    os.makedirs(tmpdir, exist_ok=True)
+    for stale in os.listdir(tmpdir):
+        p = os.path.join(tmpdir, stale)
+        if os.path.isfile(p):
+            os.remove(p)
 
     failures = 0
     worst = (0, "")

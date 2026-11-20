@@ -135,6 +135,8 @@ class Sidebar {
   static constexpr double kIndent = 14.0;  // one level per depth
   static constexpr double kPadLeft = 8.0;
   static constexpr double kPadRight = 8.0;
+  // The breadcrumb strip across the top, above the tree.
+  static constexpr double kHeaderHeight = 26.0;
 
   void set_width(double w);
   double width() const { return width_; }
@@ -151,23 +153,68 @@ class Sidebar {
   // Recomputes the label width for the current font (used for hit-testing).
   void set_font(const FontSpec& f);
 
+  // --- Navigation -----------------------------------------------------------
+  // The sidebar has two ways to look at a folder, and they answer different
+  // questions:
+  //
+  //   The tree   — click a chevron to expand a folder inline. Shows the whole
+  //                neighbourhood at once; clicking a file opens it.
+  //   Navigate   — click the "enter" affordance on a folder row (or press
+  //                Right on it) to make that folder the view. Shows just its
+  //                contents, one level at a time. The breadcrumb is how you go
+  //                back.
+  //
+  // Navigating does not change the document, and it does not collapse the tree
+  // behind it: `navigate` records the path and the tree keeps its expansion, so
+  // returning is instant.
+  //
+  // `view()` is the folder being navigated ("" = the tree, i.e. the root).
+  const std::string& view() const { return view_; }
+  bool navigating() const { return !view_.empty(); }
+  // Makes `path` the view. Must be the root or a directory under it. Returns
+  // true if the view changed.
+  bool navigate(std::string_view path);
+  // Steps out to the view's parent; at the root this returns to the tree.
+  bool navigate_up();
+  // Returns to the tree (the root's full listing).
+  bool navigate_to_root();
+  // One breadcrumb step: the label to draw and the path it jumps to. The last
+  // entry is the view itself; the first is the root.
+  struct Crumb {
+    std::string label;
+    std::string path;
+  };
+  std::vector<Crumb> breadcrumb() const;
+
   // Row index at a viewport point (y down, x within the sidebar), or -1. The
   // point is in the sidebar's coordinates, already scrolled.
   int row_at(double x, double y) const;
+  // X range of the "enter folder" affordance on a directory row, in sidebar
+  // coordinates. Empty (x0 >= x1) when the row is not a navigable directory.
+  // This is what makes a folder clickable to *enter* while its name still
+  // selects, and its chevron still expands.
+  void enter_affordance(const Row& row, double* x0, double* x1) const;
+  // True if (x, y) is inside a breadcrumb crumb; returns its index.
+  int crumb_at(double x, double y) const;
   // Vertical extent of the drawn rows.
   double content_height() const { return static_cast<double>(rows().size()) * kRowHeight; }
 
   // --- Drawing --------------------------------------------------------------
   void draw(Canvas& c, const Theme& t) const;
+  // The breadcrumb strip: the current folder and its ancestors, each a button.
+  void draw_header(Canvas& c, const Theme& t) const;
 
  private:
-  // The on-screen node for `path` (expanded nodes only), or nullptr.
+  // The on-screen node for `path` (visible rows only), or nullptr.
   SidebarNode* find(std::string_view path);
+  // The node for `path`, resolved from the root and loading directories as it
+  // goes (so a breadcrumb can jump anywhere under the root).
+  SidebarNode* resolve(const std::string& path) const;
   // Reads a directory's children once, sorted (folders first, then names
   // case-insensitively). Marks the node loaded even on failure; returns whether
   // the read succeeded.
-  bool load(SidebarNode* dir);
-  void sort_children(SidebarNode* dir);
+  bool load(SidebarNode* dir) const;
+  void sort_children(SidebarNode* dir) const;
 
   DirSource& src_;
   TextBackend& tb_;
@@ -177,10 +224,24 @@ class Sidebar {
   bool root_loaded_ = false;
   std::unique_ptr<SidebarNode> root_node_;
   std::string selected_path_;  // the selection, by path (see `selected()`)
+  mutable std::string view_;  // the folder being navigated ("" = the tree)
   mutable std::vector<Row> rows_;
   mutable bool rows_valid_ = false;
+  // The breadcrumb's drawn extents for this frame, so hit-testing does not have
+  // to re-lay-out the labels. Each entry is (index into crumbs_, x0, x1);
+  // crumbs that did not fit are absent, so a hit is always on something drawn.
+  mutable std::vector<Crumb> crumbs_;
+  mutable std::vector<std::pair<double, double>> crumb_x_;  // parallel to crumbs_
+  mutable std::vector<size_t> crumb_index_;                 // crumbs_ index
+  mutable bool crumbs_valid_ = false;
   double height_ = 600.0;
   double scroll_y_ = 0.0;
+  // Column heights are measured in rows; the header is a fixed strip above them.
+  // `rows()` holds the tree (or the navigated folder's children) and the row
+  // maths is offset by kHeaderHeight, so scrolling and hit-testing stay simple.
+  double row_top(int index) const {
+    return kHeaderHeight + static_cast<double>(index) * kRowHeight - scroll_y_;
+  }
 };
 
 }  // namespace vc

@@ -74,12 +74,20 @@ own tokens rather than inventing a value.
 - **The sidebar never discards edits silently.** Clicking a file goes through
   `confirmDiscardChanges`, exactly as File → Open does (§9 "read-only
   navigation"). Directories toggle; symlinks are leaves and are never followed.
-- **The sidebar's root is explicit, not guessed.** Default: the open file's
-  folder. File → Open Folder… (⇧⌘O) pins a folder the user chose; files opened
-  inside it keep that root, and opening one outside drops the pin. Do not add a
-  "walk up for `.git`" heuristic — it guesses, and with no ignore engine it
-  fills the tree with `build/` and `.git/`. The path test lives in one place,
-  `Sidebar::is_under_root`, which `reveal()` also uses.
+- **Opening a file never moves the sidebar.** It used to re-root at each file's
+  folder, so opening one elsewhere collapsed the tree and lost the user's place.
+  The column is set once (the open file's folder at launch, or a folder chosen
+  with File → Open Folder… / dropped on the app) and stays there; opening a file
+  only reveals it when it is under the current view.
+- **Two gestures on a directory row, not one.** The left chevron expands it
+  inline in the tree; the right-edge *enter* affordance makes it the view (one
+  level, like a column browser). The breadcrumb at the top is how you go back,
+  and each crumb is a button. Right/Left arrow navigate in and out. Navigating
+  must not disturb the tree's expansions or the selection (held by path), so a
+  round trip returns to exactly where the user was.
+- Do not add a "walk up for `.git`" heuristic — it guesses, and with no ignore
+  engine it fills the tree with `build/` and `.git/`. The path test lives in one
+  place, `Sidebar::is_under_root`, which `reveal()` also uses.
 - **The sidebar's width belongs to the user.** It is resizable by dragging its
   right edge, clamped in one place (`Sidebar::set_width`, 160–480 pt), and
   persisted under `SidebarWidth`. The view holds the AppKit width constraint and
