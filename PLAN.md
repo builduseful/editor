@@ -1182,6 +1182,13 @@ personal data, or proprietary files.
 - Line cache keyed by **(logical line, wrap width)**; one shaped run per *visual*
   line. **Bounded LRU, 1024 entries and ≤ 6 MB**; skip caching lines above ~1000
   visual lines (a 100 MB single line must not blow the cache).
+- **Scrolling is measured in pixels, not lines.** The scroll position is a
+  logical line plus a pixel offset into its block, and the scrollbar's range is
+  the *pixel* content height, so a line that wraps into several screens scrolls
+  correctly (a line-counted model says "one line fits" and offers no bar, and
+  lets a wrapped document scroll past its end). The thumb tracks the pointer
+  exactly; `max_top` walks back only a viewport of blocks, so the clamp stays
+  off the wheel path.
 - Invalidate at/after the first changed line; on a line-count-changing edit, clear
   from the first changed line onward (rekeyed). Invalidate all on width/font change.
 - Do not enumerate fonts at launch; resolve one font and enumerate lazily when
@@ -1309,9 +1316,13 @@ that combination was the launch crash.
 Known limits: for files above the discovery cap (64 MB) the vertical bar is
 approximate — its thumb is sized and placed from byte progress, a drag only
 previews until it is released, and the release then indexes up to the target
-line (a jump to 90% of a 5 GB file does that much index work); a vertical drag
-with wrap on maps logical lines proportionally (approximate, not per-visual-line).
-The horizontal range is the widest line measured so far, so it grows as you
+line (a jump to 90% of a 5 GB file does that much index work). With wrap on and
+an uneven wrap height the thumb still tracks the pointer exactly, but a given
+thumb position maps to the nearest *logical* line rather than a pixel-exact
+place (the ends are exact; only the middle is approximate). The content height
+is measured over at most 1000 visual lines and the rest extrapolated, so a
+document far larger than that gets an approximate thumb size. The horizontal
+range is the widest line measured so far, so it grows as you
 scroll and does not shrink again until another document opens. The app has no
 app icon yet (the design system's icon assets need an agreed raster step).
 

@@ -498,6 +498,199 @@ TEST(viewcore_scrollbar_accounts_for_wrap) {
   CHECK(wrapped < plain);
 }
 
+// --- Vertical scrolling in pixels (wrap, and the very end of a document) -----
+
+TEST(viewcore_wrapped_single_line_has_a_scrollbar_and_stops_at_the_end) {
+  // One logical line that wraps into many screens. Counting logical lines says
+  // "one line fits", which used to mean no bar at all; the scroll range has to
+  // be measured in pixels.
+  std::string content(4000, 'x');
+  content += "\n";
+  Doc d(content);
+  d.view->resize(80, 160);
+  d.view->set_wrap(true);
+  d.view->discover_all();
+  CHECK(d.view->scrollbar().visible);
+
+  vc::MouseEvent wheel;
+  wheel.kind = vc::MouseEvent::Kind::Scroll;
+  wheel.dy = 1e6;  // far past the end
+  d.view->mouse(wheel);
+  // The last legal position shows the end of the text, with no blank space
+  // below it (the old model let a wrapped document scroll on forever).
+  CHECK_EQ(d.view->first_visible_line(), 0);
+  const double top = d.view->scroll_px();
+  const double content_px = d.view->content_height();
+  CHECK(top > 0);
+  CHECK(top + 160.0 <= content_px + 1e-6);
+  CHECK(top + 160.0 >= content_px - 1e-6);
+  // And the thumb sits at the bottom of the track.
+  const vc::ViewCore::ScrollBar sb = d.view->scrollbar();
+  CHECK_EQ(sb.thumb_y + sb.thumb_h, 160.0);
+}
+
+TEST(viewcore_wrapped_drag_follows_the_pointer_and_stops_inside_a_line) {
+  // Lines that each wrap into many rows: a drag must be able to land part-way
+  // through one (not snap to logical line boundaries), and the thumb must stay
+  // under the pointer.
+  std::string content;
+  for (int i = 0; i < 40; ++i) content += std::string(600, 'x') + "\n";
+  Doc d(content);
+  d.view->resize(80, 160);
+  d.view->set_wrap(true);
+  d.view->discover_all();
+  const vc::ViewCore::ScrollBar sb = d.view->scrollbar();
+  CHECK(sb.visible);
+  const double travel = 160.0 - sb.thumb_h;
+
+  vc::MouseEvent down;
+  down.kind = vc::MouseEvent::Kind::Down;
+  down.x = 78;
+  down.y = sb.thumb_y + 2;  // grab the thumb
+  const double grab = 2;
+  d.view->mouse(down);
+
+  vc::MouseEvent drag;
+  drag.kind = vc::MouseEvent::Kind::Drag;
+  drag.x = 78;
+  drag.y = sb.thumb_y + 2 + travel / 2;  // half way down the track
+  d.view->mouse(drag);
+
+  const vc::ViewCore::ScrollBar moved = d.view->scrollbar();
+  CHECK(std::abs(moved.thumb_y - (drag.y - grab)) < 0.51);  // under the pointer
+  CHECK(d.view->scroll_px() > 0.5);  // inside a wrapped line, not on a boundary
+  CHECK(d.view->first_visible_line() > 0);
+}
+
+TEST(viewcore_last_points_are_reachable_when_the_viewport_is_not_a_line_multiple) {
+  // A 165 px viewport over 16 px lines: the old line-based clamp stopped with
+  // 11 px of the document still below the viewport, unreachable.
+  Doc d(n_lines(20));
+  d.view->resize(80, 165);
+  d.view->discover_all();
+  vc::MouseEvent wheel;
+  wheel.kind = vc::MouseEvent::Kind::Scroll;
+  wheel.dy = 1e6;
+  d.view->mouse(wheel);
+  const double lh = d.view->line_height();
+  const double top = static_cast<double>(d.view->first_visible_line()) * lh +
+                     d.view->scroll_px();
+  const double content_px = d.view->content_height();
+  CHECK(top + 165.0 >= content_px - 1e-6);  // the end is visible
+  CHECK(top + 165.0 <= content_px + 1e-6);  // and nothing is blank past it
+}
+
+TEST(viewcore_wrapped_track_click_pages_by_a_screen_not_a_logical_line) {
+  // A wrapped logical line is ~60 rows tall; paging by "logical lines in the
+  // viewport" would jump most of a screen's worth of them at once.
+  std::string content;
+  for (int i = 0; i < 40; ++i) content += std::string(600, 'x') + "\n";
+  Doc d(content);
+  d.view->resize(80, 160);
+  d.view->set_wrap(true);
+  d.view->discover_all();
+
+  vc::MouseEvent click;
+  click.kind = vc::MouseEvent::Kind::Down;
+  click.x = 78;
+  click.y = 159;  // the track, below the thumb
+  d.view->mouse(click);
+  // One page of rows: 160/16 - 1 = 9 rows, i.e. 144 px, still inside the first
+  // (very tall) logical line.
+  CHECK_EQ(d.view->first_visible_line(), 0);
+  CHECK_EQ(d.view->scroll_px(), 144.0);
+}
+
+TEST(viewcore_content_height_accounts_for_wrap) {
+  Doc d(n_lines(20, "the quick brown fox jumps over the lazy dog again\n"));
+  d.view->resize(80, 160);
+  d.view->discover_all();
+  const double plain = d.view->content_height();
+  d.view->set_wrap(true);
+  const double wrapped = d.view->content_height();
+  CHECK(plain > 0);
+  CHECK(wrapped > plain);  // wrapped rows are taller than the logical lines
+}
+
+// --- Page movement and caret visibility (wrap) -----------------------------
+
+TEST(viewcore_page_move_is_a_screen_under_wrap) {
+  // Every 5th line is very tall; a page must be a screen of rows, not a count
+  // of logical lines, and the caret must land inside the viewport.
+  std::string content;
+  for (int i = 0; i < 60; ++i) {
+    const int chars = (i % 5 == 0) ? 600 : 30;
+    content.append(static_cast<size_t>(chars), 'x');
+    content += "\n";
+  }
+  Doc d(content);
+  d.view->resize(80, 160);
+  d.view->set_wrap(true);
+  d.view->discover_all();
+
+  vc::KeyEvent k;
+  k.key = vc::Key::PageDown;
+  const int64_t first = d.view->first_visible_line();
+  const double px = d.view->scroll_px();
+  CHECK(d.view->key(k));
+  // Moved down by about a screen of rows, not by a screen of logical lines.
+  const double moved = (static_cast<double>(d.view->first_visible_line() -
+                                            first) *
+                           16.0 +
+                        d.view->scroll_px() - px);
+  CHECK(moved > 100.0);
+  CHECK(moved <= 161.0);
+  // The caret is on screen (the fix: it used to be placed on a line that had
+  // just been scrolled past, and ensure_caret_visible undid the page).
+  const vc::Rect cr = d.view->caret_rect(d.view->selection().caret_line,
+                                         d.view->selection().caret_col);
+  CHECK(cr.y >= 0.0);
+  CHECK(cr.y + cr.h <= d.view->viewport_height() + 0.01);
+
+  // And back up again.
+  k.key = vc::Key::PageUp;
+  CHECK(d.view->key(k));
+  const vc::Rect up = d.view->caret_rect(d.view->selection().caret_line,
+                                         d.view->selection().caret_col);
+  CHECK(up.y >= 0.0);
+  CHECK(up.y + up.h <= d.view->viewport_height() + 0.01);
+}
+
+TEST(viewcore_caret_stays_put_when_its_row_is_visible_under_wrap) {
+  // The caret's logical line starts above the viewport but the caret's own row
+  // is visible: scrolling it to the top would be wrong (the whole point of
+  // measuring the caret rect instead of counting logical lines).
+  std::string content;
+  for (int i = 0; i < 20; ++i) {
+    const int chars = (i % 3 == 0) ? 400 : 30;  // every 3rd line is tall
+    content.append(static_cast<size_t>(chars), 'x');
+    content += "\n";
+  }
+  Doc d(content);
+  d.view->resize(80, 160);
+  d.view->set_wrap(true);
+  d.view->discover_all();
+  // Scroll into the middle of the tall line 3.
+  d.view->scroll_to_line(3);
+  vc::MouseEvent w;
+  w.kind = vc::MouseEvent::Kind::Scroll;
+  w.dy = 500;
+  d.view->mouse(w);
+  // A row that is actually on screen, on a line that starts above the viewport.
+  const vc::Hit h =
+      d.view->hit_test(0, d.view->viewport_height() / 2);
+  CHECK(h.line == 3);
+  d.view->set_caret(h.line, h.col);
+  const int64_t first = d.view->first_visible_line();
+  const double px = d.view->scroll_px();
+
+  vc::KeyEvent k;
+  k.key = vc::Key::Right;  // moves the caret, which calls ensure_caret_visible
+  d.view->key(k);
+  CHECK_EQ(d.view->first_visible_line(), first);
+  CHECK_EQ(d.view->scroll_px(), px);
+}
+
 // --- Horizontal scrolling (wrap off) --------------------------------------
 
 TEST(viewcore_horizontal_bar_appears_for_a_long_line) {

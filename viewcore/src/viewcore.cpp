@@ -316,6 +316,7 @@ void ViewCore::invalidate_all() const {
   cache_.clear();
   lru_.clear();
   cache_bytes_ = 0;
+  wrap_total_valid_ = false;  // block heights changed: re-measure the total
 }
 
 double ViewCore::block_height(int64_t line) const {
@@ -355,19 +356,85 @@ void ViewCore::scroll_by(double dy) {
   clamp_scroll();
 }
 
-// The largest top line whose content still fills the viewport: scrolling stops
-// there, so no blank space appears below the last line and a document shorter
-// than the viewport always starts at line 0. Measured backwards from the end, so
-// it costs a viewport of blocks, not the whole document.
-int64_t ViewCore::max_first_line() const {
-  if (!eof_known_ || known_lines_ <= 0) return 0;
+// The furthest legal top position: walk back from the end accumulating block
+// heights until the viewport is full. Measured backwards so it costs a viewport
+// of blocks and not the document. In pixels, because under wrap a single line
+// can be several screens tall (and, without wrap, a document whose height is not
+// a whole multiple of the line height would otherwise leave the last few points
+// unreachable).
+ViewCore::ScrollPos ViewCore::max_top() const {
+  ScrollPos out;
+  if (!eof_known_ || known_lines_ <= 0) return out;
+  const double view = text_height();
   double h = 0;
-  int64_t first = known_lines_;
-  while (first > 0 && h < text_height()) {
-    --first;
-    h += block_height(first);
+  int64_t line = known_lines_;
+  while (line > 0 && h < view) {
+    --line;
+    h += block_height(line);
   }
-  return first;
+  out.line = line;
+  out.px = h - view;
+  if (out.px < 0) out.px = 0;
+  // The walk stops at the first block whose tail fills the viewport, so `px` is
+  // inside that block. Guard the boundary anyway (a zero-height block, say).
+  const double bh = block_height(line);
+  if (bh > 0 && out.px >= bh && line + 1 < known_lines_) {
+    out.line = line + 1;
+    out.px = 0;
+  }
+  return out;
+}
+
+double ViewCore::content_px() const {
+  const double lh = line_height();
+  if (!wrap_ || !eof_known_ || known_lines_ <= 0 || lh <= 0) {
+    return static_cast<double>(line_count()) * lh;  // one visual line each
+  }
+  if (wrap_total_valid_) return wrap_total_px_;
+  // Measure in visual lines, not logical ones: a single long line can wrap into
+  // hundreds of rows, and the cost here is one shaped row. Bounded so a resize
+  // on a large wrapped document stays a frame's work rather than seconds; the
+  // remainder is extrapolated from the average of what was measured.
+  double h = 0;
+  int64_t visual = 0;
+  int64_t line = 0;
+  for (; line < known_lines_ && visual < kMaxMeasuredVisualLines; ++line) {
+    const int64_t v = static_cast<int64_t>(entry_for(line).visual.size());
+    visual += v;
+    h += static_cast<double>(v) * lh;
+  }
+  if (line > 0 && line < known_lines_) {
+    h += h / static_cast<double>(line) * static_cast<double>(known_lines_ - line);
+  }
+  wrap_total_px_ = h;
+  wrap_total_valid_ = true;
+  return h;
+}
+
+double ViewCore::scroll_units(int64_t line, double px) const {
+  const double bh = block_height(line);
+  return static_cast<double>(line) + (bh > 0 ? px / bh : 0.0);
+}
+
+double ViewCore::content_height() const { return content_px(); }
+
+// Where the top sits through the scrollable range, 0..1, in *logical line*
+// units: `line` plus the fraction of that line's block already scrolled. The
+// ends are exact (0 at the document start, 1 at the last legal position), which
+// is what makes a drag stop precisely at either end. The middle is therefore
+// approximate when wrap heights vary from line to line — the thumb still tracks
+// the pointer exactly (see scroll_to_fraction), but a given thumb position maps
+// to the nearest logical line rather than a pixel-exact place.
+double ViewCore::scroll_fraction() const {
+  if (!eof_known_ || known_lines_ <= 0) return 0;
+  const ScrollPos end = max_top();
+  const double mx = scroll_units(end.line, end.px);
+  if (mx <= 0) return 0;
+  const double cur = scroll_units(first_line_, scroll_px_);
+  double f = cur / mx;
+  if (f < 0) f = 0;
+  if (f > 1) f = 1;
+  return f;
 }
 
 void ViewCore::clamp_scroll() {
@@ -378,21 +445,19 @@ void ViewCore::clamp_scroll() {
     return;
   }
   // Far from the end every line is at least `line_height` tall, so the remaining
-  // content is taller than the viewport: nothing to clamp.
+  // content is taller than the viewport: nothing to clamp. This keeps the
+  // backwards walk off the wheel path for a large document.
   const double lh = line_height();
   if (lh > 0 && static_cast<double>(known_lines_ - first_line_) * lh >
                     2.0 * text_height()) {
     return;
   }
-  const int64_t max_first = max_first_line();
-  if (first_line_ > max_first) {
-    first_line_ = max_first;
-    scroll_px_ = 0;
+  const ScrollPos end = max_top();
+  if (first_line_ > end.line ||
+      (first_line_ == end.line && scroll_px_ > end.px + 1e-9)) {
+    first_line_ = end.line;
+    scroll_px_ = end.px;
   }
-}
-
-double ViewCore::content_height() const {
-  return static_cast<double>(line_count()) * line_height();
 }
 
 int64_t ViewCore::col_at_x(const VisualLine& v, double x) const {
@@ -497,20 +562,25 @@ ViewCore::ScrollBar ViewCore::scrollbar() const {
   }
 
   if (known_lines_ <= 0) return sb;  // empty document
-  const int64_t vis = visible_logical_lines();
-  const int64_t max_first = max_first_line();
-  if (max_first <= 0) return sb;  // the whole document fits
+  const ScrollPos end = max_top();
+  if (end.line <= 0 && end.px <= 0.0) return sb;  // the whole document fits
 
   sb.visible = true;
-  sb.thumb_h = track_h * static_cast<double>(vis) /
-               static_cast<double>(known_lines_);
+  // Thumb size: the share of the content the viewport shows. Measured from the
+  // content height, so a wrapped document (or one very tall wrapped line) gets
+  // the short thumb it deserves rather than one sized in logical lines.
+  const double total = content_px();
+  if (total > 0) {
+    sb.thumb_h = track_h * (text_height() / total);
+  } else {
+    const int64_t vis = visible_logical_lines();
+    sb.thumb_h = track_h * static_cast<double>(vis) /
+                 static_cast<double>(std::max<int64_t>(1, known_lines_));
+  }
   if (sb.thumb_h < 28) sb.thumb_h = 28;
   if (sb.thumb_h > track_h) sb.thumb_h = track_h;
   const double travel = track_h - sb.thumb_h;
-  double f = static_cast<double>(first_line_) / static_cast<double>(max_first);
-  if (f < 0) f = 0;
-  if (f > 1) f = 1;
-  sb.thumb_y = f * travel;
+  sb.thumb_y = scroll_fraction() * travel;
   return sb;
 }
 
@@ -518,8 +588,28 @@ void ViewCore::scroll_to_fraction(double f) {
   if (f < 0) f = 0;
   if (f > 1) f = 1;
   if (eof_known_) {
-    scroll_to_line(static_cast<int64_t>(
-        std::llround(f * static_cast<double>(max_first_line()))));
+    // Place the top of the viewport at `f` through the scrollable range, in the
+    // same units scroll_fraction() measures, so the thumb follows the pointer
+    // and can stop part-way through a wrapped line.
+    const ScrollPos end = max_top();
+    const double mx = scroll_units(end.line, end.px);
+    double target = f * mx;
+    int64_t line = static_cast<int64_t>(std::floor(target));
+    if (line > end.line) {
+      line = end.line;
+      target = mx;
+    }
+    if (line < 0) {
+      line = 0;
+      target = 0;
+    }
+    double px = (target - static_cast<double>(line)) * block_height(line);
+    if (line == end.line && px > end.px) px = end.px;
+    if (px < 0) px = 0;
+    pending_line_ = -1;
+    first_line_ = line;
+    scroll_px_ = px;
+    clamp_scroll();
     return;
   }
   // The line count is unknown: estimate it from the bytes-per-line of the
@@ -636,6 +726,14 @@ void ViewCore::apply_tabs(Run& run) const {
 }
 
 Hit ViewCore::hit_test(double x, double y) const {
+  size_t vi = 0;
+  return hit_test_row(x, y, &vi);
+}
+
+// `vi` (may be null) receives the index of the visual row within its logical
+// line, so a caller can place a caret on the row under the pointer rather than
+// at the start of a logical line that is only partly on screen.
+Hit ViewCore::hit_test_row(double x, double y, size_t* vi) const {
   update_gutter();
   if (x < text_left()) x = text_left();  // a click in the gutter is column 0
   x -= text_left() - x_offset_;          // undo the horizontal pan
@@ -645,11 +743,15 @@ Hit ViewCore::hit_test(double x, double y) const {
   for (int64_t line = first_line_;; ++line) {
     if (!line_exists(line)) break;
     const LineEntry& e = entry_for(line);
-    for (const VisualLine& v : e.visual) {
-      if (y < top + lh) return Hit{line, col_at_x(v, x)};
+    for (size_t i = 0; i < e.visual.size(); ++i) {
+      if (y < top + lh) {
+        if (vi != nullptr) *vi = i;
+        return Hit{line, col_at_x(e.visual[i], x)};
+      }
       top += lh;
     }
   }
+  if (vi != nullptr) *vi = 0;
   return Hit{known_lines_ > 0 ? known_lines_ - 1 : 0, 0};
 }
 
@@ -964,15 +1066,31 @@ void ViewCore::move_word(int dir, bool extend) {
 }
 
 void ViewCore::page_move(int dir, bool extend) {
-  const int64_t lines =
-      std::max<int64_t>(1, static_cast<int64_t>(text_height() / line_height()));
-  scroll_lines(dir * lines);
-  int64_t line = first_line_;
-  if (!line_exists(line)) line = known_lines_ > 0 ? known_lines_ - 1 : 0;
-  const LineEntry& e = entry_for(line);
-  sel_.caret_col = col_at_x(e.visual.front(), goal_x_);
+  // A page is a screenful of rows, not logical lines: under wrap one logical
+  // line can be several screens tall, so counting lines would move far less
+  // (or much more) than a page.
+  scroll_by(dir * text_height());
+  // The caret goes to the row at the leading edge of the new viewport — the top
+  // row after a page down, the bottom row after a page up. Placing it at the
+  // start of the first logical line would leave it scrolled above (or below) the
+  // viewport, and ensure_caret_visible would scroll straight back.
+  const double y = dir > 0 ? 1.0 : text_height() - 1.0;
+  if (!v_moving_) {
+    // Keep the horizontal position vertical motion would keep.
+    const LineEntry& cur = entry_for(sel_.caret_line);
+    size_t vi = 0;
+    double x = 0;
+    caret_within(cur, sel_.caret_col, &vi, &x);
+    goal_x_ = x;
+  }
+  size_t vi = 0;
+  const Hit h = hit_test_row(text_left(), y, &vi);
+  const LineEntry& e = entry_for(h.line);
+  const size_t row = vi < e.visual.size() ? vi : 0;
+  sel_.caret_line = h.line;
+  sel_.caret_col = static_cast<int64_t>(col_at_x(e.visual[row], goal_x_));
   v_moving_ = true;
-  set_caret_extend(line, sel_.caret_col, extend);
+  set_caret_extend(sel_.caret_line, sel_.caret_col, extend);
 }
 
 void ViewCore::ensure_caret_visible() {
@@ -980,9 +1098,15 @@ void ViewCore::ensure_caret_visible() {
   if (line < first_line_) {
     scroll_to_line(line);
   } else {
-    const int64_t vis =
-        std::max<int64_t>(1, static_cast<int64_t>(text_height() / line_height()));
-    if (line >= first_line_ + vis) scroll_to_line(line - vis + 1);
+    // Use the caret's own rectangle: it is wrap-aware, so a caret on a logical
+    // line whose block is several screens tall is only scrolled when the caret
+    // itself is off screen, not when its line's first row is.
+    const Rect cr = caret_rect(line, sel_.caret_col);
+    if (cr.y < 0) {
+      scroll_by(cr.y);
+    } else if (cr.y + cr.h > text_height()) {
+      scroll_by(cr.y + cr.h - text_height());
+    }
   }
   // Keep the caret inside the text area horizontally (wrap off), clear of the
   // overlay scrollbar down the right edge.
@@ -1119,10 +1243,16 @@ bool ViewCore::mouse(const MouseEvent& e) {
             // Command-click jumps so the thumb centres on the pointer.
             scroll_to_fraction((e.y - sb.thumb_h / 2) / travel);
           } else {
-            // A plain track click pages toward the click.
-            const int64_t page =
-                std::max<int64_t>(1, visible_logical_lines() - 1);
-            scroll_lines(e.y < sb.thumb_y ? -page : page);
+            // A plain track click pages toward the click. Page in visual lines,
+            // not logical ones: with wrap on, a logical line can be several
+            // screens tall, so counting logical lines would jump far past a
+            // page. A whole number of line heights keeps wrap-off paging
+            // line-aligned, as before.
+            const double lh = line_height();
+            const int64_t page = std::max<int64_t>(
+                1, static_cast<int64_t>(text_height() / (lh > 0 ? lh : 1)) - 1);
+            const double dy = static_cast<double>(page) * lh;
+            scroll_by(e.y < sb.thumb_y ? -dy : dy);
           }
         }
         break;

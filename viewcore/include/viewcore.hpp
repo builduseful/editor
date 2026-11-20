@@ -182,6 +182,8 @@ class ViewCore {
   void scroll_x_to_fraction(double f);
 
   Hit hit_test(double x, double y) const;
+  // As hit_test, but also reports which visual row of its logical line was hit.
+  Hit hit_test_row(double x, double y, size_t* vi) const;
   Rect caret_rect(int64_t line, int64_t col) const;
 
   Selection selection() const { return sel_; }
@@ -270,8 +272,31 @@ class ViewCore {
   void draw_hscrollbar(Canvas& c) const;
   // Logical lines needed to fill the viewport from `first_line_` (wrap-aware).
   int64_t visible_logical_lines() const;
-  // Scroll limits: the largest top line that still fills the viewport.
-  int64_t max_first_line() const;
+  // A scroll position: the top of the viewport sits `px` into the block of
+  // logical `line`. Under wrap a block is several visual lines tall, so this
+  // cannot be a bare line index.
+  struct ScrollPos {
+    int64_t line = 0;
+    double px = 0;
+  };
+  // The furthest legal top position: the viewport filled from the end of the
+  // document. Costs a viewport of blocks, not the document (the same backwards
+  // walk the old line-based clamp used), which is why it is affordable per frame.
+  ScrollPos max_top() const;
+  // Total content height in pixels. Exact without wrap (one line each); with
+  // wrap it measures up to `kMaxMeasuredVisualLines` visual lines and
+  // extrapolates the rest, so a huge wrapped document is not fully shaped just
+  // to draw a thumb. Cached until the layout is invalidated.
+  double content_px() const;
+  static constexpr int64_t kMaxMeasuredVisualLines = 1000;
+  // Where the view's top is through the scrollable range, 0..1. Measured in
+  // logical lines plus the fraction of the top line already scrolled, so the
+  // ends are exact (0 at the document start, 1 at the last legal position) and
+  // a tall wrapped line maps across its whole height.
+  double scroll_fraction() const;
+  // `line` plus how far `px` is through that line's block (in logical-line
+  // units; the ends are what make the fraction exact).
+  double scroll_units(int64_t line, double px) const;
   void clamp_scroll();
   // Horizontal limits: the widest measured line, and the largest pan that still
   // leaves text in view.
@@ -338,6 +363,8 @@ class ViewCore {
   int64_t drag_anchor_line_ = 0;  // the line a triple click started on
   mutable int64_t known_lines_ = 0;  // lines discovered so far (lazy)
   mutable bool eof_known_ = false;   // the whole document has been indexed
+  mutable double wrap_total_px_ = 0;  // content_px() cache (wrap on)
+  mutable bool wrap_total_valid_ = false;
   std::vector<Decoration> decorations_;
   Color background_color_{255, 255, 255, 255};  // color.surface
   Color text_color_{23, 26, 31, 255};           // color.text (ink)
