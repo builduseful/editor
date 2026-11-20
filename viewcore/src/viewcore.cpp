@@ -487,7 +487,7 @@ double ViewCore::x_of_col(const VisualLine& v, int64_t col) const {
 void ViewCore::update_gutter() const {
   double w = 0;
   if (gutter_) {
-    int64_t n = known_lines_ > 0 ? known_lines_ : 1;
+    int64_t n = gutter_line_estimate();
     int digits = 1;
     while (n >= 10) {
       n /= 10;
@@ -499,6 +499,20 @@ void ViewCore::update_gutter() const {
     gutter_width_ = w;
     if (wrap_) invalidate_all();
   }
+}
+
+// The line count the gutter is sized for. It must not track the *discovered*
+// count: that grows while the index drips, so the gutter would widen as you
+// scroll and slide every line of text sideways. Before the count is known,
+// estimate it from the byte count — a line is at least one byte, so the byte
+// count is a stable upper bound available at open — and settle on the exact
+// count once the index completes. That is one adjustment at most, not one per
+// discovery step, and it never moves the text while the user is scrolling.
+int64_t ViewCore::gutter_line_estimate() const {
+  if (eof_known_) return known_lines_ > 0 ? known_lines_ : 1;
+  const uint64_t bytes = ed_->rev().size;
+  if (bytes == 0) return 1;
+  return static_cast<int64_t>(bytes);
 }
 
 void ViewCore::draw_scrollbar(Canvas& c) const {

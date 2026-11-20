@@ -1189,6 +1189,11 @@ personal data, or proprietary files.
   lets a wrapped document scroll past its end). The thumb tracks the pointer
   exactly; `max_top` walks back only a viewport of blocks, so the clamp stays
   off the wheel path.
+- **The gutter is sized once, not continuously.** Its width comes from the digit
+  count of the line total, so it must not track the *discovered* count — that
+  grows while the index drips and would slide every line sideways mid-scroll.
+  Before the index completes it uses a stable upper bound (the byte count); the
+  exact count settles it once, at EOF. See `gutter_line_estimate()`.
 - Invalidate at/after the first changed line; on a line-count-changing edit, clear
   from the first changed line onward (rekeyed). Invalidate all on width/font change.
 - Do not enumerate fonts at launch; resolve one font and enumerate lazily when

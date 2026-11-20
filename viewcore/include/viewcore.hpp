@@ -264,6 +264,9 @@ class ViewCore {
   // Recomputes the gutter width from the known line count (and re-wraps if the
   // width changed with wrap on).
   void update_gutter() const;
+  // The line count the gutter is sized for: exact once the index is complete,
+  // otherwise a stable upper bound from the byte count (see the .cpp).
+  int64_t gutter_line_estimate() const;
   // A quiet overlay scrollbar on the right edge (approximate, from byte
   // progress, until the line count is known).
   void draw_scrollbar(Canvas& c) const;

@@ -987,6 +987,50 @@ TEST(viewcore_gutter_draws_line_numbers_and_offsets_text) {
   CHECK(text_offset);
 }
 
+// --- Gutter width stability -------------------------------------------------
+
+TEST(viewcore_gutter_does_not_shift_text_while_the_index_drips) {
+  // The gutter must not be sized from the *discovered* line count: that grows
+  // as the index drips, so the text would slide right while the user scrolls.
+  std::string content;
+  for (int i = 0; i < 1200; ++i) content += "short line\n";
+  Doc d(content);
+  d.view->resize(800, 500);
+  d.view->set_gutter(true);
+
+  const double at_open = d.view->gutter_width();
+  for (int i = 0; i < 8; ++i) {
+    d.view->discover_step(200);
+    // Width may settle once, but it must never move while lines are still
+    // being discovered.
+    if (d.view->line_count_known()) break;
+    CHECK_EQ(d.view->gutter_width(), at_open);
+  }
+  // And the text did not move: a fixed line keeps its x once the width settled.
+  d.view->discover_all();
+  CHECK_EQ(d.view->caret_rect(0, 0).x, d.view->gutter_width());
+}
+
+TEST(viewcore_gutter_uses_a_stable_estimate_before_the_count_is_known) {
+  // A 1200-line file has 4 digits; before the index completes the gutter is
+  // sized from the byte count (an upper bound on the line count), so it is wide
+  // enough from the first frame and only settles once at EOF.
+  std::string content;
+  for (int i = 0; i < 1200; ++i) content += "short line\n";
+  Doc d(content);
+  d.view->resize(800, 500);
+  d.view->set_gutter(true);
+  CHECK(!d.view->line_count_known());
+  const double before = d.view->gutter_width();
+
+  d.view->discover_all();
+  const double after = d.view->gutter_width();
+  // Never narrower than the settled width: the estimate is an upper bound.
+  CHECK(before >= after);
+  // And the settled width fits 1200: 4 digits.
+  CHECK(after > 3 * 8.0);
+}
+
 TEST(viewcore_gutter_hit_test_offsets_x) {
   Doc d("hello\n");
   d.view->resize(800, 1000);
