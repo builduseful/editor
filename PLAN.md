@@ -1228,6 +1228,10 @@ one-file-at-a-time), but the shape is fixed now so the work is not redone:
 - **Testable like `viewcore`:** the directory reads behind an injectable seam
   (POSIX `opendir`/`readdir` in the app layer, a fake in tests), so the tree and
   its layout are covered headlessly rather than only by looking at the window.
+- **Width is the user's.** The column is 220 pt by default and resizable from
+  160 to 480 pt by dragging its right edge (the hairline is the affordance, the
+  cursor the hint); the width persists across launches, and the window has a
+  minimum content size so a wide sidebar cannot squeeze the document away.
 
 ## 10. Testing, CI, build
 

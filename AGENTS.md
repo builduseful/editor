@@ -74,6 +74,12 @@ own tokens rather than inventing a value.
 - **The sidebar never discards edits silently.** Clicking a file goes through
   `confirmDiscardChanges`, exactly as File → Open does (§9 "read-only
   navigation"). Directories toggle; symlinks are leaves and are never followed.
+- **The sidebar's width belongs to the user.** It is resizable by dragging its
+  right edge, clamped in one place (`Sidebar::set_width`, 160–480 pt), and
+  persisted under `SidebarWidth`. The view holds the AppKit width constraint and
+  writes the model's clamped width back into it, so the drawn column and the
+  constraint can never disagree; the window has a content minimum so a wide
+  column cannot push the document out.
 
 ## Engineering
 

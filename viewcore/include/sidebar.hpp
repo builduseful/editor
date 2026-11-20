@@ -123,14 +123,18 @@ class Sidebar {
   bool reveal(std::string_view path);
 
   // --- Layout ---------------------------------------------------------------
-  // Fixed-width sidebar (chrome). Row height follows the UI font.
+  // A fixed-width column (chrome), but the width is the user's: drag its right
+  // edge. The bounds keep a name at least partly readable and stop it eating
+  // the window.
   static constexpr double kDefaultWidth = 220.0;
+  static constexpr double kMinWidth = 160.0;
+  static constexpr double kMaxWidth = 480.0;
   static constexpr double kRowHeight = 22.0;
   static constexpr double kIndent = 14.0;  // one level per depth
   static constexpr double kPadLeft = 8.0;
   static constexpr double kPadRight = 8.0;
 
-  void set_width(double w) { width_ = w > 80.0 ? w : 80.0; }
+  void set_width(double w);
   double width() const { return width_; }
   // The sidebar scrolls when a folder holds more rows than fit. The offset is
   // in points from the top row, clamped to the content.

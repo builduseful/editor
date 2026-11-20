@@ -148,6 +148,8 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 @interface SidebarView : NSView
 // The document view to open a clicked file through (not retained).
 @property(nonatomic, assign) EditorView* editorView;
+// The width constraint the window set up, so a resize drag can change it.
+@property(nonatomic, strong) NSLayoutConstraint* widthConstraint;
 - (void)applyTheme:(vc::Theme)t;
 - (void)setRootPath:(NSString*)path;
 - (NSString*)rootPath;
@@ -242,6 +244,9 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   std::unique_ptr<vc::Sidebar> _sidebar;
   vc::Theme _theme;
   BOOL _hasRoot;
+  BOOL _resizing;        // dragging the right edge
+  double _resizeStartX;  // pointer x when the drag began
+  double _resizeStartW;  // width when the drag began
 }
 
 - (instancetype)initWithFrame:(NSRect)frame {
@@ -313,9 +318,54 @@ static BOOL write_view_png(NSView* v, NSString* path) {
   (void)dirtyRect;
   const NSSize size = self.bounds.size;
   _sidebar->set_height(size.height);
+  _sidebar->set_width(size.width);  // the frame follows the user's width
   CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
   auto canvas = ed::mac::create_cg_canvas(ctx, size.width, size.height);
   _sidebar->draw(*canvas, _theme);
+}
+
+// --- Resizing ---------------------------------------------------------------
+// A grab strip down the right edge. There is no drawn handle: the column's
+// hairline is the affordance and the resize cursor is the hint (the design
+// system has no decorative furniture).
+static constexpr double kSidebarGrip = 6.0;
+
+- (BOOL)inGrip:(NSPoint)p {
+  return p.x >= self.bounds.size.width - kSidebarGrip && p.y >= 0 &&
+         p.y <= self.bounds.size.height;
+}
+
+- (void)resetCursorRects {
+  [super resetCursorRects];
+  [self addCursorRect:NSMakeRect(self.bounds.size.width - kSidebarGrip, 0,
+                                 kSidebarGrip, self.bounds.size.height)
+               cursor:[NSCursor resizeLeftRightCursor]];
+}
+
+- (void)mouseDragged:(NSEvent*)event {
+  if (!_resizing) {
+    [super mouseDragged:event];
+    return;
+  }
+  const NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  _sidebar->set_width(_resizeStartW + (p.x - _resizeStartX));
+  // set_width clamps, so read back the width the column can actually have.
+  const double w = _sidebar->width();
+  if (self.widthConstraint != nil) {
+    self.widthConstraint.constant = w;
+    [self.superview layoutSubtreeIfNeeded];
+  }
+  [self setNeedsDisplay:YES];
+}
+
+- (void)mouseUp:(NSEvent*)event {
+  if (!_resizing) {
+    [super mouseUp:event];
+    return;
+  }
+  _resizing = NO;
+  [[NSUserDefaults standardUserDefaults] setDouble:_sidebar->width()
+                                             forKey:@"SidebarWidth"];
 }
 
 // Returns true if the tree changed (a redraw is needed).
@@ -361,6 +411,13 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)mouseDown:(NSEvent*)event {
   [self.window makeFirstResponder:self];  // the arrow keys follow the click
   const NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  // The right edge is the resize grip, not a row.
+  if ([self inGrip:p]) {
+    _resizing = YES;
+    _resizeStartX = p.x;
+    _resizeStartW = self.bounds.size.width;
+    return;
+  }
   const double y = self.bounds.size.height - p.y;  // AppKit y-up -> viewcore y-down
   const int row = _sidebar->row_at(p.x, y);
   if (row < 0) return;
@@ -1550,6 +1607,10 @@ int main(int argc, char** argv) {
                       ? @"Untitled"
                       : [[NSString stringWithUTF8String:path.c_str()]
                             lastPathComponent]];
+    // A floor under the window, so a wide sidebar (up to kMaxWidth) can never
+    // squeeze the document column down to nothing. There is no minimum on the
+    // height beyond the system's own.
+    [win setContentMinSize:NSMakeSize(480.0, 320.0)];
 
     EditorView* view = [[EditorView alloc] initWithEditor:ed.get()];
     if (opened && !path.empty()) {
@@ -1606,7 +1667,8 @@ int main(int argc, char** argv) {
                      forOrientation:NSLayoutConstraintOrientationVertical];
 
     // Sidebar | editor column, in one row. The sidebar is a fixed-width column
-    // with a hairline; the editor takes the rest.
+    // with a hairline; the editor takes the rest. The width is the user's (drag
+    // its right edge) and is remembered between launches.
     NSStackView* root = [NSStackView stackViewWithViews:@[ sidebar, stack ]];
     root.orientation = NSUserInterfaceLayoutOrientationHorizontal;
     root.distribution = NSStackViewDistributionFill;
@@ -1614,8 +1676,14 @@ int main(int argc, char** argv) {
     root.translatesAutoresizingMaskIntoConstraints = NO;
     [sidebar setContentHuggingPriority:NSLayoutPriorityRequired
                      forOrientation:NSLayoutConstraintOrientationHorizontal];
-    [sidebar.widthAnchor constraintEqualToConstant:vc::Sidebar::kDefaultWidth]
-        .active = YES;
+    const double savedWidth =
+        [[NSUserDefaults standardUserDefaults] objectForKey:@"SidebarWidth"] ==
+                nil
+            ? vc::Sidebar::kDefaultWidth
+            : [[NSUserDefaults standardUserDefaults] doubleForKey:@"SidebarWidth"];
+    sidebar.widthConstraint =
+        [sidebar.widthAnchor constraintEqualToConstant:savedWidth];
+    sidebar.widthConstraint.active = YES;
 
     [win setContentView:root];
     [win makeFirstResponder:view];

@@ -766,4 +766,48 @@ TEST(sidebar_keyboard_navigation_scrolls_the_selection_into_view) {
   CHECK(top + vc::Sidebar::kRowHeight <= side.scroll_y() + side.height() + 0.01);
 }
 
+// --- Width (drag-resize) ----------------------------------------------------
+
+TEST(sidebar_width_clamps_to_the_usable_range) {
+  Fixture f;
+  f.side->set_width(1000.0);
+  CHECK_EQ(f.side->width(), vc::Sidebar::kMaxWidth);
+  f.side->set_width(10.0);
+  CHECK_EQ(f.side->width(), vc::Sidebar::kMinWidth);
+  // Inside the range it is kept exactly.
+  f.side->set_width(333.0);
+  CHECK_EQ(f.side->width(), 333.0);
+}
+
+TEST(sidebar_width_is_reflected_in_the_drawing) {
+  // The ground and the hairline follow the width: a resized column must not
+  // keep drawing at the old width.
+  Fixture f;
+  f.side->set_root("/src");
+  f.side->set_height(200.0);
+  f.side->set_width(300.0);
+  vc::RecordingCanvas rc;
+  f.side->draw(rc, vc::light_theme());
+  bool ground = false, hairline = false;
+  for (const vc::DrawCmd& d : rc.cmds) {
+    if (d.kind != vc::DrawCmd::Kind::FillRect) continue;
+    if (std::abs(d.rect.w - 300.0) < 0.01 && d.rect.x == 0.0) ground = true;
+    if (d.rect.w <= 1.0 && d.rect.x >= 298.0) hairline = true;
+  }
+  CHECK(ground);
+  CHECK(hairline);
+}
+
+TEST(sidebar_width_does_not_move_the_selection_or_the_scroll) {
+  // Resizing is a layout change: the tree state has to survive it.
+  Fixture f;
+  f.side->set_root("/src");
+  f.side->reveal("/src/beta/deeper/deep.txt");
+  const std::string sel = f.side->selected_path();
+  const double scroll = f.side->scroll_y();
+  f.side->set_width(400.0);
+  CHECK(f.side->selected_path() == sel);
+  CHECK_EQ(f.side->scroll_y(), scroll);
+}
+
 }  // namespace

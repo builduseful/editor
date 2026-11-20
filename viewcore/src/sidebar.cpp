@@ -383,6 +383,14 @@ int Sidebar::row_at(double x, double y) const {
   return idx;
 }
 
+void Sidebar::set_width(double w) {
+  // Clamp rather than clamp-and-ignore: the caller (a resize drag) wants the
+  // width it can actually have, so it reads it back.
+  if (w < kMinWidth) w = kMinWidth;
+  if (w > kMaxWidth) w = kMaxWidth;
+  width_ = w;
+}
+
 void Sidebar::draw(Canvas& c, const Theme& t) const {
   const double w = width_;
   const double h = height_;
