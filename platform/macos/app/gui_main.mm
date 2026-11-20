@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "canvas_cg.hpp"
@@ -759,12 +760,39 @@ static constexpr double kSidebarGrip = 6.0;
 // shows an alert if the core refuses it.
 - (BOOL)openPath:(NSString*)path {
   if (path == nil) return NO;
-  if (_ed->open(path.UTF8String) != Status::Ok) {
-    [self showError:@"Could not open the file."];
+  // Resolve a symlink before opening: the core deliberately refuses to follow
+  // one (§6.4, nofollow), so a file reached through a symlink — which is how a
+  // Finder "Open With" or a shell glob often names it — would otherwise fail
+  // for no reason the user can see. The *save* path still refuses symlinks, so
+  // this does not weaken that: it only decides which real file to read.
+  NSString* resolved = [path stringByResolvingSymlinksInPath];
+  if (resolved.length == 0) resolved = path;
+  // Opening through a link records the real path: the title, the sidebar reveal
+  // and a later Save As should all name the file being edited.
+  const Status s = _ed->open(resolved.UTF8String);
+  if (s != Status::Ok) {
+    // Name the reason: a bare "Could not open" is impossible to act on or to
+    // diagnose after the fact. errmsg() is the core's detail ("cannot open",
+    // "NUL byte in first 8 KB", "UTF-16 BOM", …).
+    const std::string_view detail = _ed->errmsg();
+    NSString* why = detail.empty()
+                        ? @""
+                        : [NSString stringWithUTF8String:detail.data()];
+    // A directory is a likely mistake (dragging a folder onto the app), and
+    // "not a regular file" is the core's way of saying it.
+    if ([why isEqualToString:@"not a regular file"]) {
+      why = @"It is a folder, not a file.";
+    }
+    std::fprintf(stderr, "editor: cannot open %s (status %d): %.*s\n",
+                 path.UTF8String, static_cast<int>(s),
+                 static_cast<int>(detail.size()), detail.data());
+    [self showError:[NSString stringWithFormat:@"Could not open the file.%@%@",
+                                              why.length > 0 ? @"\n\n" : @"",
+                                              why]];
     return NO;
   }
   [self discardUntitledTemp];  // the core moved off the untitled buffer
-  self.documentPath = path;
+  self.documentPath = resolved;  // the real path, not the link used to reach it
   _maybeDirty = NO;
   [self reloadDocument];
   [self syncSidebarToDocument];
@@ -1313,6 +1341,8 @@ static constexpr double kSidebarGrip = 6.0;
 @property(nonatomic, assign) EditorView* view;
 @property(nonatomic, strong) NSWindow* aboutWindow;
 @property(nonatomic, copy) NSString* snapshotPath;
+// Capture before the index completes (`--snapshot-early`), not after.
+@property(nonatomic, assign) BOOL snapshotEarly;
 @property(nonatomic, assign) int64_t snapshotScrollLine;
 @property(nonatomic, assign) double snapshotScrollX;
 // Test hook: "DY,DX" wheel notches (line units) fed through the app's own
@@ -1354,7 +1384,12 @@ static constexpr double kSidebarGrip = 6.0;
 
 - (void)runSnapshot:(NSTimer*)timer {
   (void)timer;
-  [self.view finishIndex];  // a steady frame: exact scrollbars, caret on
+  // `--snapshot-early` captures the frame *before* the index completes, which
+  // is the mid-discovery state a user actually sees. Used to check that
+  // startup chrome (the gutter) does not move while the count grows; without it
+  // every snapshot is post-discovery and would hide that.
+  const BOOL early = self.snapshotEarly;
+  if (!early) [self.view finishIndex];  // a steady frame: exact scrollbars, caret on
   if (self.snapshotScrollLine > 0) {
     [self.view scrollToLine:self.snapshotScrollLine];
   }
@@ -1452,7 +1487,20 @@ static constexpr double kSidebarGrip = 6.0;
 - (BOOL)application:(NSApplication*)sender openFile:(NSString*)filename {
   if (self.editor == nullptr || filename == nil) return NO;
   if (![self.view confirmDiscardChanges]) return NO;
-  if (![self.view openPath:filename]) return NO;
+  // Finder hands a folder here too, when the user drops one on the app (or
+  // uses "Open With" on it). A folder is not a document: root the sidebar at
+  // it, exactly as File > Open Folder… does, and keep the open document.
+  NSString* resolved = [filename stringByResolvingSymlinksInPath];
+  if (resolved.length == 0) resolved = filename;
+  BOOL is_dir = NO;
+  if ([[NSFileManager defaultManager] fileExistsAtPath:resolved
+                                           isDirectory:&is_dir] &&
+      is_dir) {
+    [self.view pinSidebarRoot:resolved];
+    [sender activateIgnoringOtherApps:YES];
+    return YES;
+  }
+  if (![self.view openPath:resolved]) return NO;
   [sender activateIgnoringOtherApps:YES];
   return YES;
 }
@@ -1614,6 +1662,7 @@ static std::string arg_value(int argc, char** argv, const char* name) {
 int main(int argc, char** argv) {
   @autoreleasepool {
     std::string path, snapshot, wheel_notches;
+    bool early_snapshot = false;
     int64_t scroll_line = 0;
     double scroll_x = 0;
     double win_w = 900, win_h = 700;
@@ -1633,6 +1682,8 @@ int main(int argc, char** argv) {
         wheel_notches = argv[++i];
       } else if (a == "--sidebar-root" && i + 1 < argc) {
         ++i;  // consumed above via arg_value(); do not treat it as the document
+      } else if (a == "--snapshot-early") {
+        early_snapshot = true;  // capture mid-discovery (see runSnapshot:)
       } else if (a == "--size" && i + 1 < argc) {
         // WIDTHxHEIGHT in points, e.g. 480x320 (the smoke test's small window).
         const std::string s = argv[++i];
@@ -1654,12 +1705,21 @@ int main(int argc, char** argv) {
     create_editor(*fs, &ed);
     bool opened = false;
     if (!path.empty()) {
-      const Status s = ed->open(path);
-      if (s != Status::Ok) {
-        std::fprintf(stderr, "editor: cannot open %s (status %d)\n", path.c_str(),
-                     static_cast<int>(s));
+      // A folder on the command line (a dropped folder, `open -a editor DIR`)
+      // is a sidebar root, not a document. Say so instead of reporting a
+      // failed open.
+      struct stat st;
+      if (::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+        std::fprintf(stderr, "editor: %s is a folder; rooting the sidebar\n",
+                     path.c_str());
       } else {
-        opened = true;
+        const Status s = ed->open(path);
+        if (s != Status::Ok) {
+          std::fprintf(stderr, "editor: cannot open %s (status %d)\n",
+                       path.c_str(), static_cast<int>(s));
+        } else {
+          opened = true;
+        }
       }
     }
     // A Finder / "Open With" launch starts with no argv file and delivers the
@@ -1733,10 +1793,15 @@ int main(int argc, char** argv) {
             : [[NSUserDefaults standardUserDefaults] boolForKey:@"ShowSidebar"];
     sidebar.hidden = !wantSidebar;
     view.sidebar = sidebar;  // so the theme reaches it
-    // `--sidebar-root DIR` roots the column at a chosen folder, exactly as
-    // File > Open Folder… does, so the folder-rooted tree is inspectable
-    // headlessly (tests and snapshots) rather than only by driving the UI.
-    const std::string sidebar_root = arg_value(argc, argv, "--sidebar-root");
+    // A folder given on the command line roots the column, the same as
+    // File > Open Folder… (`--sidebar-root` is the explicit form of this).
+    std::string sidebar_root = arg_value(argc, argv, "--sidebar-root");
+    if (sidebar_root.empty() && !path.empty()) {
+      struct stat st;
+      if (::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
+        sidebar_root = path;
+      }
+    }
     if (!sidebar_root.empty()) {
       [view pinSidebarRoot:[NSString stringWithUTF8String:sidebar_root.c_str()]];
     }
@@ -1799,6 +1864,7 @@ int main(int argc, char** argv) {
     }
     if (!snapshot.empty()) {
       delegate.snapshotPath = [NSString stringWithUTF8String:snapshot.c_str()];
+      delegate.snapshotEarly = early_snapshot;
     }
     [app setDelegate:delegate];
     win.delegate = delegate;  // for the unsaved-changes prompt on close

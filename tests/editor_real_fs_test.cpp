@@ -851,6 +851,37 @@ TEST(editor_save_as_existing_requires_matching_rev) {
   CHECK_EQ(read_file(a), std::string("abc\n"));
 }
 
+TEST(editor_open_reports_a_symlink_loop_as_a_conflict) {
+  // ELOOP means the path never resolves; that is a conflict with the request,
+  // not a plain I/O failure, and the GUI shows it as such.
+  Fixture fx(make_temp_dir());
+  const std::string a = fx.path("a.txt");
+  const std::string b = fx.path("b.txt");
+  std::error_code ec;
+  std::filesystem::create_symlink(b, a, ec);
+  std::filesystem::create_symlink(a, b, ec);
+  CHECK(fx.ed->open(a) == Status::Conflict);
+}
+
+TEST(editor_open_refuses_a_directory) {
+  Fixture fx(make_temp_dir());
+  CHECK(fx.ed->open(make_temp_dir()) != Status::Ok);
+}
+
+TEST(editor_open_refuses_a_symlink_to_a_file) {
+  // The editor opens with nofollow, so a symlink to a perfectly good file is
+  // refused. That is deliberate (§6.4: never follow a symlink), but it means a
+  // symlink handed over by Finder fails, and the caller has to say why.
+  Fixture fx(make_temp_dir());
+  const std::string target = fx.path("real.txt");
+  const std::string link = fx.path("link.txt");
+  write_file(target, "hello\n");
+  std::error_code ec;
+  std::filesystem::create_symlink(target, link, ec);
+  CHECK(fx.ed->open(link) != Status::Ok);
+  CHECK(fx.ed->open(target) == Status::Ok);
+}
+
 TEST(editor_save_as_refuses_symlink_and_bad_new_rev) {
   Fixture fx(make_temp_dir());
   const std::string a = fx.path("src.txt");

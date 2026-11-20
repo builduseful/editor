@@ -27,11 +27,13 @@ Status errno_status(int e) {
     case 0: return Status::Ok;
     case ENOENT: return Status::NotFound;
     case EEXIST: return Status::Conflict;
+    // A symlink loop is the filesystem saying "this path never resolves", which
+    // is a conflict with the request, not a plain I/O failure.
+    case ELOOP: return Status::Conflict;
     case EACCES:
     case EPERM:
     case EISDIR:
-    case ENOTDIR:
-    case ELOOP: return Status::Io;
+    case ENOTDIR: return Status::Io;
     case ENOTSUP: return Status::Unsupported;
     case ENOSPC: return Status::Oom;
     default: return Status::Io;
