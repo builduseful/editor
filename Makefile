@@ -121,14 +121,32 @@ $(BUILD)/editor_gui: $(APP_OBJ) $(PLATFORM_OBJ) $(PLATFORM_GUI_OBJ) $(BUILD)/lib
 APP_BUNDLE := $(BUILD)/editor.app
 APP_EXEC := $(APP_BUNDLE)/Contents/MacOS/editor
 
-$(APP_EXEC): $(BUILD)/editor_gui platform/macos/app/Info.plist
+# The app icon. Rendered at build time from the brand's construction (see
+# tools/make_icns.mm) and packed into an .icns; nothing runs it in the app.
+ICON_SRC := tools/make_icns.mm
+ICON_GEN := $(BUILD)/make_icns
+ICON_SET := $(BUILD)/editor.iconset
+ICON_ICNS := $(APP_BUNDLE)/Contents/Resources/editor.icns
+
+$(ICON_GEN): $(ICON_SRC)
+	@mkdir -p $(@D)
+	$(CXX) $(CXXFLAGS) -o $@ $< $(FRAMEWORKS) -framework ImageIO \
+	  -framework UniformTypeIdentifiers
+
+$(ICON_ICNS): $(ICON_GEN)
+	@mkdir -p $(@D)
+	$(ICON_GEN) $@ $(ICON_SET)
+
+$(APP_EXEC): $(BUILD)/editor_gui platform/macos/app/Info.plist $(ICON_ICNS)
 	@mkdir -p $(APP_BUNDLE)/Contents/MacOS
 	cp $(BUILD)/editor_gui $@
 	cp platform/macos/app/Info.plist $(APP_BUNDLE)/Contents/Info.plist
 	# Ad-hoc sign with the bundle identifier from Info.plist. Without this the
 	# product is "signed without an identifier" while the plist names one, and
 	# the codesigning gate kills it on launch (SIGKILL, Code Signature Invalid).
-	codesign --force --sign - --identifier dev.editor.app $@
+	# Sign the *bundle*, not the executable: that seals the icon and Info.plist
+	# too, which is what a modified resource would otherwise break.
+	codesign --force --deep --sign - --identifier dev.editor.app $(APP_BUNDLE)
 
 app: $(APP_EXEC)
 

@@ -1343,8 +1343,13 @@ place (the ends are exact; only the middle is approximate). The content height
 is measured over at most 1000 visual lines and the rest extrapolated, so a
 document far larger than that gets an approximate thumb size. The horizontal
 range is the widest line measured so far, so it grows as you
-scroll and does not shrink again until another document opens. The app has no
-app icon yet (the design system's icon assets need an agreed raster step).
+scroll and does not shrink again until another document opens.
+
+The app has an icon, drawn natively from the design system's app-icon
+construction (`tools/make_icns.mm`): a 512 tile at `--color-brand-tile` with a
+112 pt radius and a single stroke motif in `--color-brand-mark`, built into an
+`.icns` at build time and sealed into the bundle signature. It is generated, not
+vendored, so no design-system asset is committed.
 
 The sidebar is a v1 implementation of the §9 shape: rooted at the open
 document's folder, or at a folder chosen with File → Open Folder… (which pins
