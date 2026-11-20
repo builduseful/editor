@@ -111,7 +111,8 @@ own tokens rather than inventing a value.
   `viewcore`); it also renders the app icon from the brand's construction
   (`tools/make_icns.mm`, CoreGraphics + `iconutil`) into the bundle's
   `Contents/Resources`, so the icon is generated rather than vendored and the
-  bundle signature seals it; `make gui-smoke` runs the GUI smoke test (`tests/gui_smoke.py`):
+  bundle signature seals it; `make gui-smoke` runs the GUI smoke test
+  (`tests/gui_smoke.py`):
   headless AppKit snapshots (`--snapshot PATH --theme light|dark --size WxH
   --scroll LINE --xscroll PX --wheel DY,DX --sidebar-root DIR`), a real launch, a
   no-file launch,
