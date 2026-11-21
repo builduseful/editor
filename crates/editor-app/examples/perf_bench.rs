@@ -8,6 +8,66 @@ use editor_app::EditorApp;
 use editor_core::{Document, SearchOptions};
 use editor_platform::{BuiltinBitmapRasterizer, HeadlessHost, StdFileSystem};
 
+#[cfg(target_os = "macos")]
+fn phys_footprint_mb() -> f64 {
+    #[repr(C)]
+    struct TaskVmInfo {
+        virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
+        resident_size: u64,
+        resident_size_peak: u64,
+        device: u64,
+        device_peak: u64,
+        internal: u64,
+        internal_peak: u64,
+        external: u64,
+        external_peak: u64,
+        reusable: u64,
+        reusable_peak: u64,
+        purgeable_volatile_pmap: u64,
+        purgeable_volatile_resident: u64,
+        purgeable_volatile_virtual: u64,
+        compressed: u64,
+        compressed_peak: u64,
+        compressed_lifetime: u64,
+        phys_footprint: u64,
+        min_address: u64,
+        max_address: u64,
+        _pad: [u64; 16],
+    }
+    extern "C" {
+        static mach_task_self_: u32;
+        fn task_info(
+            target_task: u32,
+            flavor: i32,
+            task_info_out: *mut i32,
+            task_info_outCnt: *mut u32,
+        ) -> i32;
+    }
+    const TASK_VM_INFO: i32 = 22;
+    let mut info: TaskVmInfo = unsafe { std::mem::zeroed() };
+    let mut count = (std::mem::size_of::<TaskVmInfo>() / std::mem::size_of::<i32>()) as u32;
+    let kr = unsafe {
+        task_info(
+            mach_task_self_,
+            TASK_VM_INFO,
+            (&mut info as *mut TaskVmInfo) as *mut i32,
+            &mut count,
+        )
+    };
+    if kr == 0 {
+        info.phys_footprint as f64 / 1_048_576.0
+    } else {
+        0.0
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn phys_footprint_mb() -> f64 {
+    0.0
+}
+
 fn main() {
     // 1. Create a 50 MB temporary text file (~1,000,000 lines).
     let tmp = std::env::temp_dir().join(format!("editor_perf_50mb_{}.rs", std::process::id()));
@@ -103,6 +163,7 @@ fn main() {
     println!("Retina 2240x1480 frame:   {:.3} ms/frame ({:.0} FPS eq)", frame_ms, 1000.0 / frame_ms);
     println!("Caret-blink partial rect: {:.1} us/frame ({:.0} FPS eq)", blink_us, 1_000_000.0 / blink_us.max(0.1));
     println!("10 MB single-line open+draw: {:.3} ms", single_line_ms);
+    println!("macOS phys_footprint:     {:.2} MB (after 60 MB + 10 MB + Retina FB)", phys_footprint_mb());
 
     let _ = std::fs::remove_file(&tmp);
     let _ = PathBuf::from("done");

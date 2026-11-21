@@ -2,9 +2,12 @@
 
 ## Project
 
-`editor` — a native macOS text editor with a C++20 core, a custom-drawn view, and
-a CLI-first surface. `PLAN.md` is the source of truth for scope, decisions, and
-architecture. Read it before changing scope.
+`editor` — an ultra-lightweight, zero-dependency, custom-drawn native text editor
+implemented in **Rust** (`std` only, zero third-party crates), with a minimal
+platform adapter boundary (`editor-platform`) and a deterministic CLI (`editor`).
+`PLAN.md` and `ARCHITECTURE.md` are the sources of truth for scope, decisions,
+and architecture. The archived C++ v1 implementation lives in
+`original-implementation/`.
 
 ## Design and brand
 
@@ -14,134 +17,72 @@ quiet controls, and colour only for state (danger / success / info). It is a bra
 reference, not a component library.
 
 - **Do not vendor the design system's web CSS/JS into this native app.** Implement
-  the look natively with AppKit/CoreText.
+  the look natively in our pure-Rust custom renderer (`editor-render`).
 - Use its tokens as the reference: ink and grey palette, light/dark themes, spacing
   scale, type ramp, subtle borders, minimal chrome. No accent hue.
-- The resolved colour tokens live in one place: `viewcore/include/theme.hpp` /
-  `viewcore/src/theme.cpp` (`light_theme()` / `dark_theme()`). Keep them in sync with
-  the design system's colour tokens; never hard-code a colour elsewhere. The app
-  offers System / Light / Dark and applies the matching theme.
-- Use the system UI font for chrome; the system fixed-pitch (mono) face for the
-  document and technical values.
-- Ask the user for the current design-system location/access before UI work. Never
-  commit local paths, personal data, or proprietary design-system files.
-- `LICENSE` follows the design system's app-licence template (the system is used
-  under its own licence, not vendored). The About panel carries the same notice.
+- The resolved colour tokens live in one place:
+  `crates/editor-render/src/theme.rs` (`Theme::light()` / `Theme::dark()`).
+  Keep them in sync with the design system's colour tokens; never hard-code a
+  colour elsewhere. The app offers System / Light / Dark and applies the matching
+  theme.
+- Use the system UI font (`FontStyle::Ui` / `UiBold`) for chrome; the system
+  fixed-pitch mono face (`FontStyle::Mono` / `MonoBold`) for the document and
+  technical values.
+- Never commit local paths, personal data, or proprietary design-system files.
+- `LICENSE` follows the design system's app-licence template.
 
-### Rules that apply to this app
+### UI & interaction rules
 
-The design system's guide is written for its web components; these are the parts
-that carry over to a native, custom-drawn editor. When in doubt, read the guide's
-own tokens rather than inventing a value.
-
-- **Tokens for every value.** Colours come from `theme.hpp`; spacing follows the
-  system's rhythm (2px ladder); borders are hairlines. No hex, `rgb()` or named
-  colour anywhere else in UI code.
+- **Tokens for every value.** Colours come from `editor-render::theme`; spacing
+  follows the 2px ladder; borders are hairlines.
 - **No accent hue.** Colour marks state only (danger / success / info). Selection,
-  current line, gutter and scrollbar are neutral greys — not blue.
-- **Both themes, always.** Anything you draw must look right in light and dark;
-  check both (`--theme light|dark` renders a snapshot, or switch in the app menu).
-  Draw text with the theme ink, never the default black.
+  current line, gutter and scrollbars are neutral greys — not blue.
+- **Both themes, always.** Anything drawn must look right in light and dark;
+  verify both (`editor-gui --snapshot OUT.png --theme light|dark`).
 - **Quiet, minimal chrome.** No gradients, spinners, illustrations or decorative
-  motion. Motion, when added, only explains a change and is short.
+  motion.
 - **Copy style:** actions in sentence case starting with a verb; headings in Title
-  Case; 24-hour times with a spaced en dash ("09:00 – 17:00"); no exclamation marks.
-- **One primary action per view**; name every icon-only control; keep keyboard
-  paths working and focus visible. (IME and accessibility are explicitly out of v1,
-  §8 — note the exception where it bites.)
-- **Never add a pattern only because the guide has one.** Use a component where it
-  fits the screen; otherwise compose from the same tokens.
-- **Document-view controls are custom-drawn** (D2), including the scrollbars —
-  no native-control hybrid. Both are quiet overlay thumbs (no track band): the
-  vertical one reserves no width, and the horizontal one reserves a 9 pt strip at
-  the bottom that text is clipped against.
-- **The horizontal bar keeps its own space.** Its strip is cut out of the text
-  viewport (`text_height()`) and drawing is clipped there (a partially scrolled
-  last row is cut, not moved), so a row and the bar never overlap. The vertical
-  bar overlays the last few points of long lines instead, like the system's
-  overlay scrollers.
-- **The file sidebar is custom-drawn too** (D2): a plain column with `color.page`
-  as its ground, a hairline on its right edge, folder chevrons, and
-  `color.secondary-hover` for the selection. No `NSOutlineView`. It is chrome,
-  so its labels use the **system UI face** (`FontSpec.ui`), not the document's
-  mono face — that is the one place `FontSpec.ui` is set.
-- **The sidebar is lazy by construction** (PLAN.md §9). A directory is read only
-  when it is expanded, plus the open file's ancestors so it can be revealed;
-  collapsed subtrees are never walked. Keep directory reads behind `DirSource`
-  (`platform/macos` uses `opendir`/`readdir`) so the tree, its layout and its
-  hit-testing stay headless-testable. The sidebar's selection is held **by path**,
-  never by node pointer: re-reading a directory frees its child nodes.
-- **The sidebar never discards edits silently.** Clicking a file goes through
-  `confirmDiscardChanges`, exactly as File → Open does (§9 "read-only
-  navigation"). Directories toggle; symlinks are leaves and are never followed.
-- **Opening a file never moves the sidebar.** It used to re-root at each file's
-  folder, so opening one elsewhere collapsed the tree and lost the user's place.
-  The column is set once (the open file's folder at launch, or a folder chosen
-  with File → Open Folder… / dropped on the app) and stays there; opening a file
-  only reveals it when it is under the current view.
-- **Two gestures on a directory row, not one.** The left chevron expands it
-  inline in the tree; the right-edge *enter* affordance makes it the view (one
-  level, like a column browser). The breadcrumb at the top is how you go back,
-  and each crumb is a button. Right/Left arrow navigate in and out. Navigating
-  must not disturb the tree's expansions or the selection (held by path), so a
-  round trip returns to exactly where the user was.
-- Do not add a "walk up for `.git`" heuristic — it guesses, and with no ignore
-  engine it fills the tree with `build/` and `.git/`. The path test lives in one
-  place, `Sidebar::is_under_root`, which `reveal()` also uses.
-- **The sidebar's width belongs to the user.** It is resizable by dragging its
-  right edge, clamped in one place (`Sidebar::set_width`, 160–480 pt), and
-  persisted under `SidebarWidth`. The view holds the AppKit width constraint and
-  writes the model's clamped width back into it, so the drawn column and the
-  constraint can never disagree; the window has a content minimum so a wide
-  column cannot push the document out.
+  Case; no exclamation marks.
+- **100% custom-drawn controls** — zero native-control hybrids (`NSOutlineView`,
+  `NSScrollView`, `NSTextField`, `NSAlert`). Every widget (viewport, gutter,
+  overlay scrollbars, lazy sidebar, find/replace bar, go-to-line bar, quick open,
+  project search, status bar, confirmation modal) is rasterized by `editor-render`.
+- **The horizontal scrollbar keeps its own space** (`H_SCROLLBAR_STRIP_PT = 9.0`),
+  clipping text cleanly so rows never collide with the thumb. Vertical scrolling
+  clamps flush to the bottom of the viewport with no excess whitespace.
+- **The file sidebar is lazy by construction.** Directories are read only when
+  expanded or navigated into; selection is held by `PathBuf`; opening a file never
+  re-roots the sidebar; left chevron expands inline, right chevron enters folder,
+  breadcrumbs navigate back; right edge is drag-resizable (160–480 pt, persisted
+  under `SidebarWidth`).
 
 ## Engineering
 
-- C++20, macOS-only v1, Apple Silicon.
-- No vendored/bundled third-party libraries; OS system libraries and the C++ standard
-  library are allowed.
-- Custom-drawn view only; no native-control hybrid.
-- The window always has a document before it draws. An untitled window is backed
-  by a private temp file (unlinked on open / Save As / quit); with nothing open
-  the core returns `E_IO` rather than touching unset sources. A Finder “Open
-  With” launch has no argv file — the document arrives as an `odoc` Apple event
-  after the first frame — so no path may assume the file was passed in.
-- Decisions D1–D13 in `PLAN.md` are locked unless the plan says otherwise.
-- Build/test commands: `make` (builds `build/editor_tests`, plus `libcore.a`/`editor`
-  once those sources exist) and `make test` (runs the suite, including the
-  deterministic C++ fuzzers); `make golden` runs the CLI golden-JSON tests against
-  `build/editor`; `make fuzz` runs the CLI argv/batch fuzzer
-  (`tests/cli_fuzz.py`); `make bench` builds and runs the §5.5/§7 save-gate
-  benchmark (`bench/bench_edit.cpp`); `make demo` builds and runs the M0.5
-  read-only view demo / footprint gate — first paint (open→draw) and scroll fps
-  (`demo/view_demo.cpp`, `libviewcore.a`); `make app` builds `build/editor.app`
-  (and `build/editor_gui`), the AppKit view (CoreText + CoreGraphics +
-  `viewcore`); it also renders the app icon from the brand's construction
-  (`tools/make_icns.mm`, CoreGraphics + `iconutil`) into the bundle's
-  `Contents/Resources`, so the icon is generated rather than vendored and the
-  bundle signature seals it; `make gui-smoke` runs the GUI smoke test
-  (`tests/gui_smoke.py`):
-  headless AppKit snapshots (`--snapshot PATH --theme light|dark --size WxH
-  --scroll LINE --xscroll PX --wheel DY,DX --sidebar-root DIR`), a real launch, a
-  no-file launch,
-  and a Finder-style LaunchServices open (`tests/render_smoke_test.cpp` covers the
-  same render path with pixel assertions); the same target runs
-  `tests/gui_golden.py`, which pins
-  four frames (light, dark, small, scrolled-and-panned) in `tests/golden/` and
-  compares them within a small pixel tolerance — `make gui-golden` alone checks
-  them and `make golden-update` re-pins after an intended visual change; snapshots
-  are steady frames (exact index, caret on), so the references are deterministic;
-  `make render` renders a document to a
-  PNG for inspection (`tools/render_doc.cpp`);
-  `make SANITIZE=1 test` adds ASan+UBSan; `make clean`. Apple clang + make only,
-  no third-party tooling. (libFuzzer is not in the Command Line Tools clang, and
-  we do not install it, so "fuzzing" here means seeded randomized property tests,
-  not a libFuzzer target.) This plain Makefile is a Pre-M0.0 stand-in for the
-  `PLAN.md` §10 CMake graph, which wraps the same sources when the GUI/`.app`/
-  notarization work begins; the M0.5 `viewcore` library and the M1
-  `platform/macos` ObjC++ backends are already built this way.
+- **Rust 2021, zero external crates (`std` only).** No third-party crates in
+  `Cargo.toml`.
+- **Minimal platform adapter (`crates/editor-platform`).** Only irreducible OS
+  boundaries sit behind traits (`FileSystem`, 2-method `GlyphRasterizer`,
+  `Clipboard`, `PlatformHost`, and BGRA8 framebuffer + dirty-rect presentation).
+  Platform glue lives exclusively in `crates/editor-macos/` (currently ~500 lines
+  of ObjC/C compiled by system `clang` via `build.rs`, using `IOSurface` for
+  zero-copy dirty-rect compositing and CoreText strictly on glyph-atlas misses).
+- **Focused Unicode**: strict UTF-8, English, programming languages, and an Emoji
+  grapheme cluster subset (combining marks, VS15/VS16, skin tones, flag pairs,
+  ZWJ chains, keycaps). `ImeComposition` and `A11yNode` seams keep future IME and
+  accessibility integration clean.
+- **Build, test, bundle, and benchmark commands**:
+  - `cargo test --workspace` — run all unit, property/oracle, render, app, and CLI
+    tests (must compile with zero warnings).
+  - `cargo build --release --workspace --bins` — build `target/release/editor`
+    (CLI) and `target/release/editor-gui` (GUI).
+  - `./target/release/bundle-app` — render the Build Useful `.icns` icon in pure
+    Rust and package + ad-hoc sign `target/release/Editor.app`.
+  - `cargo run --release -p editor-app --example perf_bench` — run the 60 MB / 1M
+    line + 10 MB single-line + Retina frame + macOS `phys_footprint` benchmark.
+  - `./target/release/editor-gui --snapshot OUT.png --theme light|dark --size WxH --sidebar-root DIR [FILE]`
+    — headless CoreText Retina PNG snapshot for visual verification.
 
 ## Repo hygiene
 
 - No personal paths, local machine details, or secrets in tracked files.
-- Keep tracked files minimal; `PLAN.md` and this file are the current documents.
+- Keep tracked files minimal and commit in clean, logical chunks.

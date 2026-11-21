@@ -630,6 +630,8 @@ fn main() {
     let mut sidebar_root: Option<PathBuf> = None;
     let mut wrap = false;
     let mut open_find = false;
+    let mut open_quick = false;
+    let mut open_project_search: Option<String> = None;
     let mut positional: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -671,6 +673,14 @@ fn main() {
                 open_find = true;
                 i += 1;
             }
+            "--quick-open" => {
+                open_quick = true;
+                i += 1;
+            }
+            "--project-search" if i + 1 < args.len() => {
+                open_project_search = Some(args[i + 1].clone());
+                i += 2;
+            }
             arg if !arg.starts_with('-') => {
                 positional = Some(PathBuf::from(arg));
                 i += 1;
@@ -682,6 +692,7 @@ fn main() {
     let fs: Arc<dyn FileSystem> = Arc::new(MacFileSystem {
         inner: StdFileSystem,
     });
+    let fs_clone = Arc::clone(&fs);
 
     // Headless snapshot mode (renders with REAL CoreText + Apple Color Emoji directly to PNG!)
     if let Some(out_png) = snapshot_path {
@@ -707,6 +718,14 @@ fn main() {
         if open_find {
             app.find_bar.open(true, Some("fn"));
             app.refresh_search();
+        }
+        if open_quick {
+            let root = app.sidebar.root().map(Path::to_path_buf);
+            app.palette.open_quick_open(fs_clone.as_ref(), root.as_deref());
+        } else if let Some(ref q) = open_project_search {
+            let root = app.sidebar.root().map(Path::to_path_buf);
+            app.palette
+                .open_project_search(fs_clone.as_ref(), root.as_deref(), Some(q));
         }
         app.mark_dirty();
         app.render(&mut rasterizer);
