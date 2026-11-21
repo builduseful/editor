@@ -74,6 +74,67 @@ impl TextInput {
         self.anchor = self.caret;
     }
 
+    pub fn delete_selection(&mut self) -> bool {
+        let (a, b) = self.selection_range();
+        if a == b {
+            return false;
+        }
+        self.text.replace_range(a..b, "");
+        self.caret = a;
+        self.anchor = a;
+        true
+    }
+
+    /// Hit-test a physical X coordinate inside `rect` to place or drag the caret.
+    pub fn hit_test_x(
+        &self,
+        rect: PixelRect,
+        x_px: f32,
+        scale: f32,
+        atlas: &mut GlyphAtlas,
+        rasterizer: &mut dyn GlyphRasterizer,
+    ) -> usize {
+        let pad_x = px(8.0, scale) as f32;
+        let font_px = 12.5 * scale;
+        let rel_x = (x_px - (rect.x as f32 + pad_x) + self.scroll_x).max(0.0);
+        let mut pen = 0.0f32;
+        for (off, cluster) in editor_core::grapheme_clusters(&self.text) {
+            let g = atlas.get_or_rasterize(rasterizer, FontStyle::Ui, font_px, cluster);
+            if rel_x < pen + g.advance * 0.5 {
+                return off;
+            }
+            pen += g.advance;
+        }
+        self.text.len()
+    }
+
+    pub fn mouse_down(
+        &mut self,
+        rect: PixelRect,
+        x_px: f32,
+        scale: f32,
+        extend_selection: bool,
+        atlas: &mut GlyphAtlas,
+        rasterizer: &mut dyn GlyphRasterizer,
+    ) {
+        let pos = self.hit_test_x(rect, x_px, scale, atlas, rasterizer);
+        self.caret = pos;
+        if !extend_selection {
+            self.anchor = pos;
+        }
+    }
+
+    pub fn mouse_drag(
+        &mut self,
+        rect: PixelRect,
+        x_px: f32,
+        scale: f32,
+        atlas: &mut GlyphAtlas,
+        rasterizer: &mut dyn GlyphRasterizer,
+    ) {
+        self.caret = self.hit_test_x(rect, x_px, scale, atlas, rasterizer);
+    }
+
     /// Handle a keystroke. Returns `true` if the text content changed.
     pub fn handle_key(
         &mut self,

@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use editor_app::EditorApp;
 use editor_platform::{
-    AppCommand, BuiltinBitmapRasterizer, ConfirmChoice, HeadlessHost, InputEvent, Key,
+    AppCommand, BuiltinBitmapRasterizer, Clipboard, ConfirmChoice, HeadlessHost, InputEvent, Key,
     MemoryClipboard, MemoryFileSystem, Modifiers, MouseButton, ThemePreference,
 };
 
@@ -154,4 +154,155 @@ fn full_headless_editing_find_replace_save_and_render_workflow() {
     // Accessibility snapshot exposes all key regions.
     let a11y = app.a11y_snapshot();
     assert!(a11y.len() >= 4);
+}
+
+#[test]
+fn pro_line_ops_menu_routing_confirm_modal_and_caret_blink_partial_redraw() {
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/work/code.rs", b"let a = 1;\nlet b = 2;\nlet c = 3;\n".to_vec());
+    fs.add_file("/work/next.rs", b"// next\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1000, 600, 1.0);
+    app.use_in_app_modal = true;
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_file(&PathBuf::from("/work/code.rs"), &mut host).unwrap();
+    app.render(&mut raster);
+
+    let primary = Modifiers {
+        #[cfg(target_os = "macos")]
+        meta: true,
+        #[cfg(not(target_os = "macos"))]
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    let primary_shift = Modifiers {
+        shift: true,
+        ..primary
+    };
+
+    // 1. Toggle comment (Cmd+/)
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('/'),
+            mods: primary,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(0).unwrap(), "// let a = 1;");
+    // Toggle comment off again!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('/'),
+            mods: primary,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(0).unwrap(), "let a = 1;");
+
+    // 2. Duplicate line (Cmd+Shift+D)
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('d'),
+            mods: primary_shift,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(0).unwrap(), "let a = 1;");
+    assert_eq!(app.doc.line_content(1).unwrap(), "let a = 1;");
+
+    // 3. Delete line (Cmd+Shift+K)
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('k'),
+            mods: primary_shift,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(1).unwrap(), "let b = 2;");
+
+    // 4. Move line down (Option+Down)
+    app.caret = 0;
+    app.anchor = 0;
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Down,
+            mods: Modifiers { alt: true, ..Modifiers::NONE },
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(0).unwrap(), "let b = 2;");
+    assert_eq!(app.doc.line_content(1).unwrap(), "let a = 1;");
+
+    // 5. Menu Paste routes to Find input when Find bar is focused!
+    clip.set_text("needle_from_menu");
+    app.handle_event(
+        InputEvent::Command(AppCommand::Find),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::Command(AppCommand::Paste),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.find_bar.find_input.text, "needle_from_menu");
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+
+    // 6. Caret blink triggers partial dirty-rect (NOT full redraw!).
+    app.render(&mut raster);
+    app.handle_event(InputEvent::Tick { now_ms: 600 }, &mut raster, &mut clip, &mut host);
+    assert!(!app.framebuffer.dirty.is_full(), "caret blink should use partial dirty rect!");
+    assert!(app.render(&mut raster));
+
+    // 7. In-app confirmation modal opens on dirty doc switch and discards when pressing 'd'.
+    assert!(app.doc.is_dirty());
+    app.handle_event(
+        InputEvent::OpenPath(PathBuf::from("/work/next.rs")),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.confirm_modal.visible);
+    app.render(&mut raster);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('d'),
+            mods: Modifiers::NONE,
+            text: Some("d".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.confirm_modal.visible);
+    assert_eq!(app.doc.file_name(), "next.rs");
 }

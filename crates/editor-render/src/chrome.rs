@@ -2,7 +2,7 @@
 //! and future-ready IME & Accessibility seams.
 
 use editor_core::{Eol, Language};
-use editor_platform::{FontStyle, GlyphRasterizer, PixelRect, ThemePreference};
+use editor_platform::{ConfirmChoice, FontStyle, GlyphRasterizer, PixelRect, ThemePreference};
 
 use crate::atlas::GlyphAtlas;
 use crate::painter::Painter;
@@ -503,4 +503,121 @@ pub fn draw_status_bar(
         atlas,
         rasterizer,
     );
+}
+
+// ============================================================================
+// Custom-Drawn In-App Confirmation Modal (100% OS-Independent)
+// ============================================================================
+
+#[derive(Debug, Default)]
+pub struct ConfirmModal {
+    pub visible: bool,
+    pub file_name: String,
+    pub btn_save: PixelRect,
+    pub btn_discard: PixelRect,
+    pub btn_cancel: PixelRect,
+}
+
+impl ConfirmModal {
+    pub fn open(&mut self, file_name: &str) {
+        self.visible = true;
+        self.file_name = file_name.to_string();
+    }
+
+    pub fn close(&mut self) {
+        self.visible = false;
+    }
+
+    pub fn hit_test(&self, x_px: f32, y_px: f32) -> Option<ConfirmChoice> {
+        if !self.visible {
+            return None;
+        }
+        let xi = x_px.round() as i32;
+        let yi = y_px.round() as i32;
+        if self.btn_save.contains(xi, yi) {
+            Some(ConfirmChoice::Save)
+        } else if self.btn_discard.contains(xi, yi) {
+            Some(ConfirmChoice::Discard)
+        } else if self.btn_cancel.contains(xi, yi) {
+            Some(ConfirmChoice::Cancel)
+        } else {
+            None
+        }
+    }
+
+    pub fn draw(
+        &mut self,
+        painter: &mut Painter,
+        bounds: PixelRect,
+        theme: &Theme,
+        atlas: &mut GlyphAtlas,
+        rasterizer: &mut dyn GlyphRasterizer,
+    ) {
+        if !self.visible || bounds.is_empty() {
+            return;
+        }
+        let scale = painter.scale();
+        // Subtle scrim over window.
+        let scrim = if theme.is_dark {
+            crate::theme::Color::rgba(0, 0, 0, 140)
+        } else {
+            crate::theme::Color::rgba(0x17, 0x1a, 0x1f, 80)
+        };
+        painter.fill_rect(bounds, scrim);
+
+        let card_w = px(380.0, scale).min(bounds.w - px(32.0, scale));
+        let card_h = px(136.0, scale);
+        let card = PixelRect::new(
+            bounds.x + (bounds.w - card_w) / 2,
+            bounds.y + (bounds.h - card_h) / 3,
+            card_w,
+            card_h,
+        );
+        let radius = 8.0 * scale;
+        painter.fill_rounded_rect(card, radius, theme.surface);
+        painter.stroke_rounded_rect(card, radius, (1.0 * scale).max(1.0), theme.border_control);
+
+        let pad = px(18.0, scale);
+        let title_px = 14.0 * scale;
+        let body_px = 12.0 * scale;
+        let tm = atlas.metrics(rasterizer, FontStyle::UiBold, title_px);
+        let bm = atlas.metrics(rasterizer, FontStyle::Ui, body_px);
+
+        let heading = format!("Save Changes to {}?", self.file_name);
+        painter.draw_text_ui(
+            (card.x + pad) as f32,
+            (card.y + pad) as f32 + tm.ascent,
+            &heading,
+            FontStyle::UiBold,
+            title_px,
+            theme.text,
+            atlas,
+            rasterizer,
+        );
+        painter.draw_text_ui(
+            (card.x + pad) as f32,
+            (card.y + pad + px(28.0, scale)) as f32 + bm.ascent,
+            "Your unsaved changes will be lost if you do not save them.",
+            FontStyle::Ui,
+            body_px,
+            theme.text_muted,
+            atlas,
+            rasterizer,
+        );
+
+        let btn_h = px(28.0, scale);
+        let btn_y = card.bottom() - pad - btn_h;
+        let gap = px(8.0, scale);
+        let save_w = px(72.0, scale);
+        let discard_w = px(92.0, scale);
+        let cancel_w = px(72.0, scale);
+
+        self.btn_save = PixelRect::new(card.right() - pad - save_w, btn_y, save_w, btn_h);
+        self.btn_discard = PixelRect::new(self.btn_save.x - gap - discard_w, btn_y, discard_w, btn_h);
+        self.btn_cancel = PixelRect::new(card.x + pad, btn_y, cancel_w, btn_h);
+
+        draw_button(painter, self.btn_cancel, "Cancel", false, theme, atlas, rasterizer);
+        draw_button(painter, self.btn_discard, "Don't Save", false, theme, atlas, rasterizer);
+        draw_button(painter, self.btn_save, "Save", true, theme, atlas, rasterizer);
+    }
 }

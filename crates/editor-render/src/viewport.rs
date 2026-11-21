@@ -4,7 +4,8 @@
 use std::collections::HashMap;
 
 use editor_core::{
-    cluster_cell_width, grapheme_clusters, Document, SearchMatch, TokenKind, TokenSpan,
+    cluster_cell_width, grapheme_clusters, swar::{find_byte, is_all_ascii}, Document, SearchMatch,
+    TokenKind, TokenSpan,
 };
 use editor_platform::{FontMetrics, FontStyle, GlyphRasterizer, PixelRect};
 
@@ -17,6 +18,8 @@ pub const H_SCROLLBAR_STRIP_PT: f32 = 9.0;
 pub const V_SCROLLBAR_WIDTH_PT: f32 = 9.0;
 const MAX_WRAP_CACHE_ENTRIES: usize = 1024;
 const MAX_CACHED_VISUAL_LINES: usize = 512;
+const HUGE_LINE_WINDOW_THRESHOLD: u64 = 16 * 1024;
+const HUGE_LINE_WINDOW_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ViewportLayout {
@@ -77,6 +80,7 @@ pub struct Viewport {
     wrap_cache_width: i32,
     wrap_cache_font_q: u32,
     pub layout: ViewportLayout,
+    pub last_caret_rect: PixelRect,
 }
 
 impl Default for Viewport {
@@ -106,6 +110,7 @@ impl Viewport {
             wrap_cache_width: 0,
             wrap_cache_font_q: 0,
             layout: ViewportLayout::default(),
+            last_caret_rect: PixelRect::ZERO,
         }
     }
 
@@ -392,9 +397,14 @@ impl Viewport {
         }
     }
 
-    /// Measure horizontal pixel X of `byte_col` within `line` (handles tabs, ASCII, and wide emojis).
+    /// Measure horizontal pixel X of `byte_col` within `line` (O(1) fast path for tab-free ASCII,
+    /// handles tabs and wide emojis accurately).
     pub fn measure_prefix_px(&self, line: &str, byte_col: usize, cell_w: f32) -> f32 {
         let target = byte_col.min(line.len());
+        let prefix_bytes = &line.as_bytes()[..target];
+        if is_all_ascii(prefix_bytes) && find_byte(prefix_bytes, b'\t').is_none() {
+            return target as f32 * cell_w;
+        }
         let mut col_cells = 0usize;
         for (off, cluster) in grapheme_clusters(line) {
             if off >= target {
@@ -408,6 +418,24 @@ impl Viewport {
             }
         }
         col_cells as f32 * cell_w
+    }
+
+    /// Hit-test a Y coordinate inside the gutter to select a whole logical line.
+    pub fn hit_test_gutter(
+        &mut self,
+        y_px: f32,
+        doc: &mut Document,
+        metrics: FontMetrics,
+        scale: f32,
+    ) -> usize {
+        let hit = self.hit_test_text(
+            self.layout.text.x as f32 + px(12.0, scale) as f32,
+            y_px,
+            doc,
+            metrics,
+            scale,
+        );
+        hit.line
     }
 
     /// Wrap a logical line into visual segments (fast single-segment path when wrap is off or short).
@@ -567,7 +595,8 @@ impl Viewport {
     }
 
     /// Paint the entire document viewport (gutter, lines, selection, search highlights,
-    /// caret, IME preedit underline, and custom overlay scrollbars).
+    /// matching brackets, quiet indent guides, caret, IME preedit underline, and overlay scrollbars).
+    /// Respects `painter.current_clip()` so caret-blink dirty rects skip untouched lines!
     #[allow(clippy::too_many_arguments)]
     pub fn draw(
         &mut self,
@@ -578,6 +607,7 @@ impl Viewport {
         selection: Option<(u64, u64)>,
         search_matches: &[SearchMatch],
         active_match_idx: Option<usize>,
+        matching_brackets: Option<(u64, u64)>,
         ime: &ImeComposition,
         caret_visible: bool,
         focused: bool,
@@ -594,6 +624,7 @@ impl Viewport {
         let layout = self.compute_layout(rect, doc, metrics, scale);
         self.sync_wrap_cache(doc.generation(), layout.text.w, font_px);
 
+        let clip = painter.current_clip();
         let hairline = (1.0 * scale).round().max(1.0) as i32;
         let text_pad_x = px(12.0, scale) as f32;
         let line_h = metrics.line_height.max(1) as f32;
@@ -602,11 +633,18 @@ impl Viewport {
 
         // 1. Backgrounds: document surface + gutter page ground + bottom h-scrollbar strip.
         painter.fill_rect(layout.full, theme.surface);
-        painter.fill_rect(layout.gutter, theme.page);
-        painter.fill_rect(
-            PixelRect::new(layout.gutter.right() - hairline, layout.gutter.y, hairline, layout.gutter.h),
-            theme.border_subtle,
-        );
+        if !layout.gutter.intersect(clip).is_empty() {
+            painter.fill_rect(layout.gutter, theme.page);
+            painter.fill_rect(
+                PixelRect::new(
+                    layout.gutter.right() - hairline,
+                    layout.gutter.y,
+                    hairline,
+                    layout.gutter.h,
+                ),
+                theme.border_subtle,
+            );
+        }
 
         let (caret_line, caret_col) = doc.byte_to_line_col(caret);
         let total_lines = doc.editable_line_count().max(1);
@@ -617,9 +655,11 @@ impl Viewport {
 
         let mut tokens: Vec<TokenSpan> = Vec::with_capacity(64);
         let mut cur_y = layout.text.y as f32 - self.scroll_sub_y_px;
-        let view_bottom = layout.text.bottom() as f32;
+        let view_bottom = (layout.text.bottom().min(clip.bottom())) as f32;
+        let clip_top = clip.y as f32;
         let mut line_idx = self.scroll_top_line;
         let text_origin_x = layout.text.x as f32 + text_pad_x - self.scroll_x_px;
+        let indent_guide_color = theme.border_subtle.with_alpha(150);
 
         // 2. Render visible logical lines.
         while line_idx < total_lines && cur_y < view_bottom {
@@ -627,11 +667,50 @@ impl Viewport {
             else {
                 break;
             };
-            let line_text = doc.line_content(line_idx).unwrap_or_default();
-            doc.lex_line(line_idx, &line_text, &mut tokens);
-            let segs = self.layout_line(line_idx, &line_text, cell_w, max_wrap_w);
+            let full_line_bytes = line_content_end - line_start;
 
-            if !self.word_wrap {
+            // Fast skip for lines completely above the dirty clip rect when wrap is off!
+            if !self.word_wrap && cur_y + line_h <= clip_top {
+                cur_y += line_h;
+                line_idx += 1;
+                continue;
+            }
+
+            // Pathological huge-single-line protection: read ONLY the visible horizontal window!
+            let (win_rel_start, line_text, is_windowed) =
+                if !self.word_wrap && full_line_bytes > HUGE_LINE_WINDOW_THRESHOLD {
+                    let approx_col = (self.scroll_x_px / cell_w).floor().max(0.0) as u64;
+                    let req = approx_col.saturating_sub(32);
+                    let (actual_rel, _, slice) = doc
+                        .read_line_window(line_idx, req, HUGE_LINE_WINDOW_BYTES)
+                        .unwrap_or((0, full_line_bytes, String::new()));
+                    let est_w = full_line_bytes as f32 * cell_w + text_pad_x * 2.0;
+                    if est_w > self.max_line_width_px {
+                        self.max_line_width_px = est_w;
+                    }
+                    (actual_rel as usize, slice, true)
+                } else {
+                    let full = doc.line_content(line_idx).unwrap_or_default();
+                    (0usize, full, false)
+                };
+
+            if !is_windowed {
+                doc.lex_line(line_idx, &line_text, &mut tokens);
+            } else {
+                tokens.clear();
+            }
+
+            let segs = if is_windowed {
+                vec![WrappedSegment {
+                    byte_start: 0,
+                    byte_end: line_text.len(),
+                    width_px: full_line_bytes as f32 * cell_w,
+                }]
+            } else {
+                self.layout_line(line_idx, &line_text, cell_w, max_wrap_w)
+            };
+
+            if !self.word_wrap && !is_windowed {
                 if let Some(first_seg) = segs.first() {
                     if first_seg.width_px + text_pad_x * 2.0 > self.max_line_width_px {
                         self.max_line_width_px = first_seg.width_px + text_pad_x * 2.0;
@@ -641,8 +720,13 @@ impl Viewport {
 
             let is_current_line = line_idx == caret_line;
             let block_h = segs.len() as f32 * line_h;
+            if cur_y + block_h <= clip_top {
+                cur_y += block_h;
+                line_idx += 1;
+                continue;
+            }
 
-            // Current-line highlight (when no multi-char selection or subtle line indicator).
+            // Current-line highlight.
             if is_current_line {
                 painter.push_clip(layout.text);
                 painter.fill_rect(
@@ -657,32 +741,58 @@ impl Viewport {
                 painter.pop_clip();
             }
 
-            // Gutter line number (drawn on the first visual segment of the logical line).
-            painter.push_clip(PixelRect::new(
+            // Gutter line number (skip if gutter isn't inside dirty clip).
+            let gutter_text_clip = PixelRect::new(
                 layout.gutter.x,
                 layout.gutter.y,
                 (layout.gutter.w - hairline).max(0),
                 layout.text.h,
-            ));
-            let num_str = (line_idx + 1).to_string();
-            let num_w = num_str.len() as f32 * cell_w;
-            let num_x = (layout.gutter.right() - hairline - px(12.0, scale)) as f32 - num_w;
-            let num_baseline = cur_y + metrics.ascent + metrics.leading * 0.5;
-            let num_color = if is_current_line {
-                theme.text
-            } else {
-                theme.text_muted
-            };
-            let mut gx = num_x;
-            for b in num_str.bytes() {
-                let g = atlas.get_ascii_mono(rasterizer, false, font_px, b);
-                painter.draw_glyph(gx, num_baseline, g, num_color, atlas);
-                gx += cell_w;
+            );
+            if !gutter_text_clip.intersect(clip).is_empty() {
+                painter.push_clip(gutter_text_clip);
+                let num_str = (line_idx + 1).to_string();
+                let num_w = num_str.len() as f32 * cell_w;
+                let num_x = (layout.gutter.right() - hairline - px(12.0, scale)) as f32 - num_w;
+                let num_baseline = cur_y + metrics.ascent + metrics.leading * 0.5;
+                let num_color = if is_current_line {
+                    theme.text
+                } else {
+                    theme.text_muted
+                };
+                let mut gx = num_x;
+                for b in num_str.bytes() {
+                    let g = atlas.get_ascii_mono(rasterizer, false, font_px, b);
+                    painter.draw_glyph(gx, num_baseline, g, num_color, atlas);
+                    gx += cell_w;
+                }
+                painter.pop_clip();
             }
-            painter.pop_clip();
 
             // Render each visual segment of this logical line inside `layout.text`.
             painter.push_clip(layout.text);
+            let win_x_shift = win_rel_start as f32 * cell_w;
+
+            // Quiet vertical indent guides for leading spaces on non-windowed lines.
+            if !is_windowed && !line_text.is_empty() {
+                let mut lead_cols = 0usize;
+                for &b in line_text.as_bytes() {
+                    if b == b' ' {
+                        lead_cols += 1;
+                    } else if b == b'\t' {
+                        lead_cols += self.tab_width - (lead_cols % self.tab_width);
+                    } else {
+                        break;
+                    }
+                }
+                let levels = lead_cols / self.tab_width;
+                for lv in 1..=levels {
+                    let gx = (text_origin_x + (lv * self.tab_width) as f32 * cell_w).round() as i32;
+                    painter.fill_rect(
+                        PixelRect::new(gx, cur_y.round() as i32, hairline, line_h.round() as i32),
+                        indent_guide_color,
+                    );
+                }
+            }
 
             for (seg_idx, seg) in segs.iter().enumerate() {
                 let seg_y = cur_y + seg_idx as f32 * line_h;
@@ -690,27 +800,27 @@ impl Viewport {
                     continue;
                 }
                 let seg_str = &line_text[seg.byte_start..seg.byte_end];
-                let seg_abs_start = line_start + seg.byte_start as u64;
-                let seg_abs_end = line_start + seg.byte_end as u64;
+                let seg_abs_start = line_start + (win_rel_start + seg.byte_start) as u64;
+                let seg_abs_end = line_start + (win_rel_start + seg.byte_end) as u64;
+                let seg_origin_x = text_origin_x + win_x_shift;
 
                 // Selection highlight on this visual segment.
                 if let Some((sel_a, sel_b)) = selection {
                     if sel_b > seg_abs_start && sel_a < line_full_end {
                         let ov_start = sel_a.max(seg_abs_start);
                         let ov_end = sel_b.min(seg_abs_end);
-                        let x0 = text_origin_x
+                        let x0 = seg_origin_x
                             + self.measure_prefix_px(
                                 seg_str,
                                 (ov_start - seg_abs_start) as usize,
                                 cell_w,
                             );
-                        let mut x1 = text_origin_x
+                        let mut x1 = seg_origin_x
                             + self.measure_prefix_px(
                                 seg_str,
                                 (ov_end.saturating_sub(seg_abs_start)) as usize,
                                 cell_w,
                             );
-                        // Show selection across the newline on the last segment of the line.
                         if seg_idx + 1 == segs.len() && sel_b > line_content_end {
                             x1 += cell_w * 0.65;
                         }
@@ -728,6 +838,32 @@ impl Viewport {
                     }
                 }
 
+                // Matching bracket quiet hairline boxes.
+                if let Some((b0, b1)) = matching_brackets {
+                    for brk in [b0, b1] {
+                        if brk >= seg_abs_start && brk < seg_abs_end {
+                            let bx = seg_origin_x
+                                + self.measure_prefix_px(
+                                    seg_str,
+                                    (brk - seg_abs_start) as usize,
+                                    cell_w,
+                                );
+                            let box_rect = PixelRect::new(
+                                bx.round() as i32,
+                                seg_y.round() as i32 + 1,
+                                cell_w.round().max(4.0) as i32,
+                                (line_h.round() as i32 - 2).max(2),
+                            );
+                            painter.stroke_rounded_rect(
+                                box_rect,
+                                2.0 * scale,
+                                (1.0 * scale).max(1.0),
+                                theme.border_control.with_alpha(170),
+                            );
+                        }
+                    }
+                }
+
                 // Search match highlights overlapping this segment.
                 if !search_matches.is_empty() {
                     let first_idx = search_matches.partition_point(|m| m.end <= seg_abs_start);
@@ -737,9 +873,9 @@ impl Viewport {
                         }
                         let ov_s = m.start.max(seg_abs_start);
                         let ov_e = m.end.min(seg_abs_end);
-                        let mx0 = text_origin_x
+                        let mx0 = seg_origin_x
                             + self.measure_prefix_px(seg_str, (ov_s - seg_abs_start) as usize, cell_w);
-                        let mx1 = text_origin_x
+                        let mx1 = seg_origin_x
                             + self.measure_prefix_px(seg_str, (ov_e - seg_abs_start) as usize, cell_w);
                         let is_active = active_match_idx == Some(mi);
                         let m_color = if is_active {
@@ -764,18 +900,21 @@ impl Viewport {
                 let baseline = seg_y + metrics.ascent + metrics.leading * 0.5;
                 let mut col_cells = 0usize;
                 let mut tok_cursor = 0usize;
-                let clip_left = layout.text.x as f32 - cell_w * 3.0;
-                let clip_right = layout.text.right() as f32 + cell_w;
+                let clip_left = (layout.text.x.max(clip.x)) as f32 - cell_w * 3.0;
+                let clip_right = (layout.text.right().min(clip.right())) as f32 + cell_w;
 
                 for (rel_off, cluster) in grapheme_clusters(seg_str) {
                     let abs_col_in_line = seg.byte_start + rel_off;
-                    let pen_x = text_origin_x + col_cells as f32 * cell_w;
+                    let pen_x = seg_origin_x + col_cells as f32 * cell_w;
                     if cluster == "\t" {
                         col_cells += self.tab_width - (col_cells % self.tab_width);
                         continue;
                     }
                     let cw = cluster_cell_width(cluster) as usize;
-                    if pen_x >= clip_left && pen_x < clip_right {
+                    if pen_x > clip_right {
+                        break;
+                    }
+                    if pen_x >= clip_left {
                         while tok_cursor < tokens.len()
                             && (tokens[tok_cursor].end as usize) <= abs_col_in_line
                         {
@@ -808,23 +947,25 @@ impl Viewport {
                     col_cells += cw;
                 }
 
-                // Draw blinking caret if it falls on this visual segment.
-                if is_current_line && focused && caret_visible {
-                    let in_seg = caret_col >= seg.byte_start
-                        && (caret_col < seg.byte_end || seg_idx + 1 == segs.len());
+                // Track & draw blinking caret if it falls on this visual segment.
+                if is_current_line && focused {
+                    let rel_caret = caret_col.saturating_sub(win_rel_start);
+                    let in_seg = caret_col >= win_rel_start + seg.byte_start
+                        && (caret_col < win_rel_start + seg.byte_end || seg_idx + 1 == segs.len());
                     if in_seg {
-                        let local_col = caret_col.saturating_sub(seg.byte_start).min(seg_str.len());
-                        let cx = text_origin_x + self.measure_prefix_px(seg_str, local_col, cell_w);
+                        let local_col = rel_caret.saturating_sub(seg.byte_start).min(seg_str.len());
+                        let cx = seg_origin_x + self.measure_prefix_px(seg_str, local_col, cell_w);
                         let caret_w = (2.0 * scale).round().max(1.0) as i32;
-                        painter.fill_rect(
-                            PixelRect::new(
-                                cx.round() as i32,
-                                seg_y.round() as i32 + 1,
-                                caret_w,
-                                (line_h.round() as i32 - 2).max(1),
-                            ),
-                            theme.text,
+                        let crect = PixelRect::new(
+                            cx.round() as i32,
+                            seg_y.round() as i32 + 1,
+                            caret_w,
+                            (line_h.round() as i32 - 2).max(1),
                         );
+                        self.last_caret_rect = crect;
+                        if caret_visible {
+                            painter.fill_rect(crect, theme.text);
+                        }
                         // Future IME composition preview underline if preedit text is active.
                         if !ime.preedit.is_empty() {
                             let pre_w = self.measure_prefix_px(&ime.preedit, ime.preedit.len(), cell_w);
@@ -849,7 +990,7 @@ impl Viewport {
 
         // 3. Recompute scrollbar thumbs with updated `max_line_width_px` and draw quiet overlay thumbs.
         let layout = self.compute_layout(rect, doc, metrics, scale);
-        if !layout.v_thumb.is_empty() {
+        if !layout.v_thumb.is_empty() && !layout.v_bar.intersect(clip).is_empty() {
             let alpha = if self.v_bar_dragging || self.v_bar_hovered {
                 190
             } else {
@@ -861,7 +1002,7 @@ impl Viewport {
                 theme.border_control.with_alpha(alpha),
             );
         }
-        if !layout.h_thumb.is_empty() {
+        if !layout.h_thumb.is_empty() && !layout.h_bar.intersect(clip).is_empty() {
             let alpha = if self.h_bar_dragging || self.h_bar_hovered {
                 190
             } else {

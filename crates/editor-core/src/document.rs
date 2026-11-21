@@ -340,7 +340,7 @@ impl Document {
         }
         let candidates = [
             (caret_byte < total).then_some(caret_byte),
-            (caret_byte > 0).then_some(caret_byte - 1),
+            (caret_byte > 0).then(|| caret_byte - 1),
         ];
         for cand in candidates.into_iter().flatten() {
             let b = self.read_range(cand, 1);

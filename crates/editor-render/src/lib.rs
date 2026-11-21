@@ -14,8 +14,8 @@ pub mod viewport;
 
 pub use atlas::{AtlasGlyph, GlyphAtlas};
 pub use chrome::{
-    A11yNode, A11yRole, FindBarAction, FindBarLayout, FindBarState, GotoLineState, ImeComposition,
-    StatusBarData,
+    A11yNode, A11yRole, ConfirmModal, FindBarAction, FindBarLayout, FindBarState, GotoLineState,
+    ImeComposition, StatusBarData,
 };
 pub use painter::Painter;
 pub use sidebar::{Sidebar, SidebarAction, SidebarHit};
