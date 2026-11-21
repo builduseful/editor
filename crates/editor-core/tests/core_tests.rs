@@ -365,3 +365,79 @@ fn syntax_highlighter_handles_rust_nested_comments_and_brackets() {
     assert_eq!(find_matching_bracket("fn foo(a, (b)) {}", 6), Some(13));
     assert_eq!(find_matching_bracket("fn foo(a, (b)) {}", 13), Some(6));
 }
+
+#[test]
+fn lockfile_external_identity_windowed_huge_line_and_multiline_brackets() {
+    use editor_core::IdentityCheck;
+    use editor_platform::{FileSystem, FsError};
+
+    let fs = MemoryFileSystem::new();
+    let p = PathBuf::from("/doc.rs");
+    fs.add_file(&p, b"fn outer() {\n    let v = [1, 2, 3];\n}\n".to_vec());
+
+    // 1. Advisory lockfile prevents concurrent lock until dropped.
+    let guard = fs.lock_file(&p).unwrap();
+    assert!(matches!(fs.lock_file(&p), Err(FsError::Locked(_))));
+    drop(guard);
+    assert!(fs.lock_file(&p).is_ok());
+
+    // 2. External mutation detection: auto-reload when clean, stale when dirty.
+    let mut doc = Document::open(&fs, &p).unwrap();
+    assert_eq!(doc.check_identity(&fs), IdentityCheck::Unchanged);
+    fs.add_file(&p, b"fn updated() {\n    let x = {\n        1\n    };\n}\n".to_vec());
+    assert_eq!(doc.check_identity(&fs), IdentityCheck::ReloadedClean);
+    assert_eq!(doc.line_content(0).unwrap(), "fn updated() {");
+
+    // Multi-line bracket matching across lines!
+    let open_pos = doc.line_content(0).unwrap().find('{').unwrap() as u64;
+    let pair = doc.find_matching_bracket(open_pos).unwrap();
+    assert_eq!(pair.0, open_pos);
+    let close_ch = doc.read_range(pair.1, 1);
+    assert_eq!(close_ch, b"}");
+
+    // Dirty doc detects external mutation without discarding unsaved edits.
+    doc.edit(0, 0, "// local\n", 10, false).unwrap();
+    fs.add_file(&p, b"external overwrite\n".to_vec());
+    assert_eq!(doc.check_identity(&fs), IdentityCheck::StaleDirty);
+    assert_eq!(doc.line_content(0).unwrap(), "// local");
+
+    // 3. Pathological 2 MB single-line file windowed read (never allocates full line!).
+    let mut huge_line = "a".repeat(1_000_000);
+    huge_line.push_str("🚀MIDDLE🚀");
+    huge_line.push_str(&"b".repeat(1_000_000));
+    let huge_path = PathBuf::from("/single_line.json");
+    fs.add_file(&huge_path, huge_line.as_bytes().to_vec());
+
+    let mut huge_doc = Document::open(&fs, &huge_path).unwrap();
+    let (actual_off, full_len, win) = huge_doc.read_line_window(0, 1_000_001, 64).unwrap();
+    assert_eq!(full_len, huge_line.len() as u64);
+    assert_eq!(actual_off, 1_000_000, "must snap back to emoji UTF-8 leading byte!");
+    assert!(win.starts_with("🚀MIDDLE🚀"));
+    assert!(win.len() <= 64);
+}
+
+#[test]
+fn piece_tree_heavy_delete_compaction_5000_steps() {
+    let mut rng = Rng(0x1234_5678_9ABC_DEF0);
+    let mut tree = PieceTree::from_str(&"line of text\n".repeat(400));
+    let mut oracle = "line of text\n".repeat(400).into_bytes();
+
+    for step in 0..2500 {
+        // Bias towards deletes periodically to exercise sparse leaf merging!
+        let do_delete = !oracle.is_empty() && (step % 5 != 0 || oracle.len() > 8000);
+        if do_delete {
+            let start = rng.range(oracle.len());
+            let del_len = rng.range((oracle.len() - start).min(64) + 1);
+            let got = tree.delete(start as u64, del_len as u64);
+            assert_eq!(got, oracle[start..start + del_len]);
+            oracle.drain(start..start + del_len);
+        } else {
+            let pos = rng.range(oracle.len() + 1);
+            let ins = if step % 3 == 0 { b"xyz\r\n".as_slice() } else { b"hello\n".as_slice() };
+            tree.insert(pos as u64, ins);
+            oracle.splice(pos..pos, ins.iter().copied());
+        }
+        assert_eq!(tree.len_bytes() as usize, oracle.len());
+    }
+    assert_eq!(tree.to_string_lossy().as_bytes(), oracle.as_slice());
+}

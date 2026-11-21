@@ -137,6 +137,9 @@ impl FileSystem for MacFileSystem {
     fn temp_dir(&self) -> PathBuf {
         self.inner.temp_dir()
     }
+    fn lock_file(&self, path: &Path) -> FsResult<editor_platform::FileLock> {
+        self.inner.lock_file(path)
+    }
 }
 
 // ============================================================================

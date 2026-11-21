@@ -17,7 +17,9 @@ pub mod swar;
 pub mod syntax;
 pub mod undo;
 
-pub use document::{Document, DocumentError, DocumentInfo, Eol, SaveMethod, SaveReport};
+pub use document::{
+    Document, DocumentError, DocumentInfo, Eol, IdentityCheck, SaveMethod, SaveReport,
+};
 pub use grapheme::{
     cluster_cell_width, grapheme_clusters, next_grapheme_boundary, next_word_boundary,
     prev_grapheme_boundary, prev_word_boundary, validate_utf8_offset, word_range_at,

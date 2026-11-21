@@ -87,6 +87,7 @@ impl From<FsError> for DocumentError {
 pub enum SaveMethod {
     None,
     ClonePwrite,
+    ClonePwriteTail,
     AtomicRewrite,
     InPlace,
 }
@@ -96,10 +97,19 @@ impl SaveMethod {
         match self {
             SaveMethod::None => "none",
             SaveMethod::ClonePwrite => "clone_pwrite",
+            SaveMethod::ClonePwriteTail => "clone_pwrite_tail",
             SaveMethod::AtomicRewrite => "full_rewrite",
             SaveMethod::InPlace => "in_place",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityCheck {
+    Unchanged,
+    ReloadedClean,
+    StaleDirty,
+    Missing,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -306,6 +316,101 @@ impl Document {
 
     pub fn line_content(&mut self, line: usize) -> Option<String> {
         self.tree.line_content(line)
+    }
+
+    pub fn read_line_window(
+        &mut self,
+        line: usize,
+        rel_byte_start: u64,
+        max_bytes: usize,
+    ) -> Option<(u64, u64, String)> {
+        self.tree.read_line_window(line, rel_byte_start, max_bytes)
+    }
+
+    pub fn line_byte_len(&mut self, line: usize) -> Option<u64> {
+        self.tree.line_byte_len(line)
+    }
+
+    /// Multi-line matching bracket lookup around `caret_byte` (checks byte at caret or caret-1,
+    /// scans up to 250 lines outward so huge files never stall).
+    pub fn find_matching_bracket(&mut self, caret_byte: u64) -> Option<(u64, u64)> {
+        let total = self.tree.len_bytes();
+        if total == 0 {
+            return None;
+        }
+        let candidates = [
+            (caret_byte < total).then_some(caret_byte),
+            (caret_byte > 0).then_some(caret_byte - 1),
+        ];
+        for cand in candidates.into_iter().flatten() {
+            let b = self.read_range(cand, 1);
+            let Some(&ch) = b.first() else { continue };
+            let (open, close, forward) = match ch {
+                b'(' => (b'(', b')', true),
+                b'[' => (b'[', b']', true),
+                b'{' => (b'{', b'}', true),
+                b')' => (b')', b'(', false),
+                b']' => (b']', b'[', false),
+                b'}' => (b'}', b'{', false),
+                _ => continue,
+            };
+            const MAX_SCAN: u64 = 32 * 1024;
+            let mut depth = 0i32;
+            if forward {
+                let len = (total - cand).min(MAX_SCAN) as usize;
+                let bytes = self.read_range(cand, len);
+                for (i, &c) in bytes.iter().enumerate() {
+                    if c == open {
+                        depth += 1;
+                    } else if c == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some((cand, cand + i as u64));
+                        }
+                    }
+                }
+            } else {
+                let start = cand.saturating_sub(MAX_SCAN);
+                let len = (cand - start + 1) as usize;
+                let bytes = self.read_range(start, len);
+                for i in (0..bytes.len()).rev() {
+                    let c = bytes[i];
+                    if c == open {
+                        depth += 1;
+                    } else if c == close {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some((start + i as u64, cand));
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Check whether the file on disk was modified externally:
+    /// - unchanged -> `Unchanged`
+    /// - changed + clean -> silently reloads and returns `ReloadedClean`
+    /// - changed + dirty -> keeps unsaved edits and returns `StaleDirty`
+    pub fn check_identity(&mut self, fs: &dyn FileSystem) -> IdentityCheck {
+        let Some(path) = self.path.clone() else {
+            return IdentityCheck::Unchanged;
+        };
+        let stat = match fs.stat(&path) {
+            Ok(s) => s,
+            Err(_) => return IdentityCheck::Missing,
+        };
+        if stat.rev == self.rev {
+            return IdentityCheck::Unchanged;
+        }
+        if self.is_dirty() {
+            IdentityCheck::StaleDirty
+        } else if self.reload(fs).is_ok() {
+            IdentityCheck::ReloadedClean
+        } else {
+            IdentityCheck::StaleDirty
+        }
     }
 
     pub fn line_byte_range(&mut self, line: usize) -> Option<(u64, u64, u64)> {
@@ -583,6 +688,9 @@ impl Document {
         in_place: bool,
         same_target: bool,
     ) -> Result<SaveReport, DocumentError> {
+        // Hold exclusive advisory lockfile for the entire check + write + commit critical section.
+        let _lock = fs.lock_file(target)?;
+
         // Check optimistic concurrency if requested or if saving back to our existing file.
         if let Some(exp) = expected_rev {
             let actual = fs.stat(target)?.rev;
@@ -614,7 +722,7 @@ impl Document {
         let bom = self.bom;
         let bom_len = if bom { 3 } else { 0 };
 
-        // Fast path 1: Same-length APFS CoW clone + pwrite (O(changed) even on 5 GB files!).
+        // Fast path 1a: Same-length APFS CoW clone + pwrite (O(changed) even on 5 GB files!).
         if same_target && !in_place {
             if let Some(spans) = self.tree.same_length_changed_spans(bom_len) {
                 let parent = target.parent().unwrap_or_else(|| Path::new("."));
@@ -638,6 +746,37 @@ impl Document {
                         return Ok(SaveReport {
                             method: SaveMethod::ClonePwrite,
                             bytes_written: written,
+                            rev: new_stat.rev,
+                        });
+                    } else {
+                        let _ = fs.remove_file(&tmp);
+                    }
+                }
+            } else if let Some((tail_doc_off, new_doc_len)) = self.tree.tail_rewrite_start() {
+                // Fast path 1b: Length-changing edit in last <= 25% of file -> APFS clone + tail pwrite + ftruncate!
+                let parent = target.parent().unwrap_or_else(|| Path::new("."));
+                let name = target
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("file");
+                let tmp = parent.join(format!(
+                    ".{name}.editor-tail-{}-{}",
+                    std::process::id(),
+                    self.generation
+                ));
+                if fs.clone_file(target, &tmp).is_ok() {
+                    let tail_len = (new_doc_len - tail_doc_off) as usize;
+                    let tail_bytes = self.read_range(tail_doc_off, tail_len);
+                    let raw_off = bom_len + tail_doc_off;
+                    let new_raw_len = bom_len + new_doc_len;
+                    let write_res =
+                        fs.write_in_place(&tmp, &[(raw_off, &tail_bytes)], Some(new_raw_len));
+                    if write_res.is_ok() && fs.rename(&tmp, target).is_ok() {
+                        let new_stat = fs.stat(target)?;
+                        self.rebind_after_save(fs, target, new_stat.rev)?;
+                        return Ok(SaveReport {
+                            method: SaveMethod::ClonePwriteTail,
+                            bytes_written: tail_bytes.len() as u64,
                             rev: new_stat.rev,
                         });
                     } else {

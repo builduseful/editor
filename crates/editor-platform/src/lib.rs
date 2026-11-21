@@ -13,7 +13,7 @@ pub mod raster;
 pub mod surface;
 
 pub use fs::{
-    DirEntry, EntryKind, FileHandle, FileRev, FileStat, FileSystem, FsError, FsResult,
+    DirEntry, EntryKind, FileHandle, FileLock, FileRev, FileStat, FileSystem, FsError, FsResult,
     MemoryFileSystem, StdFileSystem,
 };
 pub use host::{Clipboard, HeadlessHost, MemoryClipboard, PlatformHost};

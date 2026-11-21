@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::input::{ConfirmChoice, CursorShape};
@@ -38,6 +39,10 @@ pub trait PlatformHost {
     fn confirm_discard(&mut self, file_name: &str) -> ConfirmChoice;
     fn request_redraw(&mut self);
     fn request_quit(&mut self);
+    fn load_pref(&self, _key: &str) -> Option<String> {
+        None
+    }
+    fn save_pref(&mut self, _key: &str, _value: &str) {}
 }
 
 #[derive(Debug, Default)]
@@ -50,6 +55,7 @@ pub struct HeadlessHost {
     pub next_open_folder: Option<PathBuf>,
     pub next_save_file: Option<PathBuf>,
     pub next_confirm: Option<ConfirmChoice>,
+    pub prefs: BTreeMap<String, String>,
 }
 
 impl HeadlessHost {
@@ -89,5 +95,13 @@ impl PlatformHost for HeadlessHost {
 
     fn request_quit(&mut self) {
         self.quit_requested = true;
+    }
+
+    fn load_pref(&self, key: &str) -> Option<String> {
+        self.prefs.get(key).cloned()
+    }
+
+    fn save_pref(&mut self, key: &str, value: &str) {
+        self.prefs.insert(key.to_string(), value.to_string());
     }
 }

@@ -99,6 +99,27 @@ pub struct DirEntry {
     pub kind: EntryKind,
 }
 
+/// RAII advisory lockfile guard (`<path>.editor.lock`), automatically released on Drop.
+pub struct FileLock {
+    unlock_fn: Option<Box<dyn FnOnce() + Send>>,
+}
+
+impl FileLock {
+    pub fn new(unlock_fn: impl FnOnce() + Send + 'static) -> Self {
+        Self {
+            unlock_fn: Some(Box::new(unlock_fn)),
+        }
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        if let Some(f) = self.unlock_fn.take() {
+            f();
+        }
+    }
+}
+
 /// Random-access read-only file handle for zero-load multi-GB document backing.
 pub trait FileHandle: Send + Sync {
     fn len(&self) -> u64;
@@ -143,6 +164,9 @@ pub trait FileSystem: Send + Sync {
     fn rename(&self, from: &Path, to: &Path) -> FsResult<()>;
     fn remove_file(&self, path: &Path) -> FsResult<()>;
     fn temp_dir(&self) -> PathBuf;
+
+    /// Acquire an exclusive advisory lockfile (`<path>.editor.lock`, `O_CREAT|O_EXCL`).
+    fn lock_file(&self, path: &Path) -> FsResult<FileLock>;
 }
 
 // ============================================================================
@@ -450,6 +474,32 @@ impl FileSystem for StdFileSystem {
     fn temp_dir(&self) -> PathBuf {
         std::env::temp_dir()
     }
+
+    fn lock_file(&self, path: &Path) -> FsResult<FileLock> {
+        let mut lock_os = path.as_os_str().to_os_string();
+        lock_os.push(".editor.lock");
+        let lock_path = PathBuf::from(lock_os);
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::AlreadyExists {
+                    FsError::Locked(path.to_path_buf())
+                } else {
+                    map_io_err(&lock_path, e)
+                }
+            })?;
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let _ = io::Write::write_all(&mut f, format!("pid={}\nts={}\n", std::process::id(), nanos).as_bytes());
+        drop(f);
+        Ok(FileLock::new(move || {
+            let _ = std::fs::remove_file(&lock_path);
+        }))
+    }
 }
 
 // ============================================================================
@@ -467,6 +517,7 @@ struct MemFile {
 struct MemState {
     files: BTreeMap<PathBuf, MemFile>,
     dirs: BTreeMap<PathBuf, ()>,
+    locks: BTreeMap<PathBuf, ()>,
     next_ino: u64,
     clock_ns: u64,
 }
@@ -770,5 +821,21 @@ impl FileSystem for MemoryFileSystem {
 
     fn temp_dir(&self) -> PathBuf {
         PathBuf::from("/tmp")
+    }
+
+    fn lock_file(&self, path: &Path) -> FsResult<FileLock> {
+        let p = normalize_mem_path(path);
+        {
+            let mut s = self.state.lock().unwrap();
+            if s.locks.contains_key(&p) {
+                return Err(FsError::Locked(p));
+            }
+            s.locks.insert(p.clone(), ());
+        }
+        let state = Arc::clone(&self.state);
+        Ok(FileLock::new(move || {
+            let mut s = state.lock().unwrap();
+            s.locks.remove(&p);
+        }))
     }
 }

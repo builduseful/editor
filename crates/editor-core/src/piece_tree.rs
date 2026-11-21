@@ -545,6 +545,30 @@ impl Node {
                     }
                     i += 1;
                 }
+                // Compact adjacent sparse leaf children so heavy deletes never bloat the B-tree.
+                let mut k = 0;
+                while k + 1 < children.len() {
+                    let can_merge = match (&*children[k], &*children[k + 1]) {
+                        (
+                            Node::Leaf { pieces: a, .. },
+                            Node::Leaf { pieces: b, .. },
+                        ) => a.len() + b.len() <= MAX_LEAF_PIECES / 2,
+                        _ => false,
+                    };
+                    if can_merge {
+                        let right = children.remove(k + 1);
+                        if let (
+                            Node::Leaf { pieces: a, .. },
+                            Node::Leaf { pieces: b, .. },
+                        ) = (&mut *children[k], *right)
+                        {
+                            a.extend(b);
+                            children[k].recompute_summary();
+                        }
+                    } else {
+                        k += 1;
+                    }
+                }
                 self.recompute_summary();
             }
         }
@@ -1201,6 +1225,52 @@ impl PieceTree {
         Some(String::from_utf8(buf).unwrap_or_else(|e| String::from_utf8_lossy(e.as_bytes()).into_owned()))
     }
 
+    /// Read a bounded UTF-8 window of `line` starting at or slightly before `rel_byte_start`
+    /// (snapped to a UTF-8 codepoint boundary). Never allocates more than `max_bytes + 8`,
+    /// protecting the viewport from pathological 100 MB single-line files!
+    /// Returns `(actual_rel_start, full_line_byte_len, window_str)`.
+    pub fn read_line_window(
+        &mut self,
+        line: usize,
+        rel_byte_start: u64,
+        max_bytes: usize,
+    ) -> Option<(u64, u64, String)> {
+        let (start, content_end, _) = self.line_byte_range(line)?;
+        let line_len = content_end - start;
+        if line_len == 0 || rel_byte_start >= line_len {
+            return Some((line_len, line_len, String::new()));
+        }
+        // Back up up to 3 bytes if needed to land on a UTF-8 leading byte.
+        let probe_start = rel_byte_start.saturating_sub(3);
+        let probe_len = ((line_len - probe_start) as usize).min(max_bytes + 6);
+        let mut buf = Vec::with_capacity(probe_len);
+        self.root
+            .read_range(start + probe_start, probe_len, &mut buf, &self.base, &self.add);
+
+        // Find the UTF-8 leading byte at or before `rel_byte_start - probe_start`.
+        let mut trim_head = (rel_byte_start - probe_start) as usize;
+        while trim_head > 0 && trim_head < buf.len() && (buf[trim_head] & 0xC0) == 0x80 {
+            trim_head -= 1;
+        }
+        let actual_rel_start = probe_start + trim_head as u64;
+        let slice = &buf[trim_head..];
+        let mut take_end = slice.len().min(max_bytes);
+        // Avoid splitting a multi-byte UTF-8 sequence at the end of the window.
+        if take_end < slice.len() {
+            while take_end > 0 && (slice[take_end] & 0xC0) == 0x80 {
+                take_end -= 1;
+            }
+        }
+        let s = String::from_utf8_lossy(&slice[..take_end]).into_owned();
+        Some((actual_rel_start, line_len, s))
+    }
+
+    /// Return the byte length of `line`'s content (excluding terminator) in O(log N) without reading bytes.
+    pub fn line_byte_len(&mut self, line: usize) -> Option<u64> {
+        let (start, content_end, _) = self.line_byte_range(line)?;
+        Some(content_end - start)
+    }
+
     /// Read line bytes including terminator.
     pub fn line_with_eol_bytes(&mut self, line: usize, out: &mut Vec<u8>) -> bool {
         let Some((start, _, full_end)) = self.line_byte_range(line) else {
@@ -1363,6 +1433,33 @@ impl PieceTree {
             doc_off += p.len();
         }
         Some(spans)
+    }
+
+    /// For a length-changing edit where the unchanged base prefix is >= 75% of the file
+    /// (i.e. tail to rewrite is <= 25% of the new file), return `(first_changed_doc_offset, new_total_doc_len)`
+    /// so APFS `clone_file` + tail `pwrite` + `ftruncate` writes only the tail!
+    pub fn tail_rewrite_start(&self) -> Option<(u64, u64)> {
+        let new_len = self.len_bytes();
+        let base_doc_len = self.base.len().saturating_sub(self.base_start_offset);
+        if base_doc_len < 64 * 1024 || new_len == base_doc_len {
+            return None;
+        }
+        let mut pieces = Vec::new();
+        self.root.collect_pieces(&mut pieces);
+        let mut unchanged_prefix = 0u64;
+        for p in pieces {
+            if p.source == PieceSource::Base && p.offset == self.base_start_offset + unchanged_prefix {
+                unchanged_prefix += p.len();
+            } else {
+                break;
+            }
+        }
+        let tail_bytes = new_len.saturating_sub(unchanged_prefix);
+        if unchanged_prefix > 0 && tail_bytes * 4 <= new_len.max(1) {
+            Some((unchanged_prefix, new_len))
+        } else {
+            None
+        }
     }
 
     /// Total resident byte size of the add buffer (for diagnostics/budgets).
