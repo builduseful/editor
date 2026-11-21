@@ -2532,4 +2532,379 @@ impl EditorApp {
         self.after_document_mutated(rasterizer, host);
         self.set_notice(format!("Replaced {count} occurrence(s)"), false);
     }
+
+    // ========================================================================
+    // Full Live GUI Inspection & Control over IPC (Portable across all OSes!)
+    // ========================================================================
+
+    /// Emit a complete, deterministic JSON snapshot of the live editor state so
+    /// the CLI and AI agents can inspect everything open and visible in the GUI.
+    pub fn status_json(&mut self) -> String {
+        let (line0, col) = self.doc.byte_to_line_col(self.caret);
+        let sel = self.selection();
+        let sel_text = self.selected_text();
+        let line_count = self.doc.exact_line_count();
+        let path_json = match self.doc.path() {
+            Some(p) => json_quote(&p.to_string_lossy()),
+            None => "null".to_string(),
+        };
+        let sb_root_json = match self.sidebar.root() {
+            Some(p) => json_quote(&p.to_string_lossy()),
+            None => "null".to_string(),
+        };
+        let sb_sel_json = match self.sidebar.selected() {
+            Some(p) => json_quote(&p.to_string_lossy()),
+            None => "null".to_string(),
+        };
+        let sel_json = match (sel, sel_text) {
+            (Some((a, b)), Some(txt)) => {
+                let preview: String = txt.chars().take(4096).collect();
+                format!(
+                    "{{\"start\":{a},\"end\":{b},\"bytes\":{},\"text\":{}}}",
+                    b - a,
+                    json_quote(&preview)
+                )
+            }
+            _ => "null".to_string(),
+        };
+        let active_match_json = match self.active_match {
+            Some(i) => i.to_string(),
+            None => "null".to_string(),
+        };
+        let palette_mode = match self.palette.mode {
+            editor_render::PaletteMode::Closed => "closed",
+            editor_render::PaletteMode::QuickOpen => "quick_open",
+            editor_render::PaletteMode::ProjectSearch => "project_search",
+        };
+        let theme_pref = match self.theme_pref {
+            ThemePreference::System => "system",
+            ThemePreference::Light => "light",
+            ThemePreference::Dark => "dark",
+        };
+        let active_theme = if self.active_theme().is_dark {
+            "dark"
+        } else {
+            "light"
+        };
+        let rev = self.doc.rev();
+
+        format!(
+            concat!(
+                "{{\"running\":true,\"path\":{},\"file_name\":{},\"dirty\":{},",
+                "\"bytes\":{},\"line_count\":{},\"eol\":{},\"language\":{},",
+                "\"rev\":{{\"dev\":\"{}\",\"ino\":\"{}\",\"size\":\"{}\",\"mtime_ns\":\"{}\",\"ctime_ns\":\"{}\"}},",
+                "\"can_undo\":{},\"can_redo\":{},",
+                "\"cursor\":{{\"line\":{},\"col\":{},\"byte_offset\":{}}},",
+                "\"selection\":{},",
+                "\"scroll\":{{\"top_line\":{},\"scroll_x_px\":{:.1}}},",
+                "\"sidebar\":{{\"visible\":{},\"root\":{},\"width_pt\":{:.0},\"selected\":{}}},",
+                "\"find\":{{\"visible\":{},\"show_replace\":{},\"query\":{},\"replace\":{},\"case_sensitive\":{},\"matches\":{},\"active_match\":{}}},",
+                "\"palette\":{{\"mode\":{},\"query\":{},\"items\":{}}},",
+                "\"confirm_modal_visible\":{},",
+                "\"view\":{{\"word_wrap\":{},\"font_size_pt\":{:.1},\"theme_preference\":{},\"active_theme\":{}}}}}"
+            ),
+            path_json,
+            json_quote(self.doc.file_name()),
+            self.doc.is_dirty(),
+            self.doc.len_bytes(),
+            line_count,
+            json_quote(self.doc.eol().as_str()),
+            json_quote(self.doc.language().display_name()),
+            rev.dev,
+            rev.ino,
+            rev.size,
+            rev.mtime_ns,
+            rev.ctime_ns,
+            self.doc.can_undo(),
+            self.doc.can_redo(),
+            line0 + 1,
+            col,
+            self.caret,
+            sel_json,
+            self.viewport.scroll_top_line + 1,
+            self.viewport.scroll_x_px,
+            self.sidebar.is_visible(),
+            sb_root_json,
+            self.sidebar.width_pt(),
+            sb_sel_json,
+            self.find_bar.visible,
+            self.find_bar.show_replace,
+            json_quote(&self.find_bar.find_input.text),
+            json_quote(&self.find_bar.replace_input.text),
+            self.find_bar.case_sensitive,
+            self.search_matches.len(),
+            active_match_json,
+            json_quote(palette_mode),
+            json_quote(&self.palette.input.text),
+            self.palette.items.len(),
+            self.confirm_modal.visible,
+            self.viewport.word_wrap,
+            self.viewport.font_size_pt,
+            json_quote(theme_pref),
+            json_quote(active_theme),
+        )
+    }
+
+    fn resolve_line_col_offset(&mut self, line_1based: usize, col_bytes: usize) -> u64 {
+        let target = line_1based.saturating_sub(1);
+        self.doc.tree_mut().ensure_indexed_for_line(target + 16);
+        let max_line = self.doc.editable_line_count().saturating_sub(1);
+        let clamped = target.min(max_line);
+        let (start, content_end, _) = self.doc.line_byte_range(clamped).unwrap_or((0, 0, 0));
+        start + (col_bytes as u64).min(content_end - start)
+    }
+
+    /// Execute any CLI/agent IPC command directly against this live `EditorApp`.
+    /// Returns `(reply, should_activate_window, should_quit_immediately)`.
+    pub fn execute_ipc(
+        &mut self,
+        cmd: &editor_platform::ipc::IpcCommand,
+        rasterizer: &mut dyn GlyphRasterizer,
+        clipboard: &mut dyn Clipboard,
+        host: &mut dyn PlatformHost,
+    ) -> (editor_platform::ipc::IpcReply, bool, bool) {
+        use editor_platform::ipc::{IpcCommand, IpcReply};
+        match cmd {
+            IpcCommand::Status => (IpcReply::Json(self.status_json()), false, false),
+            IpcCommand::Open(path) => {
+                self.handle_event(
+                    InputEvent::OpenPath(path.clone()),
+                    rasterizer,
+                    clipboard,
+                    host,
+                );
+                (IpcReply::Json(self.status_json()), true, false)
+            }
+            IpcCommand::OpenFolder(dir) => {
+                self.sidebar.set_visible(true);
+                self.sidebar.set_root(self.fs.as_ref(), dir);
+                self.recompute_layout();
+                self.mark_dirty();
+                host.request_redraw();
+                (IpcReply::Json(self.status_json()), true, false)
+            }
+            IpcCommand::Goto {
+                line_1based,
+                col_bytes,
+            } => {
+                let off = self.resolve_line_col_offset(*line_1based, *col_bytes);
+                self.caret = off;
+                self.anchor = off;
+                self.preferred_x_px = None;
+                let m = self.doc_metrics(rasterizer);
+                self.viewport
+                    .ensure_caret_visible(&mut self.doc, self.caret, m, self.framebuffer.scale);
+                self.mark_dirty();
+                host.request_redraw();
+                (IpcReply::Json(self.status_json()), false, false)
+            }
+            IpcCommand::Select {
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            } => {
+                let a = self.resolve_line_col_offset(*start_line, *start_col);
+                let b = self.resolve_line_col_offset(*end_line, *end_col);
+                self.anchor = a;
+                self.caret = b;
+                let m = self.doc_metrics(rasterizer);
+                self.viewport
+                    .ensure_caret_visible(&mut self.doc, self.caret, m, self.framebuffer.scale);
+                self.mark_dirty();
+                host.request_redraw();
+                (IpcReply::Json(self.status_json()), false, false)
+            }
+            IpcCommand::Insert { text } => {
+                let (start, removed) = self
+                    .selection()
+                    .map(|(a, b)| (a, b - a))
+                    .unwrap_or((self.caret, 0));
+                match self.doc.edit(start, removed, text, self.now_ms, false) {
+                    Ok(pos) => {
+                        self.caret = pos;
+                        self.anchor = pos;
+                        self.after_document_mutated(rasterizer, host);
+                        (IpcReply::Json(self.status_json()), false, false)
+                    }
+                    Err(e) => (IpcReply::Error(e.to_string()), false, false),
+                }
+            }
+            IpcCommand::Find {
+                query,
+                replace,
+                case_sensitive,
+                replace_all,
+                close,
+            } => {
+                if *close {
+                    self.find_bar.close();
+                    self.search_matches.clear();
+                    self.active_match = None;
+                    self.recompute_layout();
+                    self.mark_dirty();
+                    host.request_redraw();
+                    return (IpcReply::Json(self.status_json()), false, false);
+                }
+                self.goto_line.close();
+                self.palette.close();
+                self.find_bar.open(replace.is_some(), Some(query));
+                self.find_bar.find_input.set_text(query.clone());
+                self.find_bar.case_sensitive = *case_sensitive;
+                if let Some(rep) = replace {
+                    self.find_bar.replace_input.set_text(rep.clone());
+                }
+                self.recompute_layout();
+                self.refresh_search();
+                if *replace_all && replace.is_some() {
+                    self.replace_all_matches(rasterizer, host);
+                } else if let Some(idx) = self.active_match {
+                    self.select_match(idx, rasterizer);
+                }
+                self.mark_dirty();
+                host.request_redraw();
+                (IpcReply::Json(self.status_json()), false, false)
+            }
+            IpcCommand::Save { as_path } => {
+                let res = match as_path {
+                    Some(dst) => self.doc.save_as(self.fs.as_ref(), dst, None, false),
+                    None => self.doc.save(self.fs.as_ref(), None, false),
+                };
+                match res {
+                    Ok(rep) => {
+                        self.sync_title(host);
+                        self.sidebar.refresh(self.fs.as_ref());
+                        self.set_notice(format!("Saved ({})", rep.method.as_str()), false);
+                        host.request_redraw();
+                        (IpcReply::Json(self.status_json()), false, false)
+                    }
+                    Err(e) => (IpcReply::Error(e.to_string()), false, false),
+                }
+            }
+            IpcCommand::Action(name) => {
+                let mut activate = false;
+                match name.as_str() {
+                    "new" => self.handle_command(AppCommand::NewFile, rasterizer, clipboard, host),
+                    "reload" => {
+                        self.handle_command(AppCommand::Reload, rasterizer, clipboard, host)
+                    }
+                    "save" => self.handle_command(AppCommand::Save, rasterizer, clipboard, host),
+                    "undo" => self.handle_command(AppCommand::Undo, rasterizer, clipboard, host),
+                    "redo" => self.handle_command(AppCommand::Redo, rasterizer, clipboard, host),
+                    "cut" => self.handle_command(AppCommand::Cut, rasterizer, clipboard, host),
+                    "copy" => self.handle_command(AppCommand::Copy, rasterizer, clipboard, host),
+                    "paste" => self.handle_command(AppCommand::Paste, rasterizer, clipboard, host),
+                    "select-all" => {
+                        self.handle_command(AppCommand::SelectAll, rasterizer, clipboard, host)
+                    }
+                    "find" => {
+                        activate = true;
+                        self.handle_command(AppCommand::Find, rasterizer, clipboard, host);
+                    }
+                    "replace" => {
+                        activate = true;
+                        self.handle_command(AppCommand::Replace, rasterizer, clipboard, host);
+                    }
+                    "goto-line" => {
+                        activate = true;
+                        self.handle_command(AppCommand::GoToLine, rasterizer, clipboard, host);
+                    }
+                    "quick-open" => {
+                        activate = true;
+                        self.handle_command(AppCommand::QuickOpen, rasterizer, clipboard, host);
+                    }
+                    "project-search" => {
+                        activate = true;
+                        self.handle_command(AppCommand::ProjectSearch, rasterizer, clipboard, host);
+                    }
+                    "toggle-wrap" => {
+                        self.handle_command(AppCommand::ToggleWrap, rasterizer, clipboard, host)
+                    }
+                    "toggle-sidebar" => {
+                        self.handle_command(AppCommand::ToggleSidebar, rasterizer, clipboard, host)
+                    }
+                    "sidebar-show" => {
+                        self.sidebar.set_visible(true);
+                        self.recompute_layout();
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    "sidebar-hide" => {
+                        self.sidebar.set_visible(false);
+                        self.recompute_layout();
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    "zoom-in" => {
+                        self.handle_command(AppCommand::ZoomIn, rasterizer, clipboard, host)
+                    }
+                    "zoom-out" => {
+                        self.handle_command(AppCommand::ZoomOut, rasterizer, clipboard, host)
+                    }
+                    "zoom-reset" => {
+                        self.handle_command(AppCommand::ZoomReset, rasterizer, clipboard, host)
+                    }
+                    "theme-system" => self.handle_command(
+                        AppCommand::SetTheme(ThemePreference::System),
+                        rasterizer,
+                        clipboard,
+                        host,
+                    ),
+                    "theme-light" => self.handle_command(
+                        AppCommand::SetTheme(ThemePreference::Light),
+                        rasterizer,
+                        clipboard,
+                        host,
+                    ),
+                    "theme-dark" => self.handle_command(
+                        AppCommand::SetTheme(ThemePreference::Dark),
+                        rasterizer,
+                        clipboard,
+                        host,
+                    ),
+                    "duplicate-line" => self.duplicate_current_line(rasterizer, host),
+                    "delete-line" => self.delete_current_line(rasterizer, host),
+                    "toggle-comment" => self.toggle_line_comment(rasterizer, host),
+                    "focus" => activate = true,
+                    other => {
+                        return (
+                            IpcReply::Error(format!("unknown action: {other}")),
+                            false,
+                            false,
+                        );
+                    }
+                }
+                (IpcReply::Json(self.status_json()), activate, false)
+            }
+            IpcCommand::Quit { force } => {
+                if *force || !self.doc.is_dirty() {
+                    (IpcReply::Quitting, false, true)
+                } else {
+                    self.handle_command(AppCommand::Quit, rasterizer, clipboard, host);
+                    (IpcReply::Prompting, true, false)
+                }
+            }
+        }
+    }
+}
+
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }

@@ -1,7 +1,8 @@
 //! Lightweight local IPC over a per-user `0600` Unix domain socket (zero external crates).
 //!
-//! Enables `editor open <path>`, `editor gui`, and `editor close` / `editor quit` to
-//! communicate directly with a running `Editor.app` / `editor-gui` instance.
+//! Gives the `editor` CLI (and AI agents driving it) full deterministic inspection and
+//! control over a running GUI instance: `status`, `open`, `goto`, `select`, `insert`,
+//! `find`, `save`, `undo`, `redo`, `action`, and `close`/`quit`.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -18,8 +19,36 @@ use std::os::unix::net::{UnixListener, UnixStream};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IpcCommand {
+    Status,
     Open(PathBuf),
-    Quit { force: bool },
+    OpenFolder(PathBuf),
+    Goto {
+        line_1based: usize,
+        col_bytes: usize,
+    },
+    Select {
+        start_line: usize,
+        start_col: usize,
+        end_line: usize,
+        end_col: usize,
+    },
+    Insert {
+        text: String,
+    },
+    Find {
+        query: String,
+        replace: Option<String>,
+        case_sensitive: bool,
+        replace_all: bool,
+        close: bool,
+    },
+    Save {
+        as_path: Option<PathBuf>,
+    },
+    Action(String),
+    Quit {
+        force: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,7 +57,170 @@ pub enum IpcReply {
     Opened,
     Quitting,
     Prompting,
+    Json(String),
     Error(String),
+}
+
+/// Lossless single-line escaping for wire payloads (`\` -> `\\`, `\n` -> `\n`, `\r` -> `\r`, `\t` -> `\t`).
+fn escape_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+fn unescape_field(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some('\\') => out.push('\\'),
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+impl IpcCommand {
+    fn to_wire(&self) -> String {
+        match self {
+            IpcCommand::Status => "STATUS\n".to_string(),
+            IpcCommand::Open(p) => format!("OPEN {}\n", escape_field(&p.to_string_lossy())),
+            IpcCommand::OpenFolder(p) => {
+                format!("OPEN_FOLDER {}\n", escape_field(&p.to_string_lossy()))
+            }
+            IpcCommand::Goto {
+                line_1based,
+                col_bytes,
+            } => format!("GOTO {line_1based} {col_bytes}\n"),
+            IpcCommand::Select {
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            } => format!("SELECT {start_line} {start_col} {end_line} {end_col}\n"),
+            IpcCommand::Insert { text } => format!("INSERT {}\n", escape_field(text)),
+            IpcCommand::Find {
+                query,
+                replace,
+                case_sensitive,
+                replace_all,
+                close,
+            } => {
+                let flags = u8::from(*case_sensitive)
+                    | (u8::from(*replace_all) << 1)
+                    | (u8::from(*close) << 2)
+                    | (u8::from(replace.is_some()) << 3);
+                let q = escape_field(query);
+                if let Some(rep) = replace {
+                    format!("FIND {flags}\t{q}\t{}\n", escape_field(rep))
+                } else {
+                    format!("FIND {flags}\t{q}\n")
+                }
+            }
+            IpcCommand::Save { as_path: None } => "SAVE\n".to_string(),
+            IpcCommand::Save { as_path: Some(p) } => {
+                format!("SAVE_AS {}\n", escape_field(&p.to_string_lossy()))
+            }
+            IpcCommand::Action(name) => format!("ACTION {}\n", escape_field(name)),
+            IpcCommand::Quit { force: false } => "QUIT\n".to_string(),
+            IpcCommand::Quit { force: true } => "QUIT_FORCE\n".to_string(),
+        }
+    }
+
+    fn from_wire(line: &str) -> Option<Self> {
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed == "STATUS" {
+            return Some(IpcCommand::Status);
+        }
+        if trimmed == "SAVE" {
+            return Some(IpcCommand::Save { as_path: None });
+        }
+        if trimmed == "QUIT" {
+            return Some(IpcCommand::Quit { force: false });
+        }
+        if trimmed == "QUIT_FORCE" {
+            return Some(IpcCommand::Quit { force: true });
+        }
+        if let Some(rest) = trimmed.strip_prefix("OPEN ") {
+            return Some(IpcCommand::Open(PathBuf::from(unescape_field(rest))));
+        }
+        if let Some(rest) = trimmed.strip_prefix("OPEN_FOLDER ") {
+            return Some(IpcCommand::OpenFolder(PathBuf::from(unescape_field(rest))));
+        }
+        if let Some(rest) = trimmed.strip_prefix("SAVE_AS ") {
+            return Some(IpcCommand::Save {
+                as_path: Some(PathBuf::from(unescape_field(rest))),
+            });
+        }
+        if let Some(rest) = trimmed.strip_prefix("GOTO ") {
+            let mut it = rest.split_whitespace();
+            let line_1based = it.next()?.parse().ok()?;
+            let col_bytes = it.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            return Some(IpcCommand::Goto {
+                line_1based,
+                col_bytes,
+            });
+        }
+        if let Some(rest) = trimmed.strip_prefix("SELECT ") {
+            let mut it = rest.split_whitespace();
+            let start_line = it.next()?.parse().ok()?;
+            let start_col = it.next()?.parse().ok()?;
+            let end_line = it.next()?.parse().ok()?;
+            let end_col = it.next()?.parse().ok()?;
+            return Some(IpcCommand::Select {
+                start_line,
+                start_col,
+                end_line,
+                end_col,
+            });
+        }
+        if let Some(rest) = trimmed.strip_prefix("INSERT ") {
+            return Some(IpcCommand::Insert {
+                text: unescape_field(rest),
+            });
+        }
+        if let Some(rest) = trimmed.strip_prefix("FIND ") {
+            let mut parts = rest.split('\t');
+            let flags: u8 = parts.next()?.parse().ok()?;
+            let query = unescape_field(parts.next().unwrap_or(""));
+            let has_replace = (flags & 8) != 0;
+            let replace = if has_replace {
+                Some(unescape_field(parts.next().unwrap_or("")))
+            } else {
+                None
+            };
+            return Some(IpcCommand::Find {
+                query,
+                replace,
+                case_sensitive: (flags & 1) != 0,
+                replace_all: (flags & 2) != 0,
+                close: (flags & 4) != 0,
+            });
+        }
+        if let Some(rest) = trimmed.strip_prefix("ACTION ") {
+            return Some(IpcCommand::Action(unescape_field(rest)));
+        }
+        None
+    }
 }
 
 impl IpcReply {
@@ -38,19 +230,22 @@ impl IpcReply {
             IpcReply::Opened => "OK OPENED\n".to_string(),
             IpcReply::Quitting => "OK QUITTING\n".to_string(),
             IpcReply::Prompting => "OK PROMPTING\n".to_string(),
+            IpcReply::Json(j) => format!("OK_JSON {}\n", j.replace('\n', " ")),
             IpcReply::Error(m) => format!("ERR {}\n", m.replace('\n', " ")),
         }
     }
 
     fn from_wire(line: &str) -> Self {
-        let trimmed = line.trim();
+        let trimmed = line.trim_end_matches(['\r', '\n']);
         match trimmed {
             "OK PONG" => IpcReply::Pong,
             "OK OPENED" => IpcReply::Opened,
             "OK QUITTING" => IpcReply::Quitting,
             "OK PROMPTING" => IpcReply::Prompting,
             other => {
-                if let Some(msg) = other.strip_prefix("ERR ") {
+                if let Some(j) = other.strip_prefix("OK_JSON ") {
+                    IpcReply::Json(j.to_string())
+                } else if let Some(msg) = other.strip_prefix("ERR ") {
                     IpcReply::Error(msg.to_string())
                 } else {
                     IpcReply::Error(format!("unexpected reply: {other}"))
@@ -105,7 +300,6 @@ impl IpcServer {
         socket_path: PathBuf,
         on_wake: Arc<dyn Fn() + Send + Sync>,
     ) -> std::io::Result<Self> {
-        // Remove stale socket if no live server answers PING.
         if socket_path.exists() {
             if send_ping(&socket_path).is_ok() {
                 return Err(std::io::Error::new(
@@ -131,8 +325,8 @@ impl IpcServer {
                 match listener.accept() {
                     Ok((stream, _)) => {
                         let _ = stream.set_nonblocking(false);
-                        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-                        let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                        let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
                         handle_client(stream, &q_clone, &on_wake);
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -186,18 +380,8 @@ fn handle_client(
     let reply = if trimmed == "PING" {
         IpcReply::Pong
     } else {
-        let cmd = if let Some(path) = trimmed.strip_prefix("OPEN ") {
-            Some(IpcCommand::Open(PathBuf::from(path)))
-        } else if trimmed == "QUIT" {
-            Some(IpcCommand::Quit { force: false })
-        } else if trimmed == "QUIT_FORCE" {
-            Some(IpcCommand::Quit { force: true })
-        } else {
-            None
-        };
-
-        match cmd {
-            None => IpcReply::Error("unknown IPC command".to_string()),
+        match IpcCommand::from_wire(trimmed) {
+            None => IpcReply::Error(format!("unknown IPC command: {trimmed}")),
             Some(cmd) => {
                 let slot = Arc::new((Mutex::new(None), std::sync::Condvar::new()));
                 {
@@ -211,7 +395,7 @@ fn handle_client(
                 let (lock, cvar) = &*slot;
                 let guard = lock.lock().unwrap();
                 let (mut guard, _) = cvar
-                    .wait_timeout_while(guard, Duration::from_secs(2), |r| r.is_none())
+                    .wait_timeout_while(guard, Duration::from_secs(3), |r| r.is_none())
                     .unwrap();
                 guard
                     .take()
@@ -230,12 +414,7 @@ pub fn send_ping(socket_path: &Path) -> std::io::Result<IpcReply> {
 
 #[cfg(unix)]
 pub fn send_command(socket_path: &Path, cmd: &IpcCommand) -> std::io::Result<IpcReply> {
-    let wire = match cmd {
-        IpcCommand::Open(p) => format!("OPEN {}\n", p.to_string_lossy().replace('\n', "")),
-        IpcCommand::Quit { force: false } => "QUIT\n".to_string(),
-        IpcCommand::Quit { force: true } => "QUIT_FORCE\n".to_string(),
-    };
-    send_raw(socket_path, &wire)
+    send_raw(socket_path, &cmd.to_wire())
 }
 
 #[cfg(unix)]
@@ -256,6 +435,43 @@ mod tests {
     use super::*;
 
     #[test]
+    fn wire_encoding_round_trips_multiline_text_and_find() {
+        let cmds = [
+            IpcCommand::Status,
+            IpcCommand::Open(PathBuf::from("/tmp/a b/file.rs")),
+            IpcCommand::Goto {
+                line_1based: 42,
+                col_bytes: 8,
+            },
+            IpcCommand::Select {
+                start_line: 1,
+                start_col: 0,
+                end_line: 3,
+                end_col: 5,
+            },
+            IpcCommand::Insert {
+                text: "line1\n\tline2 🚀\\end".to_string(),
+            },
+            IpcCommand::Find {
+                query: "foo\tbar".to_string(),
+                replace: Some("baz\nqux".to_string()),
+                case_sensitive: true,
+                replace_all: true,
+                close: false,
+            },
+            IpcCommand::Save {
+                as_path: Some(PathBuf::from("/tmp/out.rs")),
+            },
+            IpcCommand::Action("toggle-wrap".to_string()),
+            IpcCommand::Quit { force: true },
+        ];
+        for c in cmds {
+            let wire = c.to_wire();
+            assert_eq!(IpcCommand::from_wire(&wire), Some(c));
+        }
+    }
+
+    #[test]
     fn ipc_server_and_client_round_trip() {
         let sock = std::env::temp_dir().join(format!("editor_ipc_unit_{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sock);
@@ -271,13 +487,9 @@ mod tests {
 
         assert_eq!(send_ping(&sock).unwrap(), IpcReply::Pong);
 
-        // Send OPEN from a client thread and answer on the main thread.
         let s2 = sock.clone();
-        let client_t = thread::spawn(move || {
-            send_command(&s2, &IpcCommand::Open(PathBuf::from("/tmp/hello.rs"))).unwrap()
-        });
+        let client_t = thread::spawn(move || send_command(&s2, &IpcCommand::Status).unwrap());
 
-        // Poll briefly for the queued command.
         let mut received = None;
         for _ in 0..100 {
             if let Some(p) = server.try_recv() {
@@ -286,11 +498,14 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        let pending = received.expect("server should receive OPEN command");
+        let pending = received.expect("server should receive STATUS command");
         assert!(woken.load(Ordering::SeqCst));
-        assert_eq!(pending.cmd, IpcCommand::Open(PathBuf::from("/tmp/hello.rs")));
-        pending.respond(IpcReply::Opened);
-        assert_eq!(client_t.join().unwrap(), IpcReply::Opened);
+        assert_eq!(pending.cmd, IpcCommand::Status);
+        pending.respond(IpcReply::Json("{\"dirty\":false}".to_string()));
+        assert_eq!(
+            client_t.join().unwrap(),
+            IpcReply::Json("{\"dirty\":false}".to_string())
+        );
 
         drop(server);
         assert!(!sock.exists(), "socket should be removed on drop");

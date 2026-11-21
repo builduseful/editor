@@ -154,7 +154,15 @@ fn cli_ipc_open_close_and_quit_commands() {
     std::fs::write(&sample, "fn main() {}\n").unwrap();
     let sock = root.join("test.sock");
 
-    // 1. `editor close` when no GUI is running -> E_NOT_RUNNING (exit 2).
+    // 1. `editor status` when no GUI is running -> ok:true, running:false; `editor close` -> E_NOT_RUNNING.
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"running\":false"));
+
     let out = Command::new(bin)
         .env("EDITOR_IPC_SOCK", &sock)
         .arg("close")
@@ -163,16 +171,29 @@ fn cli_ipc_open_close_and_quit_commands() {
     assert!(!out.status.success());
     assert!(String::from_utf8(out.stdout).unwrap().contains("E_NOT_RUNNING"));
 
-    // 2. Start a mock IPC server mimicking a running GUI and verify `open`, `close`, `quit --force`.
+    // 2. Start a mock IPC server mimicking a running GUI and verify `status`, `open`, `goto`, `close`, `quit --force`.
     let server = IpcServer::bind(sock.clone(), Arc::new(|| {})).unwrap();
     let srv_thread = thread::spawn(move || {
         let mut handled = 0;
         for _ in 0..400 {
             if let Some(pending) = server.try_recv() {
                 match &pending.cmd {
+                    IpcCommand::Status => {
+                        pending.respond(IpcReply::Json(
+                            "{\"running\":true,\"path\":\"/tmp/hello.rs\",\"dirty\":false}".into(),
+                        ));
+                    }
                     IpcCommand::Open(p) => {
                         assert!(p.ends_with("hello.rs"));
                         pending.respond(IpcReply::Opened);
+                    }
+                    IpcCommand::Goto {
+                        line_1based: 5,
+                        col_bytes: 2,
+                    } => {
+                        pending.respond(IpcReply::Json(
+                            "{\"running\":true,\"cursor\":{\"line\":5,\"col\":2}}".into(),
+                        ));
                     }
                     IpcCommand::Quit { force: false } => {
                         pending.respond(IpcReply::Prompting);
@@ -180,16 +201,28 @@ fn cli_ipc_open_close_and_quit_commands() {
                     IpcCommand::Quit { force: true } => {
                         pending.respond(IpcReply::Quitting);
                     }
+                    other => panic!("unexpected ipc command: {other:?}"),
                 }
                 handled += 1;
-                if handled == 3 {
+                if handled == 5 {
                     break;
                 }
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(handled, 3);
+        assert_eq!(handled, 5);
     });
+
+    // `editor status`
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(s.contains("\"running\":true"));
+    assert!(s.contains("/tmp/hello.rs"));
 
     // `editor open hello.rs`
     let out = Command::new(bin)
@@ -201,6 +234,15 @@ fn cli_ipc_open_close_and_quit_commands() {
     let s = String::from_utf8(out.stdout).unwrap();
     assert!(s.contains("\"launched\":false"));
     assert!(s.contains("\"status\":\"opened\""));
+
+    // `editor goto 5:2`
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["goto", "5:2"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"line\":5,\"col\":2"));
 
     // `editor close` (mock GUI reports dirty -> prompting: true)
     let out = Command::new(bin)

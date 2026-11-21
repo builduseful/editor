@@ -579,39 +579,23 @@ extern "C" fn cb_command(ud: *mut c_void, cmd_id: u32) {
 
 extern "C" fn cb_tick(ud: *mut c_void, now_ms: u64) {
     let b = unsafe { &mut *(ud as *mut Bridge) };
-    // Drain any incoming CLI IPC commands (`editor open`, `editor close` / `editor quit`).
+    // Drain any incoming CLI/agent IPC commands (`status`, `open`, `goto`, `select`,
+    // `insert`, `find`, `save`, `undo`, `redo`, `action`, `close`/`quit`).
     while let Some(pending) = b.ipc.as_ref().and_then(|s| s.try_recv()) {
-        match &pending.cmd {
-            editor_platform::ipc::IpcCommand::Open(path) => {
-                let p = path.clone();
-                unsafe { mac_activate_app() };
-                b.app.handle_event(
-                    InputEvent::OpenPath(p),
-                    &mut b.rasterizer,
-                    &mut b.clipboard,
-                    &mut b.host,
-                );
-                pending.respond(editor_platform::ipc::IpcReply::Opened);
-            }
-            editor_platform::ipc::IpcCommand::Quit { force } => {
-                if *force || !b.app.doc.is_dirty() {
-                    pending.respond(editor_platform::ipc::IpcReply::Quitting);
-                    // Drop IPC server so socket file is removed before NSApp terminates.
-                    b.ipc = None;
-                    b.host.request_quit();
-                    return;
-                } else {
-                    // Dirty document without --force: bring window to front & show custom confirm modal!
-                    unsafe { mac_activate_app() };
-                    b.app.handle_event(
-                        InputEvent::Command(AppCommand::Quit),
-                        &mut b.rasterizer,
-                        &mut b.clipboard,
-                        &mut b.host,
-                    );
-                    pending.respond(editor_platform::ipc::IpcReply::Prompting);
-                }
-            }
+        let (reply, activate, should_quit) = b.app.execute_ipc(
+            &pending.cmd,
+            &mut b.rasterizer,
+            &mut b.clipboard,
+            &mut b.host,
+        );
+        if activate {
+            unsafe { mac_activate_app() };
+        }
+        pending.respond(reply);
+        if should_quit {
+            b.ipc = None;
+            b.host.request_quit();
+            return;
         }
     }
     b.app.handle_event(

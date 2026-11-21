@@ -89,6 +89,15 @@ fn main() -> ExitCode {
         "batch" => cmd_batch(&fs, &globals, rest, start),
         "open" => cmd_open(&fs, &globals, rest, start),
         "gui" => cmd_gui(&fs, &globals, rest, start),
+        "status" => cmd_status(start),
+        "goto" => cmd_goto(rest, start),
+        "select" => cmd_select(rest, start),
+        "insert" => cmd_insert(&fs, &globals, rest, start),
+        "find" => cmd_find(rest, start),
+        "save" => cmd_save(&fs, &globals, rest, start),
+        "undo" => cmd_action_direct("undo", start),
+        "redo" => cmd_action_direct("redo", start),
+        "action" => cmd_action(&fs, &globals, rest, start),
         "close" | "quit" => cmd_quit(cmd, rest, start),
         other => {
             emit_err(
@@ -120,6 +129,14 @@ fn print_usage() {
            editor batch [--file F | --stdin] [--check]\n\
            editor open <path>\n\
            editor gui [--sidebar-root DIR] [PATH]\n\
+           editor status                                         (inspect live GUI state)\n\
+           editor goto <LINE[:COL]>                              (jump live GUI caret)\n\
+           editor select (<L1[:C1]> <L2[:C2]> | --all)           (set live GUI selection)\n\
+           editor insert <TEXT|@FILE|->                          (insert at live GUI caret)\n\
+           editor find <QUERY> [--replace T] [--case-sensitive] [--replace-all] [--close]\n\
+           editor save [--as PATH]                               (save live GUI document)\n\
+           editor undo | redo                                    (undo/redo in live GUI)\n\
+           editor action <NAME> [ARG]                            (run any UI command)\n\
            editor close [--force]   (alias: quit)\n\
            editor version\n\
            editor schema [COMMAND]"
@@ -290,8 +307,9 @@ fn push_doc_fields(jb: &mut JsonBuf, info: &editor_core::DocumentInfo, include_r
 
 fn cmd_schema(args: &[String], start: Instant) -> u8 {
     let all = [
-        "read", "write", "edit", "info", "validate", "batch", "open", "gui", "close", "quit",
-        "version", "schema",
+        "read", "write", "edit", "info", "validate", "batch", "open", "gui", "status", "goto",
+        "select", "insert", "find", "save", "undo", "redo", "action", "close", "quit", "version",
+        "schema",
     ];
     if let Some(target) = args.first() {
         if !all.contains(&target.as_str()) {
@@ -306,7 +324,7 @@ fn cmd_schema(args: &[String], start: Instant) -> u8 {
         return 0;
     }
     let mut jb = JsonBuf::new();
-    jb.push_raw("[{\"commands\":[\"read\",\"write\",\"edit\",\"info\",\"validate\",\"batch\",\"open\",\"gui\",\"close\",\"quit\",\"version\",\"schema\"]}]");
+    jb.push_raw("[{\"commands\":[\"read\",\"write\",\"edit\",\"info\",\"validate\",\"batch\",\"open\",\"gui\",\"status\",\"goto\",\"select\",\"insert\",\"find\",\"save\",\"undo\",\"redo\",\"action\",\"close\",\"quit\",\"version\",\"schema\"]}]");
     emit_ok("schema", start, &jb.into_string());
     0
 }
@@ -1541,4 +1559,255 @@ fn cmd_quit(command_name: &str, args: &[String], start: Instant) -> u8 {
             2
         }
     }
+}
+
+fn send_live_gui_command(
+    command_name: &str,
+    cmd: &editor_platform::ipc::IpcCommand,
+    start: Instant,
+) -> u8 {
+    let sock = editor_platform::ipc::default_socket_path();
+    match editor_platform::ipc::send_command(&sock, cmd) {
+        Ok(editor_platform::ipc::IpcReply::Json(state_json)) => {
+            emit_ok(command_name, start, &format!("[{state_json}]"));
+            0
+        }
+        Ok(editor_platform::ipc::IpcReply::Error(m)) => {
+            emit_err(command_name, start, "E_IO", &m, None);
+            2
+        }
+        Ok(_) => {
+            emit_ok(command_name, start, "[{\"ok\":true}]");
+            0
+        }
+        Err(_) => {
+            emit_err(
+                command_name,
+                start,
+                "E_NOT_RUNNING",
+                "no running editor GUI instance found",
+                None,
+            );
+            2
+        }
+    }
+}
+
+fn cmd_status(start: Instant) -> u8 {
+    let sock = editor_platform::ipc::default_socket_path();
+    match editor_platform::ipc::send_command(&sock, &editor_platform::ipc::IpcCommand::Status) {
+        Ok(editor_platform::ipc::IpcReply::Json(state_json)) => {
+            emit_ok("status", start, &format!("[{state_json}]"));
+            0
+        }
+        Ok(editor_platform::ipc::IpcReply::Error(m)) => {
+            emit_err("status", start, "E_IO", &m, None);
+            2
+        }
+        Ok(_) => {
+            emit_ok("status", start, "[{\"running\":true}]");
+            0
+        }
+        Err(_) => {
+            emit_ok("status", start, "[{\"running\":false}]");
+            0
+        }
+    }
+}
+
+fn cmd_goto(args: &[String], start: Instant) -> u8 {
+    let Some(spec) = args.first() else {
+        emit_err("goto", start, "E_USAGE", "usage: editor goto <LINE[:COL]>", None);
+        return 3;
+    };
+    let Some((line_1based, col_bytes)) = parse_at_spec(spec) else {
+        emit_err("goto", start, "E_USAGE", "invalid LINE[:COL] (line must be >= 1)", None);
+        return 3;
+    };
+    send_live_gui_command(
+        "goto",
+        &editor_platform::ipc::IpcCommand::Goto {
+            line_1based,
+            col_bytes,
+        },
+        start,
+    )
+}
+
+fn cmd_select(args: &[String], start: Instant) -> u8 {
+    if args.first().map(|s| s.as_str()) == Some("--all") {
+        return send_live_gui_command(
+            "select",
+            &editor_platform::ipc::IpcCommand::Action("select-all".to_string()),
+            start,
+        );
+    }
+    if args.len() < 2 {
+        emit_err(
+            "select",
+            start,
+            "E_USAGE",
+            "usage: editor select (<LINE[:COL]> <LINE[:COL]> | --all)",
+            None,
+        );
+        return 3;
+    }
+    let (Some((sl, sc)), Some((el, ec))) = (parse_at_spec(&args[0]), parse_at_spec(&args[1]))
+    else {
+        emit_err("select", start, "E_USAGE", "invalid LINE[:COL] coordinates", None);
+        return 3;
+    };
+    send_live_gui_command(
+        "select",
+        &editor_platform::ipc::IpcCommand::Select {
+            start_line: sl,
+            start_col: sc,
+            end_line: el,
+            end_col: ec,
+        },
+        start,
+    )
+}
+
+fn cmd_insert(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
+    let Some(raw) = args.first() else {
+        emit_err("insert", start, "E_USAGE", "usage: editor insert <TEXT|@FILE|->", None);
+        return 3;
+    };
+    let text = match load_text_arg(fs, globals, raw) {
+        Ok(t) => t,
+        Err((c, m)) => {
+            emit_err("insert", start, c, &m, None);
+            return 2;
+        }
+    };
+    send_live_gui_command(
+        "insert",
+        &editor_platform::ipc::IpcCommand::Insert { text },
+        start,
+    )
+}
+
+fn cmd_find(args: &[String], start: Instant) -> u8 {
+    let mut query: Option<String> = None;
+    let mut replace: Option<String> = None;
+    let mut case_sensitive = false;
+    let mut replace_all = false;
+    let mut close = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--replace" if i + 1 < args.len() => {
+                replace = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--case-sensitive" => {
+                case_sensitive = true;
+                i += 1;
+            }
+            "--replace-all" => {
+                replace_all = true;
+                i += 1;
+            }
+            "--close" => {
+                close = true;
+                i += 1;
+            }
+            other if !other.starts_with('-') && query.is_none() => {
+                query = Some(other.to_string());
+                i += 1;
+            }
+            other => {
+                emit_err("find", start, "E_USAGE", &format!("unexpected arg: {other}"), None);
+                return 3;
+            }
+        }
+    }
+    if !close && query.is_none() {
+        emit_err("find", start, "E_USAGE", "require <QUERY> or --close", None);
+        return 3;
+    }
+    send_live_gui_command(
+        "find",
+        &editor_platform::ipc::IpcCommand::Find {
+            query: query.unwrap_or_default(),
+            replace,
+            case_sensitive,
+            replace_all,
+            close,
+        },
+        start,
+    )
+}
+
+fn cmd_save(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
+    let mut as_path: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--as" if i + 1 < args.len() => {
+                match resolve_confined(fs, globals, &args[i + 1]) {
+                    Ok(p) => as_path = Some(p),
+                    Err((c, m)) => {
+                        emit_err("save", start, c, &m, Some(Path::new(&args[i + 1])));
+                        return 2;
+                    }
+                }
+                i += 2;
+            }
+            other => {
+                emit_err("save", start, "E_USAGE", &format!("unexpected arg: {other}"), None);
+                return 3;
+            }
+        }
+    }
+    send_live_gui_command(
+        "save",
+        &editor_platform::ipc::IpcCommand::Save { as_path },
+        start,
+    )
+}
+
+fn cmd_action_direct(name: &str, start: Instant) -> u8 {
+    send_live_gui_command(
+        name,
+        &editor_platform::ipc::IpcCommand::Action(name.to_string()),
+        start,
+    )
+}
+
+fn cmd_action(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
+    let Some(name) = args.first() else {
+        emit_err(
+            "action",
+            start,
+            "E_USAGE",
+            "usage: editor action <new|reload|save|undo|redo|cut|copy|paste|select-all|find|replace|goto-line|quick-open|project-search|toggle-wrap|toggle-sidebar|sidebar-show|sidebar-hide|sidebar-root DIR|zoom-in|zoom-out|zoom-reset|theme-system|theme-light|theme-dark|duplicate-line|delete-line|toggle-comment|focus>",
+            None,
+        );
+        return 3;
+    };
+    if name == "sidebar-root" {
+        let Some(dir_arg) = args.get(1) else {
+            emit_err("action", start, "E_USAGE", "sidebar-root requires <DIR>", None);
+            return 3;
+        };
+        let dir = match resolve_confined(fs, globals, dir_arg) {
+            Ok(p) => p,
+            Err((c, m)) => {
+                emit_err("action", start, c, &m, Some(Path::new(dir_arg)));
+                return 2;
+            }
+        };
+        return send_live_gui_command(
+            "action",
+            &editor_platform::ipc::IpcCommand::OpenFolder(dir),
+            start,
+        );
+    }
+    send_live_gui_command(
+        "action",
+        &editor_platform::ipc::IpcCommand::Action(name.clone()),
+        start,
+    )
 }

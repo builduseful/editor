@@ -398,3 +398,102 @@ fn quick_open_and_project_wide_swar_search() {
     let (line, _) = app.doc.byte_to_line_col(app.caret);
     assert_eq!(line, 2, "must jump directly to line 3 (0-based 2)!");
 }
+
+#[test]
+fn ipc_full_ui_inspection_and_control() {
+    use editor_platform::ipc::{IpcCommand, IpcReply};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/demo.rs", b"fn first() {}\nfn second() {}\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1200, 800, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.set_sidebar_root(&PathBuf::from("/repo"));
+    let (reply, activate, quit) = app.execute_ipc(
+        &IpcCommand::Open(PathBuf::from("/repo/demo.rs")),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(activate && !quit);
+    let IpcReply::Json(status) = reply else { panic!("expected json status") };
+    assert!(status.contains("\"path\":\"/repo/demo.rs\""));
+    assert!(status.contains("\"dirty\":false"));
+
+    // Jump to line 2 col 3, insert text, verify dirty & cursor in status JSON!
+    app.execute_ipc(
+        &IpcCommand::Goto {
+            line_1based: 2,
+            col_bytes: 3,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Insert {
+            text: "pub_".into(),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let IpcReply::Json(s) = reply else { panic!("expected json") };
+    assert!(s.contains("\"dirty\":true"));
+    assert!(s.contains("\"line\":2,\"col\":7"));
+    assert_eq!(app.doc.line_content(1).unwrap(), "fn pub_second() {}");
+
+    // Select range and check selection text in status JSON!
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Select {
+            start_line: 2,
+            start_col: 3,
+            end_line: 2,
+            end_col: 13,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let IpcReply::Json(s) = reply else { panic!("expected json") };
+    assert!(s.contains("\"text\":\"pub_second\""));
+
+    // Undo restores clean line; toggle wrap & dark theme via `Action`!
+    app.execute_ipc(&IpcCommand::Action("undo".into()), &mut raster, &mut clip, &mut host);
+    assert_eq!(app.doc.line_content(1).unwrap(), "fn second() {}");
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Action("theme-dark".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let IpcReply::Json(s) = reply else { panic!("expected json") };
+    assert!(s.contains("\"active_theme\":\"dark\""));
+
+    // Find & replace-all via IPC, then save!
+    app.execute_ipc(
+        &IpcCommand::Find {
+            query: "fn".into(),
+            replace: Some("pub fn".into()),
+            case_sensitive: true,
+            replace_all: true,
+            close: false,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(0).unwrap(), "pub fn first() {}");
+
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Save { as_path: None },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let IpcReply::Json(s) = reply else { panic!("expected json") };
+    assert!(s.contains("\"dirty\":false"));
+}
