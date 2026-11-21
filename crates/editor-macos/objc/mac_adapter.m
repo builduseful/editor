@@ -582,14 +582,30 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
 }
 
 - (void)reclaimSpareSurfaces {
-    // Mark non-front swapchain surfaces volatile after idle so macOS excludes them from phys_footprint
-    // while keeping them hot for <5us re-acquisition on the next scroll or keystroke!
+    // Free any burst 3rd slot and mark the spare back-buffer volatile 200ms after activity stops.
+    // macOS immediately excludes VOLATILE surfaces from Physical footprint while keeping the
+    // spare surface hot for <5us non-volatile re-acquisition on the next scroll or keystroke!
+    int keptSpare = 0;
     for (int i = 0; i < MAX_SWAP_SLOTS; i++) {
-        if (i == _frontIdx) continue;
-        if (_slots[i].surface && !_slots[i].is_volatile && !IOSurfaceIsInUse(_slots[i].surface)) {
-            if (IOSurfaceSetPurgeable(_slots[i].surface, kIOSurfacePurgeableVolatile, NULL) == kIOReturnSuccess) {
-                _slots[i].is_volatile = YES;
+        if (i == _frontIdx || !_slots[i].surface) continue;
+        if (IOSurfaceIsInUse(_slots[i].surface)) continue;
+        if (keptSpare == 0) {
+            keptSpare = 1;
+            if (!_slots[i].is_volatile) {
+                if (IOSurfaceSetPurgeable(_slots[i].surface, kIOSurfacePurgeableVolatile, NULL) == kIOReturnSuccess) {
+                    _slots[i].is_volatile = YES;
+                }
             }
+        } else {
+            // Release any extra burst slot beyond double-buffering.
+            CFRelease(_slots[i].surface);
+            _slots[i].surface = NULL;
+            _slots[i].needs_full = YES;
+            _slots[i].is_volatile = NO;
+            _slots[i].dmg_x = 0;
+            _slots[i].dmg_y = 0;
+            _slots[i].dmg_w = 0;
+            _slots[i].dmg_h = 0;
         }
     }
 }
@@ -658,11 +674,11 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
         [CATransaction commit];
         _frontIdx = slotIdx;
 
-        // Schedule idle reclamation of spare back-buffer(s) 1.5s after activity stops.
+        // Schedule idle reclamation 200ms after activity stops (>12 vsyncs, <530ms caret blink).
         [NSObject cancelPreviousPerformRequestsWithTarget:self
                                                  selector:@selector(reclaimSpareSurfaces)
                                                    object:nil];
-        [self performSelector:@selector(reclaimSpareSurfaces) withObject:nil afterDelay:1.5];
+        [self performSelector:@selector(reclaimSpareSurfaces) withObject:nil afterDelay:0.2];
     }
     _inPresent = NO;
 }
