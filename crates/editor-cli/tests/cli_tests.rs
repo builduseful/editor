@@ -1,69 +1,139 @@
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 
 #[test]
-fn cli_round_trip_write_info_read_edit_validate() {
+fn cli_round_trip_write_info_read_edit_validate_and_batch() {
     let bin = env!("CARGO_BIN_EXE_editor");
-    let tmp = std::env::temp_dir().join(format!("editor_cli_test_{}.rs", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
+    let root = std::env::temp_dir().join(format!("editor_cli_suite_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
 
-    // 1. Version
+    let target = root.join("main.rs");
+    let payload = root.join("payload.txt");
+    std::fs::write(&payload, "fn main() {\n    println!(\"hello 🚀\");\n}\n").unwrap();
+
+    // 1. Version & Schema
     let out = Command::new(bin).arg("version").output().unwrap();
     assert!(out.status.success());
-    let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains("\"ok\":true"));
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"ok\":true"));
 
-    // 2. Write new file from @FILE
-    let payload = std::env::temp_dir().join(format!("editor_cli_payload_{}.txt", std::process::id()));
-    std::fs::write(&payload, "fn main() {\n    println!(\"hello 🚀\");\n}\n").unwrap();
+    let out = Command::new(bin).args(["schema", "batch"]).output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"batch\""));
+
+    // 2. Write new file confined under --root
     let out = Command::new(bin)
-        .args(["write", tmp.to_str().unwrap(), &format!("@{}", payload.display())])
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "write",
+            "main.rs",
+            "@payload.txt",
+        ])
         .output()
         .unwrap();
     assert!(out.status.success(), "write failed: {}", String::from_utf8_lossy(&out.stdout));
-    let _ = std::fs::remove_file(&payload);
 
-    // 3. Info
+    // 3. Confinement rejects escaping --root with E_OUTSIDE_ROOT
     let out = Command::new(bin)
-        .args(["info", tmp.to_str().unwrap()])
+        .args(["--root", root.to_str().unwrap(), "info", "../outside.txt"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("E_OUTSIDE_ROOT"));
+
+    // 4. Read byte axis & line axis
+    let out = Command::new(bin)
+        .args(["--root", root.to_str().unwrap(), "read", "main.rs", "--from", "1", "--to", "2"])
         .output()
         .unwrap();
     assert!(out.status.success());
-    let info_json = String::from_utf8(out.stdout).unwrap();
-    assert!(info_json.contains("\"line_count\":3"));
-    assert!(info_json.contains("\"eol\":\"lf\""));
+    assert!(String::from_utf8(out.stdout).unwrap().contains("hello 🚀"));
 
-    // 4. Read lines 1..2
     let out = Command::new(bin)
-        .args(["read", tmp.to_str().unwrap(), "--from", "1", "--to", "2"])
+        .args(["--root", root.to_str().unwrap(), "read", "main.rs", "--from-offset", "0", "--length", "9"])
         .output()
         .unwrap();
     assert!(out.status.success());
-    let read_json = String::from_utf8(out.stdout).unwrap();
-    assert!(read_json.contains("hello 🚀"));
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"content\":\"fn main()\""));
 
-    // 5. Edit with --force
+    // 5. Positional edit --at LINE:COL --op insert + --dry-run first
     let out = Command::new(bin)
         .args([
+            "--root",
+            root.to_str().unwrap(),
             "edit",
-            tmp.to_str().unwrap(),
-            "--old",
-            "hello",
-            "--new",
-            "world",
+            "main.rs",
+            "--at",
+            "1:0",
+            "--op",
+            "insert",
+            "--text",
+            "// header\n",
+            "--force",
+            "--dry-run",
+        ])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"line_count\":4"));
+    // Dry-run must not modify file on disk!
+    assert!(!std::fs::read_to_string(&target).unwrap().contains("// header"));
+
+    // Now apply for real!
+    let out = Command::new(bin)
+        .args([
+            "--root",
+            root.to_str().unwrap(),
+            "edit",
+            "main.rs",
+            "--at",
+            "1:0",
+            "--op",
+            "insert",
+            "--text",
+            "// header\n",
             "--force",
         ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "edit failed: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(out.status.success());
+    assert!(std::fs::read_to_string(&target).unwrap().starts_with("// header\n"));
 
-    // 6. Validate
+    // 6. Batch --check + multi-file commit via stdin JSON-lines
+    let batch_prog = "{\"op\":\"edit\",\"path\":\"main.rs\",\"old\":\"hello\",\"new\":\"world\",\"force\":true}\n\
+                      {\"op\":\"write\",\"path\":\"second.rs\",\"content\":\"pub const X: u32 = 7;\\n\"}\n";
+
+    let mut child = Command::new(bin)
+        .args(["--root", root.to_str().unwrap(), "batch", "--check"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(batch_prog.as_bytes()).unwrap();
+    let check_out = child.wait_with_output().unwrap();
+    assert!(check_out.status.success());
+    assert!(String::from_utf8(check_out.stdout).unwrap().contains("\"valid\":true"));
+    assert!(!root.join("second.rs").exists(), "--check must not write!");
+
+    let mut child = Command::new(bin)
+        .args(["--root", root.to_str().unwrap(), "batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.as_mut().unwrap().write_all(batch_prog.as_bytes()).unwrap();
+    let run_out = child.wait_with_output().unwrap();
+    assert!(run_out.status.success(), "batch failed: {}", String::from_utf8_lossy(&run_out.stdout));
+    assert!(std::fs::read_to_string(&target).unwrap().contains("world 🚀"));
+    assert_eq!(std::fs::read_to_string(root.join("second.rs")).unwrap(), "pub const X: u32 = 7;\n");
+
+    // 7. Validate
     let out = Command::new(bin)
-        .args(["validate", tmp.to_str().unwrap()])
+        .args(["--root", root.to_str().unwrap(), "validate", "main.rs"])
         .output()
         .unwrap();
     assert!(out.status.success());
 
-    let final_text = std::fs::read_to_string(&tmp).unwrap();
-    assert!(final_text.contains("world 🚀"));
-    let _ = std::fs::remove_file(&tmp);
+    let _ = std::fs::remove_dir_all(&root);
 }
