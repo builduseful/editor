@@ -43,5 +43,6 @@ fn main() {
     println!("cargo:rustc-link-lib=framework=CoreGraphics");
     println!("cargo:rustc-link-lib=framework=CoreText");
     println!("cargo:rustc-link-lib=framework=QuartzCore");
+    println!("cargo:rustc-link-lib=framework=IOSurface");
     println!("cargo:rustc-link-lib=framework=Foundation");
 }

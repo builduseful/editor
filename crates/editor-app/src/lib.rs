@@ -66,6 +66,8 @@ pub struct EditorApp {
     pub atlas: GlyphAtlas,
     pub framebuffer: Framebuffer,
     pub layout: AppLayout,
+    /// Bounding pixel rect updated during the most recent `render()` call (for zero-copy IOSurface upload).
+    pub last_rendered_dirty: PixelRect,
 
     window_focused: bool,
     caret_visible: bool,
@@ -106,6 +108,7 @@ impl EditorApp {
             atlas: GlyphAtlas::new(),
             framebuffer: Framebuffer::new(width_px.max(1), height_px.max(1), scale),
             layout: AppLayout::default(),
+            last_rendered_dirty: PixelRect::ZERO,
             window_focused: true,
             caret_visible: true,
             last_blink_ms: 0,
@@ -427,6 +430,7 @@ impl EditorApp {
         }
 
         painter.pop_clip();
+        self.last_rendered_dirty = effective_clip;
         self.framebuffer.dirty.clear();
         self.dirty_frame = false;
         true

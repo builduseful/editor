@@ -6,6 +6,7 @@
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 #import <CoreText/CoreText.h>
+#import <IOSurface/IOSurface.h>
 #import <QuartzCore/QuartzCore.h>
 #include <math.h>
 #include <stdint.h>
@@ -328,8 +329,9 @@ typedef struct {
     void (*on_open_path)(void* ud, const char* path);
     void (*on_command)(void* ud, uint32_t cmd_id);
     void (*on_tick)(void* ud, uint64_t now_ms);
-    // Rust fills out pointer + dimensions of the BGRA8 framebuffer to present.
-    int (*on_render)(void* ud, const uint8_t** out_pixels, uint32_t* out_w, uint32_t* out_h);
+    // Rust fills out pointer, framebuffer dimensions, and the dirty rect to upload into IOSurface.
+    int (*on_render)(void* ud, const uint8_t** out_pixels, uint32_t* out_w, uint32_t* out_h,
+                     int32_t* dirty_x, int32_t* dirty_y, int32_t* dirty_w, int32_t* dirty_h);
 } MacCallbacks;
 
 static uint32_t encode_mods(NSEventModifierFlags f) {
@@ -353,13 +355,24 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
     return [match isEqualToString:NSAppearanceNameDarkAqua] ? 1 : 0;
 }
 
-@interface EditorSurfaceView : NSView
+@interface EditorSurfaceView : NSView {
+    IOSurfaceRef _surface;
+    uint32_t _surfW;
+    uint32_t _surfH;
+}
 @property (nonatomic) MacCallbacks cb;
 - (void)presentFramebuffer;
 - (void)notifyResize;
 @end
 
 @implementation EditorSurfaceView
+
+- (void)dealloc {
+    if (_surface) {
+        CFRelease(_surface);
+        _surface = NULL;
+    }
+}
 
 - (BOOL)isFlipped { return YES; }
 - (BOOL)acceptsFirstResponder { return YES; }
@@ -432,32 +445,73 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
     }
 }
 
+- (void)ensureSurfaceWidth:(uint32_t)w height:(uint32_t)h {
+    if (_surface && _surfW == w && _surfH == h) return;
+    if (_surface) {
+        CFRelease(_surface);
+        _surface = NULL;
+    }
+    size_t bpr = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, (size_t)w * 4);
+    size_t alloc_size = IOSurfaceAlignProperty(kIOSurfaceAllocSize, bpr * (size_t)h);
+    NSDictionary* props = @{
+        (id)kIOSurfaceWidth: @(w),
+        (id)kIOSurfaceHeight: @(h),
+        (id)kIOSurfaceBytesPerElement: @(4),
+        (id)kIOSurfaceBytesPerRow: @(bpr),
+        (id)kIOSurfaceAllocSize: @(alloc_size),
+        (id)kIOSurfacePixelFormat: @(0x42475241u), // 'BGRA'
+    };
+    _surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (_surface) {
+        IOSurfaceSetValue(_surface, kIOSurfaceColorSpace, kCGColorSpaceSRGB);
+    }
+    _surfW = w;
+    _surfH = h;
+}
+
 - (void)presentFramebuffer {
     if (!self.cb.on_render) return;
     const uint8_t* pixels = NULL;
     uint32_t w = 0, h = 0;
-    int updated = self.cb.on_render(self.cb.userdata, &pixels, &w, &h);
+    int32_t dx = 0, dy = 0, dw = 0, dh = 0;
+    int updated = self.cb.on_render(self.cb.userdata, &pixels, &w, &h, &dx, &dy, &dw, &dh);
     if (!updated || !pixels || w == 0 || h == 0) return;
 
-    size_t byte_len = (size_t)w * (size_t)h * 4;
-    NSData* data = [NSData dataWithBytes:pixels length:byte_len];
-    CGDataProviderRef provider = CGDataProviderCreateWithCFData((__bridge CFDataRef)data);
-    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-    CGImageRef img = CGImageCreate(
-        w, h, 8, 32, (size_t)w * 4, cs,
-        (CGBitmapInfo)kCGBitmapByteOrder32Little | (CGBitmapInfo)kCGImageAlphaPremultipliedFirst,
-        provider, NULL, false, kCGRenderingIntentDefault);
-    CGColorSpaceRelease(cs);
-    CGDataProviderRelease(provider);
+    BOOL recreated = (!_surface || _surfW != w || _surfH != h);
+    [self ensureSurfaceWidth:w height:h];
+    if (!_surface) return;
 
-    if (img) {
-        [CATransaction begin];
-        [CATransaction setDisableActions:YES];
-        self.layer.contentsScale = self.window.backingScaleFactor > 0 ? self.window.backingScaleFactor : 1.0;
-        self.layer.contents = (__bridge id)img;
-        [CATransaction commit];
-        CGImageRelease(img);
+    if (recreated || dw <= 0 || dh <= 0) {
+        dx = 0; dy = 0; dw = (int32_t)w; dh = (int32_t)h;
+    } else {
+        if (dx < 0) { dw += dx; dx = 0; }
+        if (dy < 0) { dh += dy; dy = 0; }
+        if (dx + dw > (int32_t)w) dw = (int32_t)w - dx;
+        if (dy + dh > (int32_t)h) dh = (int32_t)h - dy;
     }
+
+    if (IOSurfaceLock(_surface, 0, NULL) == kIOReturnSuccess) {
+        uint8_t* dst_base = (uint8_t*)IOSurfaceGetBaseAddress(_surface);
+        size_t dst_bpr = IOSurfaceGetBytesPerRow(_surface);
+        size_t src_bpr = (size_t)w * 4;
+        size_t copy_bytes = (size_t)dw * 4;
+        if (dst_base && copy_bytes > 0) {
+            for (int32_t row = dy; row < dy + dh; row++) {
+                memcpy(dst_base + (size_t)row * dst_bpr + (size_t)dx * 4,
+                       pixels + (size_t)row * src_bpr + (size_t)dx * 4,
+                       copy_bytes);
+            }
+        }
+        IOSurfaceUnlock(_surface, 0, NULL);
+    }
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.layer.contentsScale = self.window.backingScaleFactor > 0 ? self.window.backingScaleFactor : 1.0;
+    // Re-assigning the IOSurface notifies WindowServer to composite the updated dirty region.
+    self.layer.contents = nil;
+    self.layer.contents = (__bridge id)_surface;
+    [CATransaction commit];
 }
 
 - (NSPoint)pixelPointFromEvent:(NSEvent*)event {

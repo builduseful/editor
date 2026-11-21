@@ -11,12 +11,17 @@ pub enum Language {
     PlainText,
     Rust,
     C,
+    Go,
+    Swift,
     Python,
     JavaScript,
     Json,
     Markdown,
     Shell,
     Toml,
+    Html,
+    Css,
+    Sql,
 }
 
 impl Language {
@@ -28,12 +33,17 @@ impl Language {
         match ext.as_deref() {
             Some("rs") => Language::Rust,
             Some("c" | "h" | "cc" | "cpp" | "cxx" | "hpp" | "hh" | "m" | "mm") => Language::C,
+            Some("go") => Language::Go,
+            Some("swift") => Language::Swift,
             Some("py" | "pyi") => Language::Python,
             Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs") => Language::JavaScript,
             Some("json" | "jsonc") => Language::Json,
             Some("md" | "markdown") => Language::Markdown,
             Some("sh" | "bash" | "zsh") => Language::Shell,
             Some("toml" | "yaml" | "yml" | "ini") => Language::Toml,
+            Some("html" | "htm" | "xml" | "svg" | "plist") => Language::Html,
+            Some("css" | "scss") => Language::Css,
+            Some("sql") => Language::Sql,
             _ => Language::PlainText,
         }
     }
@@ -43,12 +53,17 @@ impl Language {
             Language::PlainText => "Plain Text",
             Language::Rust => "Rust",
             Language::C => "C / C++",
+            Language::Go => "Go",
+            Language::Swift => "Swift",
             Language::Python => "Python",
             Language::JavaScript => "JS / TS",
             Language::Json => "JSON",
             Language::Markdown => "Markdown",
             Language::Shell => "Shell",
             Language::Toml => "TOML / Config",
+            Language::Html => "HTML / XML",
+            Language::Css => "CSS",
+            Language::Sql => "SQL",
         }
     }
 }
@@ -170,8 +185,110 @@ pub fn lex_line_stateless(
         Language::Json => lex_json(line, out),
         Language::Python => lex_python(state, line, out),
         Language::Shell | Language::Toml => lex_hash_script(lang, line, out),
-        Language::Rust | Language::C | Language::JavaScript => lex_c_like(lang, state, line, out),
+        Language::Html => lex_html(line, out),
+        Language::Sql => lex_sql(line, out),
+        Language::Rust | Language::C | Language::Go | Language::Swift | Language::JavaScript | Language::Css => {
+            lex_c_like(lang, state, line, out)
+        }
     }
+}
+
+fn lex_html(line: &str, out: &mut Vec<TokenSpan>) -> LineState {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        if bytes[i..].starts_with(b"<!--") {
+            let start = i;
+            i += 4;
+            while i + 2 < len && !bytes[i..].starts_with(b"-->") {
+                i += 1;
+            }
+            if i + 3 <= len && bytes[i..].starts_with(b"-->") {
+                i += 3;
+            } else {
+                i = len;
+            }
+            push_span(out, start, i, TokenKind::Comment);
+        } else if bytes[i] == b'<' {
+            let start = i;
+            i += 1;
+            if i < len && (bytes[i] == b'/' || bytes[i] == b'?' || bytes[i] == b'!') {
+                i += 1;
+            }
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'-' || bytes[i] == b':') {
+                i += 1;
+            }
+            push_span(out, start, i, TokenKind::Keyword);
+        } else if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let q = bytes[i];
+            let start = i;
+            i += 1;
+            while i < len && bytes[i] != q {
+                i += 1;
+            }
+            if i < len {
+                i += 1;
+            }
+            push_span(out, start, i, TokenKind::String);
+        } else {
+            i += 1;
+        }
+    }
+    LineState::NORMAL
+}
+
+fn lex_sql(line: &str, out: &mut Vec<TokenSpan>) -> LineState {
+    let bytes = line.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            push_span(out, i, len, TokenKind::Comment);
+            return LineState::NORMAL;
+        } else if bytes[i] == b'\'' {
+            let start = i;
+            i += 1;
+            while i < len {
+                if bytes[i] == b'\'' {
+                    i += 1;
+                    if i < len && bytes[i] == b'\'' {
+                        i += 1;
+                    } else {
+                        break;
+                    }
+                } else {
+                    i += 1;
+                }
+            }
+            push_span(out, start, i, TokenKind::String);
+        } else if bytes[i].is_ascii_digit() {
+            let start = i;
+            while i < len && (bytes[i].is_ascii_digit() || bytes[i] == b'.') {
+                i += 1;
+            }
+            push_span(out, start, i, TokenKind::Number);
+        } else if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
+            let start = i;
+            while i < len && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            let up = line[start..i].to_ascii_uppercase();
+            if matches!(
+                up.as_str(),
+                "SELECT" | "FROM" | "WHERE" | "INSERT" | "INTO" | "VALUES" | "UPDATE" | "SET"
+                    | "DELETE" | "CREATE" | "TABLE" | "INDEX" | "DROP" | "ALTER" | "JOIN"
+                    | "LEFT" | "RIGHT" | "INNER" | "OUTER" | "ON" | "AS" | "AND" | "OR" | "NOT"
+                    | "NULL" | "ORDER" | "BY" | "GROUP" | "HAVING" | "LIMIT" | "OFFSET"
+                    | "PRIMARY" | "KEY" | "BEGIN" | "COMMIT" | "ROLLBACK"
+            ) {
+                push_span(out, start, i, TokenKind::Keyword);
+            }
+        } else {
+            i += 1;
+        }
+    }
+    LineState::NORMAL
 }
 
 fn push_span(out: &mut Vec<TokenSpan>, start: usize, end: usize, kind: TokenKind) {
@@ -595,6 +712,29 @@ fn is_c_like_keyword(lang: Language, w: &str) -> bool {
                 | "protected" | "public" | "readonly" | "return" | "static" | "super" | "switch"
                 | "this" | "throw" | "true" | "try" | "type" | "typeof" | "undefined" | "var"
                 | "void" | "while" | "yield"
+        ),
+        Language::Go => matches!(
+            w,
+            "break" | "case" | "chan" | "const" | "continue" | "default" | "defer" | "else"
+                | "fallthrough" | "for" | "func" | "go" | "goto" | "if" | "import" | "interface"
+                | "map" | "nil" | "package" | "range" | "return" | "select" | "struct" | "switch"
+                | "true" | "false" | "type" | "var"
+        ),
+        Language::Swift => matches!(
+            w,
+            "actor" | "as" | "async" | "await" | "break" | "case" | "catch" | "class" | "continue"
+                | "default" | "defer" | "do" | "else" | "enum" | "extension" | "false" | "for"
+                | "func" | "guard" | "if" | "import" | "in" | "init" | "inout" | "internal"
+                | "is" | "let" | "nil" | "open" | "override" | "private" | "protocol" | "public"
+                | "repeat" | "return" | "self" | "Self" | "static" | "struct" | "super"
+                | "switch" | "throw" | "throws" | "true" | "try" | "typealias" | "var" | "where"
+                | "while"
+        ),
+        Language::Css => matches!(
+            w,
+            "color" | "background" | "display" | "flex" | "grid" | "margin" | "padding"
+                | "border" | "font" | "width" | "height" | "position" | "top" | "left"
+                | "right" | "bottom" | "none" | "auto" | "inherit" | "important"
         ),
         _ => false,
     }

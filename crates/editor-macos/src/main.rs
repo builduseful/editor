@@ -50,7 +50,16 @@ struct MacCallbacks {
     on_open_path: extern "C" fn(*mut c_void, *const c_char),
     on_command: extern "C" fn(*mut c_void, u32),
     on_tick: extern "C" fn(*mut c_void, u64),
-    on_render: extern "C" fn(*mut c_void, *mut *const u8, *mut u32, *mut u32) -> c_int,
+    on_render: extern "C" fn(
+        *mut c_void,
+        *mut *const u8,
+        *mut u32,
+        *mut u32,
+        *mut i32,
+        *mut i32,
+        *mut i32,
+        *mut i32,
+    ) -> c_int,
 }
 
 extern "C" {
@@ -578,16 +587,25 @@ extern "C" fn cb_render(
     out_pixels: *mut *const u8,
     out_w: *mut u32,
     out_h: *mut u32,
+    dirty_x: *mut i32,
+    dirty_y: *mut i32,
+    dirty_w: *mut i32,
+    dirty_h: *mut i32,
 ) -> c_int {
     let b = unsafe { &mut *(ud as *mut Bridge) };
     if !b.app.render(&mut b.rasterizer) {
         return 0;
     }
     let bytes = b.app.framebuffer.as_bgra_bytes();
+    let dr = b.app.last_rendered_dirty;
     unsafe {
         *out_pixels = bytes.as_ptr();
         *out_w = b.app.framebuffer.width;
         *out_h = b.app.framebuffer.height;
+        *dirty_x = dr.x;
+        *dirty_y = dr.y;
+        *dirty_w = dr.w;
+        *dirty_h = dr.h;
     }
     1
 }
@@ -704,6 +722,8 @@ fn main() {
         clipboard: MacClipboard,
         host: MacHost,
     });
+    // Use our 100% custom-drawn Build Useful confirmation modal instead of native NSAlert.
+    bridge.app.use_in_app_modal = true;
     bridge.app.load_preferences(&bridge.host);
     if let Some(pref) = theme_override {
         bridge.app.set_theme_preference(pref);
