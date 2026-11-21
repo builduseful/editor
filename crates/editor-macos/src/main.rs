@@ -400,6 +400,8 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         21 => Some(AppCommand::Quit),
         22 => Some(AppCommand::QuickOpen),
         23 => Some(AppCommand::ProjectSearch),
+        24 => Some(AppCommand::SplitPane),
+        25 => Some(AppCommand::CloseSplit),
         100 => Some(AppCommand::SetTheme(ThemePreference::System)),
         101 => Some(AppCommand::SetTheme(ThemePreference::Light)),
         102 => Some(AppCommand::SetTheme(ThemePreference::Dark)),
@@ -667,6 +669,7 @@ fn main() {
     let mut open_find = false;
     let mut open_quick = false;
     let mut open_project_search: Option<String> = None;
+    let mut split_file: Option<PathBuf> = None;
     let mut positional: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -716,6 +719,10 @@ fn main() {
                 open_project_search = Some(args[i + 1].clone());
                 i += 2;
             }
+            "--split" if i + 1 < args.len() => {
+                split_file = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
             arg if !arg.starts_with('-') => {
                 positional = Some(PathBuf::from(arg));
                 i += 1;
@@ -749,6 +756,9 @@ fn main() {
             if let Err(e) = app.open_path_or_dir(&p, &mut host) {
                 eprintln!("warning: could not open {}: {e}", p.display());
             }
+        }
+        if let Some(sp) = split_file {
+            app.split_pane_with(Some(&sp), &mut host);
         }
         if open_find {
             app.find_bar.open(true, Some("fn"));

@@ -195,6 +195,16 @@ fn cli_ipc_open_close_and_quit_commands() {
                             "{\"running\":true,\"cursor\":{\"line\":5,\"col\":2}}".into(),
                         ));
                     }
+                    IpcCommand::Split { path: Some(p) } => {
+                        assert!(p.ends_with("hello.rs"));
+                        pending.respond(IpcReply::Json("{\"running\":true,\"split\":true,\"active_pane\":1}".into()));
+                    }
+                    IpcCommand::FocusPane(0) => {
+                        pending.respond(IpcReply::Json("{\"running\":true,\"split\":true,\"active_pane\":0}".into()));
+                    }
+                    IpcCommand::Unsplit => {
+                        pending.respond(IpcReply::Json("{\"running\":true,\"split\":false}".into()));
+                    }
                     IpcCommand::Quit { force: false } => {
                         pending.respond(IpcReply::Prompting);
                     }
@@ -204,13 +214,13 @@ fn cli_ipc_open_close_and_quit_commands() {
                     other => panic!("unexpected ipc command: {other:?}"),
                 }
                 handled += 1;
-                if handled == 5 {
+                if handled == 8 {
                     break;
                 }
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(handled, 5);
+        assert_eq!(handled, 8);
     });
 
     // `editor status`
@@ -243,6 +253,31 @@ fn cli_ipc_open_close_and_quit_commands() {
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8(out.stdout).unwrap().contains("\"line\":5,\"col\":2"));
+
+    // `editor split hello.rs`, `editor focus-pane left`, `editor unsplit`
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["--root", root.to_str().unwrap(), "split", "hello.rs"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"split\":true"));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["focus-pane", "left"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"active_pane\":0"));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .arg("unsplit")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"split\":false"));
 
     // `editor close` (mock GUI reports dirty -> prompting: true)
     let out = Command::new(bin)

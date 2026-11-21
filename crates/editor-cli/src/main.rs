@@ -87,8 +87,10 @@ fn main() -> ExitCode {
         "write" => cmd_write(&fs, &globals, rest, start),
         "edit" => cmd_edit(&fs, &globals, rest, start),
         "batch" => cmd_batch(&fs, &globals, rest, start),
-        "open" => cmd_open(&fs, &globals, rest, start),
-        "gui" => cmd_gui(&fs, &globals, rest, start),
+        "open" | "gui" => cmd_open(cmd, &fs, &globals, rest, start),
+        "split" => cmd_split(&fs, &globals, rest, start),
+        "unsplit" => send_live_gui_command("unsplit", &editor_platform::ipc::IpcCommand::Unsplit, start),
+        "focus-pane" => cmd_focus_pane(rest, start),
         "status" => cmd_status(start),
         "goto" => cmd_goto(rest, start),
         "select" => cmd_select(rest, start),
@@ -127,8 +129,10 @@ fn print_usage() {
                              | --at LINE[:COL] --op insert|replace|delete [--text T] [--length L])\n\
                              (--expect REV | --force) [--dry-run] [--in-place]\n\
            editor batch [--file F | --stdin] [--check]\n\
-           editor open <path>\n\
-           editor gui [--sidebar-root DIR] [PATH]\n\
+           editor open [--sidebar-root DIR] [PATH]               (launch or focus GUI, alias: gui)\n\
+           editor split [PATH]                                   (open/focus side-by-side split pane)\n\
+           editor unsplit                                        (close split pane)\n\
+           editor focus-pane <left|right|0|1>                    (switch active split pane)\n\
            editor status                                         (inspect live GUI state)\n\
            editor goto <LINE[:COL]>                              (jump live GUI caret)\n\
            editor select (<L1[:C1]> <L2[:C2]> | --all)           (set live GUI selection)\n\
@@ -307,8 +311,29 @@ fn push_doc_fields(jb: &mut JsonBuf, info: &editor_core::DocumentInfo, include_r
 
 fn cmd_schema(args: &[String], start: Instant) -> u8 {
     let all = [
-        "read", "write", "edit", "info", "validate", "batch", "open", "gui", "status", "goto",
-        "select", "insert", "find", "save", "undo", "redo", "action", "close", "quit", "version",
+        "read",
+        "write",
+        "edit",
+        "info",
+        "validate",
+        "batch",
+        "open",
+        "gui",
+        "split",
+        "unsplit",
+        "focus-pane",
+        "status",
+        "goto",
+        "select",
+        "insert",
+        "find",
+        "save",
+        "undo",
+        "redo",
+        "action",
+        "close",
+        "quit",
+        "version",
         "schema",
     ];
     if let Some(target) = args.first() {
@@ -1388,53 +1413,13 @@ fn launch_gui_process(sidebar_root: Option<&Path>, target: Option<&Path>) -> Res
     Ok(())
 }
 
-fn cmd_open(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
-    let Some(path_arg) = args.first() else {
-        emit_err("open", start, "E_USAGE", "missing <path>", None);
-        return 3;
-    };
-    let path = match resolve_confined(fs, globals, path_arg) {
-        Ok(p) => p,
-        Err((code, msg)) => {
-            emit_err("open", start, code, &msg, Some(Path::new(path_arg)));
-            return 2;
-        }
-    };
-
-    let sock = editor_platform::ipc::default_socket_path();
-    let (launched, status) = match editor_platform::ipc::send_command(
-        &sock,
-        &editor_platform::ipc::IpcCommand::Open(path.clone()),
-    ) {
-        Ok(editor_platform::ipc::IpcReply::Opened) => (false, "opened"),
-        Ok(editor_platform::ipc::IpcReply::Error(m)) => {
-            emit_err("open", start, "E_IO", &m, Some(&path));
-            return 2;
-        }
-        Ok(_) => (false, "opened"),
-        Err(_) => {
-            // No running GUI -> launch a fresh instance on this path!
-            if let Err(e) = launch_gui_process(Some(&globals.root), Some(&path)) {
-                emit_err("open", start, "E_IO", &e, Some(&path));
-                return 2;
-            }
-            (true, "launched")
-        }
-    };
-
-    let mut jb = JsonBuf::new();
-    jb.push_raw("[{\"path\":");
-    jb.push_str(&path.to_string_lossy());
-    jb.push_raw(",\"launched\":");
-    jb.push_bool(launched);
-    jb.push_raw(",\"status\":");
-    jb.push_str(status);
-    jb.push_raw("}]");
-    emit_ok("open", start, &jb.into_string());
-    0
-}
-
-fn cmd_gui(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
+fn cmd_open(
+    command_name: &str,
+    fs: &dyn FileSystem,
+    globals: &GlobalOpts,
+    args: &[String],
+    start: Instant,
+) -> u8 {
     let mut sidebar_root: Option<PathBuf> = None;
     let mut target: Option<PathBuf> = None;
     let mut i = 0;
@@ -1444,60 +1429,144 @@ fn cmd_gui(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: In
                 match resolve_confined(fs, globals, &args[i + 1]) {
                     Ok(p) => sidebar_root = Some(p),
                     Err((c, m)) => {
-                        emit_err("gui", start, c, &m, Some(Path::new(&args[i + 1])));
+                        emit_err(command_name, start, c, &m, Some(Path::new(&args[i + 1])));
                         return 2;
                     }
                 }
                 i += 2;
             }
-            other if !other.starts_with('-') => {
+            other if !other.starts_with('-') && target.is_none() => {
                 match resolve_confined(fs, globals, other) {
                     Ok(p) => target = Some(p),
                     Err((c, m)) => {
-                        emit_err("gui", start, c, &m, Some(Path::new(other)));
+                        emit_err(command_name, start, c, &m, Some(Path::new(other)));
                         return 2;
                     }
                 }
                 i += 1;
             }
             other => {
-                emit_err("gui", start, "E_USAGE", &format!("unexpected arg: {other}"), None);
+                emit_err(
+                    command_name,
+                    start,
+                    "E_USAGE",
+                    &format!("unexpected arg: {other}"),
+                    None,
+                );
                 return 3;
             }
         }
     }
 
     let sock = editor_platform::ipc::default_socket_path();
-    let mut launched = false;
-    if let Some(ref p) = target {
-        if editor_platform::ipc::send_command(
-            &sock,
-            &editor_platform::ipc::IpcCommand::Open(p.clone()),
-        )
-        .is_err()
-        {
-            if let Err(e) =
-                launch_gui_process(sidebar_root.as_deref().or(Some(&globals.root)), Some(p))
-            {
-                emit_err("gui", start, "E_IO", &e, Some(p));
+    let gui_running = editor_platform::ipc::send_ping(&sock).is_ok();
+    let (launched, status) = if gui_running {
+        if let Some(ref root) = sidebar_root {
+            if let Ok(editor_platform::ipc::IpcReply::Error(m)) = editor_platform::ipc::send_command(
+                &sock,
+                &editor_platform::ipc::IpcCommand::OpenFolder(root.clone()),
+            ) {
+                emit_err(command_name, start, "E_IO", &m, Some(root));
                 return 2;
             }
-            launched = true;
         }
-    } else if editor_platform::ipc::send_ping(&sock).is_err() {
-        if let Err(e) = launch_gui_process(sidebar_root.as_deref().or(Some(&globals.root)), None) {
-            emit_err("gui", start, "E_IO", &e, None);
+        if let Some(ref p) = target {
+            match editor_platform::ipc::send_command(
+                &sock,
+                &editor_platform::ipc::IpcCommand::Open(p.clone()),
+            ) {
+                Ok(editor_platform::ipc::IpcReply::Error(m)) => {
+                    emit_err(command_name, start, "E_IO", &m, Some(p));
+                    return 2;
+                }
+                Ok(_) => (false, "opened"),
+                Err(e) => {
+                    emit_err(command_name, start, "E_IO", &e.to_string(), Some(p));
+                    return 2;
+                }
+            }
+        } else {
+            let _ = editor_platform::ipc::send_command(
+                &sock,
+                &editor_platform::ipc::IpcCommand::Action("focus".to_string()),
+            );
+            (false, "focused")
+        }
+    } else {
+        if let Err(e) =
+            launch_gui_process(sidebar_root.as_deref().or(Some(&globals.root)), target.as_deref())
+        {
+            emit_err(command_name, start, "E_IO", &e, target.as_deref());
             return 2;
         }
-        launched = true;
-    }
+        (true, "launched")
+    };
 
     let mut jb = JsonBuf::new();
-    jb.push_raw("[{\"launched\":");
+    jb.push_raw("[{");
+    if let Some(ref p) = target {
+        jb.push_raw("\"path\":");
+        jb.push_str(&p.to_string_lossy());
+        jb.push_raw(",");
+    }
+    jb.push_raw("\"launched\":");
     jb.push_bool(launched);
+    jb.push_raw(",\"status\":");
+    jb.push_str(status);
     jb.push_raw("}]");
-    emit_ok("gui", start, &jb.into_string());
+    emit_ok(command_name, start, &jb.into_string());
     0
+}
+
+fn cmd_split(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
+    let path = if let Some(arg) = args.first() {
+        match resolve_confined(fs, globals, arg) {
+            Ok(p) => Some(p),
+            Err((c, m)) => {
+                emit_err("split", start, c, &m, Some(Path::new(arg)));
+                return 2;
+            }
+        }
+    } else {
+        None
+    };
+    send_live_gui_command(
+        "split",
+        &editor_platform::ipc::IpcCommand::Split { path },
+        start,
+    )
+}
+
+fn cmd_focus_pane(args: &[String], start: Instant) -> u8 {
+    let Some(arg) = args.first() else {
+        emit_err(
+            "focus-pane",
+            start,
+            "E_USAGE",
+            "usage: editor focus-pane <left|right|0|1>",
+            None,
+        );
+        return 3;
+    };
+    let idx = match arg.as_str() {
+        "0" | "left" => 0,
+        "1" | "right" => 1,
+        _ => {
+            emit_err(
+                "focus-pane",
+                start,
+                "E_USAGE",
+                "pane must be left, right, 0, or 1",
+                None,
+            );
+            return 3;
+        }
+    };
+    send_live_gui_command(
+        "focus-pane",
+        &editor_platform::ipc::IpcCommand::FocusPane(idx),
+        start,
+    )
 }
 
 fn cmd_quit(command_name: &str, args: &[String], start: Instant) -> u8 {

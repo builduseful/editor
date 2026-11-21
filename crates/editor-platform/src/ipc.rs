@@ -45,6 +45,11 @@ pub enum IpcCommand {
     Save {
         as_path: Option<PathBuf>,
     },
+    Split {
+        path: Option<PathBuf>,
+    },
+    Unsplit,
+    FocusPane(usize),
     Action(String),
     Quit {
         force: bool,
@@ -140,6 +145,12 @@ impl IpcCommand {
             IpcCommand::Save { as_path: Some(p) } => {
                 format!("SAVE_AS {}\n", escape_field(&p.to_string_lossy()))
             }
+            IpcCommand::Split { path: None } => "SPLIT\n".to_string(),
+            IpcCommand::Split { path: Some(p) } => {
+                format!("SPLIT {}\n", escape_field(&p.to_string_lossy()))
+            }
+            IpcCommand::Unsplit => "UNSPLIT\n".to_string(),
+            IpcCommand::FocusPane(idx) => format!("FOCUS_PANE {idx}\n"),
             IpcCommand::Action(name) => format!("ACTION {}\n", escape_field(name)),
             IpcCommand::Quit { force: false } => "QUIT\n".to_string(),
             IpcCommand::Quit { force: true } => "QUIT_FORCE\n".to_string(),
@@ -153,6 +164,21 @@ impl IpcCommand {
         }
         if trimmed == "SAVE" {
             return Some(IpcCommand::Save { as_path: None });
+        }
+        if trimmed == "SPLIT" {
+            return Some(IpcCommand::Split { path: None });
+        }
+        if trimmed == "UNSPLIT" {
+            return Some(IpcCommand::Unsplit);
+        }
+        if let Some(rest) = trimmed.strip_prefix("SPLIT ") {
+            return Some(IpcCommand::Split {
+                path: Some(PathBuf::from(unescape_field(rest))),
+            });
+        }
+        if let Some(rest) = trimmed.strip_prefix("FOCUS_PANE ") {
+            let idx: usize = rest.trim().parse().ok()?;
+            return Some(IpcCommand::FocusPane(idx));
         }
         if trimmed == "QUIT" {
             return Some(IpcCommand::Quit { force: false });
@@ -473,6 +499,12 @@ mod tests {
             IpcCommand::Save {
                 as_path: Some(PathBuf::from("/tmp/out.rs")),
             },
+            IpcCommand::Split {
+                path: Some(PathBuf::from("/tmp/right pane.rs")),
+            },
+            IpcCommand::Split { path: None },
+            IpcCommand::Unsplit,
+            IpcCommand::FocusPane(1),
             IpcCommand::Action("toggle-wrap".to_string()),
             IpcCommand::Quit { force: true },
         ];

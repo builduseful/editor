@@ -497,3 +497,68 @@ fn ipc_full_ui_inspection_and_control() {
     let IpcReply::Json(s) = reply else { panic!("expected json") };
     assert!(s.contains("\"dirty\":false"));
 }
+
+#[test]
+fn split_panes_independent_editing_and_ipc() {
+    use editor_platform::ipc::{IpcCommand, IpcReply};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/left.rs", b"fn left_fn() {}\n".to_vec());
+    fs.add_file("/repo/right.rs", b"fn right_fn() {}\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1200, 800, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_path_or_dir(&PathBuf::from("/repo/left.rs"), &mut host)
+        .unwrap();
+    assert!(!app.is_split());
+
+    // Open right pane via IPC Split.
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Split {
+            path: Some(PathBuf::from("/repo/right.rs")),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let IpcReply::Json(s) = reply else { panic!("expected json") };
+    assert!(app.is_split());
+    assert!(s.contains("\"split\":true"));
+    assert!(s.contains("\"active_pane\":1"));
+    assert!(s.contains("/repo/left.rs"));
+    assert!(s.contains("/repo/right.rs"));
+
+    // Edit in active right pane without touching left pane.
+    app.execute_ipc(
+        &IpcCommand::Insert {
+            text: "// right\n".into(),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(0).unwrap(), "// right");
+
+    // Switch focus back to left pane and verify its content is untouched.
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::FocusPane(0),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let IpcReply::Json(s) = reply else { panic!("expected json") };
+    assert!(s.contains("\"active_pane\":0"));
+    assert_eq!(app.doc.line_content(0).unwrap(), "fn left_fn() {}");
+
+    // Render dual-pane frame to ensure layout & paint succeed cleanly.
+    assert!(app.render(&mut raster));
+
+    // Close split pane.
+    let (reply, _, _) = app.execute_ipc(&IpcCommand::Unsplit, &mut raster, &mut clip, &mut host);
+    let IpcReply::Json(s) = reply else { panic!("expected json") };
+    assert!(!app.is_split());
+    assert!(s.contains("\"split\":false"));
+}

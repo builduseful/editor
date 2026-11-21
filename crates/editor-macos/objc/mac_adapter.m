@@ -786,6 +786,10 @@ void mac_activate_app(void) {
     [viewMenu addItem:[self menuItem:@"Toggle Sidebar" key:@"b" tag:16 mods:NSEventModifierFlagCommand]];
     [viewMenu addItem:[self menuItem:@"Toggle Word Wrap" key:@"z" tag:15 mods:NSEventModifierFlagOption]];
     [viewMenu addItem:[NSMenuItem separatorItem]];
+    [viewMenu addItem:[self menuItem:@"Split Editor Right" key:@"\\" tag:24 mods:NSEventModifierFlagCommand]];
+    [viewMenu addItem:[self menuItem:@"Close Split Pane" key:@"\\" tag:25
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
+    [viewMenu addItem:[NSMenuItem separatorItem]];
     [viewMenu addItem:[self menuItem:@"Zoom In" key:@"=" tag:17 mods:NSEventModifierFlagCommand]];
     [viewMenu addItem:[self menuItem:@"Zoom Out" key:@"-" tag:18 mods:NSEventModifierFlagCommand]];
     [viewMenu addItem:[self menuItem:@"Reset Zoom" key:@"0" tag:19 mods:NSEventModifierFlagCommand]];
