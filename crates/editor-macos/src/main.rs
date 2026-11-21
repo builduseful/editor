@@ -456,6 +456,7 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         44 => Some(AppCommand::ToggleLastBuffer),
         45 => Some(AppCommand::ToggleSyntaxStyle),
         46 => Some(AppCommand::CloseWindow),
+        47 => Some(AppCommand::ToggleSidebarSide),
         100 => Some(AppCommand::SetTheme(ThemePreference::System)),
         101 => Some(AppCommand::SetTheme(ThemePreference::Light)),
         102 => Some(AppCommand::SetTheme(ThemePreference::Dark)),
@@ -794,6 +795,7 @@ fn main() {
     let mut open_harpoon = false;
     let mut zoom_pane = false;
     let mut hide_sidebar = false;
+    let mut sidebar_side_override: Option<editor_render::SidebarSide> = None;
     let mut positional: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -896,6 +898,10 @@ fn main() {
                 hide_sidebar = true;
                 i += 1;
             }
+            "--sidebar-side" if i + 1 < args.len() => {
+                sidebar_side_override = editor_render::SidebarSide::parse(&args[i + 1]);
+                i += 2;
+            }
             arg if !arg.starts_with('-') => {
                 positional = Some(PathBuf::from(arg));
                 i += 1;
@@ -959,9 +965,11 @@ fn main() {
         if zoom_pane {
             app.toggle_zoom_pane(&mut host);
         }
+        if let Some(side) = sidebar_side_override {
+            app.set_sidebar_side(side, &mut host);
+        }
         if hide_sidebar {
-            app.sidebar.set_visible(false);
-            app.recompute_layout();
+            app.set_sidebar_visible_user(false, &mut host);
         }
         if let Some(spec) = drag_preview_arg {
             // Format: <pane_idx>:<zone>:<path>

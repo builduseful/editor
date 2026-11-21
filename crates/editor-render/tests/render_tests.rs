@@ -214,7 +214,7 @@ fn tab_strip_hit_testing_drop_targets_and_overflow_scroll() {
     let mut strip = TabStrip::new();
     {
         let mut p = Painter::new(&mut fb);
-        strip.draw(&mut p, rect, &items, true, false, false, None, &theme, &mut atlas, &mut raster);
+        strip.draw(&mut p, rect, &items, true, false, false, None, None, &theme, &mut atlas, &mut raster);
     }
 
     // First tab hit & right-edge utility buttons (menu, zoom, new tab) all hit-test accurately!
@@ -222,6 +222,46 @@ fn tab_strip_hit_testing_drop_targets_and_overflow_scroll() {
     assert_eq!(strip.hit_test(884.0, 15.0), TabStripHit::OpenMenu);
     assert_eq!(strip.hit_test(858.0, 15.0), TabStripHit::ToggleZoom);
     assert_eq!(strip.hit_test(832.0, 15.0), TabStripHit::NewTab);
+
+    // When sidebar is minimized on Left or Right, the quiet expand button hit-tests cleanly!
+    {
+        let mut p = Painter::new(&mut fb);
+        strip.draw(
+            &mut p,
+            rect,
+            &items,
+            false,
+            false,
+            true,
+            None,
+            Some(editor_render::SidebarSide::Left),
+            &theme,
+            &mut atlas,
+            &mut raster,
+        );
+    }
+    assert_eq!(strip.hit_test(14.0, 15.0), TabStripHit::ToggleSidebar);
+    {
+        let mut p = Painter::new(&mut fb);
+        strip.draw(
+            &mut p,
+            rect,
+            &items,
+            false,
+            false,
+            true,
+            None,
+            Some(editor_render::SidebarSide::Right),
+            &theme,
+            &mut atlas,
+            &mut raster,
+        );
+    }
+    assert_eq!(strip.hit_test(884.0, 15.0), TabStripHit::ToggleSidebar);
+    {
+        let mut p = Painter::new(&mut fb);
+        strip.draw(&mut p, rect, &items, true, false, false, None, None, &theme, &mut atlas, &mut raster);
+    }
 
     // Drop target left of divider resolves PinnedAt, right of divider resolves OpenAt!
     let (left_target, _) = strip.drop_target_at(20.0, 15.0).expect("left drop");
@@ -243,7 +283,7 @@ fn tab_strip_hit_testing_drop_targets_and_overflow_scroll() {
         .collect();
     {
         let mut p = Painter::new(&mut fb);
-        strip.draw(&mut p, rect, &many, false, false, true, None, &theme, &mut atlas, &mut raster);
+        strip.draw(&mut p, rect, &many, false, false, true, None, None, &theme, &mut atlas, &mut raster);
     }
     strip.scroll_by(10_000.0);
     assert!(strip.scroll_x_px > 0.0);

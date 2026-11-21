@@ -2008,7 +2008,7 @@ fn remembers_last_opened_folder_across_restarts_and_handles_missing_dir() {
     );
 
     // 3. Launching a fresh EditorApp restores the exact last opened folder cleanly!
-    let mut app2 = EditorApp::new(fs.clone(), 900, 600, 2.0);
+    let mut app2 = EditorApp::new(fs.clone(), 1400, 900, 2.0);
     assert_eq!(app2.sidebar.root(), None);
     app2.load_preferences(&host);
     assert_eq!(
@@ -2032,7 +2032,7 @@ fn sidebar_hover_exit_and_caret_blink_never_desync_swapchain() {
     fs.add_file("/repo/alpha.rs", b"fn alpha() { let x = 1; }\n".to_vec());
     fs.add_file("/repo/beta.rs", b"fn beta() { let y = 2; }\n".to_vec());
 
-    let (w, h, scale) = (900u32, 540u32, 2.0f32);
+    let (w, h, scale) = (1400u32, 800u32, 2.0f32);
     let mut app = EditorApp::new(fs.clone(), w, h, scale);
     let mut raster = BuiltinBitmapRasterizer;
     let mut clip = MemoryClipboard::new();
@@ -2415,4 +2415,197 @@ fn close_window_respects_dirty_guard_saves_session_and_uses_os_host_policy() {
         win_linux_host.quit_requested,
         "non-macOS hosts default to quitting when closing the last window"
     );
+}
+
+#[test]
+fn sidebar_moves_left_right_minimizes_and_auto_minimizes_on_narrow_window() {
+    use editor_platform::ipc::IpcCommand;
+    use editor_platform::{AppCommand, InputEvent, Modifiers, MouseButton};
+    use editor_render::SidebarSide;
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/main.rs", b"fn main() {}\n".to_vec());
+
+    // Start wide (`1000x600` pt @ 2x -> `2000x1200` px).
+    let mut app = EditorApp::new(fs.clone(), 2000, 1200, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_file(Path::new("/repo/main.rs"), &mut host).unwrap();
+    app.render(&mut raster);
+    assert!(app.sidebar.is_visible());
+    assert_eq!(app.sidebar.side(), SidebarSide::Left);
+    assert_eq!(app.layout.sidebar.x, 0);
+    assert!(app.layout.viewport.x >= app.layout.sidebar.right());
+
+    // 1. Move sidebar to Right side via `ToggleSidebarSide` (`⌥⌘B`) -> persists `SidebarSide = right`!
+    app.handle_event(
+        InputEvent::Command(AppCommand::ToggleSidebarSide),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.render(&mut raster);
+    assert_eq!(app.sidebar.side(), SidebarSide::Right);
+    assert_eq!(app.layout.viewport.x, 0);
+    assert_eq!(app.layout.sidebar.right(), 2000);
+    assert!(app.layout.sidebar.x > 0);
+
+    // Dragging the LEFT edge of a right-docked sidebar resizes width cleanly!
+    let edge_x = app.layout.sidebar.x as f32;
+    let edge_y = (app.layout.sidebar.y + 120) as f32;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: edge_x,
+            y_px: edge_y,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: 2000.0 - 300.0 * 2.0,
+            y_px: edge_y,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseUp {
+            x_px: 2000.0 - 300.0 * 2.0,
+            y_px: edge_y,
+            button: MouseButton::Left,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!((app.sidebar.width_pt() - 300.0).abs() <= 1.0);
+
+    // 2. Shrink window below 640 pt (`560x400` pt @ 2x -> `1120x800` px) -> auto-minimizes cleanly!
+    app.handle_event(
+        InputEvent::Resize {
+            width_px: 1120,
+            height_px: 800,
+            scale: 2.0,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.render(&mut raster);
+    assert!(!app.sidebar.is_visible(), "narrow window must auto-minimize sidebar");
+    assert!(app.is_sidebar_auto_minimized());
+    assert_eq!(app.layout.sidebar.w, 0);
+    assert_eq!(app.layout.tab_strip.w, 1120);
+
+    // Clicking the expand icon in TabStrip (right edge since docked Right!) overrides narrow auto-minimize!
+    let sb_btn_x = (app.layout.tab_strip.right() - 24) as f32;
+    let sb_btn_y = (app.layout.tab_strip.y + app.layout.tab_strip.h / 2) as f32;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: sb_btn_x,
+            y_px: sb_btn_y,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.sidebar.is_visible(), "explicit expand click while narrow must open sidebar");
+
+    // 3. Widen back to `1000pt`, then shrink again -> auto-minimizes again; widen back -> auto-restores!
+    app.handle_event(
+        InputEvent::Resize {
+            width_px: 2000,
+            height_px: 1200,
+            scale: 2.0,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.sidebar.is_visible());
+    assert!(!app.is_sidebar_auto_minimized());
+
+    app.handle_event(
+        InputEvent::Resize {
+            width_px: 1120,
+            height_px: 800,
+            scale: 2.0,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.sidebar.is_visible());
+    assert!(app.is_sidebar_auto_minimized());
+
+    app.handle_event(
+        InputEvent::Resize {
+            width_px: 2000,
+            height_px: 1200,
+            scale: 2.0,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.sidebar.is_visible(), "widening back must auto-restore sidebar");
+
+    // 4. Manual minimize (`⌘B`) stays minimized even when resizing narrow -> wide!
+    app.handle_event(
+        InputEvent::Command(AppCommand::ToggleSidebar),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.sidebar.is_visible());
+    app.handle_event(
+        InputEvent::Resize {
+            width_px: 1120,
+            height_px: 800,
+            scale: 2.0,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::Resize {
+            width_px: 2000,
+            height_px: 1200,
+            scale: 2.0,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(
+        !app.sidebar.is_visible(),
+        "manual minimize must stay respected after window resize"
+    );
+
+    // 5. Preference persistence restores `SidebarSide::Right`, and IPC `sidebar-left` switches back.
+    let mut app2 = EditorApp::new(fs, 2000, 1200, 2.0);
+    app2.load_preferences(&host);
+    assert_eq!(app2.sidebar.side(), SidebarSide::Right);
+    let _ = app2.execute_ipc(
+        &IpcCommand::Action("sidebar-left".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app2.sidebar.side(), SidebarSide::Left);
 }

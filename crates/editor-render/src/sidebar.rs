@@ -21,6 +21,48 @@ use crate::theme::{px, Theme};
 pub const SIDEBAR_MIN_WIDTH_PT: f32 = 160.0;
 pub const SIDEBAR_MAX_WIDTH_PT: f32 = 480.0;
 pub const SIDEBAR_DEFAULT_WIDTH_PT: f32 = 220.0;
+/// Window logical width (pt) below which the sidebar automatically minimizes so the editor stays usable.
+pub const SIDEBAR_AUTO_MINIMIZE_WIDTH_PT: f32 = 580.0;
+
+/// Docked edge for the file navigation sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum SidebarSide {
+    #[default]
+    Left,
+    Right,
+}
+
+impl SidebarSide {
+    #[inline]
+    pub const fn toggle(self) -> Self {
+        match self {
+            SidebarSide::Left => SidebarSide::Right,
+            SidebarSide::Right => SidebarSide::Left,
+        }
+    }
+
+    #[inline]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            SidebarSide::Left => "left",
+            SidebarSide::Right => "right",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "left" | "l" => Some(SidebarSide::Left),
+            "right" | "r" => Some(SidebarSide::Right),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeaderBtn {
+    ToggleSide,
+    Minimize,
+}
 
 #[derive(Debug, Clone)]
 pub struct FlatRow {
@@ -42,12 +84,16 @@ pub enum SidebarAction {
     None,
     OpenFile(PathBuf),
     Changed,
+    ToggleSide,
+    Minimize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarHit {
     None,
     ResizeEdge,
+    ToggleSide,
+    Minimize,
     Breadcrumb(PathBuf),
     RowDisclosure(usize),
     RowEnter(usize),
@@ -57,6 +103,7 @@ pub enum SidebarHit {
 pub struct Sidebar {
     visible: bool,
     focused: bool,
+    side: SidebarSide,
     width_pt: f32,
     /// Current root directory displayed in the sidebar view.
     root: Option<PathBuf>,
@@ -70,10 +117,15 @@ pub struct Sidebar {
     selected: Option<PathBuf>,
     /// Hovered row index (for subtle hover & enter-chevron affordance).
     hovered_row: Option<usize>,
+    /// Hovered header utility button (`ToggleSide` / `Minimize`).
+    hovered_header_btn: Option<HeaderBtn>,
     /// Vertical scroll offset in physical pixels.
     scroll_y_px: f32,
     /// Cached breadcrumb rects from last paint for exact hit-testing.
     crumb_rects: Vec<(PixelRect, PathBuf)>,
+    /// Cached header utility button rects from last paint for exact hit-testing.
+    toggle_side_rect: PixelRect,
+    minimize_rect: PixelRect,
     header_height_px: i32,
     row_height_px: i32,
 }
@@ -89,6 +141,7 @@ impl Sidebar {
         Self {
             visible: true,
             focused: false,
+            side: SidebarSide::Left,
             width_pt: SIDEBAR_DEFAULT_WIDTH_PT,
             root: None,
             expanded: HashSet::new(),
@@ -96,11 +149,27 @@ impl Sidebar {
             rows: Vec::new(),
             selected: None,
             hovered_row: None,
+            hovered_header_btn: None,
             scroll_y_px: 0.0,
             crumb_rects: Vec::new(),
-            header_height_px: 28,
+            toggle_side_rect: PixelRect::ZERO,
+            minimize_rect: PixelRect::ZERO,
+            header_height_px: 30,
             row_height_px: 24,
         }
+    }
+
+    pub fn side(&self) -> SidebarSide {
+        self.side
+    }
+
+    pub fn set_side(&mut self, side: SidebarSide) {
+        self.side = side;
+    }
+
+    pub fn toggle_side(&mut self) -> SidebarSide {
+        self.side = self.side.toggle();
+        self.side
     }
 
     pub fn is_visible(&self) -> bool {
@@ -112,6 +181,7 @@ impl Sidebar {
         if !visible {
             self.focused = false;
             self.hovered_row = None;
+            self.hovered_header_btn = None;
         }
     }
 
@@ -272,7 +342,7 @@ impl Sidebar {
     }
 
     /// Update hover state from pointer coordinates. Returns `(changed, hit)` so the caller
-    /// always invalidates the sidebar on hover entry, row change, AND hover exit — while
+    /// always invalidates the sidebar on hover entry, row/button change, AND hover exit — while
     /// avoiding redundant repaints when moving within the same row.
     pub fn set_hovered(
         &mut self,
@@ -281,7 +351,8 @@ impl Sidebar {
         y_px: f32,
         scale: f32,
     ) -> (bool, SidebarHit) {
-        let prev = self.hovered_row;
+        let prev_row = self.hovered_row;
+        let prev_btn = self.hovered_header_btn;
         let hit = self.hit_test(rect, x_px, y_px, scale);
         self.hovered_row = match hit {
             SidebarHit::RowBody(i) | SidebarHit::RowDisclosure(i) | SidebarHit::RowEnter(i) => {
@@ -289,12 +360,19 @@ impl Sidebar {
             }
             _ => None,
         };
-        (self.hovered_row != prev, hit)
+        self.hovered_header_btn = match hit {
+            SidebarHit::ToggleSide => Some(HeaderBtn::ToggleSide),
+            SidebarHit::Minimize => Some(HeaderBtn::Minimize),
+            _ => None,
+        };
+        (self.hovered_row != prev_row || self.hovered_header_btn != prev_btn, hit)
     }
 
-    /// Clear any active row hover highlight, returning `true` if visual state changed.
+    /// Clear any active row/header hover highlight, returning `true` if visual state changed.
     pub fn clear_hover(&mut self) -> bool {
-        self.hovered_row.take().is_some()
+        let r = self.hovered_row.take().is_some();
+        let b = self.hovered_header_btn.take().is_some();
+        r || b
     }
 
     pub fn hit_test(&self, rect: PixelRect, x_px: f32, y_px: f32, scale: f32) -> SidebarHit {
@@ -304,14 +382,24 @@ impl Sidebar {
         let xi = x_px.round() as i32;
         let yi = y_px.round() as i32;
         let edge_grab = px(4.0, scale);
-        if (xi - rect.right()).abs() <= edge_grab && yi >= rect.y && yi < rect.bottom() {
+        let resize_edge_x = match self.side {
+            SidebarSide::Left => rect.right(),
+            SidebarSide::Right => rect.x,
+        };
+        if (xi - resize_edge_x).abs() <= edge_grab && yi >= rect.y && yi < rect.bottom() {
             return SidebarHit::ResizeEdge;
         }
         if !rect.contains(xi, yi) {
             return SidebarHit::None;
         }
-        // Check breadcrumb buttons.
+        // Check header utility buttons & breadcrumb buttons.
         if yi < rect.y + self.header_height_px {
+            if !self.minimize_rect.is_empty() && self.minimize_rect.contains(xi, yi) {
+                return SidebarHit::Minimize;
+            }
+            if !self.toggle_side_rect.is_empty() && self.toggle_side_rect.contains(xi, yi) {
+                return SidebarHit::ToggleSide;
+            }
             for (r, path) in &self.crumb_rects {
                 if r.contains(xi, yi) {
                     return SidebarHit::Breadcrumb(path.clone());
@@ -350,6 +438,8 @@ impl Sidebar {
         scale: f32,
     ) -> SidebarAction {
         match self.hit_test(rect, x_px, y_px, scale) {
+            SidebarHit::ToggleSide => SidebarAction::ToggleSide,
+            SidebarHit::Minimize => SidebarAction::Minimize,
             SidebarHit::Breadcrumb(dir) => {
                 self.navigate_to(fs, &dir);
                 SidebarAction::Changed
@@ -516,25 +606,70 @@ impl Sidebar {
         self.header_height_px = px(30.0, scale);
         self.row_height_px = px(24.0, scale);
 
-        // Background: color.page, right-edge hairline: color.border-subtle.
+        // Background: color.page, inner-edge hairline: color.border-subtle.
         painter.fill_rect(rect, theme.page);
         let hairline = (1.0 * scale).round().max(1.0) as i32;
+        let (sep_x, content_x) = match self.side {
+            SidebarSide::Left => (rect.right() - hairline, rect.x),
+            SidebarSide::Right => (rect.x, rect.x + hairline),
+        };
         painter.fill_rect(
-            PixelRect::new(rect.right() - hairline, rect.y, hairline, rect.h),
+            PixelRect::new(sep_x, rect.y, hairline, rect.h),
             theme.border_subtle,
         );
 
-        let content_rect = PixelRect::new(rect.x, rect.y, (rect.w - hairline).max(0), rect.h);
+        let content_rect = PixelRect::new(content_x, rect.y, (rect.w - hairline).max(0), rect.h);
         painter.push_clip(content_rect);
 
-        // 1. Breadcrumb header bar.
+        // 1. Breadcrumb header bar + quiet dock-side & minimize utility icons.
         let header_rect = PixelRect::new(
             content_rect.x,
             content_rect.y,
             content_rect.w,
             self.header_height_px,
         );
-        self.draw_breadcrumbs(painter, header_rect, theme, atlas, rasterizer);
+        let btn_w = px(22.0, scale);
+        let btn_h = (self.header_height_px - hairline - px(6.0, scale)).max(12);
+        let btn_y = header_rect.y + ((self.header_height_px - hairline) - btn_h) / 2;
+        let btn_gap = px(2.0, scale);
+        let pad_r = px(4.0, scale);
+        let min_x = header_rect.right() - pad_r - btn_w;
+        let side_x = min_x - btn_gap - btn_w;
+        self.minimize_rect = PixelRect::new(min_x, btn_y, btn_w, btn_h);
+        self.toggle_side_rect = PixelRect::new(side_x, btn_y, btn_w, btn_h);
+
+        let crumb_clip = PixelRect::new(
+            header_rect.x,
+            header_rect.y,
+            (side_x - px(4.0, scale) - header_rect.x).max(0),
+            header_rect.h - hairline,
+        );
+        painter.push_clip(crumb_clip);
+        self.draw_breadcrumbs(painter, crumb_clip, theme, atlas, rasterizer);
+        painter.pop_clip();
+
+        // Dock-side switch button (shows target side cleanly).
+        if self.hovered_header_btn == Some(HeaderBtn::ToggleSide) {
+            painter.fill_rounded_rect(self.toggle_side_rect, 4.0 * scale, theme.current_line);
+        }
+        let side_col = if self.hovered_header_btn == Some(HeaderBtn::ToggleSide) {
+            theme.text
+        } else {
+            theme.text_muted
+        };
+        draw_sidebar_panel_icon(painter, self.toggle_side_rect, self.side.toggle(), side_col, scale);
+
+        // Minimize button (quiet chevron pointing toward docked edge).
+        if self.hovered_header_btn == Some(HeaderBtn::Minimize) {
+            painter.fill_rounded_rect(self.minimize_rect, 4.0 * scale, theme.current_line);
+        }
+        let min_col = if self.hovered_header_btn == Some(HeaderBtn::Minimize) {
+            theme.text
+        } else {
+            theme.text_muted
+        };
+        draw_minimize_chevron_icon(painter, self.minimize_rect, self.side, min_col, scale);
+
         painter.fill_rect(
             PixelRect::new(
                 header_rect.x,
@@ -752,5 +887,61 @@ impl Sidebar {
                 path.clone(),
             ));
         }
+    }
+}
+
+/// Crisp 1px vector sidebar-dock icon (rectangle with a shaded panel on `side`).
+/// Shared between the sidebar header switch-side button and the TabStrip expand button!
+pub(crate) fn draw_sidebar_panel_icon(
+    painter: &mut Painter,
+    rect: PixelRect,
+    side: SidebarSide,
+    color: crate::theme::Color,
+    scale: f32,
+) {
+    let t = (1.0 * scale).round().max(1.0) as i32;
+    let iw = px(13.0, scale).max(9);
+    let ih = px(10.0, scale).max(7);
+    let x = rect.x + (rect.w - iw) / 2;
+    let y = rect.y + (rect.h - ih) / 2;
+    let box_rect = PixelRect::new(x, y, iw, ih);
+    painter.stroke_rounded_rect(box_rect, 2.0 * scale, t as f32, color);
+    let pane_w = (iw / 3).max(t * 2);
+    let div_x = match side {
+        SidebarSide::Left => x + pane_w,
+        SidebarSide::Right => box_rect.right() - pane_w - t,
+    };
+    painter.fill_rect(PixelRect::new(div_x, y + t, t, (ih - 2 * t).max(1)), color);
+    let fill_x = match side {
+        SidebarSide::Left => x + t,
+        SidebarSide::Right => div_x + t,
+    };
+    let fill_w = (pane_w - t).max(1);
+    painter.fill_rect(
+        PixelRect::new(fill_x, y + t, fill_w, (ih - 2 * t).max(1)),
+        color.with_alpha(95),
+    );
+}
+
+/// Quiet 1px collapse chevron (`‹` when docked left, `›` when docked right).
+fn draw_minimize_chevron_icon(
+    painter: &mut Painter,
+    rect: PixelRect,
+    side: SidebarSide,
+    color: crate::theme::Color,
+    scale: f32,
+) {
+    let cx = rect.x + rect.w / 2;
+    let cy = rect.y + rect.h / 2;
+    let half = px(3.5, scale).max(2);
+    let thick = (1.2 * scale).round().max(1.0) as i32;
+    let dir: i32 = match side {
+        SidebarSide::Left => -1,
+        SidebarSide::Right => 1,
+    };
+    for i in 0..=half {
+        let px_x = cx + dir * (half / 2 - i);
+        painter.fill_rect(PixelRect::new(px_x, cy - i, thick, thick), color);
+        painter.fill_rect(PixelRect::new(px_x, cy + i, thick, thick), color);
     }
 }

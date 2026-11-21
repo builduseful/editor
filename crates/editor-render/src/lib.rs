@@ -25,7 +25,9 @@ pub use harpoon::{HarpoonAction, HarpoonEntry, HarpoonOverlay};
 pub use painter::Painter;
 pub use palette::{fuzzy_score, CommandPalette, PaletteAction, PaletteItem, PaletteMode};
 pub use shortcuts::{ShortcutDisplayItem, ShortcutsAction, ShortcutsOverlay};
-pub use sidebar::{Sidebar, SidebarAction, SidebarBadge, SidebarHit};
+pub use sidebar::{
+    Sidebar, SidebarAction, SidebarBadge, SidebarHit, SidebarSide, SIDEBAR_AUTO_MINIMIZE_WIDTH_PT,
+};
 pub use tab_strip::{
     tab_strip_height_px, StripDropTarget, TabDisplayItem, TabStrip, TabStripHit,
     TAB_STRIP_HEIGHT_PT,

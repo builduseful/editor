@@ -12,6 +12,7 @@ use editor_platform::{FontStyle, GlyphRasterizer, PixelRect};
 
 use crate::atlas::GlyphAtlas;
 use crate::painter::Painter;
+use crate::sidebar::{draw_sidebar_panel_icon, SidebarSide};
 use crate::theme::{px, Theme};
 
 pub const TAB_STRIP_HEIGHT_PT: f32 = 30.0;
@@ -39,6 +40,7 @@ pub struct TabDisplayItem {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabStripHit {
     None,
+    ToggleSidebar,
     Tab(u32),
     CloseTab(u32),
     NewTab,
@@ -67,11 +69,13 @@ pub struct TabStrip {
     pub scroll_x_px: f32,
     hovered_tab: Option<u32>,
     hovered_close: Option<u32>,
+    hovered_sidebar_btn: bool,
     tabs: Vec<RenderedTab>,
     divider_x: Option<i32>,
     pinned_count: usize,
     open_count: usize,
     tabs_clip_rect: PixelRect,
+    sidebar_btn_rect: PixelRect,
     new_tab_rect: PixelRect,
     zoom_btn_rect: PixelRect,
     menu_btn_rect: PixelRect,
@@ -90,11 +94,13 @@ impl TabStrip {
             scroll_x_px: 0.0,
             hovered_tab: None,
             hovered_close: None,
+            hovered_sidebar_btn: false,
             tabs: Vec::new(),
             divider_x: None,
             pinned_count: 0,
             open_count: 0,
             tabs_clip_rect: PixelRect::ZERO,
+            sidebar_btn_rect: PixelRect::ZERO,
             new_tab_rect: PixelRect::ZERO,
             zoom_btn_rect: PixelRect::ZERO,
             menu_btn_rect: PixelRect::ZERO,
@@ -112,16 +118,23 @@ impl TabStrip {
             TabStripHit::CloseTab(id) => Some(id),
             _ => None,
         };
-        let changed = self.hovered_tab != new_tab || self.hovered_close != new_close;
+        let new_sb = hit == TabStripHit::ToggleSidebar;
+        let changed = self.hovered_tab != new_tab
+            || self.hovered_close != new_close
+            || self.hovered_sidebar_btn != new_sb;
         self.hovered_tab = new_tab;
         self.hovered_close = new_close;
+        self.hovered_sidebar_btn = new_sb;
         (changed, hit)
     }
 
     pub fn clear_hover(&mut self) -> bool {
-        let changed = self.hovered_tab.is_some() || self.hovered_close.is_some();
+        let changed = self.hovered_tab.is_some()
+            || self.hovered_close.is_some()
+            || self.hovered_sidebar_btn;
         self.hovered_tab = None;
         self.hovered_close = None;
+        self.hovered_sidebar_btn = false;
         changed
     }
 
@@ -130,6 +143,9 @@ impl TabStrip {
         let yi = y_px.round() as i32;
         if !self.last_rect.contains(xi, yi) {
             return TabStripHit::None;
+        }
+        if !self.sidebar_btn_rect.is_empty() && self.sidebar_btn_rect.contains(xi, yi) {
+            return TabStripHit::ToggleSidebar;
         }
         if self.zoom_btn_rect.contains(xi, yi) {
             return TabStripHit::ToggleZoom;
@@ -236,6 +252,7 @@ impl TabStrip {
         is_zoomed: bool,
         merge_active_bottom: bool,
         drop_indicator_x: Option<i32>,
+        minimized_sidebar_side: Option<SidebarSide>,
         theme: &Theme,
         atlas: &mut GlyphAtlas,
         rasterizer: &mut dyn GlyphRasterizer,
@@ -245,6 +262,7 @@ impl TabStrip {
         self.divider_x = None;
         self.pinned_count = 0;
         self.open_count = 0;
+        self.sidebar_btn_rect = PixelRect::ZERO;
         self.new_tab_rect = PixelRect::ZERO;
         self.zoom_btn_rect = PixelRect::ZERO;
         self.menu_btn_rect = PixelRect::ZERO;
@@ -264,10 +282,41 @@ impl TabStrip {
             theme.border_subtle,
         );
 
-        // Right-side utility buttons (right-to-left): [Zoom (if split)] [Menu ⌘E] [+]
         let btn_h = rect.h - hairline;
+        let mut left_edge = rect.x + px(4.0, scale);
         let mut right_edge = rect.right() - px(4.0, scale);
 
+        // Quiet sidebar-expand button shown when the sidebar is minimized (on its docked edge!).
+        if let Some(side) = minimized_sidebar_side {
+            let sb_w = px(24.0, scale);
+            let sb_h = (btn_h - px(6.0, scale)).max(12);
+            let sb_y = rect.y + (btn_h - sb_h) / 2;
+            let sb_x = match side {
+                SidebarSide::Left => {
+                    let x = left_edge;
+                    left_edge += sb_w + px(4.0, scale);
+                    x
+                }
+                SidebarSide::Right => {
+                    right_edge -= sb_w;
+                    let x = right_edge;
+                    right_edge -= px(2.0, scale);
+                    x
+                }
+            };
+            self.sidebar_btn_rect = PixelRect::new(sb_x, sb_y, sb_w, sb_h);
+            if self.hovered_sidebar_btn {
+                painter.fill_rounded_rect(self.sidebar_btn_rect, 4.0 * scale, theme.current_line);
+            }
+            let sb_col = if self.hovered_sidebar_btn {
+                theme.text
+            } else {
+                theme.text_muted
+            };
+            draw_sidebar_panel_icon(painter, self.sidebar_btn_rect, side, sb_col, scale);
+        }
+
+        // Right-side utility buttons (right-to-left): [Zoom (if split)] [Menu ⌘E] [+]
         // 1. Harpoon / open list button (quiet 3-bar icon).
         let menu_w = px(24.0, scale);
         right_edge -= menu_w;
@@ -331,12 +380,11 @@ impl TabStrip {
         );
 
         // Clip region for scrollable tab pills.
-        let left_pad = px(4.0, scale);
-        let tabs_right = (right_edge - px(4.0, scale)).max(rect.x + left_pad);
+        let tabs_right = (right_edge - px(4.0, scale)).max(left_edge);
         self.tabs_clip_rect = PixelRect::new(
-            rect.x + left_pad,
+            left_edge,
             rect.y,
-            (tabs_right - (rect.x + left_pad)).max(0),
+            (tabs_right - left_edge).max(0),
             rect.h,
         );
 

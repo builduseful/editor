@@ -364,6 +364,7 @@ fn default_shortcuts() -> Vec<ShortcutEntry> {
         bind("zoom-pane", "Toggle fullscreen pane zoom", "Panes & View", KeyScope::Global, vec![KeyChord::primary_shift(Key::Enter)], Some("⇧⌘↵"), true, AppCommand::ToggleZoomPane),
         bind("close-tab", "Close tab or active split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('w'))], Some("⌘W"), true, AppCommand::CloseTab),
         bind("toggle-sidebar", "Toggle file sidebar", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('b'))], None, true, AppCommand::ToggleSidebar),
+        bind("toggle-sidebar-side", "Move sidebar left / right", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Char('b'))], None, false, AppCommand::ToggleSidebarSide),
         bind("save", "Save file", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('s'))], None, true, AppCommand::Save),
         bind("toggle-comment", "Toggle line comment", "Editing", KeyScope::Document, vec![KeyChord::primary(Key::Char('/'))], Some("⌘/"), true, AppCommand::ToggleComment),
         bind("toggle-vim", "Toggle Vim mode", "Panes & View", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('v'))], None, true, AppCommand::ToggleVimMode),

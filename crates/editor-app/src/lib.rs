@@ -30,9 +30,9 @@ use editor_render::{
     parse_mono_style, tab_strip_height_px, A11yNode, A11yRole, Color, CommandPalette, ConfirmModal,
     FindBarAction, FindBarState, GlyphAtlas, GotoLineState, HarpoonAction, HarpoonOverlay,
     ImeComposition, Painter, PaletteAction, ScrollbarHit, ShortcutsAction, ShortcutsOverlay,
-    Sidebar, SidebarAction, SidebarBadge, SidebarHit, StatusBarData, StripDropTarget,
+    Sidebar, SidebarAction, SidebarBadge, SidebarHit, SidebarSide, StatusBarData, StripDropTarget,
     SyntaxPalette, SyntaxStylePreference, SyntaxThemeConfig, SyntaxThemePreset, TabStrip,
-    TabStripHit, Theme, TokenOverride, Viewport,
+    TabStripHit, Theme, TokenOverride, Viewport, SIDEBAR_AUTO_MINIMIZE_WIDTH_PT,
 };
 
 pub use buffers::{
@@ -175,6 +175,12 @@ pub struct EditorApp {
     pub harpoon: HarpoonOverlay,
 
     pub sidebar: Sidebar,
+    /// User's explicit sidebar visibility preference (persisted; preserved across narrow auto-minimize).
+    sidebar_user_visible: bool,
+    /// `true` while a narrow window (`< 640 pt`) has automatically minimized the sidebar.
+    sidebar_auto_minimized: bool,
+    /// `true` if the user explicitly expanded the sidebar while the window was narrow.
+    sidebar_manual_override_small: bool,
     pub viewport: Viewport,
     /// Inactive panes (0–3). `self.doc`/`self.viewport` ALWAYS hold the active pane.
     pub other_panes: Vec<PaneState>,
@@ -273,6 +279,9 @@ impl EditorApp {
             tab_strip: TabStrip::new(),
             harpoon: HarpoonOverlay::new(),
             sidebar: Sidebar::new(),
+            sidebar_user_visible: true,
+            sidebar_auto_minimized: false,
+            sidebar_manual_override_small: false,
             viewport: Viewport::new(),
             other_panes: Vec::new(),
             active_id: 1,
@@ -329,7 +338,11 @@ impl EditorApp {
             self.sidebar.set_width_pt(w);
         }
         if let Some(vis) = host.load_pref("SidebarVisible") {
-            self.sidebar.set_visible(vis == "1" || vis == "true");
+            self.sidebar_user_visible = vis == "1" || vis == "true";
+            self.sidebar.set_visible(self.sidebar_user_visible);
+        }
+        if let Some(side) = host.load_pref("SidebarSide").and_then(|s| SidebarSide::parse(&s)) {
+            self.sidebar.set_side(side);
         }
         if let Some(max_tabs) = host
             .load_pref("MaxOpenTabs")
@@ -398,7 +411,11 @@ impl EditorApp {
 
     pub fn save_preferences(&self, host: &mut dyn PlatformHost) {
         host.save_pref("SidebarWidth", &format!("{:.0}", self.sidebar.width_pt()));
-        host.save_pref("SidebarVisible", if self.sidebar.is_visible() { "1" } else { "0" });
+        host.save_pref(
+            "SidebarVisible",
+            if self.sidebar_user_visible { "1" } else { "0" },
+        );
+        host.save_pref("SidebarSide", self.sidebar.side().as_str());
         host.save_pref("MaxOpenTabs", &self.max_open_tabs.to_string());
         self.persist_last_folder(host);
         host.save_pref("FolderSessions", &self.session_store.encode());
@@ -1014,6 +1031,7 @@ impl EditorApp {
         if !same_folder {
             self.save_session(host);
         }
+        self.sidebar_user_visible = true;
         self.sidebar.set_visible(true);
         self.sidebar.set_root(self.fs.as_ref(), &canonical);
         if !same_folder && !self.any_buffer_dirty() && self.session_store.get(&canonical).is_some() {
@@ -1934,10 +1952,70 @@ impl EditorApp {
         host.request_redraw();
     }
 
+    /// Reconcile responsive sidebar auto-minimize on very narrow windows without fighting
+    /// explicit user choices.
+    fn sync_sidebar_responsive(&mut self) {
+        let width_pt = self.framebuffer.width as f32 / self.framebuffer.scale.max(1.0);
+        let is_narrow = width_pt < SIDEBAR_AUTO_MINIMIZE_WIDTH_PT;
+        if !is_narrow {
+            self.sidebar_manual_override_small = false;
+            self.sidebar_auto_minimized = false;
+            self.sidebar.set_visible(self.sidebar_user_visible);
+        } else if self.sidebar_user_visible && !self.sidebar_manual_override_small {
+            self.sidebar_auto_minimized = true;
+            self.sidebar.set_visible(false);
+        } else {
+            self.sidebar_auto_minimized = false;
+            self.sidebar
+                .set_visible(self.sidebar_user_visible && self.sidebar_manual_override_small);
+        }
+    }
+
+    pub fn is_sidebar_auto_minimized(&self) -> bool {
+        self.sidebar_auto_minimized
+    }
+
+    pub fn set_sidebar_visible_user(&mut self, visible: bool, host: &mut dyn PlatformHost) {
+        self.sidebar_user_visible = visible;
+        let width_pt = self.framebuffer.width as f32 / self.framebuffer.scale.max(1.0);
+        if visible && width_pt < SIDEBAR_AUTO_MINIMIZE_WIDTH_PT {
+            self.sidebar_manual_override_small = true;
+            self.sidebar_auto_minimized = false;
+        } else {
+            self.sidebar_manual_override_small = false;
+            self.sidebar_auto_minimized = false;
+        }
+        self.sidebar.set_visible(visible);
+        self.save_preferences(host);
+        self.recompute_layout();
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    pub fn toggle_sidebar(&mut self, host: &mut dyn PlatformHost) {
+        let next = !self.sidebar.is_visible();
+        self.set_sidebar_visible_user(next, host);
+    }
+
+    pub fn set_sidebar_side(&mut self, side: SidebarSide, host: &mut dyn PlatformHost) {
+        self.sidebar.set_side(side);
+        self.save_preferences(host);
+        self.recompute_layout();
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    pub fn toggle_sidebar_side(&mut self, host: &mut dyn PlatformHost) {
+        let next = self.sidebar.side().toggle();
+        self.set_sidebar_side(next, host);
+    }
+
     pub fn recompute_layout(&mut self) {
         let w = self.framebuffer.width as i32;
         let h = self.framebuffer.height as i32;
         let scale = self.framebuffer.scale;
+
+        self.sync_sidebar_responsive();
 
         let status_h = status_bar_height_px(scale);
         let main_h = (h - status_h).max(0);
@@ -1948,22 +2026,24 @@ impl EditorApp {
         } else {
             0
         };
-        let sidebar = PixelRect::new(0, 0, sidebar_w, main_h);
-        let right_x = sidebar_w;
-        let right_w = (w - sidebar_w).max(0);
+        let editor_w = (w - sidebar_w).max(0);
+        let (sidebar, editor_x) = match self.sidebar.side() {
+            SidebarSide::Left => (PixelRect::new(0, 0, sidebar_w, main_h), sidebar_w),
+            SidebarSide::Right => (PixelRect::new(editor_w, 0, sidebar_w, main_h), 0),
+        };
 
         let strip_h = tab_strip_height_px(scale);
-        let tab_strip = PixelRect::new(right_x, 0, right_w, strip_h);
+        let tab_strip = PixelRect::new(editor_x, 0, editor_w, strip_h);
 
         let find_h = self.find_bar.height_px(scale);
-        let find_bar = PixelRect::new(right_x, tab_strip.bottom(), right_w, find_h);
+        let find_bar = PixelRect::new(editor_x, tab_strip.bottom(), editor_w, find_h);
 
         let goto_h = self.goto_line.height_px(scale);
-        let goto_bar = PixelRect::new(right_x, find_bar.bottom(), right_w, goto_h);
+        let goto_bar = PixelRect::new(editor_x, find_bar.bottom(), editor_w, goto_h);
 
         let vp_y = goto_bar.bottom();
         let vp_h = (main_h - vp_y).max(0);
-        let pane_area = PixelRect::new(right_x, vp_y, right_w, vp_h);
+        let pane_area = PixelRect::new(editor_x, vp_y, editor_w, vp_h);
         let grid = if self.zoomed && self.is_split() {
             self.arrangement.layout_zoomed(pane_area, self.active_id)
         } else {
@@ -2116,6 +2196,7 @@ impl EditorApp {
                 .as_ref()
                 .filter(|d| d.started)
                 .and_then(|d| d.strip_drop.map(|(_, ix)| ix));
+            let minimized_sidebar_side = (!self.sidebar.is_visible()).then_some(self.sidebar.side());
             self.tab_strip.draw(
                 &mut painter,
                 layout.tab_strip,
@@ -2124,6 +2205,7 @@ impl EditorApp {
                 self.zoomed,
                 merge_active,
                 drop_ix,
+                minimized_sidebar_side,
                 &theme,
                 &mut self.atlas,
                 rasterizer,
@@ -3608,11 +3690,10 @@ impl EditorApp {
                 host.request_redraw();
             }
             AppCommand::ToggleSidebar => {
-                self.sidebar.toggle_visible();
-                self.save_preferences(host);
-                self.recompute_layout();
-                self.mark_dirty();
-                host.request_redraw();
+                self.toggle_sidebar(host);
+            }
+            AppCommand::ToggleSidebarSide => {
+                self.toggle_sidebar_side(host);
             }
             AppCommand::SplitPane => {
                 self.split_pane_with(None, host);
@@ -3870,6 +3951,12 @@ impl EditorApp {
                     } else {
                         self.sidebar.set_focused(false);
                     }
+                }
+                SidebarAction::ToggleSide => {
+                    self.toggle_sidebar_side(host);
+                }
+                SidebarAction::Minimize => {
+                    self.set_sidebar_visible_user(false, host);
                 }
                 SidebarAction::Changed => {
                     if self.sidebar.root() != root_before.as_deref() {
@@ -4554,6 +4641,12 @@ impl EditorApp {
                         self.mark_dirty_rect(self.layout.sidebar);
                         host.request_redraw();
                     }
+                    SidebarAction::ToggleSide => {
+                        self.toggle_sidebar_side(host);
+                    }
+                    SidebarAction::Minimize => {
+                        self.set_sidebar_visible_user(false, host);
+                    }
                     SidebarAction::Changed => {
                         if self.sidebar.root() != root_before.as_deref() {
                             self.persist_last_folder(host);
@@ -4573,6 +4666,9 @@ impl EditorApp {
             self.find_bar.find_input.focused = false;
             self.find_bar.replace_input.focused = false;
             match self.tab_strip.hit_test(x_px, y_px) {
+                TabStripHit::ToggleSidebar => {
+                    self.toggle_sidebar(host);
+                }
                 TabStripHit::Tab(buf_id) => {
                     self.begin_drag(DragPayload::Tab(buf_id), x_px, y_px, false, click_count);
                 }
@@ -4810,7 +4906,11 @@ impl EditorApp {
             return;
         }
         if self.dragging_sidebar_edge {
-            self.sidebar.set_width_pt(x_px / scale);
+            let new_w_pt = match self.sidebar.side() {
+                SidebarSide::Left => x_px / scale,
+                SidebarSide::Right => (self.framebuffer.width as f32 - x_px) / scale,
+            };
+            self.sidebar.set_width_pt(new_w_pt);
             self.recompute_layout();
             self.mark_dirty();
             host.request_redraw();
@@ -5327,7 +5427,7 @@ impl EditorApp {
                 "\"cursor\":{{\"line\":{},\"col\":{},\"byte_offset\":{}}},",
                 "\"selection\":{},",
                 "\"scroll\":{{\"top_line\":{},\"scroll_x_px\":{:.1}}},",
-                "\"sidebar\":{{\"visible\":{},\"root\":{},\"width_pt\":{:.0},\"selected\":{}}},",
+                "\"sidebar\":{{\"visible\":{},\"side\":{},\"auto_minimized\":{},\"root\":{},\"width_pt\":{:.0},\"selected\":{}}},",
                 "\"find\":{{\"visible\":{},\"show_replace\":{},\"query\":{},\"replace\":{},\"case_sensitive\":{},\"matches\":{},\"active_match\":{}}},",
                 "\"palette\":{{\"mode\":{},\"query\":{},\"items\":{}}},",
                 "\"shortcuts_open\":{},",
@@ -5364,6 +5464,8 @@ impl EditorApp {
             self.viewport.scroll_top_line + 1,
             self.viewport.scroll_x_px,
             self.sidebar.is_visible(),
+            json_quote(self.sidebar.side().as_str()),
+            self.sidebar_auto_minimized,
             sb_root_json,
             self.sidebar.width_pt(),
             sb_sel_json,
@@ -5618,20 +5720,16 @@ impl EditorApp {
                     "toggle-sidebar" => {
                         self.handle_command(AppCommand::ToggleSidebar, rasterizer, clipboard, host)
                     }
-                    "sidebar-show" => {
-                        self.sidebar.set_visible(true);
-                        self.save_preferences(host);
-                        self.recompute_layout();
-                        self.mark_dirty();
-                        host.request_redraw();
-                    }
-                    "sidebar-hide" => {
-                        self.sidebar.set_visible(false);
-                        self.save_preferences(host);
-                        self.recompute_layout();
-                        self.mark_dirty();
-                        host.request_redraw();
-                    }
+                    "toggle-sidebar-side" => self.handle_command(
+                        AppCommand::ToggleSidebarSide,
+                        rasterizer,
+                        clipboard,
+                        host,
+                    ),
+                    "sidebar-left" => self.set_sidebar_side(SidebarSide::Left, host),
+                    "sidebar-right" => self.set_sidebar_side(SidebarSide::Right, host),
+                    "sidebar-show" => self.set_sidebar_visible_user(true, host),
+                    "sidebar-hide" => self.set_sidebar_visible_user(false, host),
                     "zoom-in" => {
                         self.handle_command(AppCommand::ZoomIn, rasterizer, clipboard, host)
                     }

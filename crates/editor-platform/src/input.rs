@@ -126,6 +126,7 @@ pub enum AppCommand {
     ToggleComment,
     ToggleWrap,
     ToggleSidebar,
+    ToggleSidebarSide,
     SplitPane,
     SplitPaneDown,
     CloseSplit,

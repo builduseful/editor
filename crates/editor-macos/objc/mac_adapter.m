@@ -867,7 +867,7 @@ void mac_activate_app(void) {
                                            styleMask:style
                                              backing:NSBackingStoreBuffered
                                                defer:NO];
-    g_window.minSize = NSMakeSize(520, 340);
+    g_window.minSize = NSMakeSize(380, 300);
     g_window.title = @"editor";
     g_window.delegate = self;
     g_window.acceptsMouseMovedEvents = YES;
@@ -1072,6 +1072,8 @@ void mac_activate_app(void) {
     NSMenuItem* viewItem = [[NSMenuItem alloc] init];
     NSMenu* viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
     [viewMenu addItem:[self menuItem:@"Toggle Sidebar" key:@"b" tag:16 mods:NSEventModifierFlagCommand]];
+    [viewMenu addItem:[self menuItem:@"Move Sidebar Left / Right" key:@"b" tag:47
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
     [viewMenu addItem:[self menuItem:@"Toggle Word Wrap" key:@"z" tag:15 mods:NSEventModifierFlagOption]];
     [viewMenu addItem:[self menuItem:@"Toggle Vim Mode" key:@"v" tag:26
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
