@@ -1859,6 +1859,27 @@ fn cmd_action(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start:
         );
         return 3;
     };
+    if name == "wrap-ext" {
+        let spec = match (args.get(1), args.get(2)) {
+            (Some(a), Some(b)) => format!("{a}={b}"),
+            (Some(a), None) => a.clone(),
+            _ => {
+                emit_err(
+                    "action",
+                    start,
+                    "E_USAGE",
+                    "usage: editor action wrap-ext <EXT>=<on|off|default>",
+                    None,
+                );
+                return 3;
+            }
+        };
+        return send_live_gui_command(
+            "action",
+            &editor_platform::ipc::IpcCommand::Action(format!("wrap-ext:{spec}")),
+            start,
+        );
+    }
     if name == "sidebar-root" {
         let Some(dir_arg) = args.get(1) else {
             emit_err("action", start, "E_USAGE", "sidebar-root requires <DIR>", None);

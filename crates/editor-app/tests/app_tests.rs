@@ -907,3 +907,48 @@ fn keymap_has_zero_conflicts_and_undo_to_clean_and_pane_swap_close() {
     assert!(!app.is_split());
     assert_eq!(app.doc.file_name(), "left.rs");
 }
+
+#[test]
+fn per_file_type_word_wrap_applies_and_persists_per_extension() {
+    use editor_platform::ipc::{IpcCommand, IpcReply};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/README.md", b"# Heading\nSome prose.\n".to_vec());
+    fs.add_file("/repo/main.rs", b"fn main() {}\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1000, 600, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    // Markdown wraps by default, Rust does not!
+    app.open_path_or_dir(&PathBuf::from("/repo/README.md"), &mut host)
+        .unwrap();
+    assert!(app.viewport.word_wrap);
+
+    app.open_path_or_dir(&PathBuf::from("/repo/main.rs"), &mut host)
+        .unwrap();
+    assert!(!app.viewport.word_wrap);
+
+    // Toggle wrap on `main.rs` -> persists specifically for `.rs`, leaving `.md` unchanged!
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Action("toggle-wrap".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let IpcReply::Json(s) = reply else { panic!("expected json") };
+    assert!(app.viewport.word_wrap);
+    assert!(s.contains("\"rs\":true"));
+
+    // Configure via CLI action `wrap-ext:rs=off` and verify live update!
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Action("wrap-ext:rs=off".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let IpcReply::Json(s) = reply else { panic!("expected json") };
+    assert!(!app.viewport.word_wrap);
+    assert!(s.contains("\"rs\":false"));
+}

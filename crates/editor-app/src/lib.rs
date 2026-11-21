@@ -8,6 +8,7 @@ pub mod keymap;
 pub mod vim;
 mod vim_exec;
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -129,6 +130,10 @@ pub struct EditorApp {
 
     pub theme_pref: ThemePreference,
     pub system_theme: SystemTheme,
+    /// Global fallback word wrap for files without a per-extension override.
+    pub default_word_wrap: bool,
+    /// Per-file-extension word wrap overrides (lowercase extension without dot, e.g. `"md" => true`).
+    pub wrap_by_ext: BTreeMap<String, bool>,
 
     pub atlas: GlyphAtlas,
     pub framebuffer: Framebuffer,
@@ -200,6 +205,8 @@ impl EditorApp {
             active_match: None,
             theme_pref: ThemePreference::System,
             system_theme: SystemTheme::Light,
+            default_word_wrap: false,
+            wrap_by_ext: default_wrap_by_ext(),
             atlas: GlyphAtlas::new(),
             framebuffer,
             layout: AppLayout::default(),
@@ -232,7 +239,10 @@ impl EditorApp {
             self.viewport.font_size_pt = sz.clamp(8.0, 36.0);
         }
         if let Some(wrap) = host.load_pref("WordWrap") {
-            self.viewport.word_wrap = wrap == "1" || wrap == "true";
+            self.default_word_wrap = wrap == "1" || wrap == "true";
+        }
+        if let Some(ext_pref) = host.load_pref("WordWrapByExt") {
+            self.wrap_by_ext = parse_wrap_by_ext(&ext_pref);
         }
         if let Some(theme) = host.load_pref("Theme") {
             self.theme_pref = match theme.as_str() {
@@ -244,6 +254,7 @@ impl EditorApp {
         if let Some(vim) = host.load_pref("VimMode") {
             self.vim.set_enabled(vim == "1" || vim == "true");
         }
+        self.sync_wrap_for_panes();
         self.recompute_layout();
         self.mark_dirty();
     }
@@ -251,7 +262,8 @@ impl EditorApp {
     pub fn save_preferences(&self, host: &mut dyn PlatformHost) {
         host.save_pref("SidebarWidth", &format!("{:.0}", self.sidebar.width_pt()));
         host.save_pref("FontSize", &format!("{:.1}", self.viewport.font_size_pt));
-        host.save_pref("WordWrap", if self.viewport.word_wrap { "1" } else { "0" });
+        host.save_pref("WordWrap", if self.default_word_wrap { "1" } else { "0" });
+        host.save_pref("WordWrapByExt", &format_wrap_by_ext(&self.wrap_by_ext));
         let t = match self.theme_pref {
             ThemePreference::System => "system",
             ThemePreference::Light => "light",
@@ -259,6 +271,64 @@ impl EditorApp {
         };
         host.save_pref("Theme", t);
         host.save_pref("VimMode", if self.vim.enabled { "1" } else { "0" });
+    }
+
+    /// Resolve effective word wrap for `path` (per-extension override -> global default).
+    pub fn effective_word_wrap(&self, path: Option<&Path>) -> bool {
+        if let Some(ext) = file_ext_key(path) {
+            if let Some(&v) = self.wrap_by_ext.get(&ext) {
+                return v;
+            }
+        }
+        self.default_word_wrap
+    }
+
+    /// Set or clear a per-extension word wrap override (`Some(true/false)` or `None` to reset to default).
+    pub fn set_word_wrap_for_ext(
+        &mut self,
+        ext: &str,
+        enabled: Option<bool>,
+        host: &mut dyn PlatformHost,
+    ) {
+        let key = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+        if key.is_empty() {
+            return;
+        }
+        match enabled {
+            Some(v) => {
+                self.wrap_by_ext.insert(key, v);
+            }
+            None => {
+                self.wrap_by_ext.remove(&key);
+            }
+        }
+        self.sync_wrap_for_panes();
+        self.save_preferences(host);
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    fn sync_wrap_for_panes(&mut self) {
+        let primary_wrap = self.effective_word_wrap(self.doc.path());
+        if self.viewport.word_wrap != primary_wrap {
+            self.viewport.word_wrap = primary_wrap;
+            if primary_wrap {
+                self.viewport.scroll_x_px = 0.0;
+            }
+        }
+        let sec_path = self
+            .secondary_pane
+            .as_ref()
+            .and_then(|s| s.doc.path().map(Path::to_path_buf));
+        let sec_wrap = self.effective_word_wrap(sec_path.as_deref());
+        if let Some(ref mut sec) = self.secondary_pane {
+            if sec.viewport.word_wrap != sec_wrap {
+                sec.viewport.word_wrap = sec_wrap;
+                if sec_wrap {
+                    sec.viewport.scroll_x_px = 0.0;
+                }
+            }
+        }
     }
 
     pub fn active_theme(&self) -> Theme {
@@ -291,6 +361,7 @@ impl EditorApp {
         self.anchor = 0;
         self.preferred_x_px = None;
         self.viewport.reset_for_document();
+        self.viewport.word_wrap = self.effective_word_wrap(canonical.as_deref());
         self.search_matches.clear();
         self.active_match = None;
 
@@ -396,8 +467,9 @@ impl EditorApp {
             }
             self.secondary_pane = Some(right);
             self.active_pane = 0;
-            // Focus the newly opened right pane!
+            // Focus the newly opened right pane and apply its per-extension word wrap!
             self.focus_pane(1, host);
+            self.sync_wrap_for_panes();
         } else {
             self.focus_pane(1, host);
             if let Some(p) = path {
@@ -1644,6 +1716,28 @@ impl EditorApp {
             }
             AppCommand::ToggleWrap => {
                 self.viewport.toggle_wrap();
+                let enabled = self.viewport.word_wrap;
+                if let Some(ext) = file_ext_key(self.doc.path()) {
+                    self.wrap_by_ext.insert(ext.clone(), enabled);
+                    self.set_notice(
+                        format!(
+                            "Word wrap {} for .{ext}",
+                            if enabled { "on" } else { "off" }
+                        ),
+                        false,
+                    );
+                } else {
+                    self.default_word_wrap = enabled;
+                    self.set_notice(
+                        if enabled {
+                            "Word wrap on (default)"
+                        } else {
+                            "Word wrap off (default)"
+                        },
+                        false,
+                    );
+                }
+                self.sync_wrap_for_panes();
                 self.save_preferences(host);
                 self.mark_dirty();
                 host.request_redraw();
@@ -3183,7 +3277,7 @@ impl EditorApp {
                 "\"shortcuts_open\":{},",
                 "\"vim\":{{\"enabled\":{},\"mode\":{}}},",
                 "\"confirm_modal_visible\":{},",
-                "\"view\":{{\"word_wrap\":{},\"font_size_pt\":{:.1},\"theme_preference\":{},\"active_theme\":{}}}}}"
+                "\"view\":{{\"word_wrap\":{},\"default_word_wrap\":{},\"word_wrap_by_ext\":{},\"font_size_pt\":{:.1},\"theme_preference\":{},\"active_theme\":{}}}}}"
             ),
             path_json,
             json_quote(self.doc.file_name()),
@@ -3227,6 +3321,8 @@ impl EditorApp {
             json_quote(self.vim.mode.label()),
             self.confirm_modal.visible,
             self.viewport.word_wrap,
+            self.default_word_wrap,
+            wrap_by_ext_json(&self.wrap_by_ext),
             self.viewport.font_size_pt,
             json_quote(theme_pref),
             json_quote(active_theme),
@@ -3500,6 +3596,36 @@ impl EditorApp {
                     "save-as" => self.handle_command(AppCommand::SaveAs, rasterizer, clipboard, host),
                     "quit" => self.handle_command(AppCommand::Quit, rasterizer, clipboard, host),
                     "focus" => activate = true,
+                    other if other.starts_with("wrap-ext:") => {
+                        let spec = &other["wrap-ext:".len()..];
+                        if let Some((ext, val)) = spec.split_once('=') {
+                            let mode = match val.trim().to_ascii_lowercase().as_str() {
+                                "1" | "on" | "true" => Some(Some(true)),
+                                "0" | "off" | "false" => Some(Some(false)),
+                                "default" | "reset" | "none" => Some(None),
+                                _ => None,
+                            };
+                            if let Some(m) = mode {
+                                self.set_word_wrap_for_ext(ext, m, host);
+                            } else {
+                                return (
+                                    IpcReply::Error(format!(
+                                        "invalid wrap value `{val}` (use on|off|default)"
+                                    )),
+                                    false,
+                                    false,
+                                );
+                            }
+                        } else {
+                            return (
+                                IpcReply::Error(
+                                    "usage: wrap-ext:<ext>=<on|off|default>".to_string(),
+                                ),
+                                false,
+                                false,
+                            );
+                        }
+                    }
                     other => {
                         return (
                             IpcReply::Error(format!("unknown action: {other}")),
@@ -3583,6 +3709,61 @@ fn draw_pane_header(
         atlas,
         rasterizer,
     );
+}
+
+fn file_ext_key(path: Option<&Path>) -> Option<String> {
+    let ext = path?.extension()?.to_str()?;
+    let lower = ext.trim().to_ascii_lowercase();
+    (!lower.is_empty()).then_some(lower)
+}
+
+fn default_wrap_by_ext() -> BTreeMap<String, bool> {
+    let mut m = BTreeMap::new();
+    m.insert("md".to_string(), true);
+    m.insert("markdown".to_string(), true);
+    m.insert("txt".to_string(), true);
+    m
+}
+
+fn parse_wrap_by_ext(raw: &str) -> BTreeMap<String, bool> {
+    let mut m = BTreeMap::new();
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if let Some((k, v)) = pair.split_once('=') {
+            let ext = k.trim().trim_start_matches('.').to_ascii_lowercase();
+            if !ext.is_empty() {
+                m.insert(ext, v.trim() == "1" || v.trim().eq_ignore_ascii_case("true"));
+            }
+        }
+    }
+    m
+}
+
+fn format_wrap_by_ext(map: &BTreeMap<String, bool>) -> String {
+    let mut out = String::new();
+    for (idx, (k, &v)) in map.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(k);
+        out.push('=');
+        out.push(if v { '1' } else { '0' });
+    }
+    out
+}
+
+fn wrap_by_ext_json(map: &BTreeMap<String, bool>) -> String {
+    let mut out = String::from("{");
+    for (idx, (k, &v)) in map.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&json_quote(k));
+        out.push(':');
+        out.push_str(if v { "true" } else { "false" });
+    }
+    out.push('}');
+    out
 }
 
 fn json_quote(s: &str) -> String {
