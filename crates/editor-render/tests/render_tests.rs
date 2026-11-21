@@ -123,3 +123,41 @@ fn text_input_edits_selects_and_copies() {
     let (_, copied) = input.handle_key(Key::Char('c'), primary, None, None);
     assert_eq!(copied.as_deref(), Some("hello "));
 }
+
+#[test]
+fn viewport_vertical_scroll_clamps_flush_to_bottom_with_no_excess_whitespace() {
+    use editor_core::Document;
+    use editor_platform::GlyphRasterizer;
+    use editor_render::Viewport;
+
+    let mut raster = BuiltinBitmapRasterizer;
+    let metrics = raster.metrics(FontStyle::Mono, 13.5);
+    let line_h = metrics.line_height as f32;
+    let rect = PixelRect::new(0, 0, 800, 400);
+
+    // 1. Short file (5 lines, fits inside 400px viewport) must NEVER scroll down!
+    let mut short_doc = Document::from_str("a\nb\nc\nd\ne\n", None);
+    let mut vp = Viewport::new();
+    vp.compute_layout(rect, &short_doc, metrics, 1.0);
+    vp.scroll_by(0.0, 5000.0, &mut short_doc, metrics, 1.0);
+    assert_eq!(vp.scroll_top_line, 0);
+    assert_eq!(vp.scroll_sub_y_px, 0.0);
+
+    // 2. Long file (100 lines) scrolled way past bottom stops flush with last line at bottom!
+    let mut text = String::new();
+    for i in 0..100 {
+        text.push_str(&format!("line {i}\n"));
+    }
+    let mut long_doc = Document::from_str(&text, None);
+    vp.compute_layout(rect, &long_doc, metrics, 1.0);
+    vp.scroll_by(0.0, 100_000.0, &mut long_doc, metrics, 1.0);
+
+    let text_h = vp.layout.text.h as f32;
+    let total_h = long_doc.editable_line_count() as f32 * line_h;
+    let cur_scroll = vp.scroll_top_line as f32 * line_h + vp.scroll_sub_y_px;
+    let expected_max = (total_h - text_h).max(0.0);
+    assert!(
+        (cur_scroll - expected_max).abs() <= 1.0,
+        "scroll={cur_scroll} expected={expected_max} (should leave zero bottom void)"
+    );
+}

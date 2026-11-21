@@ -307,7 +307,7 @@ impl Viewport {
             let max_y = (total_h - text_h).max(0.0);
             let dy = y_px - self.drag_anchor_px;
             let target = (self.drag_start_scroll + (dy / travel) * max_y).clamp(0.0, max_y);
-            self.set_vertical_scroll_px(target, doc, line_h);
+            self.set_vertical_scroll_px(target, doc, metrics, scale);
             return true;
         }
         if self.h_bar_dragging && !self.word_wrap {
@@ -338,11 +338,8 @@ impl Viewport {
         let line_h = metrics.line_height.max(1) as f32;
         if dy_px.abs() > 0.01 {
             let cur = self.scroll_top_line as f32 * line_h + self.scroll_sub_y_px;
-            let est_lines = doc.estimated_editable_line_count().max(1);
-            let total_h = est_lines as f32 * line_h;
-            let max_y = (total_h - line_h).max(0.0);
-            let target = (cur + dy_px).clamp(0.0, max_y);
-            self.set_vertical_scroll_px(target, doc, line_h);
+            let target = (cur + dy_px).max(0.0);
+            self.set_vertical_scroll_px(target, doc, metrics, scale);
         }
         if !self.word_wrap && dx_px.abs() > 0.01 {
             let max_x = (self.max_line_width_px + 32.0 * scale - self.layout.text.w as f32).max(0.0);
@@ -350,17 +347,88 @@ impl Viewport {
         }
     }
 
-    fn set_vertical_scroll_px(&mut self, target_px: f32, doc: &mut Document, line_h: f32) {
-        let target_line = (target_px / line_h).floor().max(0.0) as usize;
-        doc.tree_mut().ensure_indexed_for_line(target_line + 64);
-        let max_line = doc.editable_line_count().saturating_sub(1);
-        if target_line >= max_line {
-            self.scroll_top_line = max_line;
-            self.scroll_sub_y_px = 0.0;
-        } else {
-            self.scroll_top_line = target_line;
-            self.scroll_sub_y_px = (target_px - target_line as f32 * line_h).max(0.0);
+    /// Compute the exact maximum top position `(max_line, max_sub_y_px)` so the last line
+    /// lands flush with the bottom of the text viewport (zero excess whitespace at the bottom).
+    fn compute_max_top(
+        &mut self,
+        doc: &mut Document,
+        metrics: FontMetrics,
+        scale: f32,
+    ) -> (usize, f32) {
+        let line_h = metrics.line_height.max(1) as f32;
+        let text_h = self.layout.text.h.max(0) as f32;
+        if text_h <= 0.0 {
+            return (0, 0.0);
         }
+        let total_lines = doc.editable_line_count().max(1);
+        if !self.word_wrap {
+            let total_h = total_lines as f32 * line_h;
+            let max_y = (total_h - text_h).max(0.0);
+            let max_line = (max_y / line_h).floor() as usize;
+            let max_sub = (max_y - max_line as f32 * line_h).max(0.0);
+            return (max_line.min(total_lines - 1), max_sub);
+        }
+
+        // Wrapped mode: walk backward at most one viewport of visual blocks from the last line.
+        let text_pad_x = px(12.0, scale) as f32;
+        let max_wrap_w =
+            (self.layout.text.w as f32 - text_pad_x * 2.0).max(metrics.cell_width * 4.0);
+        let mut acc_h = 0.0f32;
+        let mut line = total_lines;
+        while line > 0 {
+            line -= 1;
+            let content = doc.line_content(line).unwrap_or_default();
+            let segs = self.layout_line(line, &content, metrics.cell_width, max_wrap_w);
+            let block_h = segs.len() as f32 * line_h;
+            if acc_h + block_h >= text_h {
+                let overflow = (acc_h + block_h - text_h).max(0.0);
+                return (line, overflow);
+            }
+            acc_h += block_h;
+        }
+        (0, 0.0)
+    }
+
+    pub fn clamp_vertical_scroll(
+        &mut self,
+        doc: &mut Document,
+        metrics: FontMetrics,
+        scale: f32,
+    ) {
+        if !doc.is_fully_indexed() {
+            // Only clamp to bottom once we've reached the end of the file.
+            return;
+        }
+        let (max_line, max_sub) = self.compute_max_top(doc, metrics, scale);
+        if self.scroll_top_line > max_line
+            || (self.scroll_top_line == max_line && self.scroll_sub_y_px > max_sub)
+        {
+            self.scroll_top_line = max_line;
+            self.scroll_sub_y_px = max_sub;
+        }
+    }
+
+    fn set_vertical_scroll_px(
+        &mut self,
+        target_px: f32,
+        doc: &mut Document,
+        metrics: FontMetrics,
+        scale: f32,
+    ) {
+        let line_h = metrics.line_height.max(1) as f32;
+        let text_h = self.layout.text.h.max(0) as f32;
+        let est_total_h = doc.estimated_editable_line_count().max(1) as f32 * line_h;
+        let est_max_y = (est_total_h - text_h).max(0.0);
+        let clamped_est = target_px.clamp(0.0, est_max_y);
+
+        let target_line = (clamped_est / line_h).floor().max(0.0) as usize;
+        let visible_lines = (text_h / line_h).ceil().max(1.0) as usize;
+        doc.tree_mut()
+            .ensure_indexed_for_line(target_line + visible_lines + 16);
+
+        self.scroll_top_line = target_line;
+        self.scroll_sub_y_px = (clamped_est - target_line as f32 * line_h).max(0.0);
+        self.clamp_vertical_scroll(doc, metrics, scale);
     }
 
     /// Ensure the caret at `(line, col_bytes)` is comfortably visible inside the viewport.
@@ -623,6 +691,7 @@ impl Viewport {
         let metrics = atlas.metrics(rasterizer, FontStyle::Mono, font_px);
         let layout = self.compute_layout(rect, doc, metrics, scale);
         self.sync_wrap_cache(doc.generation(), layout.text.w, font_px);
+        self.clamp_vertical_scroll(doc, metrics, scale);
 
         let clip = painter.current_clip();
         let hairline = (1.0 * scale).round().max(1.0) as i32;
