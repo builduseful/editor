@@ -114,6 +114,8 @@ pub enum AppCommand {
     ZoomOut,
     ZoomReset,
     SetTheme(ThemePreference),
+    ShowShortcuts,
+    ToggleVimMode,
     Quit,
 }
 

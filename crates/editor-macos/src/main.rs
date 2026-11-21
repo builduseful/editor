@@ -418,6 +418,8 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         23 => Some(AppCommand::ProjectSearch),
         24 => Some(AppCommand::SplitPane),
         25 => Some(AppCommand::CloseSplit),
+        26 => Some(AppCommand::ToggleVimMode),
+        27 => Some(AppCommand::ShowShortcuts),
         100 => Some(AppCommand::SetTheme(ThemePreference::System)),
         101 => Some(AppCommand::SetTheme(ThemePreference::Light)),
         102 => Some(AppCommand::SetTheme(ThemePreference::Dark)),
@@ -709,6 +711,9 @@ fn main() {
     let mut open_quick = false;
     let mut open_project_search: Option<String> = None;
     let mut split_file: Option<PathBuf> = None;
+    let mut open_shortcuts = false;
+    let mut open_shortcuts_all = false;
+    let mut enable_vim = false;
     let mut positional: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -762,6 +767,19 @@ fn main() {
                 split_file = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--shortcuts" => {
+                open_shortcuts = true;
+                i += 1;
+            }
+            "--shortcuts-all" => {
+                open_shortcuts = true;
+                open_shortcuts_all = true;
+                i += 1;
+            }
+            "--vim" => {
+                enable_vim = true;
+                i += 1;
+            }
             arg if !arg.starts_with('-') => {
                 positional = Some(PathBuf::from(arg));
                 i += 1;
@@ -810,6 +828,15 @@ fn main() {
             let root = app.sidebar.root().map(Path::to_path_buf);
             app.palette
                 .open_project_search(fs_clone.as_ref(), root.as_deref(), Some(q));
+        }
+        if enable_vim {
+            app.vim.set_enabled(true);
+        }
+        if open_shortcuts {
+            app.shortcuts.open(app.keymap.to_display_items());
+            if open_shortcuts_all {
+                app.shortcuts.toggle_expanded();
+            }
         }
         app.mark_dirty();
         app.render(&mut rasterizer);

@@ -676,3 +676,181 @@ fn split_pane_double_buffer_damage_tracking_is_bit_exact() {
     app.focus_pane(0, &mut host);
     present_and_verify(&mut app, &mut raster);
 }
+
+#[test]
+fn keymap_rebind_and_shortcuts_overlay_search_expand_and_run() {
+    use editor_app::KeyChord;
+    use editor_platform::{AppCommand, InputEvent, Key, Modifiers};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/a.rs", b"fn main() {}\n".to_vec());
+    let mut app = EditorApp::new(fs, 1120, 740, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    // Custom keybinding foundation: parse + rebind an action and verify lookup updates live!
+    let chord = KeyChord::parse("cmd+shift+k").expect("parse chord");
+    assert!(app.keymap.rebind("quick-open", chord));
+    let mut m = Modifiers::NONE;
+    #[cfg(target_os = "macos")]
+    {
+        m.meta = true;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        m.ctrl = true;
+    }
+    m.shift = true;
+    assert_eq!(app.keymap.lookup_command(Key::Char('k'), m), Some(AppCommand::QuickOpen));
+
+    // Open Keyboard Shortcuts overlay via `Cmd+?`, expand via `Tab`, search "vim", press `Enter` to toggle Vim!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('?'),
+            mods: m,
+            text: Some("?".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.shortcuts.visible);
+    assert!(!app.shortcuts.expanded);
+
+    // Tab toggles expanded state to show all shortcuts.
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Tab,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.shortcuts.expanded);
+    assert!(app.render(&mut raster));
+
+    // Type "Toggle Vim" and press Enter -> closes overlay and enables Vim mode!
+    for ch in "Toggle Vim".chars() {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+    }
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.shortcuts.visible);
+    assert!(app.vim.enabled);
+}
+
+#[test]
+fn vim_mode_motions_operators_text_objects_visual_and_splits() {
+    use editor_app::VimMode;
+    use editor_platform::{InputEvent, Key, Modifiers};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file(
+        "/repo/vim.rs",
+        b"fn alpha() {\n    let name = \"hello\";\n    let x = 1;\n}\n".to_vec(),
+    );
+    let mut app = EditorApp::new(fs, 1000, 600, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_path_or_dir(&PathBuf::from("/repo/vim.rs"), &mut host)
+        .unwrap();
+    app.vim.set_enabled(true);
+
+    let send_ch = |app: &mut EditorApp,
+                   ch: char,
+                   raster: &mut BuiltinBitmapRasterizer,
+                   clip: &mut MemoryClipboard,
+                   host: &mut HeadlessHost| {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            raster,
+            clip,
+            host,
+        );
+    };
+
+    // `j` moves to line 2 (`    let name = "hello";`), `f"` jumps to opening quote, `ci"` changes inside quotes!
+    send_ch(&mut app, 'j', &mut raster, &mut clip, &mut host);
+    assert_eq!(app.doc.byte_to_line_col(app.caret).0, 1);
+
+    send_ch(&mut app, 'f', &mut raster, &mut clip, &mut host);
+    send_ch(&mut app, '"', &mut raster, &mut clip, &mut host);
+    send_ch(&mut app, 'c', &mut raster, &mut clip, &mut host);
+    send_ch(&mut app, 'i', &mut raster, &mut clip, &mut host);
+    send_ch(&mut app, '"', &mut raster, &mut clip, &mut host);
+    assert_eq!(app.vim.mode, VimMode::Insert);
+    for ch in "world".chars() {
+        send_ch(&mut app, ch, &mut raster, &mut clip, &mut host);
+    }
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.vim.mode, VimMode::Normal);
+    assert_eq!(app.doc.line_content(1).unwrap(), "    let name = \"world\";");
+
+    // `j` -> `dd` deletes line 3, `p` pastes it back below!
+    send_ch(&mut app, 'j', &mut raster, &mut clip, &mut host);
+    send_ch(&mut app, 'd', &mut raster, &mut clip, &mut host);
+    send_ch(&mut app, 'd', &mut raster, &mut clip, &mut host);
+    assert_eq!(app.doc.line_content(2).unwrap(), "}");
+
+    // `u` undoes `dd`!
+    send_ch(&mut app, 'u', &mut raster, &mut clip, &mut host);
+    assert_eq!(app.doc.line_content(2).unwrap(), "    let x = 1;");
+
+    // `gg` jumps to top, `G` jumps to bottom.
+    send_ch(&mut app, 'g', &mut raster, &mut clip, &mut host);
+    send_ch(&mut app, 'g', &mut raster, &mut clip, &mut host);
+    assert_eq!(app.doc.byte_to_line_col(app.caret).0, 0);
+    send_ch(&mut app, 'G', &mut raster, &mut clip, &mut host);
+    assert!(app.doc.byte_to_line_col(app.caret).0 >= 3);
+
+    // `Ctrl+W v` splits pane right!
+    let mut ctrl = Modifiers::NONE;
+    ctrl.ctrl = true;
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('w'),
+            mods: ctrl,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    send_ch(&mut app, 'v', &mut raster, &mut clip, &mut host);
+    assert!(app.is_split());
+}

@@ -954,6 +954,8 @@ void mac_activate_app(void) {
     NSMenu* viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
     [viewMenu addItem:[self menuItem:@"Toggle Sidebar" key:@"b" tag:16 mods:NSEventModifierFlagCommand]];
     [viewMenu addItem:[self menuItem:@"Toggle Word Wrap" key:@"z" tag:15 mods:NSEventModifierFlagOption]];
+    [viewMenu addItem:[self menuItem:@"Toggle Vim Mode" key:@"v" tag:26
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
     [viewMenu addItem:[NSMenuItem separatorItem]];
     [viewMenu addItem:[self menuItem:@"Split Editor Right" key:@"\\" tag:24 mods:NSEventModifierFlagCommand]];
     [viewMenu addItem:[self menuItem:@"Close Split Pane" key:@"\\" tag:25
@@ -968,6 +970,14 @@ void mac_activate_app(void) {
     [viewMenu addItem:[self menuItem:@"Theme: Dark" key:@"" tag:102 mods:0]];
     viewItem.submenu = viewMenu;
     [mainMenu addItem:viewItem];
+
+    // Help Menu
+    NSMenuItem* helpItem = [[NSMenuItem alloc] init];
+    NSMenu* helpMenu = [[NSMenu alloc] initWithTitle:@"Help"];
+    [helpMenu addItem:[self menuItem:@"Keyboard Shortcuts" key:@"?" tag:27
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
+    helpItem.submenu = helpMenu;
+    [mainMenu addItem:helpItem];
 
     NSApp.mainMenu = mainMenu;
 }

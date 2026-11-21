@@ -402,6 +402,7 @@ pub struct StatusBarData<'a> {
     pub word_wrap: bool,
     pub theme_pref: ThemePreference,
     pub notice: Option<(&'a str, bool)>, // (message, is_error)
+    pub vim_badge: Option<&'a str>,
 }
 
 pub fn status_bar_height_px(scale: f32) -> i32 {
@@ -432,14 +433,45 @@ pub fn draw_status_bar(
     let baseline = rect.y as f32 + (rect.h as f32 + metrics.ascent - metrics.descent) * 0.5;
     let pad = px(12.0, scale) as f32;
 
-    // Left: filename + modified indicator + optional transient notice.
+    // Left: optional Vim mode pill + filename + modified indicator + optional transient notice.
+    let mut lx = rect.x as f32 + pad;
+    if let Some(vim) = data.vim_badge {
+        let badge_font = 10.5 * scale;
+        let bm = atlas.metrics(rasterizer, FontStyle::MonoBold, badge_font);
+        let bw = Painter::measure_text_ui(vim, FontStyle::MonoBold, badge_font, atlas, rasterizer)
+            .ceil() as i32;
+        let pill_pad_x = px(6.0, scale);
+        let pill_w = bw + pill_pad_x * 2;
+        let pill_h = px(17.0, scale);
+        let pill_rect = PixelRect::new(
+            lx.round() as i32,
+            rect.y + (rect.h - pill_h) / 2,
+            pill_w,
+            pill_h,
+        );
+        painter.fill_rounded_rect(pill_rect, 3.5 * scale, theme.surface);
+        painter.stroke_rounded_rect(pill_rect, 3.5 * scale, hairline as f32, theme.border_control);
+        let bbase = pill_rect.y as f32 + (pill_rect.h as f32 + bm.ascent - bm.descent) * 0.5;
+        painter.draw_text_ui(
+            (pill_rect.x + pill_pad_x) as f32,
+            bbase,
+            vim,
+            FontStyle::MonoBold,
+            badge_font,
+            theme.text,
+            atlas,
+            rasterizer,
+        );
+        lx = pill_rect.right() as f32 + px(10.0, scale) as f32;
+    }
+
     let left_text = if data.dirty {
         format!("{} • Modified", data.file_label)
     } else {
         data.file_label.to_string()
     };
-    let mut lx = painter.draw_text_ui(
-        rect.x as f32 + pad,
+    lx = painter.draw_text_ui(
+        lx,
         baseline,
         &left_text,
         FontStyle::Ui,

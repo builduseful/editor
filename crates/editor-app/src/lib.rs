@@ -4,6 +4,10 @@
 //! 100% testable headlessly by feeding `InputEvent`s and inspecting document state
 //! and rendered pixels in `Framebuffer`.
 
+pub mod keymap;
+pub mod vim;
+mod vim_exec;
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -19,9 +23,12 @@ use editor_platform::{
 use editor_render::{
     chrome::{draw_status_bar, status_bar_height_px},
     A11yNode, A11yRole, CommandPalette, ConfirmModal, FindBarAction, FindBarState, GlyphAtlas,
-    GotoLineState, ImeComposition, Painter, PaletteAction, ScrollbarHit, Sidebar, SidebarAction,
-    SidebarHit, StatusBarData, Theme, Viewport,
+    GotoLineState, ImeComposition, Painter, PaletteAction, ScrollbarHit, ShortcutsAction,
+    ShortcutsOverlay, Sidebar, SidebarAction, SidebarHit, StatusBarData, Theme, Viewport,
 };
+
+pub use keymap::{KeyChord, Keymap, ShortcutEntry};
+pub use vim::{VimMode, VimState};
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppLayout {
@@ -108,7 +115,10 @@ pub struct EditorApp {
     pub find_bar: FindBarState,
     pub goto_line: GotoLineState,
     pub palette: CommandPalette,
+    pub shortcuts: ShortcutsOverlay,
     pub confirm_modal: ConfirmModal,
+    pub keymap: Keymap,
+    pub vim: VimState,
     pub ime: ImeComposition,
     pending_discard: Option<PendingDiscardAction>,
     pub use_in_app_modal: bool,
@@ -178,7 +188,10 @@ impl EditorApp {
             find_bar: FindBarState::new(),
             goto_line: GotoLineState::new(),
             palette: CommandPalette::new(),
+            shortcuts: ShortcutsOverlay::new(),
             confirm_modal: ConfirmModal::default(),
+            keymap: Keymap::new(),
+            vim: VimState::new(),
             ime: ImeComposition::default(),
             pending_discard: None,
             use_in_app_modal: false,
@@ -227,6 +240,9 @@ impl EditorApp {
                 _ => ThemePreference::System,
             };
         }
+        if let Some(vim) = host.load_pref("VimMode") {
+            self.vim.set_enabled(vim == "1" || vim == "true");
+        }
         self.recompute_layout();
         self.mark_dirty();
     }
@@ -241,6 +257,7 @@ impl EditorApp {
             ThemePreference::Dark => "dark",
         };
         host.save_pref("Theme", t);
+        host.save_pref("VimMode", if self.vim.enabled { "1" } else { "0" });
     }
 
     pub fn active_theme(&self) -> Theme {
@@ -542,6 +559,7 @@ impl EditorApp {
         let app_dirty = if self.framebuffer.dirty.is_full()
             || self.confirm_modal.visible
             || self.palette.is_open()
+            || self.shortcuts.visible
         {
             full_bounds
         } else {
@@ -567,9 +585,14 @@ impl EditorApp {
         let doc_focused = self.window_focused
             && !self.confirm_modal.visible
             && !self.palette.is_open()
+            && !self.shortcuts.visible
             && !self.sidebar.is_focused()
             && !self.find_bar.is_focused()
             && !self.goto_line.visible;
+        self.viewport.block_caret = self.vim.uses_block_caret();
+        if let Some(ref mut sec) = self.secondary_pane {
+            sec.viewport.block_caret = false;
+        }
         let matching_brackets = if sel.is_none() && doc_focused {
             self.doc.find_matching_bracket(self.caret)
         } else {
@@ -725,6 +748,7 @@ impl EditorApp {
 
         // 5. Status bar
         if !layout.status_bar.intersect(effective_clip).is_empty() {
+            let vim_badge_owned = self.vim.status_badge();
             let status_data = StatusBarData {
                 file_label: self.doc.file_name(),
                 dirty: self.doc.is_dirty(),
@@ -736,6 +760,7 @@ impl EditorApp {
                 word_wrap: self.viewport.word_wrap,
                 theme_pref: self.theme_pref,
                 notice,
+                vim_badge: vim_badge_owned.as_deref(),
             };
             draw_status_bar(
                 &mut painter,
@@ -759,7 +784,19 @@ impl EditorApp {
             );
         }
 
-        // 7. Optional in-app confirmation modal overlay.
+        // 7. Optional Keyboard Shortcuts overlay (`Cmd+?`).
+        if self.shortcuts.visible {
+            self.shortcuts.draw(
+                &mut painter,
+                full_bounds,
+                &theme,
+                &mut self.atlas,
+                rasterizer,
+                self.caret_visible,
+            );
+        }
+
+        // 8. Optional in-app confirmation modal overlay.
         if self.confirm_modal.visible {
             self.confirm_modal
                 .draw(&mut painter, full_bounds, &theme, &mut self.atlas, rasterizer);
@@ -849,6 +886,81 @@ impl EditorApp {
                     self.framebuffer.resize(width_px.max(1), height_px.max(1), scale);
                     self.recompute_layout();
                     self.mark_dirty();
+                    return;
+                }
+                _ => return,
+            }
+        }
+
+        // Intercept keyboard, scroll & mouse when the Keyboard Shortcuts overlay (`Cmd+?`) is open.
+        if self.shortcuts.visible {
+            match event {
+                InputEvent::KeyDown { key, mods, text } => {
+                    self.caret_visible = true;
+                    self.last_blink_ms = self.now_ms;
+                    if self.keymap.lookup_command(key, mods) == Some(AppCommand::ShowShortcuts) {
+                        self.shortcuts.close();
+                        self.mark_dirty();
+                        host.request_redraw();
+                        return;
+                    }
+                    let act = self.shortcuts.handle_key(key, mods, text.as_deref());
+                    self.handle_shortcuts_action(act, rasterizer, clipboard, host);
+                    return;
+                }
+                InputEvent::Scroll { dy_px, .. } => {
+                    if self.shortcuts.handle_scroll(dy_px) {
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    return;
+                }
+                InputEvent::MouseDown {
+                    x_px,
+                    y_px,
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    let act = self.shortcuts.handle_mouse_down(x_px, y_px);
+                    self.handle_shortcuts_action(act, rasterizer, clipboard, host);
+                    return;
+                }
+                InputEvent::Command(AppCommand::ShowShortcuts) => {
+                    self.shortcuts.close();
+                    self.mark_dirty();
+                    host.request_redraw();
+                    return;
+                }
+                InputEvent::Command(cmd)
+                    if matches!(
+                        cmd,
+                        AppCommand::Copy
+                            | AppCommand::Cut
+                            | AppCommand::Paste
+                            | AppCommand::SelectAll
+                    ) =>
+                {
+                    self.handle_command(cmd, rasterizer, clipboard, host);
+                    return;
+                }
+                InputEvent::Resize {
+                    width_px,
+                    height_px,
+                    scale,
+                } => {
+                    self.framebuffer.resize(width_px.max(1), height_px.max(1), scale);
+                    self.recompute_layout();
+                    self.mark_dirty();
+                    return;
+                }
+                InputEvent::Tick { now_ms } => {
+                    self.now_ms = now_ms;
+                    if self.window_focused && now_ms.saturating_sub(self.last_blink_ms) >= 530 {
+                        self.caret_visible = !self.caret_visible;
+                        self.last_blink_ms = now_ms;
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
                     return;
                 }
                 _ => return,
@@ -1259,8 +1371,32 @@ impl EditorApp {
         }
     }
 
+    fn handle_shortcuts_action(
+        &mut self,
+        act: ShortcutsAction,
+        rasterizer: &mut dyn GlyphRasterizer,
+        clipboard: &mut dyn Clipboard,
+        host: &mut dyn PlatformHost,
+    ) {
+        match act {
+            ShortcutsAction::None => {}
+            ShortcutsAction::Changed | ShortcutsAction::Close => {
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            ShortcutsAction::RunAction(id) => {
+                let cmd = editor_platform::ipc::IpcCommand::Action(id.to_string());
+                let _ = self.execute_ipc(&cmd, rasterizer, clipboard, host);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+        }
+    }
+
     fn active_text_input_mut(&mut self) -> Option<&mut editor_render::TextInput> {
-        if self.palette.is_open() {
+        if self.shortcuts.visible {
+            Some(&mut self.shortcuts.input)
+        } else if self.palette.is_open() {
             Some(&mut self.palette.input)
         } else if self.goto_line.visible {
             Some(&mut self.goto_line.input)
@@ -1503,6 +1639,31 @@ impl EditorApp {
                 self.mark_dirty();
                 host.request_redraw();
             }
+            AppCommand::ShowShortcuts => {
+                if self.shortcuts.visible {
+                    self.shortcuts.close();
+                } else {
+                    self.palette.close();
+                    self.goto_line.close();
+                    self.shortcuts.open(self.keymap.to_display_items());
+                }
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::ToggleVimMode => {
+                let enabled = self.vim.toggle();
+                self.save_preferences(host);
+                self.set_notice(
+                    if enabled {
+                        "Vim mode enabled (Normal)"
+                    } else {
+                        "Vim mode disabled"
+                    },
+                    false,
+                );
+                self.mark_dirty();
+                host.request_redraw();
+            }
             AppCommand::Quit => {
                 self.request_discard_or_run(PendingDiscardAction::Quit, host);
             }
@@ -1518,96 +1679,25 @@ impl EditorApp {
         clipboard: &mut dyn Clipboard,
         host: &mut dyn PlatformHost,
     ) {
-        // Global shortcut dispatch first.
-        if mods.primary() {
-            match key {
-                Key::Char('s') | Key::Char('S') => {
-                    let cmd = if mods.shift {
-                        AppCommand::SaveAs
-                    } else {
-                        AppCommand::Save
-                    };
-                    self.handle_command(cmd, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('o') | Key::Char('O') => {
-                    let cmd = if mods.shift {
-                        AppCommand::OpenFolder
-                    } else {
-                        AppCommand::OpenFile
-                    };
-                    self.handle_command(cmd, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('n') | Key::Char('N') => {
-                    self.handle_command(AppCommand::NewFile, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('f') | Key::Char('F') => {
-                    let cmd = if mods.shift {
-                        AppCommand::ProjectSearch
-                    } else if mods.alt {
-                        AppCommand::Replace
-                    } else {
-                        AppCommand::Find
-                    };
-                    self.handle_command(cmd, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('p') | Key::Char('P') => {
-                    self.handle_command(AppCommand::QuickOpen, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('g') | Key::Char('G') => {
-                    if self.find_bar.visible {
-                        self.jump_search_match(!mods.shift, rasterizer, host);
-                    } else {
-                        self.handle_command(AppCommand::GoToLine, rasterizer, clipboard, host);
-                    }
-                    return;
-                }
-                Key::Char('b') | Key::Char('B') => {
-                    self.handle_command(AppCommand::ToggleSidebar, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('\\') => {
-                    let cmd = if mods.shift {
-                        AppCommand::CloseSplit
-                    } else {
-                        AppCommand::SplitPane
-                    };
-                    self.handle_command(cmd, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Left if mods.alt => {
-                    self.handle_command(AppCommand::FocusLeftPane, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Right if mods.alt => {
-                    self.handle_command(AppCommand::FocusRightPane, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('=') | Key::Char('+') => {
-                    self.handle_command(AppCommand::ZoomIn, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('-') => {
-                    self.handle_command(AppCommand::ZoomOut, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('0') => {
-                    self.handle_command(AppCommand::ZoomReset, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('q') | Key::Char('Q') => {
-                    self.handle_command(AppCommand::Quit, rasterizer, clipboard, host);
-                    return;
-                }
-                _ => {}
-            }
+        // Global shortcut dispatch via data-driven `self.keymap` (ready for custom keybindings!).
+        // Special case: `Cmd+G` / `Cmd+Shift+G` while Find bar is open jumps between search matches.
+        if mods.primary() && matches!(key, Key::Char('g') | Key::Char('G')) && self.find_bar.visible
+        {
+            self.jump_search_match(!mods.shift, rasterizer, host);
+            return;
         }
-        if mods.alt && !mods.primary() && matches!(key, Key::Char('z') | Key::Char('Z')) {
-            self.handle_command(AppCommand::ToggleWrap, rasterizer, clipboard, host);
+        // `Cmd++` (shifted `=` on US keyboards) also maps to ZoomIn.
+        if mods.primary() && matches!(key, Key::Char('+')) {
+            self.handle_command(AppCommand::ZoomIn, rasterizer, clipboard, host);
+            return;
+        }
+        // `Cmd+?` (`Shift+Cmd+/` or `Cmd+?`) opens/toggles Keyboard Shortcuts.
+        if mods.primary() && matches!(key, Key::Char('?')) {
+            self.handle_command(AppCommand::ShowShortcuts, rasterizer, clipboard, host);
+            return;
+        }
+        if let Some(cmd) = self.keymap.lookup_command(key, mods) {
+            self.handle_command(cmd, rasterizer, clipboard, host);
             return;
         }
 
@@ -1778,6 +1868,15 @@ impl EditorApp {
         if mods.alt && !mods.primary() && !mods.shift && matches!(key, Key::Up | Key::Down) {
             self.move_current_line(key == Key::Up, rasterizer, host);
             return;
+        }
+
+        // Neovim modal editing when Vim mode is enabled and document is focused.
+        if self.vim.enabled {
+            let vim_act = self.vim.handle_key(key, mods, text);
+            if vim_act != crate::vim::VimAction::PassThrough {
+                self.execute_vim_action(vim_act, rasterizer, clipboard, host);
+                return;
+            }
         }
 
         // Document navigation & text editing!
@@ -3046,6 +3145,8 @@ impl EditorApp {
                 "\"sidebar\":{{\"visible\":{},\"root\":{},\"width_pt\":{:.0},\"selected\":{}}},",
                 "\"find\":{{\"visible\":{},\"show_replace\":{},\"query\":{},\"replace\":{},\"case_sensitive\":{},\"matches\":{},\"active_match\":{}}},",
                 "\"palette\":{{\"mode\":{},\"query\":{},\"items\":{}}},",
+                "\"shortcuts_open\":{},",
+                "\"vim\":{{\"enabled\":{},\"mode\":{}}},",
                 "\"confirm_modal_visible\":{},",
                 "\"view\":{{\"word_wrap\":{},\"font_size_pt\":{:.1},\"theme_preference\":{},\"active_theme\":{}}}}}"
             ),
@@ -3086,6 +3187,9 @@ impl EditorApp {
             json_quote(palette_mode),
             json_quote(&self.palette.input.text),
             self.palette.items.len(),
+            self.shortcuts.visible,
+            self.vim.enabled,
+            json_quote(self.vim.mode.label()),
             self.confirm_modal.visible,
             self.viewport.word_wrap,
             self.viewport.font_size_pt,
@@ -3326,6 +3430,33 @@ impl EditorApp {
                     "duplicate-line" => self.duplicate_current_line(rasterizer, host),
                     "delete-line" => self.delete_current_line(rasterizer, host),
                     "toggle-comment" => self.toggle_line_comment(rasterizer, host),
+                    "shortcuts" => {
+                        activate = true;
+                        self.handle_command(AppCommand::ShowShortcuts, rasterizer, clipboard, host);
+                    }
+                    "toggle-vim" => {
+                        self.handle_command(AppCommand::ToggleVimMode, rasterizer, clipboard, host);
+                    }
+                    "vim-on" => {
+                        self.vim.set_enabled(true);
+                        self.save_preferences(host);
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    "vim-off" => {
+                        self.vim.set_enabled(false);
+                        self.save_preferences(host);
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    "split" => self.handle_command(AppCommand::SplitPane, rasterizer, clipboard, host),
+                    "unsplit" => self.handle_command(AppCommand::CloseSplit, rasterizer, clipboard, host),
+                    "focus-left" => self.handle_command(AppCommand::FocusLeftPane, rasterizer, clipboard, host),
+                    "focus-right" => self.handle_command(AppCommand::FocusRightPane, rasterizer, clipboard, host),
+                    "open-dialog" => self.handle_command(AppCommand::OpenFile, rasterizer, clipboard, host),
+                    "open-folder" => self.handle_command(AppCommand::OpenFolder, rasterizer, clipboard, host),
+                    "save-as" => self.handle_command(AppCommand::SaveAs, rasterizer, clipboard, host),
+                    "quit" => self.handle_command(AppCommand::Quit, rasterizer, clipboard, host),
                     "focus" => activate = true,
                     other => {
                         return (

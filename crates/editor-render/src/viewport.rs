@@ -81,6 +81,8 @@ pub struct Viewport {
     wrap_cache_font_q: u32,
     pub layout: ViewportLayout,
     pub last_caret_rect: PixelRect,
+    /// Render a cell-wide block cursor (used in Vim Normal / Visual modes) instead of a thin bar.
+    pub block_caret: bool,
 }
 
 impl Default for Viewport {
@@ -111,6 +113,7 @@ impl Viewport {
             wrap_cache_font_q: 0,
             layout: ViewportLayout::default(),
             last_caret_rect: PixelRect::ZERO,
+            block_caret: false,
         }
     }
 
@@ -1024,7 +1027,11 @@ impl Viewport {
                     if in_seg {
                         let local_col = rel_caret.saturating_sub(seg.byte_start).min(seg_str.len());
                         let cx = seg_origin_x + self.measure_prefix_px(seg_str, local_col, cell_w);
-                        let caret_w = (2.0 * scale).round().max(1.0) as i32;
+                        let caret_w = if self.block_caret {
+                            cell_w.round().max(4.0) as i32
+                        } else {
+                            (2.0 * scale).round().max(1.0) as i32
+                        };
                         let crect = PixelRect::new(
                             cx.round() as i32,
                             seg_y.round() as i32 + 1,
@@ -1033,7 +1040,27 @@ impl Viewport {
                         );
                         self.last_caret_rect = crect;
                         if caret_visible {
-                            painter.fill_rect(crect, theme.text);
+                            if self.block_caret {
+                                painter.fill_rect(crect, theme.text.with_alpha(95));
+                                painter.fill_rect(
+                                    PixelRect::new(crect.x, crect.y, crect.w, (1.0 * scale).round().max(1.0) as i32),
+                                    theme.text,
+                                );
+                                painter.fill_rect(
+                                    PixelRect::new(crect.x, crect.bottom() - (1.0 * scale).round().max(1.0) as i32, crect.w, (1.0 * scale).round().max(1.0) as i32),
+                                    theme.text,
+                                );
+                                painter.fill_rect(
+                                    PixelRect::new(crect.x, crect.y, (1.0 * scale).round().max(1.0) as i32, crect.h),
+                                    theme.text,
+                                );
+                                painter.fill_rect(
+                                    PixelRect::new(crect.right() - (1.0 * scale).round().max(1.0) as i32, crect.y, (1.0 * scale).round().max(1.0) as i32, crect.h),
+                                    theme.text,
+                                );
+                            } else {
+                                painter.fill_rect(crect, theme.text);
+                            }
                         }
                         // Future IME composition preview underline if preedit text is active.
                         if !ime.preedit.is_empty() {
