@@ -314,6 +314,19 @@ impl EditorApp {
         if let Some(w) = host.load_pref("SidebarWidth").and_then(|s| s.parse::<f32>().ok()) {
             self.sidebar.set_width_pt(w);
         }
+        if let Some(vis) = host.load_pref("SidebarVisible") {
+            self.sidebar.set_visible(vis == "1" || vis == "true");
+        }
+        if self.sidebar.root().is_none() {
+            if let Some(raw_dir) = host.load_pref("LastFolder") {
+                let dir = PathBuf::from(raw_dir.trim());
+                if !dir.as_os_str().is_empty()
+                    && self.fs.stat(&dir).map(|s| s.is_dir).unwrap_or(false)
+                {
+                    self.sidebar.set_root(self.fs.as_ref(), &dir);
+                }
+            }
+        }
         if let Some(sz) = host.load_pref("FontSize").and_then(|s| s.parse::<f32>().ok()) {
             self.viewport.font_size_pt = sz.clamp(8.0, 36.0);
         }
@@ -358,6 +371,8 @@ impl EditorApp {
 
     pub fn save_preferences(&self, host: &mut dyn PlatformHost) {
         host.save_pref("SidebarWidth", &format!("{:.0}", self.sidebar.width_pt()));
+        host.save_pref("SidebarVisible", if self.sidebar.is_visible() { "1" } else { "0" });
+        self.persist_last_folder(host);
         host.save_pref("FontSize", &format!("{:.1}", self.viewport.font_size_pt));
         host.save_pref("WordWrap", if self.default_word_wrap { "1" } else { "0" });
         host.save_pref("WordWrapByExt", &format_wrap_by_ext(&self.wrap_by_ext));
@@ -729,6 +744,12 @@ impl EditorApp {
         out
     }
 
+    fn persist_last_folder(&self, host: &mut dyn PlatformHost) {
+        if let Some(root) = self.sidebar.root() {
+            host.save_pref("LastFolder", &root.to_string_lossy());
+        }
+    }
+
     pub fn set_sidebar_root(&mut self, dir: &Path) {
         self.sidebar.set_root(self.fs.as_ref(), dir);
         self.mark_dirty();
@@ -934,6 +955,7 @@ impl EditorApp {
         if self.sidebar.root().is_none() {
             if let Some(parent) = canonical.parent() {
                 self.sidebar.set_root(self.fs.as_ref(), parent);
+                self.persist_last_folder(host);
             }
         }
 
@@ -1253,6 +1275,7 @@ impl EditorApp {
             if st.is_dir {
                 self.sidebar.set_visible(true);
                 self.sidebar.set_root(self.fs.as_ref(), path);
+                self.save_preferences(host);
                 self.mark_dirty();
                 host.request_redraw();
                 return Ok(());
@@ -3049,6 +3072,7 @@ impl EditorApp {
                 if let Some(dir) = host.open_folder_dialog() {
                     self.sidebar.set_visible(true);
                     self.sidebar.set_root(self.fs.as_ref(), &dir);
+                    self.save_preferences(host);
                     self.recompute_layout();
                     self.mark_dirty();
                     host.request_redraw();
@@ -3264,6 +3288,7 @@ impl EditorApp {
             }
             AppCommand::ToggleSidebar => {
                 self.sidebar.toggle_visible();
+                self.save_preferences(host);
                 self.recompute_layout();
                 self.mark_dirty();
                 host.request_redraw();
@@ -3512,6 +3537,7 @@ impl EditorApp {
                 host.request_redraw();
                 return;
             }
+            let root_before = self.sidebar.root().map(Path::to_path_buf);
             match self
                 .sidebar
                 .handle_key(self.fs.as_ref(), key, self.layout.sidebar.h)
@@ -3524,6 +3550,9 @@ impl EditorApp {
                     }
                 }
                 SidebarAction::Changed => {
+                    if self.sidebar.root() != root_before.as_deref() {
+                        self.persist_last_folder(host);
+                    }
                     self.mark_dirty();
                     host.request_redraw();
                 }
@@ -4191,6 +4220,7 @@ impl EditorApp {
                 self.sidebar.set_focused(true);
                 self.find_bar.find_input.focused = false;
                 self.find_bar.replace_input.focused = false;
+                let root_before = self.sidebar.root().map(Path::to_path_buf);
                 match self
                     .sidebar
                     .handle_click(self.fs.as_ref(), self.layout.sidebar, x_px, y_px, scale)
@@ -4203,6 +4233,9 @@ impl EditorApp {
                         host.request_redraw();
                     }
                     SidebarAction::Changed => {
+                        if self.sidebar.root() != root_before.as_deref() {
+                            self.persist_last_folder(host);
+                        }
                         self.mark_dirty();
                         host.request_redraw();
                     }
@@ -5032,6 +5065,7 @@ impl EditorApp {
             IpcCommand::OpenFolder(dir) => {
                 self.sidebar.set_visible(true);
                 self.sidebar.set_root(self.fs.as_ref(), dir);
+                self.save_preferences(host);
                 self.recompute_layout();
                 self.mark_dirty();
                 host.request_redraw();
@@ -5227,12 +5261,14 @@ impl EditorApp {
                     }
                     "sidebar-show" => {
                         self.sidebar.set_visible(true);
+                        self.save_preferences(host);
                         self.recompute_layout();
                         self.mark_dirty();
                         host.request_redraw();
                     }
                     "sidebar-hide" => {
                         self.sidebar.set_visible(false);
+                        self.save_preferences(host);
                         self.recompute_layout();
                         self.mark_dirty();
                         host.request_redraw();

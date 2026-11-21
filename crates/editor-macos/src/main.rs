@@ -1084,6 +1084,7 @@ fn main() {
     }
     if let Some(dir) = sidebar_root {
         bridge.app.set_sidebar_root(&dir);
+        bridge.app.save_preferences(&mut bridge.host);
     }
     if let Some(p) = positional {
         let _ = bridge.app.open_path_or_dir(&p, &mut bridge.host);

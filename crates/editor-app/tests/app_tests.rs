@@ -1970,3 +1970,56 @@ fn syntax_cli_ipc_overrides_styles_ext_map_and_plugin_line_comments() {
     assert!(matches!(reply, IpcReply::Json(_)));
     assert_eq!(app2.doc.language().id(), "rust");
 }
+
+#[test]
+fn remembers_last_opened_folder_across_restarts_and_handles_missing_dir() {
+    use editor_platform::ipc::IpcCommand;
+    use editor_platform::PlatformHost;
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/workspace/project_a/main.rs", b"fn main() {}\n".to_vec());
+    fs.add_file("/workspace/project_b/sub/lib.rs", b"pub fn x() {}\n".to_vec());
+
+    let mut host = HeadlessHost::new();
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+
+    // 1. Opening a folder persists `LastFolder` in host preferences.
+    let mut app1 = EditorApp::new(fs.clone(), 900, 600, 2.0);
+    app1.open_path_or_dir(&PathBuf::from("/workspace/project_a"), &mut host)
+        .unwrap();
+    assert_eq!(app1.sidebar.root(), Some(Path::new("/workspace/project_a")));
+    assert_eq!(
+        host.load_pref("LastFolder").as_deref(),
+        Some("/workspace/project_a")
+    );
+
+    // 2. Switching folder via IPC `OpenFolder` updates `LastFolder` immediately.
+    let _ = app1.execute_ipc(
+        &IpcCommand::OpenFolder(PathBuf::from("/workspace/project_b/sub")),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(
+        host.load_pref("LastFolder").as_deref(),
+        Some("/workspace/project_b/sub")
+    );
+
+    // 3. Launching a fresh EditorApp restores the exact last opened folder cleanly!
+    let mut app2 = EditorApp::new(fs.clone(), 900, 600, 2.0);
+    assert_eq!(app2.sidebar.root(), None);
+    app2.load_preferences(&host);
+    assert_eq!(
+        app2.sidebar.root(),
+        Some(Path::new("/workspace/project_b/sub"))
+    );
+    assert!(app2.sidebar.is_visible());
+
+    // 4. If the persisted folder was deleted before next launch, startup degrades gracefully!
+    host.save_pref("LastFolder", "/workspace/deleted_folder");
+    let mut app3 = EditorApp::new(fs, 900, 600, 2.0);
+    app3.load_preferences(&host);
+    assert_eq!(app3.sidebar.root(), None);
+}
