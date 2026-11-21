@@ -255,21 +255,27 @@ impl IpcReply {
     }
 }
 
-/// Resolve the default per-user IPC socket path (honors `EDITOR_IPC_SOCK` for isolated tests).
+/// Resolve the canonical per-user IPC socket path (honors `EDITOR_IPC_SOCK` for isolated tests).
+/// Uses `/tmp/editor-ipc-<uid>.sock` on Unix so GUI apps launched via macOS LaunchServices
+/// (which have a different `$TMPDIR` than terminal shells) and CLI processes always meet!
 pub fn default_socket_path() -> PathBuf {
     if let Ok(override_path) = std::env::var("EDITOR_IPC_SOCK") {
         if !override_path.is_empty() {
             return PathBuf::from(override_path);
         }
     }
-    let user = std::env::var("USER")
-        .or_else(|_| std::env::var("LOGNAME"))
-        .unwrap_or_else(|_| "user".to_string());
-    let safe_user: String = user
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect();
-    std::env::temp_dir().join(format!("editor-ipc-{safe_user}.sock"))
+    #[cfg(unix)]
+    {
+        extern "C" {
+            fn getuid() -> u32;
+        }
+        let uid = unsafe { getuid() };
+        PathBuf::from(format!("/tmp/editor-ipc-{uid}.sock"))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join("editor-ipc.sock")
+    }
 }
 
 pub struct PendingIpc {
