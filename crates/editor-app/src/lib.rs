@@ -27,7 +27,7 @@ use editor_render::{
     ShortcutsOverlay, Sidebar, SidebarAction, SidebarHit, StatusBarData, Theme, Viewport,
 };
 
-pub use keymap::{KeyChord, Keymap, ShortcutEntry};
+pub use keymap::{KeyChord, KeyScope, Keymap, ShortcutEntry};
 pub use vim::{VimMode, VimState};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -94,6 +94,7 @@ enum PendingDiscardAction {
     },
     OpenFileDialog,
     Reload,
+    CloseActivePane,
     Quit,
 }
 
@@ -408,15 +409,41 @@ impl EditorApp {
         host.request_redraw();
     }
 
-    /// Close the inactive split pane, returning to single-pane mode.
+    /// Close the active split pane immediately, promoting the remaining pane to full width.
     pub fn close_split(&mut self, host: &mut dyn PlatformHost) {
-        if self.secondary_pane.take().is_some() {
+        if let Some(other) = self.secondary_pane.take() {
+            self.doc = other.doc;
+            self.caret = other.caret;
+            self.anchor = other.anchor;
+            self.preferred_x_px = other.preferred_x_px;
+            self.viewport = other.viewport;
+            self.search_matches = other.search_matches;
+            self.active_match = other.active_match;
             self.active_pane = 0;
             self.recompute_layout();
             self.sync_title(host);
             self.mark_dirty();
             host.request_redraw();
         }
+    }
+
+    /// Close the active split pane, prompting to save first if it has unsaved edits.
+    pub fn request_close_active_pane(&mut self, host: &mut dyn PlatformHost) {
+        if self.secondary_pane.is_none() {
+            return;
+        }
+        self.request_discard_or_run(PendingDiscardAction::CloseActivePane, host);
+    }
+
+    /// Swap left and right split panes in O(1) while keeping focus on the active document.
+    pub fn swap_panes(&mut self, host: &mut dyn PlatformHost) {
+        if self.secondary_pane.is_none() {
+            return;
+        }
+        self.active_pane = if self.active_pane == 0 { 1 } else { 0 };
+        self.recompute_layout();
+        self.mark_dirty();
+        host.request_redraw();
     }
 
     /// Switch focus to pane `idx` (`0` = left, `1` = right) in O(1) via zero-copy swap!
@@ -1272,6 +1299,9 @@ impl EditorApp {
                 self.mark_dirty();
                 host.request_redraw();
             }
+            PendingDiscardAction::CloseActivePane => {
+                self.close_split(host);
+            }
             PendingDiscardAction::Quit => {
                 host.request_quit();
             }
@@ -1555,6 +1585,12 @@ impl EditorApp {
                 self.mark_dirty();
                 host.request_redraw();
             }
+            AppCommand::FindNext => {
+                self.jump_search_match(true, rasterizer, host);
+            }
+            AppCommand::FindPrev => {
+                self.jump_search_match(false, rasterizer, host);
+            }
             AppCommand::GoToLine => {
                 self.find_bar.close();
                 self.palette.close();
@@ -1591,6 +1627,21 @@ impl EditorApp {
                 self.mark_dirty();
                 host.request_redraw();
             }
+            AppCommand::DuplicateLine => {
+                self.duplicate_current_line(rasterizer, host);
+            }
+            AppCommand::DeleteLine => {
+                self.delete_current_line(rasterizer, host);
+            }
+            AppCommand::MoveLineUp => {
+                self.move_current_line(true, rasterizer, host);
+            }
+            AppCommand::MoveLineDown => {
+                self.move_current_line(false, rasterizer, host);
+            }
+            AppCommand::ToggleComment => {
+                self.toggle_line_comment(rasterizer, host);
+            }
             AppCommand::ToggleWrap => {
                 self.viewport.toggle_wrap();
                 self.save_preferences(host);
@@ -1607,7 +1658,10 @@ impl EditorApp {
                 self.split_pane_with(None, host);
             }
             AppCommand::CloseSplit => {
-                self.close_split(host);
+                self.request_close_active_pane(host);
+            }
+            AppCommand::SwapPanes => {
+                self.swap_panes(host);
             }
             AppCommand::FocusLeftPane => {
                 self.focus_pane(0, host);
@@ -1679,24 +1733,14 @@ impl EditorApp {
         clipboard: &mut dyn Clipboard,
         host: &mut dyn PlatformHost,
     ) {
-        // Global shortcut dispatch via data-driven `self.keymap` (ready for custom keybindings!).
-        // Special case: `Cmd+G` / `Cmd+Shift+G` while Find bar is open jumps between search matches.
-        if mods.primary() && matches!(key, Key::Char('g') | Key::Char('G')) && self.find_bar.visible
-        {
-            self.jump_search_match(!mods.shift, rasterizer, host);
-            return;
+        // 1. Context-scoped shortcut dispatch via single-source-of-truth `self.keymap`.
+        if self.find_bar.visible {
+            if let Some(cmd) = self.keymap.resolve(KeyScope::FindBar, key, mods) {
+                self.handle_command(cmd, rasterizer, clipboard, host);
+                return;
+            }
         }
-        // `Cmd++` (shifted `=` on US keyboards) also maps to ZoomIn.
-        if mods.primary() && matches!(key, Key::Char('+')) {
-            self.handle_command(AppCommand::ZoomIn, rasterizer, clipboard, host);
-            return;
-        }
-        // `Cmd+?` (`Shift+Cmd+/` or `Cmd+?`) opens/toggles Keyboard Shortcuts.
-        if mods.primary() && matches!(key, Key::Char('?')) {
-            self.handle_command(AppCommand::ShowShortcuts, rasterizer, clipboard, host);
-            return;
-        }
-        if let Some(cmd) = self.keymap.lookup_command(key, mods) {
+        if let Some(cmd) = self.keymap.resolve(KeyScope::Global, key, mods) {
             self.handle_command(cmd, rasterizer, clipboard, host);
             return;
         }
@@ -1822,51 +1866,10 @@ impl EditorApp {
             return;
         }
 
-        // Document primary editing shortcuts & pro line operations!
-        if mods.primary() {
-            match key {
-                Key::Char('z') | Key::Char('Z') => {
-                    let cmd = if mods.shift {
-                        AppCommand::Redo
-                    } else {
-                        AppCommand::Undo
-                    };
-                    self.handle_command(cmd, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('a') | Key::Char('A') => {
-                    self.handle_command(AppCommand::SelectAll, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('c') | Key::Char('C') => {
-                    self.handle_command(AppCommand::Copy, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('x') | Key::Char('X') => {
-                    self.handle_command(AppCommand::Cut, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('v') | Key::Char('V') => {
-                    self.handle_command(AppCommand::Paste, rasterizer, clipboard, host);
-                    return;
-                }
-                Key::Char('d') | Key::Char('D') if mods.shift => {
-                    self.duplicate_current_line(rasterizer, host);
-                    return;
-                }
-                Key::Char('k') | Key::Char('K') if mods.shift => {
-                    self.delete_current_line(rasterizer, host);
-                    return;
-                }
-                Key::Char('/') => {
-                    self.toggle_line_comment(rasterizer, host);
-                    return;
-                }
-                _ => {}
-            }
-        }
-        if mods.alt && !mods.primary() && !mods.shift && matches!(key, Key::Up | Key::Down) {
-            self.move_current_line(key == Key::Up, rasterizer, host);
+        // Document-scoped shortcuts (Undo/Redo, clipboard, comment, duplicate/delete/move line)
+        // dispatched via the same unified `self.keymap`!
+        if let Some(cmd) = self.keymap.resolve(KeyScope::Document, key, mods) {
+            self.handle_command(cmd, rasterizer, clipboard, host);
             return;
         }
 
@@ -2605,7 +2608,7 @@ impl EditorApp {
             return;
         }
 
-        // 3. Split pane divider drag or inactive-pane focus switch!
+        // 3. Split pane divider drag, pane header close (`×`) / double-click swap, or focus switch!
         if self.secondary_pane.is_some() {
             let grab = (5.0 * scale).round() as i32;
             if (xi - self.layout.split_divider.x).abs() <= grab
@@ -2614,6 +2617,38 @@ impl EditorApp {
             {
                 self.dragging_split_edge = true;
                 host.set_cursor(CursorShape::ResizeHorizontal);
+                return;
+            }
+            let header_h = (24.0 * scale).round() as i32;
+            let close_w = (24.0 * scale).round() as i32;
+            let left_hdr = PixelRect::new(
+                self.layout.left_pane.x,
+                self.layout.split_area.y,
+                self.layout.left_pane.w,
+                header_h,
+            );
+            let right_hdr = PixelRect::new(
+                self.layout.right_pane.x,
+                self.layout.split_area.y,
+                self.layout.right_pane.w,
+                header_h,
+            );
+            let left_close = PixelRect::new(left_hdr.right() - close_w, left_hdr.y, close_w, header_h);
+            let right_close =
+                PixelRect::new(right_hdr.right() - close_w, right_hdr.y, close_w, header_h);
+            if left_close.contains(xi, yi) {
+                self.focus_pane(0, host);
+                self.request_close_active_pane(host);
+                return;
+            }
+            if right_close.contains(xi, yi) {
+                self.focus_pane(1, host);
+                self.request_close_active_pane(host);
+                return;
+            }
+            // Double-clicking either pane header swaps left ↔ right panes!
+            if click_count >= 2 && (left_hdr.contains(xi, yi) || right_hdr.contains(xi, yi)) {
+                self.swap_panes(host);
                 return;
             }
             let clicked_left = xi >= self.layout.left_pane.x
@@ -3450,9 +3485,16 @@ impl EditorApp {
                         host.request_redraw();
                     }
                     "split" => self.handle_command(AppCommand::SplitPane, rasterizer, clipboard, host),
-                    "unsplit" => self.handle_command(AppCommand::CloseSplit, rasterizer, clipboard, host),
+                    "unsplit" | "close-pane" => {
+                        self.handle_command(AppCommand::CloseSplit, rasterizer, clipboard, host)
+                    }
+                    "swap-panes" => self.handle_command(AppCommand::SwapPanes, rasterizer, clipboard, host),
                     "focus-left" => self.handle_command(AppCommand::FocusLeftPane, rasterizer, clipboard, host),
                     "focus-right" => self.handle_command(AppCommand::FocusRightPane, rasterizer, clipboard, host),
+                    "find-next" => self.handle_command(AppCommand::FindNext, rasterizer, clipboard, host),
+                    "find-prev" => self.handle_command(AppCommand::FindPrev, rasterizer, clipboard, host),
+                    "move-line-up" => self.handle_command(AppCommand::MoveLineUp, rasterizer, clipboard, host),
+                    "move-line-down" => self.handle_command(AppCommand::MoveLineDown, rasterizer, clipboard, host),
                     "open-dialog" => self.handle_command(AppCommand::OpenFile, rasterizer, clipboard, host),
                     "open-folder" => self.handle_command(AppCommand::OpenFolder, rasterizer, clipboard, host),
                     "save-as" => self.handle_command(AppCommand::SaveAs, rasterizer, clipboard, host),
@@ -3511,7 +3553,9 @@ fn draw_pane_header(
     } else {
         file_name.to_string()
     };
-    painter.push_clip(rect);
+    let close_w = (24.0 * scale).round() as i32;
+    let text_clip = PixelRect::new(rect.x, rect.y, (rect.w - close_w).max(0), rect.h);
+    painter.push_clip(text_clip);
     painter.draw_text_ui(
         rect.x as f32 + (12.0 * scale),
         baseline,
@@ -3523,6 +3567,22 @@ fn draw_pane_header(
         rasterizer,
     );
     painter.pop_clip();
+
+    // Quiet `×` close button on the right edge of each pane header.
+    let close_glyph = "×";
+    let cw = Painter::measure_text_ui(close_glyph, FontStyle::Ui, 13.0 * scale, atlas, rasterizer);
+    let cm = atlas.metrics(rasterizer, FontStyle::Ui, 13.0 * scale);
+    let cbase = rect.y as f32 + (rect.h as f32 + cm.ascent - cm.descent) * 0.5;
+    painter.draw_text_ui(
+        rect.right() as f32 - (close_w as f32 + cw) * 0.5,
+        cbase,
+        close_glyph,
+        FontStyle::Ui,
+        13.0 * scale,
+        theme.text_muted,
+        atlas,
+        rasterizer,
+    );
 }
 
 fn json_quote(s: &str) -> String {

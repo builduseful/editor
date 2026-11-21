@@ -134,6 +134,7 @@ pub enum VimAction {
     CenterView,
     SplitRight,
     CloseSplit,
+    SwapPanes,
     FocusPaneLeft,
     FocusPaneRight,
     FocusOtherPane,
@@ -384,6 +385,7 @@ impl VimState {
                     Some('l') => VimAction::FocusPaneRight,
                     Some('w') => VimAction::FocusOtherPane,
                     Some('v') => VimAction::SplitRight,
+                    Some('x') | Some('r') => VimAction::SwapPanes,
                     Some('q') | Some('c') => VimAction::CloseSplit,
                     _ => VimAction::Consumed,
                 };

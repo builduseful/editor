@@ -1,11 +1,30 @@
-//! Data-driven keymap and single-source-of-truth shortcut registry.
+//! Data-driven, context-scoped keymap and single-source-of-truth shortcut registry.
 //!
-//! Designed so user-customizable keybindings (`keybindings.json` / `rebind()`) slot in
-//! cleanly while guaranteeing that active bindings and the `Cmd+?` Keyboard Shortcuts
-//! overlay never drift out of sync.
+//! Architecture:
+//! - Every shortcut in the app (Global, FindBar, Document, and Vim reference) lives here.
+//! - Zero hardcoded keybinding switches in `EditorApp::handle_key_down`: every action
+//!   dispatches via `Keymap::resolve(scope, key, mods)` so user customization (`rebind` /
+//!   `apply_overrides` / `unbind`) automatically applies everywhere AND stays 100% in sync
+//!   with the `⌘K` / `⇧⌘/` Keyboard Shortcuts overlay.
+//! - Multi-chord bindings (`Vec<KeyChord>`) cleanly handle secondary aliases (e.g. `⌘=` +
+//!   `⌘+` for Zoom In, `⌘K` + `⇧⌘/` for Keyboard Shortcuts, `⌘W` + `⇧⌘\` for Close Pane).
+//! - Built-in `Keymap::conflicts()` detects duplicate bindings within overlapping scopes.
 
 use editor_platform::{AppCommand, Key, Modifiers};
 use editor_render::ShortcutDisplayItem;
+
+/// Context scope in which a shortcut is active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum KeyScope {
+    /// Active everywhere in the window.
+    Global,
+    /// Active when the Find / Replace bar is visible (overrides Global, e.g. `⌘G` = Find Next).
+    FindBar,
+    /// Active when editing the document viewport (yields `⌘C`/`⌘V`/`⌘A` to focused `TextInput`s).
+    Document,
+    /// Reference-only entry for Vim modal commands (handled by `VimState`).
+    Vim,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct KeyChord {
@@ -39,6 +58,14 @@ impl KeyChord {
         Self::new(key, true, false, true, false)
     }
 
+    pub const fn primary_ctrl(key: Key) -> Self {
+        Self::new(key, true, false, false, true)
+    }
+
+    pub const fn alt(key: Key) -> Self {
+        Self::new(key, false, false, true, false)
+    }
+
     pub fn matches(self, key: Key, mods: Modifiers) -> bool {
         if self.primary != mods.primary() || self.shift != mods.shift || self.alt != mods.alt {
             return false;
@@ -53,8 +80,8 @@ impl KeyChord {
         }
     }
 
-    /// Parse a human-friendly binding string like `"cmd+shift+p"` or `"alt+z"` for future
-    /// custom keybinding files.
+    /// Parse a portable human-readable binding string (e.g. `"cmd+shift+p"`, `"ctrl+cmd+\\"`
+    /// or `"alt+up"`) for future user `keybindings.json` customization.
     pub fn parse(spec: &str) -> Option<Self> {
         let mut primary = false;
         let mut shift = false;
@@ -96,6 +123,7 @@ impl KeyChord {
         })
     }
 
+    /// Format using standard macOS modifier order (`⌃⌥⇧⌘`).
     pub fn format_display(self) -> String {
         let mut out = String::new();
         if self.ctrl {
@@ -136,7 +164,8 @@ pub struct ShortcutEntry {
     pub id: &'static str,
     pub label: &'static str,
     pub category: &'static str,
-    pub chord: Option<KeyChord>,
+    pub scope: KeyScope,
+    pub chords: Vec<KeyChord>,
     pub display_override: Option<&'static str>,
     pub featured: bool,
     pub command: Option<AppCommand>,
@@ -147,8 +176,8 @@ impl ShortcutEntry {
     pub fn display_keys(&self) -> String {
         if let Some(ov) = self.display_override {
             ov.to_string()
-        } else if let Some(ch) = self.chord {
-            ch.format_display()
+        } else if let Some(first) = self.chords.first() {
+            first.format_display()
         } else {
             String::new()
         }
@@ -176,27 +205,88 @@ impl Keymap {
         &self.entries
     }
 
-    /// Look up a global `AppCommand` matching `(key, mods)` from the active keymap.
-    pub fn lookup_command(&self, key: Key, mods: Modifiers) -> Option<AppCommand> {
+    /// Resolve a key press strictly within `scope`.
+    pub fn resolve(&self, scope: KeyScope, key: Key, mods: Modifiers) -> Option<AppCommand> {
         for entry in &self.entries {
-            if let (Some(chord), Some(cmd)) = (entry.chord, entry.command) {
-                if chord.matches(key, mods) {
-                    return Some(cmd);
+            if entry.scope == scope {
+                if let Some(cmd) = entry.command {
+                    if entry.chords.iter().any(|ch| ch.matches(key, mods)) {
+                        return Some(cmd);
+                    }
                 }
             }
         }
         None
     }
 
-    /// Rebind an existing action by stable ID (foundation for user custom shortcuts).
+    /// Convenience alias for resolving Global commands.
+    pub fn lookup_command(&self, key: Key, mods: Modifiers) -> Option<AppCommand> {
+        self.resolve(KeyScope::Global, key, mods)
+    }
+
+    /// Rebind an action by stable ID to a new primary chord (custom-shortcut ready).
     pub fn rebind(&mut self, id: &str, new_chord: KeyChord) -> bool {
         if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
-            entry.chord = Some(new_chord);
+            entry.chords = vec![new_chord];
             entry.display_override = None;
             true
         } else {
             false
         }
+    }
+
+    /// Unbind an action by stable ID (e.g. `"none"` in a user keybindings file).
+    pub fn unbind(&mut self, id: &str) -> bool {
+        if let Some(entry) = self.entries.iter_mut().find(|e| e.id == id) {
+            entry.chords.clear();
+            entry.display_override = Some("Unbound");
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Apply a list of `(action_id, chord_spec)` user overrides cleanly.
+    /// Returns the number of overrides applied.
+    pub fn apply_overrides(&mut self, overrides: &[(&str, &str)]) -> usize {
+        let mut applied = 0;
+        for &(id, spec) in overrides {
+            if spec.eq_ignore_ascii_case("none") || spec.trim().is_empty() {
+                if self.unbind(id) {
+                    applied += 1;
+                }
+            } else if let Some(chord) = KeyChord::parse(spec) {
+                if self.rebind(id, chord) {
+                    applied += 1;
+                }
+            }
+        }
+        applied
+    }
+
+    /// Detect any conflicting chords within the same scope (or Global vs Document).
+    /// Note: `FindBar` intentionally overrides `Global` (e.g. `⌘G` = Find Next while Find is open).
+    pub fn conflicts(&self) -> Vec<(&'static str, &'static str, KeyChord)> {
+        let mut out = Vec::new();
+        for (i, a) in self.entries.iter().enumerate() {
+            for b in &self.entries[i + 1..] {
+                let overlaps = a.scope == b.scope
+                    || matches!(
+                        (a.scope, b.scope),
+                        (KeyScope::Global, KeyScope::Document)
+                            | (KeyScope::Document, KeyScope::Global)
+                    );
+                if !overlaps {
+                    continue;
+                }
+                for &ca in &a.chords {
+                    if b.chords.iter().any(|&cb| cb == ca) {
+                        out.push((a.id, b.id, ca));
+                    }
+                }
+            }
+        }
+        out
     }
 
     pub fn to_display_items(&self) -> Vec<ShortcutDisplayItem> {
@@ -214,11 +304,13 @@ impl Keymap {
     }
 }
 
-fn cmd_entry(
+#[allow(clippy::too_many_arguments)]
+fn bind(
     id: &'static str,
     label: &'static str,
     category: &'static str,
-    chord: KeyChord,
+    scope: KeyScope,
+    chords: Vec<KeyChord>,
     display_override: Option<&'static str>,
     featured: bool,
     command: AppCommand,
@@ -227,7 +319,8 @@ fn cmd_entry(
         id,
         label,
         category,
-        chord: Some(chord),
+        scope,
+        chords,
         display_override,
         featured,
         command: Some(command),
@@ -235,89 +328,94 @@ fn cmd_entry(
     }
 }
 
-fn info_entry(
+fn vim_ref(
     id: &'static str,
     label: &'static str,
     category: &'static str,
     keys: &'static str,
-    featured: bool,
-    runnable: bool,
 ) -> ShortcutEntry {
     ShortcutEntry {
         id,
         label,
         category,
-        chord: None,
+        scope: KeyScope::Vim,
+        chords: Vec::new(),
         display_override: Some(keys),
-        featured,
+        featured: false,
         command: None,
-        runnable,
+        runnable: false,
     }
 }
 
 fn default_shortcuts() -> Vec<ShortcutEntry> {
     vec![
-        // ── Main Shortcuts (featured = true, shown immediately in Cmd+?) ──
-        cmd_entry("quick-open", "Quick open file", "File & Navigation", KeyChord::primary(Key::Char('p')), None, true, AppCommand::QuickOpen),
-        cmd_entry("project-search", "Search across project", "File & Navigation", KeyChord::primary_shift(Key::Char('f')), None, true, AppCommand::ProjectSearch),
-        cmd_entry("find", "Find in file", "File & Navigation", KeyChord::primary(Key::Char('f')), None, true, AppCommand::Find),
-        cmd_entry("goto-line", "Go to line", "File & Navigation", KeyChord::primary(Key::Char('g')), None, true, AppCommand::GoToLine),
-        cmd_entry("split", "Split editor right", "Panes & View", KeyChord::primary(Key::Char('\\')), Some("⌘\\"), true, AppCommand::SplitPane),
-        cmd_entry("toggle-sidebar", "Toggle file sidebar", "Panes & View", KeyChord::primary(Key::Char('b')), None, true, AppCommand::ToggleSidebar),
-        cmd_entry("save", "Save file", "File & Navigation", KeyChord::primary(Key::Char('s')), None, true, AppCommand::Save),
-        info_entry("toggle-comment", "Toggle line comment", "Editing", "⌘/", true, true),
-        cmd_entry("toggle-vim", "Toggle Vim mode", "Vim Mode", KeyChord::primary_shift(Key::Char('v')), None, true, AppCommand::ToggleVimMode),
-        cmd_entry("shortcuts", "Show keyboard shortcuts", "Panes & View", KeyChord::primary_shift(Key::Char('/')), Some("⇧⌘?"), true, AppCommand::ShowShortcuts),
+        // ── Main Shortcuts (featured = true, shown immediately in ⌘K / ⇧⌘/) ──
+        bind("quick-open", "Quick open file", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('p'))], None, true, AppCommand::QuickOpen),
+        bind("project-search", "Search across project", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('f'))], None, true, AppCommand::ProjectSearch),
+        bind("find", "Find in file", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('f'))], None, true, AppCommand::Find),
+        bind("goto-line", "Go to line", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('g'))], None, true, AppCommand::GoToLine),
+        bind("split", "Split editor right", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('\\'))], Some("⌘\\"), true, AppCommand::SplitPane),
+        bind("close-pane", "Close active split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('w')), KeyChord::primary_shift(Key::Char('\\'))], Some("⌘W"), true, AppCommand::CloseSplit),
+        bind("toggle-sidebar", "Toggle file sidebar", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('b'))], None, true, AppCommand::ToggleSidebar),
+        bind("save", "Save file", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('s'))], None, true, AppCommand::Save),
+        bind("toggle-comment", "Toggle line comment", "Editing", KeyScope::Document, vec![KeyChord::primary(Key::Char('/'))], Some("⌘/"), true, AppCommand::ToggleComment),
+        bind("toggle-vim", "Toggle Vim mode", "Panes & View", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('v'))], None, true, AppCommand::ToggleVimMode),
+        bind("shortcuts", "Show keyboard shortcuts", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('k')), KeyChord::primary_shift(Key::Char('/')), KeyChord::primary_shift(Key::Char('?')), KeyChord::primary(Key::Char('?'))], Some("⌘K"), true, AppCommand::ShowShortcuts),
 
         // ── File & Navigation (extra) ──
-        cmd_entry("new", "New untitled file", "File & Navigation", KeyChord::primary(Key::Char('n')), None, false, AppCommand::NewFile),
-        cmd_entry("open-dialog", "Open file…", "File & Navigation", KeyChord::primary(Key::Char('o')), None, false, AppCommand::OpenFile),
-        cmd_entry("open-folder", "Open folder…", "File & Navigation", KeyChord::primary_shift(Key::Char('o')), None, false, AppCommand::OpenFolder),
-        cmd_entry("save-as", "Save file as…", "File & Navigation", KeyChord::primary_shift(Key::Char('s')), None, false, AppCommand::SaveAs),
-        cmd_entry("replace", "Find and replace", "File & Navigation", KeyChord::primary_alt(Key::Char('f')), None, false, AppCommand::Replace),
-        info_entry("find-next", "Jump to next / previous match", "File & Navigation", "⌘G / ⇧⌘G", false, false),
-        cmd_entry("quit", "Quit editor", "File & Navigation", KeyChord::primary(Key::Char('q')), None, false, AppCommand::Quit),
+        bind("new", "New untitled file", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('n'))], None, false, AppCommand::NewFile),
+        bind("open-dialog", "Open file…", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('o'))], None, false, AppCommand::OpenFile),
+        bind("open-folder", "Open folder…", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('o'))], None, false, AppCommand::OpenFolder),
+        bind("save-as", "Save file as…", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('s'))], None, false, AppCommand::SaveAs),
+        bind("replace", "Find and replace", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_alt(Key::Char('f'))], None, false, AppCommand::Replace),
+        bind("find-next", "Find next match (when Find is open)", "File & Navigation", KeyScope::FindBar, vec![KeyChord::primary(Key::Char('g'))], Some("⌘G"), false, AppCommand::FindNext),
+        bind("find-prev", "Find previous match (when Find is open)", "File & Navigation", KeyScope::FindBar, vec![KeyChord::primary_shift(Key::Char('g'))], Some("⇧⌘G"), false, AppCommand::FindPrev),
+        bind("quit", "Quit editor", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('q'))], None, false, AppCommand::Quit),
 
-        // ── Editing ──
-        info_entry("undo", "Undo / Redo", "Editing", "⌘Z / ⇧⌘Z", false, true),
-        info_entry("duplicate-line", "Duplicate line or selection", "Editing", "⇧⌘D", false, true),
-        info_entry("delete-line", "Delete current line", "Editing", "⇧⌘K", false, true),
-        info_entry("move-line", "Move line up / down", "Editing", "⌥↑ / ⌥↓", false, false),
-        info_entry("indent-line", "Indent / outdent selection", "Editing", "Tab / ⇧Tab", false, false),
-        info_entry("select-all", "Select all", "Editing", "⌘A", false, true),
+        // ── Editing (Document scope — 100% Keymap-dispatched!) ──
+        bind("undo", "Undo", "Editing", KeyScope::Document, vec![KeyChord::primary(Key::Char('z'))], None, false, AppCommand::Undo),
+        bind("redo", "Redo", "Editing", KeyScope::Document, vec![KeyChord::primary_shift(Key::Char('z'))], None, false, AppCommand::Redo),
+        bind("cut", "Cut selection", "Editing", KeyScope::Document, vec![KeyChord::primary(Key::Char('x'))], None, false, AppCommand::Cut),
+        bind("copy", "Copy selection", "Editing", KeyScope::Document, vec![KeyChord::primary(Key::Char('c'))], None, false, AppCommand::Copy),
+        bind("paste", "Paste", "Editing", KeyScope::Document, vec![KeyChord::primary(Key::Char('v'))], None, false, AppCommand::Paste),
+        bind("select-all", "Select all", "Editing", KeyScope::Document, vec![KeyChord::primary(Key::Char('a'))], None, false, AppCommand::SelectAll),
+        bind("duplicate-line", "Duplicate current line", "Editing", KeyScope::Document, vec![KeyChord::primary_shift(Key::Char('d'))], None, false, AppCommand::DuplicateLine),
+        bind("delete-line", "Delete current line", "Editing", KeyScope::Document, vec![KeyChord::primary_shift(Key::Char('k'))], None, false, AppCommand::DeleteLine),
+        bind("move-line-up", "Move line up", "Editing", KeyScope::Document, vec![KeyChord::alt(Key::Up)], None, false, AppCommand::MoveLineUp),
+        bind("move-line-down", "Move line down", "Editing", KeyScope::Document, vec![KeyChord::alt(Key::Down)], None, false, AppCommand::MoveLineDown),
 
         // ── Panes & View ──
-        cmd_entry("unsplit", "Close split pane", "Panes & View", KeyChord::primary_shift(Key::Char('\\')), Some("⇧⌘\\"), false, AppCommand::CloseSplit),
-        cmd_entry("focus-left", "Focus left split pane", "Panes & View", KeyChord::primary_alt(Key::Left), Some("⌥⌘←"), false, AppCommand::FocusLeftPane),
-        cmd_entry("focus-right", "Focus right split pane", "Panes & View", KeyChord::primary_alt(Key::Right), Some("⌥⌘→"), false, AppCommand::FocusRightPane),
-        cmd_entry("toggle-wrap", "Toggle word wrap", "Panes & View", KeyChord::new(Key::Char('z'), false, false, true, false), Some("⌥Z"), false, AppCommand::ToggleWrap),
-        cmd_entry("zoom-in", "Zoom in text", "Panes & View", KeyChord::primary(Key::Char('=')), Some("⌘+"), false, AppCommand::ZoomIn),
-        cmd_entry("zoom-out", "Zoom out text", "Panes & View", KeyChord::primary(Key::Char('-')), Some("⌘-"), false, AppCommand::ZoomOut),
-        cmd_entry("zoom-reset", "Reset zoom level", "Panes & View", KeyChord::primary(Key::Char('0')), Some("⌘0"), false, AppCommand::ZoomReset),
+        bind("swap-panes", "Swap left and right panes", "Panes & View", KeyScope::Global, vec![KeyChord::primary_ctrl(Key::Char('\\'))], Some("⌃⌘\\"), false, AppCommand::SwapPanes),
+        bind("focus-left", "Focus left split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Left)], Some("⌥⌘←"), false, AppCommand::FocusLeftPane),
+        bind("focus-right", "Focus right split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Right)], Some("⌥⌘→"), false, AppCommand::FocusRightPane),
+        bind("toggle-wrap", "Toggle word wrap", "Panes & View", KeyScope::Global, vec![KeyChord::alt(Key::Char('z'))], Some("⌥Z"), false, AppCommand::ToggleWrap),
+        bind("zoom-in", "Zoom in text", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('=')), KeyChord::primary_shift(Key::Char('=')), KeyChord::primary(Key::Char('+'))], Some("⌘+"), false, AppCommand::ZoomIn),
+        bind("zoom-out", "Zoom out text", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('-'))], Some("⌘-"), false, AppCommand::ZoomOut),
+        bind("zoom-reset", "Reset zoom level", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('0'))], Some("⌘0"), false, AppCommand::ZoomReset),
 
         // ── Vim Motions (Normal Mode) ──
-        info_entry("vim.hjkl", "Move left / down / up / right", "Vim Motions", "h j k l", false, false),
-        info_entry("vim.word", "Next word / previous word / word end", "Vim Motions", "w / b / e", false, false),
-        info_entry("vim.line", "Line start / first non-blank / line end", "Vim Motions", "0 / ^ / $", false, false),
-        info_entry("vim.file", "Top of file / bottom or line N", "Vim Motions", "gg / G", false, false),
-        info_entry("vim.bracket", "Jump to matching bracket", "Vim Motions", "%", false, false),
-        info_entry("vim.findchar", "Find / till character on line (repeat ; ,)", "Vim Motions", "f / F / t / T", false, false),
-        info_entry("vim.paragraph", "Previous / next paragraph", "Vim Motions", "{ / }", false, false),
-        info_entry("vim.halfpage", "Scroll half-page down / up", "Vim Motions", "⌃D / ⌃U", false, false),
-        info_entry("vim.center", "Centre current line in viewport", "Vim Motions", "zz", false, false),
-        info_entry("vim.search", "Search / next / prev / word under cursor", "Vim Motions", "/  n  N  *", false, false),
+        vim_ref("vim.hjkl", "Move left / down / up / right", "Vim Motions", "h j k l"),
+        vim_ref("vim.word", "Next word / previous word / word end", "Vim Motions", "w / b / e"),
+        vim_ref("vim.line", "Line start / first non-blank / line end", "Vim Motions", "0 / ^ / $"),
+        vim_ref("vim.file", "Top of file / bottom or line N", "Vim Motions", "gg / G"),
+        vim_ref("vim.bracket", "Jump to matching bracket", "Vim Motions", "%"),
+        vim_ref("vim.findchar", "Find / till character on line (repeat ; ,)", "Vim Motions", "f / F / t / T"),
+        vim_ref("vim.paragraph", "Previous / next paragraph", "Vim Motions", "{ / }"),
+        vim_ref("vim.halfpage", "Scroll half-page down / up", "Vim Motions", "⌃D / ⌃U"),
+        vim_ref("vim.center", "Centre current line in viewport", "Vim Motions", "zz"),
+        vim_ref("vim.search", "Search / next / prev / word under cursor", "Vim Motions", "/  n  N  *"),
 
         // ── Vim Editing & Panes ──
-        info_entry("vim.insert", "Insert before / after / line start / end", "Vim Editing & Panes", "i  a  I  A", false, false),
-        info_entry("vim.openline", "Open new line below / above", "Vim Editing & Panes", "o / O", false, false),
-        info_entry("vim.operators", "Delete / change / yank + motion or text object", "Vim Editing & Panes", "d / c / y", false, false),
-        info_entry("vim.lineops", "Delete / change / yank whole line", "Vim Editing & Panes", "dd / cc / yy", false, false),
-        info_entry("vim.textobj", "Inner word / quotes / brackets (e.g. ciw, di\")", "Vim Editing & Panes", "iw  i\"  i(  i{", false, false),
-        info_entry("vim.charops", "Delete char / replace char / join lines", "Vim Editing & Panes", "x  r  J", false, false),
-        info_entry("vim.paste", "Paste after / before cursor", "Vim Editing & Panes", "p / P", false, false),
-        info_entry("vim.indent", "Indent / outdent line", "Vim Editing & Panes", ">> / <<", false, false),
-        info_entry("vim.undo", "Undo / Redo", "Vim Editing & Panes", "u / ⌃R", false, false),
-        info_entry("vim.visual", "Visual character / visual line mode", "Vim Editing & Panes", "v / V", false, false),
-        info_entry("vim.panes", "Split right / switch pane / close split", "Vim Editing & Panes", "⌃W v / h l w / q", false, false),
+        vim_ref("vim.insert", "Insert before / after / line start / end", "Vim Editing & Panes", "i  a  I  A"),
+        vim_ref("vim.openline", "Open new line below / above", "Vim Editing & Panes", "o / O"),
+        vim_ref("vim.operators", "Delete / change / yank + motion or text object", "Vim Editing & Panes", "d / c / y"),
+        vim_ref("vim.lineops", "Delete / change / yank whole line", "Vim Editing & Panes", "dd / cc / yy"),
+        vim_ref("vim.textobj", "Inner word / quotes / brackets (e.g. ciw, di\")", "Vim Editing & Panes", "iw  i\"  i(  i{"),
+        vim_ref("vim.charops", "Delete char / replace char / join lines", "Vim Editing & Panes", "x  r  J"),
+        vim_ref("vim.paste", "Paste after / before cursor", "Vim Editing & Panes", "p / P"),
+        vim_ref("vim.indent", "Indent / outdent line", "Vim Editing & Panes", ">> / <<"),
+        vim_ref("vim.undo", "Undo / Redo", "Vim Editing & Panes", "u / ⌃R"),
+        vim_ref("vim.visual", "Visual character / visual line mode", "Vim Editing & Panes", "v / V"),
+        vim_ref("vim.panes", "Split / swap / switch / close pane", "Vim Editing & Panes", "⌃W v / x / h l w / q"),
     ]
 }

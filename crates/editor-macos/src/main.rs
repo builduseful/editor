@@ -387,6 +387,11 @@ fn decode_key(keycode: u16, text: &str) -> Option<Key> {
         119 => Some(Key::End),
         116 => Some(Key::PageUp),
         121 => Some(Key::PageDown),
+        // Normalize physical macOS punctuation keys so shifted chords (⇧⌘/, ⇧⌘\, ⇧⌘=) always match!
+        44 => Some(Key::Char('/')),
+        42 => Some(Key::Char('\\')),
+        24 => Some(Key::Char('=')),
+        27 => Some(Key::Char('-')),
         _ => text.chars().next().map(Key::Char),
     }
 }
@@ -420,6 +425,12 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         25 => Some(AppCommand::CloseSplit),
         26 => Some(AppCommand::ToggleVimMode),
         27 => Some(AppCommand::ShowShortcuts),
+        28 => Some(AppCommand::SwapPanes),
+        29 => Some(AppCommand::FocusLeftPane),
+        30 => Some(AppCommand::FocusRightPane),
+        31 => Some(AppCommand::ToggleComment),
+        32 => Some(AppCommand::DuplicateLine),
+        33 => Some(AppCommand::DeleteLine),
         100 => Some(AppCommand::SetTheme(ThemePreference::System)),
         101 => Some(AppCommand::SetTheme(ThemePreference::Light)),
         102 => Some(AppCommand::SetTheme(ThemePreference::Dark)),

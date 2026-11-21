@@ -352,7 +352,8 @@ impl EditorApp {
                 host.request_redraw();
             }
             VimAction::SplitRight => self.split_pane_with(None, host),
-            VimAction::CloseSplit => self.close_split(host),
+            VimAction::CloseSplit => self.request_close_active_pane(host),
+            VimAction::SwapPanes => self.swap_panes(host),
             VimAction::FocusPaneLeft => self.focus_pane(0, host),
             VimAction::FocusPaneRight => self.focus_pane(1, host),
             VimAction::FocusOtherPane => {

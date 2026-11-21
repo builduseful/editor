@@ -854,3 +854,56 @@ fn vim_mode_motions_operators_text_objects_visual_and_splits() {
     send_ch(&mut app, 'v', &mut raster, &mut clip, &mut host);
     assert!(app.is_split());
 }
+
+#[test]
+fn keymap_has_zero_conflicts_and_undo_to_clean_and_pane_swap_close() {
+    use editor_app::Keymap;
+
+    // 1. Single-source-of-truth keymap must NEVER ship conflicting chords in overlapping scopes!
+    let km = Keymap::new();
+    assert!(
+        km.conflicts().is_empty(),
+        "unexpected shortcut conflicts: {:?}",
+        km.conflicts()
+    );
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/left.rs", b"fn left() {}\n".to_vec());
+    fs.add_file("/repo/right.rs", b"fn right() {}\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1000, 600, 2.0);
+    let mut host = HeadlessHost::new();
+    app.open_path_or_dir(&PathBuf::from("/repo/left.rs"), &mut host)
+        .unwrap();
+    assert!(!app.doc.is_dirty());
+
+    // 2. Edit -> dirty; Undo all the way -> cleanly NOT dirty; Redo -> dirty again!
+    app.doc.edit(0, 0, "// edit\n", 100, false).unwrap();
+    assert!(app.doc.is_dirty());
+    app.doc.undo().unwrap();
+    assert!(!app.doc.is_dirty(), "undoing all the way back must clear dirty flag");
+    app.doc.redo().unwrap();
+    assert!(app.doc.is_dirty());
+
+    // Save at edited state -> clean; undo -> dirty; redo back to saved state -> clean again!
+    app.doc.save(fs.as_ref(), None, false).unwrap();
+    assert!(!app.doc.is_dirty());
+    app.doc.undo().unwrap();
+    assert!(app.doc.is_dirty());
+    app.doc.redo().unwrap();
+    assert!(!app.doc.is_dirty(), "redoing back to saved revision must clear dirty flag");
+
+    // 3. Split, swap left<->right, and close active pane (keeps remaining pane!).
+    app.split_pane_with(Some(&PathBuf::from("/repo/right.rs")), &mut host);
+    assert_eq!(app.active_pane, 1);
+    assert_eq!(app.doc.file_name(), "right.rs");
+
+    app.swap_panes(&mut host);
+    assert_eq!(app.active_pane, 0);
+    assert_eq!(app.doc.file_name(), "right.rs");
+
+    // Closing active pane (`right.rs`) promotes remaining pane (`left.rs`)!
+    app.request_close_active_pane(&mut host);
+    assert!(!app.is_split());
+    assert_eq!(app.doc.file_name(), "left.rs");
+}

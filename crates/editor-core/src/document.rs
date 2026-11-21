@@ -248,7 +248,7 @@ impl Document {
 
     #[inline]
     pub fn is_dirty(&self) -> bool {
-        self.tree.is_dirty()
+        self.undo.is_dirty()
     }
 
     #[inline]
@@ -309,7 +309,7 @@ impl Document {
             eol: infer_eol(self.tree.base_eol_counts()),
             bom: self.bom,
             final_newline,
-            dirty: self.tree.is_dirty(),
+            dirty: self.is_dirty(),
             rev: self.rev,
         }
     }
@@ -592,6 +592,9 @@ impl Document {
         if earliest_line != usize::MAX {
             self.syntax.invalidate_from(earliest_line);
         }
+        if !self.undo.is_dirty() {
+            self.tree.set_clean();
+        }
         self.generation += 1;
         Some(cursor)
     }
@@ -614,6 +617,9 @@ impl Document {
         }
         if earliest_line != usize::MAX {
             self.syntax.invalidate_from(earliest_line);
+        }
+        if !self.undo.is_dirty() {
+            self.tree.set_clean();
         }
         self.generation += 1;
         Some(cursor)
@@ -711,7 +717,7 @@ impl Document {
             }
         }
 
-        if same_target && !self.tree.is_dirty() && self.rev != FileRev::default() {
+        if same_target && !self.is_dirty() && self.rev != FileRev::default() {
             return Ok(SaveReport {
                 method: SaveMethod::None,
                 bytes_written: 0,
@@ -846,7 +852,7 @@ impl Document {
         self.path = Some(canonical.clone());
         self.rev = new_rev;
         self.syntax.set_language(Language::from_path(Some(&canonical)));
-        self.undo.break_coalescing();
+        self.undo.mark_saved();
         self.generation += 1;
         Ok(())
     }

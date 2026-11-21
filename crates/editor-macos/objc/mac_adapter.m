@@ -940,6 +940,12 @@ void mac_activate_app(void) {
     [editMenu addItem:[self menuItem:@"Paste" key:@"v" tag:10 mods:NSEventModifierFlagCommand]];
     [editMenu addItem:[self menuItem:@"Select All" key:@"a" tag:11 mods:NSEventModifierFlagCommand]];
     [editMenu addItem:[NSMenuItem separatorItem]];
+    [editMenu addItem:[self menuItem:@"Toggle Line Comment" key:@"/" tag:31 mods:NSEventModifierFlagCommand]];
+    [editMenu addItem:[self menuItem:@"Duplicate Line" key:@"d" tag:32
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
+    [editMenu addItem:[self menuItem:@"Delete Line" key:@"k" tag:33
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
+    [editMenu addItem:[NSMenuItem separatorItem]];
     [editMenu addItem:[self menuItem:@"Find…" key:@"f" tag:12 mods:NSEventModifierFlagCommand]];
     [editMenu addItem:[self menuItem:@"Find in Folder…" key:@"f" tag:23
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
@@ -958,8 +964,13 @@ void mac_activate_app(void) {
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
     [viewMenu addItem:[NSMenuItem separatorItem]];
     [viewMenu addItem:[self menuItem:@"Split Editor Right" key:@"\\" tag:24 mods:NSEventModifierFlagCommand]];
-    [viewMenu addItem:[self menuItem:@"Close Split Pane" key:@"\\" tag:25
-                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
+    [viewMenu addItem:[self menuItem:@"Close Active Pane" key:@"w" tag:25 mods:NSEventModifierFlagCommand]];
+    [viewMenu addItem:[self menuItem:@"Swap Split Panes" key:@"\\" tag:28
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagControl]];
+    [viewMenu addItem:[self menuItem:@"Focus Left Pane" key:@"\uF702" tag:29
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
+    [viewMenu addItem:[self menuItem:@"Focus Right Pane" key:@"\uF703" tag:30
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
     [viewMenu addItem:[NSMenuItem separatorItem]];
     [viewMenu addItem:[self menuItem:@"Zoom In" key:@"=" tag:17 mods:NSEventModifierFlagCommand]];
     [viewMenu addItem:[self menuItem:@"Zoom Out" key:@"-" tag:18 mods:NSEventModifierFlagCommand]];
@@ -974,8 +985,8 @@ void mac_activate_app(void) {
     // Help Menu
     NSMenuItem* helpItem = [[NSMenuItem alloc] init];
     NSMenu* helpMenu = [[NSMenu alloc] initWithTitle:@"Help"];
-    [helpMenu addItem:[self menuItem:@"Keyboard Shortcuts" key:@"?" tag:27
-                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
+    [helpMenu addItem:[self menuItem:@"Keyboard Shortcuts" key:@"k" tag:27
+                                mods:NSEventModifierFlagCommand]];
     helpItem.submenu = helpMenu;
     [mainMenu addItem:helpItem];
 

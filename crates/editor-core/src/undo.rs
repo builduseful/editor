@@ -18,24 +18,56 @@ struct UndoEntry {
     timestamp_ms: u64,
     coalescable: bool,
     byte_cost: usize,
+    rev_before: u64,
+    rev_after: u64,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct UndoStack {
     undo: Vec<UndoEntry>,
     redo: Vec<UndoEntry>,
     resident_bytes: usize,
+    next_rev: u64,
+    current_rev: u64,
+    saved_rev: Option<u64>,
+}
+
+impl Default for UndoStack {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl UndoStack {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            undo: Vec::new(),
+            redo: Vec::new(),
+            resident_bytes: 0,
+            next_rev: 1,
+            current_rev: 0,
+            saved_rev: Some(0),
+        }
     }
 
     pub fn clear(&mut self) {
         self.undo.clear();
         self.redo.clear();
         self.resident_bytes = 0;
+        self.current_rev = self.next_rev;
+        self.next_rev += 1;
+        self.saved_rev = Some(self.current_rev);
+    }
+
+    pub fn mark_saved(&mut self) {
+        self.break_coalescing();
+        self.saved_rev = Some(self.current_rev);
+    }
+
+    /// True whenever the current document revision differs from the last saved (or opened) revision.
+    /// Undoing all the way back to the saved state cleanly restores `is_dirty() == false`.
+    pub fn is_dirty(&self) -> bool {
+        self.saved_rev != Some(self.current_rev)
     }
 
     pub fn can_undo(&self) -> bool {
@@ -77,6 +109,10 @@ impl UndoStack {
                         prev.cursor_after = op.cursor_after;
                         last.timestamp_ms = timestamp_ms;
                         last.byte_cost += cost;
+                        let rev = self.next_rev;
+                        self.next_rev += 1;
+                        last.rev_after = rev;
+                        self.current_rev = rev;
                         self.resident_bytes += cost;
                         self.enforce_budget();
                         return;
@@ -94,6 +130,10 @@ impl UndoStack {
                         prev.cursor_after = op.cursor_after;
                         last.timestamp_ms = timestamp_ms;
                         last.byte_cost += cost;
+                        let rev = self.next_rev;
+                        self.next_rev += 1;
+                        last.rev_after = rev;
+                        self.current_rev = rev;
                         self.resident_bytes += cost;
                         self.enforce_budget();
                         return;
@@ -102,11 +142,17 @@ impl UndoStack {
             }
         }
 
+        let rev_before = self.current_rev;
+        let rev_after = self.next_rev;
+        self.next_rev += 1;
+        self.current_rev = rev_after;
         self.undo.push(UndoEntry {
             ops: vec![op],
             timestamp_ms,
             coalescable,
             byte_cost: cost,
+            rev_before,
+            rev_after,
         });
         self.resident_bytes += cost;
         self.enforce_budget();
@@ -120,11 +166,17 @@ impl UndoStack {
             self.resident_bytes = self.resident_bytes.saturating_sub(dropped.byte_cost);
         }
         let cost: usize = ops.iter().map(|o| o.deleted.len() + o.inserted.len()).sum();
+        let rev_before = self.current_rev;
+        let rev_after = self.next_rev;
+        self.next_rev += 1;
+        self.current_rev = rev_after;
         self.undo.push(UndoEntry {
             ops,
             timestamp_ms,
             coalescable: false,
             byte_cost: cost,
+            rev_before,
+            rev_after,
         });
         self.resident_bytes += cost;
         self.enforce_budget();
@@ -141,6 +193,7 @@ impl UndoStack {
     pub fn pop_undo(&mut self) -> Option<Vec<EditOp>> {
         let entry = self.undo.pop()?;
         let ops = entry.ops.clone();
+        self.current_rev = entry.rev_before;
         self.redo.push(entry);
         Some(ops)
     }
@@ -149,6 +202,7 @@ impl UndoStack {
     pub fn pop_redo(&mut self) -> Option<Vec<EditOp>> {
         let entry = self.redo.pop()?;
         let ops = entry.ops.clone();
+        self.current_rev = entry.rev_after;
         self.undo.push(entry);
         Some(ops)
     }
@@ -158,6 +212,10 @@ impl UndoStack {
             || (self.resident_bytes > MAX_UNDO_BYTES && self.undo.len() > 1)
         {
             let removed = self.undo.remove(0);
+            if self.saved_rev == Some(removed.rev_before) && self.current_rev != removed.rev_before
+            {
+                self.saved_rev = None;
+            }
             self.resident_bytes = self.resident_bytes.saturating_sub(removed.byte_cost);
         }
     }
