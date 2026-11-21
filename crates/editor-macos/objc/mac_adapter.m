@@ -536,7 +536,8 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
     for (NSTrackingArea* area in self.trackingAreas) {
         [self removeTrackingArea:area];
     }
-    NSTrackingAreaOptions opts = NSTrackingMouseMoved | NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect;
+    NSTrackingAreaOptions opts = NSTrackingMouseMoved | NSTrackingMouseEnteredAndExited |
+                                 NSTrackingActiveInKeyWindow | NSTrackingInVisibleRect;
     NSTrackingArea* tracking = [[NSTrackingArea alloc] initWithRect:self.bounds
                                                             options:opts
                                                               owner:self
@@ -758,6 +759,12 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
 - (void)mouseMoved:(NSEvent*)event {
     NSPoint p = [self pixelPointFromEvent:event];
     self.cb.on_mouse(self.cb.userdata, 1, (float)p.x, (float)p.y, 0, 0,
+                     encode_mods(event.modifierFlags));
+}
+
+- (void)mouseExited:(NSEvent*)event {
+    // Signal pointer exit cleanly so sidebar, tab strip, and scrollbar hover states clear immediately.
+    self.cb.on_mouse(self.cb.userdata, 1, -1000.0f, -1000.0f, 0, 0,
                      encode_mods(event.modifierFlags));
 }
 

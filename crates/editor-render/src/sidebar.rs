@@ -111,6 +111,7 @@ impl Sidebar {
         self.visible = visible;
         if !visible {
             self.focused = false;
+            self.hovered_row = None;
         }
     }
 
@@ -270,7 +271,17 @@ impl Sidebar {
         self.scroll_y_px = (self.scroll_y_px + dy_px).clamp(0.0, max_scroll);
     }
 
-    pub fn set_hovered(&mut self, rect: PixelRect, x_px: f32, y_px: f32, scale: f32) -> SidebarHit {
+    /// Update hover state from pointer coordinates. Returns `(changed, hit)` so the caller
+    /// always invalidates the sidebar on hover entry, row change, AND hover exit — while
+    /// avoiding redundant repaints when moving within the same row.
+    pub fn set_hovered(
+        &mut self,
+        rect: PixelRect,
+        x_px: f32,
+        y_px: f32,
+        scale: f32,
+    ) -> (bool, SidebarHit) {
+        let prev = self.hovered_row;
         let hit = self.hit_test(rect, x_px, y_px, scale);
         self.hovered_row = match hit {
             SidebarHit::RowBody(i) | SidebarHit::RowDisclosure(i) | SidebarHit::RowEnter(i) => {
@@ -278,7 +289,12 @@ impl Sidebar {
             }
             _ => None,
         };
-        hit
+        (self.hovered_row != prev, hit)
+    }
+
+    /// Clear any active row hover highlight, returning `true` if visual state changed.
+    pub fn clear_hover(&mut self) -> bool {
+        self.hovered_row.take().is_some()
     }
 
     pub fn hit_test(&self, rect: PixelRect, x_px: f32, y_px: f32, scale: f32) -> SidebarHit {

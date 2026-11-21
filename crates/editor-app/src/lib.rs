@@ -2313,7 +2313,12 @@ impl EditorApp {
             }
             InputEvent::FocusChanged(focused) => {
                 self.window_focused = focused;
-                if focused {
+                if !focused {
+                    let _ = self.sidebar.clear_hover();
+                    let _ = self.tab_strip.clear_hover();
+                    self.viewport.v_bar_hovered = false;
+                    self.viewport.h_bar_hovered = false;
+                } else {
                     self.caret_visible = true;
                     self.last_blink_ms = self.now_ms;
                     self.sidebar.refresh(self.fs.as_ref());
@@ -4591,81 +4596,119 @@ impl EditorApp {
             return;
         }
 
-        // Hover cursor & scrollbar hover highlight.
+        // Unconditional single-pass hover reconciliation across ALL hoverable surfaces
+        // (sidebar, tab strip, scrollbars). Never early-return before reconciling every surface,
+        // so moving between regions or out of the window can NEVER leave stale hover pixels on
+        // a swapchain back-buffer!
         let xi = x_px.round() as i32;
         let yi = y_px.round() as i32;
-        if self.sidebar.is_visible() {
-            let hit = self
+        let overlay_open = self.confirm_modal.visible
+            || self.palette.is_open()
+            || self.shortcuts.visible
+            || self.harpoon.visible;
+        let mut needs_redraw = false;
+
+        // 1. Sidebar hover (always reconciled so exiting to ResizeEdge, editor, or outside invalidates!)
+        let sb_hit = if !overlay_open && self.sidebar.is_visible() {
+            let (changed, hit) = self
                 .sidebar
                 .set_hovered(self.layout.sidebar, x_px, y_px, scale);
-            if hit == SidebarHit::ResizeEdge {
-                host.set_cursor(CursorShape::ResizeHorizontal);
-                return;
-            }
-            if hit != SidebarHit::None {
-                host.set_cursor(CursorShape::Pointer);
+            if changed {
                 self.mark_dirty_rect(self.layout.sidebar);
-                host.request_redraw();
-                return;
+                needs_redraw = true;
             }
-        }
-        if self.layout.tab_strip.contains(xi, yi) {
+            hit
+        } else {
+            if self.sidebar.clear_hover() {
+                self.mark_dirty_rect(self.layout.sidebar);
+                needs_redraw = true;
+            }
+            SidebarHit::None
+        };
+
+        // 2. Working-Set Tab Strip hover
+        let in_tab_strip =
+            !overlay_open && sb_hit == SidebarHit::None && self.layout.tab_strip.contains(xi, yi);
+        let tab_hit = if in_tab_strip {
             let (changed, hit) = self.tab_strip.set_hovered(x_px, y_px);
             if changed {
                 self.mark_dirty_rect(self.layout.tab_strip);
-                host.request_redraw();
+                needs_redraw = true;
             }
-            host.set_cursor(if hit != TabStripHit::None {
-                CursorShape::Pointer
-            } else {
-                CursorShape::Arrow
-            });
-            return;
-        } else if self.tab_strip.clear_hover() {
-            self.mark_dirty_rect(self.layout.tab_strip);
-            host.request_redraw();
-        }
-        if !self.other_panes.is_empty() && !self.zoomed {
-            let grab = (5.0 * scale).round() as i32;
-            if let Some(div) = self.layout.grid.divider_at(xi, yi, grab) {
-                let cur = match div.axis {
-                    DividerAxis::Columns => CursorShape::ResizeHorizontal,
-                    DividerAxis::Rows(_) => CursorShape::ResizeVertical,
-                };
-                host.set_cursor(cur);
-                return;
+            hit
+        } else {
+            if self.tab_strip.clear_hover() {
+                self.mark_dirty_rect(self.layout.tab_strip);
+                needs_redraw = true;
             }
-            if let Some(pr) = self.layout.grid.pane_at(xi, yi) {
-                if pr.header.contains(xi, yi) {
-                    host.set_cursor(CursorShape::Pointer);
-                    return;
-                }
-            }
-        }
-        let sb = self.viewport.hit_test_scrollbar(x_px, y_px);
+            TabStripHit::None
+        };
+
+        // 3. Active viewport scrollbar hover
+        let sb_scroll = if !overlay_open && sb_hit == SidebarHit::None && !in_tab_strip {
+            self.viewport.hit_test_scrollbar(x_px, y_px)
+        } else {
+            ScrollbarHit::None
+        };
         let prev_vh = self.viewport.v_bar_hovered;
         let prev_hh = self.viewport.h_bar_hovered;
         self.viewport.v_bar_hovered =
-            matches!(sb, ScrollbarHit::VerticalThumb | ScrollbarHit::VerticalTrack);
+            matches!(sb_scroll, ScrollbarHit::VerticalThumb | ScrollbarHit::VerticalTrack);
         self.viewport.h_bar_hovered = matches!(
-            sb,
+            sb_scroll,
             ScrollbarHit::HorizontalThumb | ScrollbarHit::HorizontalTrack
         );
         if prev_vh != self.viewport.v_bar_hovered || prev_hh != self.viewport.h_bar_hovered {
-            self.mark_dirty();
-            host.request_redraw();
+            self.mark_dirty_rect(self.layout.viewport);
+            needs_redraw = true;
         }
-        if sb != ScrollbarHit::None {
-            host.set_cursor(CursorShape::Arrow);
+
+        // 4. Resolve cursor shape cleanly from active hit region.
+        let cursor = if overlay_open {
+            CursorShape::Arrow
+        } else if sb_hit == SidebarHit::ResizeEdge {
+            CursorShape::ResizeHorizontal
+        } else if sb_hit != SidebarHit::None {
+            CursorShape::Pointer
+        } else if in_tab_strip {
+            if tab_hit != TabStripHit::None {
+                CursorShape::Pointer
+            } else {
+                CursorShape::Arrow
+            }
+        } else if let Some(div) = (!self.other_panes.is_empty() && !self.zoomed)
+            .then(|| self.layout.grid.divider_at(xi, yi, (5.0 * scale).round() as i32))
+            .flatten()
+        {
+            match div.axis {
+                DividerAxis::Columns => CursorShape::ResizeHorizontal,
+                DividerAxis::Rows(_) => CursorShape::ResizeVertical,
+            }
+        } else if !self.other_panes.is_empty()
+            && !self.zoomed
+            && self
+                .layout
+                .grid
+                .pane_at(xi, yi)
+                .is_some_and(|pr| pr.header.contains(xi, yi))
+        {
+            CursorShape::Pointer
+        } else if sb_scroll != ScrollbarHit::None {
+            CursorShape::Arrow
         } else if self.viewport.layout.text.contains(xi, yi)
             || self
                 .other_panes
                 .iter()
                 .any(|p| p.viewport.layout.text.contains(xi, yi))
         {
-            host.set_cursor(CursorShape::IBeam);
+            CursorShape::IBeam
         } else {
-            host.set_cursor(CursorShape::Arrow);
+            CursorShape::Arrow
+        };
+        host.set_cursor(cursor);
+
+        if needs_redraw {
+            host.request_redraw();
         }
     }
 

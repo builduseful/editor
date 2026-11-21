@@ -2023,3 +2023,204 @@ fn remembers_last_opened_folder_across_restarts_and_handles_missing_dir() {
     app3.load_preferences(&host);
     assert_eq!(app3.sidebar.root(), None);
 }
+
+#[test]
+fn sidebar_hover_exit_and_caret_blink_never_desync_swapchain() {
+    use editor_platform::{InputEvent, Modifiers, PixelRect, SurfaceMut};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/alpha.rs", b"fn alpha() { let x = 1; }\n".to_vec());
+    fs.add_file("/repo/beta.rs", b"fn beta() { let y = 2; }\n".to_vec());
+
+    let (w, h, scale) = (900u32, 540u32, 2.0f32);
+    let mut app = EditorApp::new(fs.clone(), w, h, scale);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_path_or_dir(&PathBuf::from("/repo/alpha.rs"), &mut host)
+        .unwrap();
+
+    // Simulate a 2-slot double-buffered IOSurface swapchain identical to `mac_adapter.m`!
+    let mut slots = [vec![0u32; (w * h) as usize], vec![0u32; (w * h) as usize]];
+    let mut needs_full = [true, true];
+    let mut dmg = [PixelRect::ZERO, PixelRect::ZERO];
+    let mut front = 1usize;
+
+    let mut present_if_dirty_and_verify =
+        |app: &mut EditorApp, raster: &mut BuiltinBitmapRasterizer, step: &str| {
+            if app.is_dirty_frame() {
+                let back = 1 - front;
+                let surf = SurfaceMut {
+                    width: w,
+                    height: h,
+                    stride: w as usize,
+                    scale,
+                    pixels: &mut slots[back],
+                };
+                if let Some(painted) =
+                    app.render_into_with_damage(surf, raster, dmg[back], needs_full[back])
+                {
+                    needs_full[back] = false;
+                    dmg[back] = PixelRect::ZERO;
+                    if !needs_full[front] {
+                        dmg[front] = dmg[front].union(painted);
+                    }
+                    front = back;
+                }
+            }
+            // The displayed front buffer MUST ALWAYS match a fresh full-redraw bit-for-bit!
+            let mut ref_buf = vec![0u32; (w * h) as usize];
+            let ref_surf = SurfaceMut {
+                width: w,
+                height: h,
+                stride: w as usize,
+                scale,
+                pixels: &mut ref_buf,
+            };
+            app.render_into_with_damage(ref_surf, raster, PixelRect::ZERO, true)
+                .expect("reference full render");
+            assert_eq!(
+                slots[front], ref_buf,
+                "swapchain front buffer diverged from reference at step: {step}"
+            );
+        };
+
+    // Frame 0: initial full paint.
+    present_if_dirty_and_verify(&mut app, &mut raster, "initial");
+
+    // 1. Hover over the second sidebar file (`beta.rs`).
+    let sb = app.layout.sidebar;
+    let row2_x = (sb.x + 60) as f32;
+    let row2_y = (sb.y + (28.0 * scale) as i32 + (24.0 * scale) as i32 + 10) as f32;
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: row2_x,
+            y_px: row2_y,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.is_dirty_frame(), "hovering sidebar row must mark dirty");
+    present_if_dirty_and_verify(&mut app, &mut raster, "hover_sidebar_beta");
+
+    // Moving 2px within the SAME row should NOT trigger redundant repaints!
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: row2_x + 2.0,
+            y_px: row2_y,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.is_dirty_frame(), "same-row mouse move must not repaint redundantly");
+
+    // 2. Move across the sidebar resize edge directly into the editor pane!
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: sb.right() as f32,
+            y_px: row2_y,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.is_dirty_frame(), "moving onto resize edge must clear sidebar hover & mark dirty");
+    present_if_dirty_and_verify(&mut app, &mut raster, "hover_resize_edge");
+
+    let vp = app.layout.viewport;
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: (vp.x + 120) as f32,
+            y_px: (vp.y + 80) as f32,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    present_if_dirty_and_verify(&mut app, &mut raster, "enter_editor_pane");
+
+    // 3. Re-hover sidebar directly, then jump straight into editor pane (skipping resize edge!),
+    //    then blink the caret 6 times! Before the fix, this permanently ping-ponged the hovered row!
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: row2_x,
+            y_px: row2_y,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    present_if_dirty_and_verify(&mut app, &mut raster, "rehover_sidebar_beta");
+
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: (vp.x + 160) as f32,
+            y_px: (vp.y + 80) as f32,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.is_dirty_frame(), "jumping from sidebar to editor must clear hover & mark dirty");
+    present_if_dirty_and_verify(&mut app, &mut raster, "jump_to_editor");
+
+    for tick in 1..=6u64 {
+        app.handle_event(
+            InputEvent::Tick {
+                now_ms: tick * 600,
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        present_if_dirty_and_verify(&mut app, &mut raster, &format!("caret_blink_{tick}"));
+    }
+
+    // 4. Hover tab strip, move directly to sidebar, then exit window (`-1000, -1000`).
+    let ts = app.layout.tab_strip;
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: (ts.x + 40) as f32,
+            y_px: (ts.y + ts.h / 2) as f32,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    present_if_dirty_and_verify(&mut app, &mut raster, "hover_tab_strip");
+
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: row2_x,
+            y_px: row2_y,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    present_if_dirty_and_verify(&mut app, &mut raster, "tab_strip_to_sidebar");
+
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: -1000.0,
+            y_px: -1000.0,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.is_dirty_frame(), "window mouseExited must clear sidebar hover");
+    present_if_dirty_and_verify(&mut app, &mut raster, "mouse_exited_window");
+}
