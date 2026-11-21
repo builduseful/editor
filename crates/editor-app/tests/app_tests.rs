@@ -630,8 +630,9 @@ fn split_pane_double_buffer_damage_tracking_is_bit_exact() {
     present_and_verify(&mut app, &mut raster);
 
     // Frame 1: scroll right (active) pane down.
-    let rx = (app.layout.right_pane.x + 40) as f32;
-    let ry = (app.layout.right_pane.y + 40) as f32;
+    let rp = app.layout.pane_body(&app.arrangement, 1);
+    let rx = (rp.x + 40) as f32;
+    let ry = (rp.y + 40) as f32;
     app.handle_event(
         InputEvent::Scroll {
             dx_px: 0.0,
@@ -647,8 +648,9 @@ fn split_pane_double_buffer_damage_tracking_is_bit_exact() {
     present_and_verify(&mut app, &mut raster);
 
     // Frame 2: scroll left (inactive) pane down while pointer is over left pane!
-    let lx = (app.layout.left_pane.x + 40) as f32;
-    let ly = (app.layout.left_pane.y + 40) as f32;
+    let lp = app.layout.pane_body(&app.arrangement, 0);
+    let lx = (lp.x + 40) as f32;
+    let ly = (lp.y + 40) as f32;
     app.handle_event(
         InputEvent::Scroll {
             dx_px: 0.0,
@@ -895,11 +897,11 @@ fn keymap_has_zero_conflicts_and_undo_to_clean_and_pane_swap_close() {
 
     // 3. Split, swap left<->right, and close active pane (keeps remaining pane!).
     app.split_pane_with(Some(&PathBuf::from("/repo/right.rs")), &mut host);
-    assert_eq!(app.active_pane, 1);
+    assert_eq!(app.active_pane_index(), 1);
     assert_eq!(app.doc.file_name(), "right.rs");
 
     app.swap_panes(&mut host);
-    assert_eq!(app.active_pane, 0);
+    assert_eq!(app.active_pane_index(), 0);
     assert_eq!(app.doc.file_name(), "right.rs");
 
     // Closing active pane (`right.rs`) promotes remaining pane (`left.rs`)!
@@ -951,4 +953,293 @@ fn per_file_type_word_wrap_applies_and_persists_per_extension() {
     let IpcReply::Json(s) = reply else { panic!("expected json") };
     assert!(!app.viewport.word_wrap);
     assert!(s.contains("\"rs\":false"));
+}
+
+#[test]
+fn grid_2x2_drag_and_drop_files_and_pane_headers_with_bit_exact_swapchain() {
+    use editor_app::DropZone;
+    use editor_platform::{DragPhase, InputEvent, Modifiers, MouseButton, PixelRect, SurfaceMut};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/tl.rs", b"fn tl() -> u32 { 1 }\n".to_vec());
+    fs.add_file("/repo/tr.rs", b"fn tr() -> u32 { 2 }\n".to_vec());
+    fs.add_file("/repo/bl.rs", b"fn bl() -> u32 { 3 }\n".to_vec());
+    fs.add_file("/repo/br.rs", b"fn br() -> u32 { 4 }\n".to_vec());
+
+    let (w, h, scale) = (1000u32, 640u32, 2.0f32);
+    let mut app = EditorApp::new(fs.clone(), w, h, scale);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.set_sidebar_root(std::path::Path::new("/repo"));
+    app.open_path_or_dir(&PathBuf::from("/repo/tl.rs"), &mut host)
+        .unwrap();
+
+    // 2-slot swapchain verifier: ensures every partial drag/split/scroll repaint matches full redraw!
+    let mut slots = [vec![0u32; (w * h) as usize], vec![0u32; (w * h) as usize]];
+    let mut needs_full = [true, true];
+    let mut dmg = [PixelRect::ZERO, PixelRect::ZERO];
+    let mut front = 1usize;
+
+    let mut verify_frame = |app: &mut EditorApp, raster: &mut BuiltinBitmapRasterizer| {
+        if !app.is_dirty_frame() && !needs_full[1 - front] {
+            return;
+        }
+        let back = 1 - front;
+        let surf = SurfaceMut {
+            width: w,
+            height: h,
+            stride: w as usize,
+            scale,
+            pixels: &mut slots[back],
+        };
+        if let Some(painted) =
+            app.render_into_with_damage(surf, raster, dmg[back], needs_full[back])
+        {
+            needs_full[back] = false;
+            dmg[back] = PixelRect::ZERO;
+            if !needs_full[front] {
+                dmg[front] = dmg[front].union(painted);
+            }
+            front = back;
+        }
+        let mut ref_buf = vec![0u32; (w * h) as usize];
+        let ref_surf = SurfaceMut {
+            width: w,
+            height: h,
+            stride: w as usize,
+            scale,
+            pixels: &mut ref_buf,
+        };
+        app.render_into_with_damage(ref_surf, raster, PixelRect::ZERO, true)
+            .expect("reference full render");
+        assert_eq!(
+            slots[front], ref_buf,
+            "swapchain back-buffer must match full redraw bit-for-bit during drag & 2x2 grid"
+        );
+    };
+
+    verify_frame(&mut app, &mut raster);
+
+    // 1. External Finder drag of `tr.rs` onto the right edge of pane 0 -> splits right!
+    let p0 = app.layout.grid.panes()[0].frame;
+    let (rx, ry) = ((p0.right() - 24) as f32, (p0.y + p0.h / 2) as f32);
+    app.handle_event(
+        InputEvent::ExternalDrag {
+            phase: DragPhase::Enter,
+            x_px: rx,
+            y_px: ry,
+            path: Some(PathBuf::from("/repo/tr.rs")),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.is_dragging());
+    assert_eq!(app.drag_plan().unwrap().zone, DropZone::Right);
+    verify_frame(&mut app, &mut raster);
+
+    // Move drag slightly within the right edge and verify partial-damage preview repaint!
+    app.handle_event(
+        InputEvent::ExternalDrag {
+            phase: DragPhase::Move,
+            x_px: rx - 10.0,
+            y_px: ry + 20.0,
+            path: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    verify_frame(&mut app, &mut raster);
+
+    // Drop to commit the right split!
+    app.handle_event(
+        InputEvent::ExternalDrag {
+            phase: DragPhase::Drop,
+            x_px: rx - 10.0,
+            y_px: ry + 20.0,
+            path: Some(PathBuf::from("/repo/tr.rs")),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.is_dragging());
+    assert_eq!(app.pane_count(), 2);
+    assert_eq!(app.doc.file_name(), "tr.rs");
+    verify_frame(&mut app, &mut raster);
+
+    // 2. Drag `bl.rs` onto the bottom edge of the left pane (index 0) -> creates bottom-left pane!
+    let left_frame = app
+        .layout
+        .grid
+        .get(app.arrangement.id_at_index(0).unwrap())
+        .unwrap()
+        .frame;
+    let (bx, by) = (
+        (left_frame.x + left_frame.w / 2) as f32,
+        (left_frame.bottom() - 20) as f32,
+    );
+    app.handle_event(
+        InputEvent::ExternalDrag {
+            phase: DragPhase::Enter,
+            x_px: bx,
+            y_px: by,
+            path: Some(PathBuf::from("/repo/bl.rs")),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.drag_plan().unwrap().zone, DropZone::Bottom);
+    verify_frame(&mut app, &mut raster);
+    app.handle_event(
+        InputEvent::ExternalDrag {
+            phase: DragPhase::Drop,
+            x_px: bx,
+            y_px: by,
+            path: Some(PathBuf::from("/repo/bl.rs")),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.pane_count(), 3);
+    assert_eq!(app.doc.file_name(), "bl.rs");
+    verify_frame(&mut app, &mut raster);
+
+    // 3. Drag `br.rs` onto the bottom edge of the right pane (index 1) -> full 2x2 grid (4 panes)!
+    let right_frame = app
+        .layout
+        .grid
+        .get(app.arrangement.id_at_index(1).unwrap())
+        .unwrap()
+        .frame;
+    let (brx, bry) = (
+        (right_frame.x + right_frame.w / 2) as f32,
+        (right_frame.bottom() - 20) as f32,
+    );
+    app.handle_event(
+        InputEvent::ExternalDrag {
+            phase: DragPhase::Enter,
+            x_px: brx,
+            y_px: bry,
+            path: Some(PathBuf::from("/repo/br.rs")),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.drag_plan().unwrap().zone, DropZone::Bottom);
+    verify_frame(&mut app, &mut raster);
+    app.handle_event(
+        InputEvent::ExternalDrag {
+            phase: DragPhase::Drop,
+            x_px: brx,
+            y_px: bry,
+            path: Some(PathBuf::from("/repo/br.rs")),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.pane_count(), 4);
+    assert_eq!(app.active_pane_index(), 3);
+    assert_eq!(app.doc.file_name(), "br.rs");
+    verify_frame(&mut app, &mut raster);
+
+    // 4. Dragging a 5th file onto an edge when already at 2x2 (4 panes) cleanly falls back to Center!
+    let tl_frame = app
+        .layout
+        .grid
+        .get(app.arrangement.id_at_index(0).unwrap())
+        .unwrap()
+        .frame;
+    app.handle_event(
+        InputEvent::ExternalDrag {
+            phase: DragPhase::Enter,
+            x_px: (tl_frame.x + 8) as f32,
+            y_px: (tl_frame.y + tl_frame.h / 2) as f32,
+            path: Some(PathBuf::from("/repo/br.rs")),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(
+        app.drag_plan().unwrap().zone,
+        DropZone::Center,
+        "when 4 panes are already open, edge drops must preview Center replacement"
+    );
+    app.handle_event(
+        InputEvent::ExternalDrag {
+            phase: DragPhase::Exit,
+            x_px: 0.0,
+            y_px: 0.0,
+            path: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    verify_frame(&mut app, &mut raster);
+
+    // 5. Drag top-left pane header onto bottom-right pane center -> swaps TL and BR!
+    let tl_hdr = app
+        .layout
+        .grid
+        .get(app.arrangement.id_at_index(0).unwrap())
+        .unwrap()
+        .header;
+    let br_body = app
+        .layout
+        .grid
+        .get(app.arrangement.id_at_index(3).unwrap())
+        .unwrap()
+        .body;
+    let (hx, hy) = ((tl_hdr.x + 40) as f32, (tl_hdr.y + tl_hdr.h / 2) as f32);
+    let (tx, ty) = (
+        (br_body.x + br_body.w / 2) as f32,
+        (br_body.y + br_body.h / 2) as f32,
+    );
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: hx,
+            y_px: hy,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: tx,
+            y_px: ty,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.is_dragging());
+    verify_frame(&mut app, &mut raster);
+    app.handle_event(
+        InputEvent::MouseUp {
+            x_px: tx,
+            y_px: ty,
+            button: MouseButton::Left,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.active_pane_index(), 3);
+    assert_eq!(app.doc.file_name(), "tl.rs");
+    verify_frame(&mut app, &mut raster);
 }

@@ -327,6 +327,7 @@ typedef struct {
     void (*on_focus)(void* ud, uint32_t focused);
     void (*on_theme)(void* ud, uint32_t is_dark);
     void (*on_open_path)(void* ud, const char* path);
+    void (*on_drag)(void* ud, uint32_t phase, float x, float y, const char* path);
     void (*on_command)(void* ud, uint32_t cmd_id);
     void (*on_tick)(void* ud, uint64_t now_ms);
     // Zero-copy swapchain render: Rust paints directly into a free back-buffer IOSurface
@@ -470,22 +471,55 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
     [self scheduleRedraw];
 }
 
-- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+- (NSPoint)pixelPointFromDrag:(id<NSDraggingInfo>)sender {
+    NSPoint pt = [self convertPoint:[sender draggingLocation] fromView:nil];
+    CGFloat scale = self.window.backingScaleFactor > 0 ? self.window.backingScaleFactor : 1.0;
+    return NSMakePoint(pt.x * scale, pt.y * scale);
+}
+
+- (NSString*)firstDraggedFilePath:(id<NSDraggingInfo>)sender {
     NSPasteboard* pb = [sender draggingPasteboard];
-    if ([pb canReadObjectForClasses:@[[NSURL class]] options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}]) {
+    NSArray<NSURL*>* urls = [pb readObjectsForClasses:@[[NSURL class]]
+                                              options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    return urls.count > 0 ? urls.firstObject.path : nil;
+}
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    NSString* path = [self firstDraggedFilePath:sender];
+    if (path) {
+        if (self.cb.on_drag) {
+            NSPoint p = [self pixelPointFromDrag:sender];
+            self.cb.on_drag(self.cb.userdata, 0, (float)p.x, (float)p.y, [path UTF8String]);
+        }
         return NSDragOperationCopy;
     }
     return NSDragOperationNone;
 }
 
+- (NSDragOperation)draggingUpdated:(id<NSDraggingInfo>)sender {
+    if (self.cb.on_drag) {
+        NSPoint p = [self pixelPointFromDrag:sender];
+        self.cb.on_drag(self.cb.userdata, 1, (float)p.x, (float)p.y, NULL);
+    }
+    return NSDragOperationCopy;
+}
+
+- (void)draggingExited:(id<NSDraggingInfo>)sender {
+    (void)sender;
+    if (self.cb.on_drag) {
+        self.cb.on_drag(self.cb.userdata, 2, 0.0f, 0.0f, NULL);
+    }
+}
+
 - (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
-    NSPasteboard* pb = [sender draggingPasteboard];
-    NSArray<NSURL*>* urls = [pb readObjectsForClasses:@[[NSURL class]]
-                                              options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
-    if (urls.count > 0 && self.cb.on_open_path) {
-        NSURL* url = urls.firstObject;
-        if (url.path) {
-            self.cb.on_open_path(self.cb.userdata, [url.path UTF8String]);
+    NSString* path = [self firstDraggedFilePath:sender];
+    if (path) {
+        if (self.cb.on_drag) {
+            NSPoint p = [self pixelPointFromDrag:sender];
+            self.cb.on_drag(self.cb.userdata, 3, (float)p.x, (float)p.y, [path UTF8String]);
+            return YES;
+        } else if (self.cb.on_open_path) {
+            self.cb.on_open_path(self.cb.userdata, [path UTF8String]);
             [self scheduleRedraw];
             return YES;
         }
@@ -756,6 +790,8 @@ void mac_set_cursor(uint32_t cursor_id) {
         case 1: [[NSCursor IBeamCursor] set]; break;
         case 2: [[NSCursor pointingHandCursor] set]; break;
         case 3: [[NSCursor resizeLeftRightCursor] set]; break;
+        case 4: [[NSCursor resizeUpDownCursor] set]; break;
+        case 5: [[NSCursor closedHandCursor] set]; break;
         default: [[NSCursor arrowCursor] set]; break;
     }
 }
@@ -964,12 +1000,18 @@ void mac_activate_app(void) {
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
     [viewMenu addItem:[NSMenuItem separatorItem]];
     [viewMenu addItem:[self menuItem:@"Split Editor Right" key:@"\\" tag:24 mods:NSEventModifierFlagCommand]];
+    [viewMenu addItem:[self menuItem:@"Split Editor Down" key:@"\\" tag:34
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
     [viewMenu addItem:[self menuItem:@"Close Active Pane" key:@"w" tag:25 mods:NSEventModifierFlagCommand]];
     [viewMenu addItem:[self menuItem:@"Swap Split Panes" key:@"\\" tag:28
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagControl]];
     [viewMenu addItem:[self menuItem:@"Focus Left Pane" key:@"\uF702" tag:29
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
     [viewMenu addItem:[self menuItem:@"Focus Right Pane" key:@"\uF703" tag:30
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
+    [viewMenu addItem:[self menuItem:@"Focus Upper Pane" key:@"\uF700" tag:35
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
+    [viewMenu addItem:[self menuItem:@"Focus Lower Pane" key:@"\uF701" tag:36
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
     [viewMenu addItem:[NSMenuItem separatorItem]];
     [viewMenu addItem:[self menuItem:@"Zoom In" key:@"=" tag:17 mods:NSEventModifierFlagCommand]];

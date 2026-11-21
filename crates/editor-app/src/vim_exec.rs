@@ -352,14 +352,14 @@ impl EditorApp {
                 host.request_redraw();
             }
             VimAction::SplitRight => self.split_pane_with(None, host),
+            VimAction::SplitDown => self.split_pane_down(None, host),
             VimAction::CloseSplit => self.request_close_active_pane(host),
             VimAction::SwapPanes => self.swap_panes(host),
-            VimAction::FocusPaneLeft => self.focus_pane(0, host),
-            VimAction::FocusPaneRight => self.focus_pane(1, host),
-            VimAction::FocusOtherPane => {
-                let next = if self.active_pane == 0 { 1 } else { 0 };
-                self.focus_pane(next, host);
-            }
+            VimAction::FocusPaneLeft => self.focus_direction(crate::Direction::Left, host),
+            VimAction::FocusPaneRight => self.focus_direction(crate::Direction::Right, host),
+            VimAction::FocusPaneUp => self.focus_direction(crate::Direction::Up, host),
+            VimAction::FocusPaneDown => self.focus_direction(crate::Direction::Down, host),
+            VimAction::FocusOtherPane => self.focus_next_pane(host),
         }
     }
 

@@ -133,10 +133,13 @@ pub enum VimAction {
     SearchWordUnderCursor,
     CenterView,
     SplitRight,
+    SplitDown,
     CloseSplit,
     SwapPanes,
     FocusPaneLeft,
     FocusPaneRight,
+    FocusPaneUp,
+    FocusPaneDown,
     FocusOtherPane,
 }
 
@@ -383,8 +386,11 @@ impl VimState {
                 return match ch_opt {
                     Some('h') => VimAction::FocusPaneLeft,
                     Some('l') => VimAction::FocusPaneRight,
+                    Some('k') => VimAction::FocusPaneUp,
+                    Some('j') => VimAction::FocusPaneDown,
                     Some('w') => VimAction::FocusOtherPane,
                     Some('v') => VimAction::SplitRight,
+                    Some('s') => VimAction::SplitDown,
                     Some('x') | Some('r') => VimAction::SwapPanes,
                     Some('q') | Some('c') => VimAction::CloseSplit,
                     _ => VimAction::Consumed,

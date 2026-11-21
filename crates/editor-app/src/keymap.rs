@@ -385,9 +385,12 @@ fn default_shortcuts() -> Vec<ShortcutEntry> {
         bind("move-line-down", "Move line down", "Editing", KeyScope::Document, vec![KeyChord::alt(Key::Down)], None, false, AppCommand::MoveLineDown),
 
         // ── Panes & View ──
-        bind("swap-panes", "Swap left and right panes", "Panes & View", KeyScope::Global, vec![KeyChord::primary_ctrl(Key::Char('\\'))], Some("⌃⌘\\"), false, AppCommand::SwapPanes),
+        bind("split-down", "Split editor down", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Char('\\'))], Some("⌥⌘\\"), false, AppCommand::SplitPaneDown),
+        bind("swap-panes", "Swap split panes", "Panes & View", KeyScope::Global, vec![KeyChord::primary_ctrl(Key::Char('\\'))], Some("⌃⌘\\"), false, AppCommand::SwapPanes),
         bind("focus-left", "Focus left split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Left)], Some("⌥⌘←"), false, AppCommand::FocusLeftPane),
         bind("focus-right", "Focus right split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Right)], Some("⌥⌘→"), false, AppCommand::FocusRightPane),
+        bind("focus-up", "Focus upper split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Up)], Some("⌥⌘↑"), false, AppCommand::FocusUpPane),
+        bind("focus-down", "Focus lower split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Down)], Some("⌥⌘↓"), false, AppCommand::FocusDownPane),
         bind("toggle-wrap", "Toggle word wrap", "Panes & View", KeyScope::Global, vec![KeyChord::alt(Key::Char('z'))], Some("⌥Z"), false, AppCommand::ToggleWrap),
         bind("zoom-in", "Zoom in text", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('=')), KeyChord::primary_shift(Key::Char('=')), KeyChord::primary(Key::Char('+'))], Some("⌘+"), false, AppCommand::ZoomIn),
         bind("zoom-out", "Zoom out text", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('-'))], Some("⌘-"), false, AppCommand::ZoomOut),
@@ -416,6 +419,6 @@ fn default_shortcuts() -> Vec<ShortcutEntry> {
         vim_ref("vim.indent", "Indent / outdent line", "Vim Editing & Panes", ">> / <<"),
         vim_ref("vim.undo", "Undo / Redo", "Vim Editing & Panes", "u / ⌃R"),
         vim_ref("vim.visual", "Visual character / visual line mode", "Vim Editing & Panes", "v / V"),
-        vim_ref("vim.panes", "Split / swap / switch / close pane", "Vim Editing & Panes", "⌃W v / x / h l w / q"),
+        vim_ref("vim.panes", "Split / swap / switch / close pane", "Vim Editing & Panes", "⌃W v s / x / h j k l w / q"),
     ]
 }

@@ -5,6 +5,7 @@
 //! and rendered pixels in `Framebuffer`.
 
 pub mod keymap;
+pub mod panes;
 pub mod vim;
 mod vim_exec;
 
@@ -18,7 +19,7 @@ use editor_core::{
 };
 use editor_platform::{
     AppCommand, Clipboard, ConfirmChoice, CursorShape, FileSystem, FontStyle, Framebuffer,
-    GlyphRasterizer, InputEvent, Key, Modifiers, MouseButton, PixelRect, PlatformHost, SurfaceMut,
+    DragPhase, GlyphRasterizer, InputEvent, Key, Modifiers, MouseButton, PixelRect, PlatformHost, SurfaceMut,
     SystemTheme, ThemePreference,
 };
 use editor_render::{
@@ -29,6 +30,10 @@ use editor_render::{
 };
 
 pub use keymap::{KeyChord, KeyScope, Keymap, ShortcutEntry};
+pub use panes::{
+    Arrangement, Direction, Divider, DividerAxis, DropPlan, DropZone, GridLayout, PaneId,
+    PaneRect, PaneSlot, MAX_PANES,
+};
 pub use vim::{VimMode, VimState};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -36,18 +41,52 @@ pub struct AppLayout {
     pub sidebar: PixelRect,
     pub find_bar: PixelRect,
     pub goto_bar: PixelRect,
-    /// Active pane's viewport rect (equals full right area when unsplit, or left/right half when split).
+    /// Active pane's document viewport rect (the whole pane area when only one pane is open).
     pub viewport: PixelRect,
-    /// Full combined viewport area across both panes when split.
-    pub split_area: PixelRect,
-    pub left_pane: PixelRect,
-    pub right_pane: PixelRect,
-    pub split_divider: PixelRect,
+    /// Resolved pane grid (up to 2 × 2): per-pane header/body rects plus divider hairlines.
+    pub grid: GridLayout,
     pub status_bar: PixelRect,
 }
 
-/// Independent state for a second side-by-side split pane.
+impl AppLayout {
+    /// Body (document viewport) rect of the pane at reading-order index `idx`.
+    pub fn pane_body(&self, arr: &Arrangement, idx: usize) -> PixelRect {
+        arr.id_at_index(idx)
+            .and_then(|id| self.grid.get(id))
+            .map(|r| r.body)
+            .unwrap_or_default()
+    }
+}
+
+/// What is being dragged towards the pane grid.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DragPayload {
+    /// A file from the sidebar or from Finder.
+    File(PathBuf),
+    /// An existing pane, dragged by its header.
+    Pane(PaneId),
+}
+
+/// Live drag-and-drop gesture state. All visuals are derived from this; damage is limited
+/// to the old ∪ new preview and chip rects, so a drag repaints only a few small rects per frame.
+#[derive(Debug, Clone)]
+struct PaneDrag {
+    payload: DragPayload,
+    origin: (f32, f32),
+    pos: (f32, f32),
+    /// Passed the 4pt movement threshold (a plain click never becomes a drag).
+    started: bool,
+    /// Came from outside the app (Finder): releasing off-grid opens in the active pane.
+    external: bool,
+    plan: Option<DropPlan>,
+    /// Floating label chip rect last drawn (for exact damage tracking).
+    chip: PixelRect,
+}
+
+/// Independent state for an inactive pane. The *active* pane always lives directly in
+/// `EditorApp::{doc, caret, anchor, viewport, ...}` and is swapped in O(1) on focus change.
 pub struct PaneState {
+    pub id: PaneId,
     pub doc: Document,
     pub caret: u64,
     pub anchor: u64,
@@ -58,11 +97,12 @@ pub struct PaneState {
 }
 
 impl PaneState {
-    fn new_from_font(font_size_pt: f32, word_wrap: bool) -> Self {
+    fn new_from_font(id: PaneId, font_size_pt: f32, word_wrap: bool) -> Self {
         let mut vp = Viewport::new();
         vp.font_size_pt = font_size_pt;
         vp.word_wrap = word_wrap;
         Self {
+            id,
             doc: Document::new_untitled(),
             caret: 0,
             anchor: 0,
@@ -108,12 +148,13 @@ pub struct EditorApp {
 
     pub sidebar: Sidebar,
     pub viewport: Viewport,
-    /// Optional second side-by-side pane; `self.doc`/`self.viewport` ALWAYS hold the active pane!
-    pub secondary_pane: Option<PaneState>,
-    /// Active pane index (`0` = left, `1` = right when split).
-    pub active_pane: usize,
-    /// Split ratio for left pane (`0.2..=0.8`, default `0.5`).
-    pub split_ratio: f32,
+    /// Inactive panes (0–3). `self.doc`/`self.viewport` ALWAYS hold the active pane.
+    pub other_panes: Vec<PaneState>,
+    /// Stable id of the active pane (its slot lives in `arrangement`).
+    pub active_id: PaneId,
+    next_pane_id: PaneId,
+    /// Pane grid model: who lives where (≤ 2 columns × ≤ 2 rows) plus split ratios.
+    pub arrangement: Arrangement,
     pub find_bar: FindBarState,
     pub goto_line: GotoLineState,
     pub palette: CommandPalette,
@@ -154,7 +195,8 @@ pub struct EditorApp {
     drag_click_count: u8,
     drag_word_anchor: (u64, u64),
     dragging_sidebar_edge: bool,
-    dragging_split_edge: bool,
+    dragging_divider: Option<Divider>,
+    drag: Option<PaneDrag>,
     dirty_frame: bool,
 }
 
@@ -188,9 +230,10 @@ impl EditorApp {
             preferred_x_px: None,
             sidebar: Sidebar::new(),
             viewport: Viewport::new(),
-            secondary_pane: None,
-            active_pane: 0,
-            split_ratio: 0.5,
+            other_panes: Vec::new(),
+            active_id: 1,
+            next_pane_id: 2,
+            arrangement: Arrangement::new(1),
             find_bar: FindBarState::new(),
             goto_line: GotoLineState::new(),
             palette: CommandPalette::new(),
@@ -223,7 +266,8 @@ impl EditorApp {
             drag_click_count: 1,
             drag_word_anchor: (0, 0),
             dragging_sidebar_edge: false,
-            dragging_split_edge: false,
+            dragging_divider: None,
+            drag: None,
             dirty_frame: true,
         };
         app.recompute_layout();
@@ -316,15 +360,12 @@ impl EditorApp {
                 self.viewport.scroll_x_px = 0.0;
             }
         }
-        let sec_path = self
-            .secondary_pane
-            .as_ref()
-            .and_then(|s| s.doc.path().map(Path::to_path_buf));
-        let sec_wrap = self.effective_word_wrap(sec_path.as_deref());
-        if let Some(ref mut sec) = self.secondary_pane {
-            if sec.viewport.word_wrap != sec_wrap {
-                sec.viewport.word_wrap = sec_wrap;
-                if sec_wrap {
+        for i in 0..self.other_panes.len() {
+            let wrap = self.effective_word_wrap(self.other_panes[i].doc.path());
+            let sec = &mut self.other_panes[i];
+            if sec.viewport.word_wrap != wrap {
+                sec.viewport.word_wrap = wrap;
+                if wrap {
                     sec.viewport.scroll_x_px = 0.0;
                 }
             }
@@ -449,95 +490,207 @@ impl EditorApp {
     }
 
     pub fn is_split(&self) -> bool {
-        self.secondary_pane.is_some()
+        !self.other_panes.is_empty()
     }
 
-    /// Open a side-by-side right pane (optionally opening `path` inside it, else opening the current file or untitled).
-    pub fn split_pane_with(&mut self, path: Option<&Path>, host: &mut dyn PlatformHost) {
-        if self.secondary_pane.is_none() {
-            let mut right = PaneState::new_from_font(self.viewport.font_size_pt, self.viewport.word_wrap);
-            if let Some(p) = path {
-                if let Ok(doc) = Document::open(self.fs.as_ref(), p) {
-                    right.doc = doc;
-                }
-            } else if let Some(cur_path) = self.doc.path() {
-                if let Ok(doc) = Document::open(self.fs.as_ref(), cur_path) {
-                    right.doc = doc;
-                }
-            }
-            self.secondary_pane = Some(right);
-            self.active_pane = 0;
-            // Focus the newly opened right pane and apply its per-extension word wrap!
-            self.focus_pane(1, host);
-            self.sync_wrap_for_panes();
-        } else {
-            self.focus_pane(1, host);
-            if let Some(p) = path {
-                let _ = self.open_path_or_dir(p, host);
-            }
+    /// Number of visible panes (1–4).
+    pub fn pane_count(&self) -> usize {
+        self.arrangement.len()
+    }
+
+    /// Reading-order index (TL, TR, BL, BR) of the active pane.
+    pub fn active_pane_index(&self) -> usize {
+        self.arrangement.index_of(self.active_id).unwrap_or(0)
+    }
+
+    fn alloc_pane_id(&mut self) -> PaneId {
+        let id = self.next_pane_id;
+        self.next_pane_id = self.next_pane_id.wrapping_add(1).max(1);
+        id
+    }
+
+    /// Build a fresh inactive pane, opening `path` (or the active file when `None`).
+    fn make_pane(&mut self, path: Option<&Path>) -> Result<PaneState, String> {
+        let id = self.alloc_pane_id();
+        let mut pane = PaneState::new_from_font(id, self.viewport.font_size_pt, self.viewport.word_wrap);
+        let src = path.map(Path::to_path_buf).or_else(|| self.doc.path().map(Path::to_path_buf));
+        if let Some(p) = src {
+            pane.doc = Document::open(self.fs.as_ref(), &p).map_err(|e| e.to_string())?;
         }
+        pane.viewport.word_wrap = self.effective_word_wrap(pane.doc.path());
+        Ok(pane)
+    }
+
+    /// Create a new pane at `zone` of pane `target` and focus it.
+    /// Returns `false` (with a quiet notice) when the grid is full or the zone is impossible.
+    pub fn split_pane_at(
+        &mut self,
+        target: PaneId,
+        zone: DropZone,
+        path: Option<&Path>,
+        host: &mut dyn PlatformHost,
+    ) -> bool {
+        if !self.arrangement.can_insert(target, zone) {
+            if self.arrangement.is_full() {
+                self.set_notice(format!("Maximum of {MAX_PANES} panes"), false);
+            }
+            return false;
+        }
+        let pane = match self.make_pane(path) {
+            Ok(p) => p,
+            Err(e) => {
+                self.set_notice(e, true);
+                return false;
+            }
+        };
+        let id = pane.id;
+        self.arrangement.insert(target, zone, id);
+        self.other_panes.push(pane);
+        self.focus_pane_id(id, host);
         self.recompute_layout();
+        self.mark_dirty();
+        host.request_redraw();
+        true
+    }
+
+    /// Split the active pane to the right (falling back to below once two columns exist).
+    pub fn split_pane_with(&mut self, path: Option<&Path>, host: &mut dyn PlatformHost) {
+        let a = self.active_id;
+        let zone = if self.arrangement.can_insert(a, DropZone::Right) {
+            DropZone::Right
+        } else {
+            DropZone::Bottom
+        };
+        self.split_pane_at(a, zone, path, host);
+    }
+
+    /// Split the active pane downwards (falling back to the right when its column is full).
+    pub fn split_pane_down(&mut self, path: Option<&Path>, host: &mut dyn PlatformHost) {
+        let a = self.active_id;
+        let zone = if self.arrangement.can_insert(a, DropZone::Bottom) {
+            DropZone::Bottom
+        } else {
+            DropZone::Right
+        };
+        self.split_pane_at(a, zone, path, host);
+    }
+
+    /// Close the active pane immediately, focusing the pane that takes over its space.
+    pub fn close_split(&mut self, host: &mut dyn PlatformHost) {
+        if self.other_panes.is_empty() {
+            return;
+        }
+        let old_frame = self.layout.grid.get(self.active_id).map(|r| r.frame);
+        self.arrangement.remove(self.active_id);
+        self.recompute_layout();
+        // Prefer the pane that now covers the centre of the closed pane's old area.
+        let heir = old_frame
+            .and_then(|f| self.layout.grid.pane_at(f.x + f.w / 2, f.y + f.h / 2).map(|r| r.id))
+            .filter(|id| self.other_panes.iter().any(|p| p.id == *id))
+            .unwrap_or(self.other_panes[0].id);
+        let idx = self.other_panes.iter().position(|p| p.id == heir).unwrap_or(0);
+        let next = self.other_panes.swap_remove(idx);
+        self.active_id = next.id;
+        self.doc = next.doc;
+        self.caret = next.caret;
+        self.anchor = next.anchor;
+        self.preferred_x_px = next.preferred_x_px;
+        self.viewport = next.viewport;
+        self.search_matches = next.search_matches;
+        self.active_match = next.active_match;
+        self.recompute_layout();
+        self.sync_title(host);
         self.mark_dirty();
         host.request_redraw();
     }
 
-    /// Close the active split pane immediately, promoting the remaining pane to full width.
-    pub fn close_split(&mut self, host: &mut dyn PlatformHost) {
-        if let Some(other) = self.secondary_pane.take() {
-            self.doc = other.doc;
-            self.caret = other.caret;
-            self.anchor = other.anchor;
-            self.preferred_x_px = other.preferred_x_px;
-            self.viewport = other.viewport;
-            self.search_matches = other.search_matches;
-            self.active_match = other.active_match;
-            self.active_pane = 0;
-            self.recompute_layout();
-            self.sync_title(host);
-            self.mark_dirty();
-            host.request_redraw();
-        }
-    }
-
-    /// Close the active split pane, prompting to save first if it has unsaved edits.
+    /// Close the active pane, prompting to save first if it has unsaved edits.
     pub fn request_close_active_pane(&mut self, host: &mut dyn PlatformHost) {
-        if self.secondary_pane.is_none() {
+        if self.other_panes.is_empty() {
             return;
         }
         self.request_discard_or_run(PendingDiscardAction::CloseActivePane, host);
     }
 
-    /// Swap left and right split panes in O(1) while keeping focus on the active document.
+    /// Swap the active pane with its neighbour (right/left first, then below/above).
     pub fn swap_panes(&mut self, host: &mut dyn PlatformHost) {
-        if self.secondary_pane.is_none() {
-            return;
-        }
-        self.active_pane = if self.active_pane == 0 { 1 } else { 0 };
-        self.recompute_layout();
-        self.mark_dirty();
-        host.request_redraw();
-    }
-
-    /// Switch focus to pane `idx` (`0` = left, `1` = right) in O(1) via zero-copy swap!
-    pub fn focus_pane(&mut self, idx: usize, host: &mut dyn PlatformHost) {
-        let target = idx.min(1);
-        if self.secondary_pane.is_none() || self.active_pane == target {
-            return;
-        }
-        if let Some(other) = self.secondary_pane.as_mut() {
-            std::mem::swap(&mut self.doc, &mut other.doc);
-            std::mem::swap(&mut self.caret, &mut other.caret);
-            std::mem::swap(&mut self.anchor, &mut other.anchor);
-            std::mem::swap(&mut self.preferred_x_px, &mut other.preferred_x_px);
-            std::mem::swap(&mut self.viewport, &mut other.viewport);
-            std::mem::swap(&mut self.search_matches, &mut other.search_matches);
-            std::mem::swap(&mut self.active_match, &mut other.active_match);
-            self.active_pane = target;
+        let a = self.active_id;
+        let grid = self.layout.grid;
+        let other = [Direction::Right, Direction::Left, Direction::Down, Direction::Up]
+            .iter()
+            .find_map(|d| self.arrangement.neighbor(&grid, a, *d));
+        if let Some(b) = other {
+            self.arrangement.swap(a, b);
             self.recompute_layout();
-            self.sync_title(host);
             self.mark_dirty();
             host.request_redraw();
         }
+    }
+
+    /// Move the active pane next to (or swap with, for `Center`) the pane at index `target_idx`.
+    pub fn move_pane(&mut self, src: PaneId, target: PaneId, zone: DropZone, host: &mut dyn PlatformHost) -> bool {
+        let ok = self.arrangement.move_pane(src, target, zone);
+        if ok {
+            self.recompute_layout();
+            self.mark_dirty();
+            host.request_redraw();
+        }
+        ok
+    }
+
+    /// Focus the pane at reading-order index `idx` (TL=0, TR=1, BL=2, BR=3).
+    pub fn focus_pane(&mut self, idx: usize, host: &mut dyn PlatformHost) {
+        if let Some(id) = self.arrangement.id_at_index(idx) {
+            self.focus_pane_id(id, host);
+        }
+    }
+
+    /// Focus the spatial neighbour of the active pane in `dir`.
+    pub fn focus_direction(&mut self, dir: Direction, host: &mut dyn PlatformHost) {
+        let grid = self.layout.grid;
+        if let Some(id) = self.arrangement.neighbor(&grid, self.active_id, dir) {
+            self.focus_pane_id(id, host);
+        }
+    }
+
+    /// Cycle focus through panes in reading order.
+    pub fn focus_next_pane(&mut self, host: &mut dyn PlatformHost) {
+        let n = self.arrangement.len();
+        if n > 1 {
+            let next = (self.active_pane_index() + 1) % n;
+            self.focus_pane(next, host);
+        }
+    }
+
+    /// Switch focus to pane `id` in O(1) by swapping its state with the active fields.
+    pub fn focus_pane_id(&mut self, id: PaneId, host: &mut dyn PlatformHost) {
+        if id == self.active_id {
+            return;
+        }
+        let Some(i) = self.other_panes.iter().position(|p| p.id == id) else {
+            return;
+        };
+        let prev_active = self.layout.grid.get(self.active_id).map(|r| r.frame);
+        let other = &mut self.other_panes[i];
+        std::mem::swap(&mut self.doc, &mut other.doc);
+        std::mem::swap(&mut self.caret, &mut other.caret);
+        std::mem::swap(&mut self.anchor, &mut other.anchor);
+        std::mem::swap(&mut self.preferred_x_px, &mut other.preferred_x_px);
+        std::mem::swap(&mut self.viewport, &mut other.viewport);
+        std::mem::swap(&mut self.search_matches, &mut other.search_matches);
+        std::mem::swap(&mut self.active_match, &mut other.active_match);
+        std::mem::swap(&mut self.active_id, &mut other.id);
+        self.recompute_layout();
+        self.sync_title(host);
+        // Only the two affected panes (headers + carets) and the status bar change.
+        if let Some(f) = prev_active {
+            self.mark_dirty_rect(f);
+        }
+        if let Some(r) = self.layout.grid.get(self.active_id) {
+            self.mark_dirty_rect(r.frame);
+        }
+        self.mark_dirty_rect(self.layout.status_bar);
+        host.request_redraw();
     }
 
     pub fn recompute_layout(&mut self) {
@@ -566,25 +719,9 @@ impl EditorApp {
 
         let vp_y = goto_bar.bottom();
         let vp_h = (main_h - vp_y).max(0);
-        let split_area = PixelRect::new(right_x, vp_y, right_w, vp_h);
-
-        let (left_pane, right_pane, split_divider, viewport) = if self.secondary_pane.is_some() {
-            let hairline = (1.0 * scale).round().max(1.0) as i32;
-            let header_h = (24.0 * scale).round() as i32;
-            let left_w = ((right_w as f32) * self.split_ratio)
-                .round()
-                .clamp(120.0 * scale, (right_w as f32 - 120.0 * scale).max(120.0 * scale))
-                as i32;
-            let div = PixelRect::new(right_x + left_w, vp_y, hairline, vp_h);
-            let lp = PixelRect::new(right_x, vp_y + header_h, left_w, (vp_h - header_h).max(0));
-            let rp_x = div.right();
-            let rp_w = (right_x + right_w - rp_x).max(0);
-            let rp = PixelRect::new(rp_x, vp_y + header_h, rp_w, (vp_h - header_h).max(0));
-            let active_vp = if self.active_pane == 0 { lp } else { rp };
-            (lp, rp, div, active_vp)
-        } else {
-            (split_area, PixelRect::ZERO, PixelRect::ZERO, split_area)
-        };
+        let pane_area = PixelRect::new(right_x, vp_y, right_w, vp_h);
+        let grid = self.arrangement.layout(pane_area, scale);
+        let viewport = grid.get(self.active_id).map(|r| r.body).unwrap_or(pane_area);
 
         let status_bar = PixelRect::new(0, main_h, w, status_h);
 
@@ -593,10 +730,7 @@ impl EditorApp {
             find_bar,
             goto_bar,
             viewport,
-            split_area,
-            left_pane,
-            right_pane,
-            split_divider,
+            grid,
             status_bar,
         };
     }
@@ -689,7 +823,7 @@ impl EditorApp {
             && !self.find_bar.is_focused()
             && !self.goto_line.visible;
         self.viewport.block_caret = self.vim.uses_block_caret();
-        if let Some(ref mut sec) = self.secondary_pane {
+        for sec in &mut self.other_panes {
             sec.viewport.block_caret = false;
         }
         let matching_brackets = if sel.is_none() && doc_focused {
@@ -731,43 +865,50 @@ impl EditorApp {
             );
         }
 
-        // 4. Document viewport(s) — single pane OR side-by-side split panes!
-        if self.secondary_pane.is_some() {
-            let scale = painter.scale();
-            let hairline = (1.0 * scale).round().max(1.0) as i32;
-            let header_h = (24.0 * scale).round() as i32;
-            let left_hdr = PixelRect::new(layout.left_pane.x, layout.split_area.y, layout.left_pane.w, header_h);
-            let right_hdr = PixelRect::new(layout.right_pane.x, layout.split_area.y, layout.right_pane.w, header_h);
-
-            let (active_rect, inactive_rect) = if self.active_pane == 0 {
-                (layout.left_pane, layout.right_pane)
-            } else {
-                (layout.right_pane, layout.left_pane)
-            };
-            let (active_hdr, inactive_hdr) = if self.active_pane == 0 {
-                (left_hdr, right_hdr)
-            } else {
-                (right_hdr, left_hdr)
-            };
-
-            // Draw quiet pane headers (Build Useful tokens: page bg, hairline bottom, bold active name).
-            if !active_hdr.intersect(effective_clip).is_empty() {
-                draw_pane_header(
-                    &mut painter,
-                    active_hdr,
-                    self.doc.file_name(),
-                    self.doc.is_dirty(),
-                    true,
-                    &theme,
-                    &mut self.atlas,
-                    rasterizer,
-                );
+        // 4. Document viewport(s) — 1 to 4 panes in a ≤ 2 × 2 grid.
+        let multi = !self.other_panes.is_empty();
+        for pr in layout.grid.panes() {
+            let pr = *pr;
+            if pr.frame.intersect(effective_clip).is_empty() {
+                continue;
             }
-            if let Some(ref mut sec) = self.secondary_pane {
-                if !inactive_hdr.intersect(effective_clip).is_empty() {
+            if pr.id == self.active_id {
+                if multi && !pr.header.intersect(effective_clip).is_empty() {
                     draw_pane_header(
                         &mut painter,
-                        inactive_hdr,
+                        pr.header,
+                        self.doc.file_name(),
+                        self.doc.is_dirty(),
+                        true,
+                        &theme,
+                        &mut self.atlas,
+                        rasterizer,
+                    );
+                }
+                if !pr.body.intersect(effective_clip).is_empty() {
+                    self.viewport.draw(
+                        &mut painter,
+                        pr.body,
+                        &mut self.doc,
+                        self.caret,
+                        sel,
+                        &self.search_matches,
+                        self.active_match,
+                        matching_brackets,
+                        &self.ime,
+                        self.caret_visible,
+                        doc_focused,
+                        &theme,
+                        &mut self.atlas,
+                        rasterizer,
+                    );
+                    self.ime.caret_rect_px = self.viewport.last_caret_rect;
+                }
+            } else if let Some(sec) = self.other_panes.iter_mut().find(|p| p.id == pr.id) {
+                if !pr.header.intersect(effective_clip).is_empty() {
+                    draw_pane_header(
+                        &mut painter,
+                        pr.header,
                         sec.doc.file_name(),
                         sec.doc.is_dirty(),
                         false,
@@ -776,11 +917,11 @@ impl EditorApp {
                         rasterizer,
                     );
                 }
-                if !inactive_rect.intersect(effective_clip).is_empty() {
+                if !pr.body.intersect(effective_clip).is_empty() {
                     let sec_sel = sec.selection();
                     sec.viewport.draw(
                         &mut painter,
-                        inactive_rect,
+                        pr.body,
                         &mut sec.doc,
                         sec.caret,
                         sec_sel,
@@ -796,53 +937,12 @@ impl EditorApp {
                     );
                 }
             }
-            if !active_rect.intersect(effective_clip).is_empty() {
-                self.viewport.draw(
-                    &mut painter,
-                    active_rect,
-                    &mut self.doc,
-                    self.caret,
-                    sel,
-                    &self.search_matches,
-                    self.active_match,
-                    matching_brackets,
-                    &self.ime,
-                    self.caret_visible,
-                    doc_focused,
-                    &theme,
-                    &mut self.atlas,
-                    rasterizer,
-                );
-                self.ime.caret_rect_px = self.viewport.last_caret_rect;
+        }
+        // Crisp 1px hairline dividers between columns / rows.
+        for d in layout.grid.dividers() {
+            if !d.rect.intersect(effective_clip).is_empty() {
+                painter.fill_rect(d.rect, theme.border_subtle);
             }
-            // Crisp 1px vertical split hairline divider.
-            let div_rect = PixelRect::new(
-                layout.split_divider.x,
-                layout.split_area.y,
-                hairline,
-                layout.split_area.h,
-            );
-            if !div_rect.intersect(effective_clip).is_empty() {
-                painter.fill_rect(div_rect, theme.border_subtle);
-            }
-        } else if !layout.viewport.intersect(effective_clip).is_empty() {
-            self.viewport.draw(
-                &mut painter,
-                layout.viewport,
-                &mut self.doc,
-                self.caret,
-                sel,
-                &self.search_matches,
-                self.active_match,
-                matching_brackets,
-                &self.ime,
-                self.caret_visible,
-                doc_focused,
-                &theme,
-                &mut self.atlas,
-                rasterizer,
-            );
-            self.ime.caret_rect_px = self.viewport.last_caret_rect;
         }
 
         // 5. Status bar
@@ -865,6 +965,22 @@ impl EditorApp {
                 &mut painter,
                 layout.status_bar,
                 &status_data,
+                &theme,
+                &mut self.atlas,
+                rasterizer,
+            );
+        }
+
+        // 5b. Drag-and-drop preview: exact post-drop rect + floating label chip.
+        if let Some(drag) = self.drag.as_ref().filter(|d| d.started) {
+            let (plan, chip) = (drag.plan, drag.chip);
+            let (name, action) = self.drag_labels();
+            draw_drag_overlay(
+                &mut painter,
+                plan.map(|p| p.preview),
+                chip,
+                &name,
+                action,
                 &theme,
                 &mut self.atlas,
                 rasterizer,
@@ -1208,6 +1324,10 @@ impl EditorApp {
             InputEvent::KeyDown { key, mods, text } => {
                 self.caret_visible = true;
                 self.last_blink_ms = self.now_ms;
+                if key == Key::Escape && self.drag.is_some() {
+                    self.cancel_drag(host);
+                    return;
+                }
                 self.handle_key_down(key, mods, text.as_deref(), rasterizer, clipboard, host);
             }
             InputEvent::MouseDown {
@@ -1226,17 +1346,22 @@ impl EditorApp {
             InputEvent::MouseMove { x_px, y_px, .. } => {
                 self.handle_mouse_move(x_px, y_px, rasterizer, host);
             }
-            InputEvent::MouseUp { button, .. } => {
+            InputEvent::MouseUp {
+                x_px, y_px, button, ..
+            } => {
                 if button == MouseButton::Left {
                     if self.dragging_sidebar_edge {
                         self.save_preferences(host);
+                    }
+                    if self.drag.is_some() {
+                        self.finish_drag(x_px, y_px, rasterizer, host);
                     }
                     self.dragging_selection = false;
                     self.dragging_gutter_anchor_line = None;
                     self.dragging_find_input = false;
                     self.dragging_replace_input = false;
                     self.dragging_sidebar_edge = false;
-                    self.dragging_split_edge = false;
+                    self.dragging_divider = None;
                     self.viewport.end_scrollbar_drag();
                 }
             }
@@ -1249,7 +1374,242 @@ impl EditorApp {
             } => {
                 self.handle_scroll(dx_px, dy_px, x_px, y_px, rasterizer, host);
             }
+            InputEvent::ExternalDrag {
+                phase,
+                x_px,
+                y_px,
+                path,
+            } => match phase {
+                DragPhase::Enter => {
+                    let is_file = path
+                        .as_deref()
+                        .is_some_and(|p| self.fs.stat(p).map(|st| !st.is_dir).unwrap_or(false));
+                    if let (true, Some(p)) = (is_file, path) {
+                        self.begin_drag(DragPayload::File(p), x_px, y_px, true);
+                        self.update_drag(x_px, y_px, rasterizer, host);
+                    }
+                }
+                DragPhase::Move => {
+                    if self.drag.is_some() {
+                        self.update_drag(x_px, y_px, rasterizer, host);
+                    }
+                }
+                DragPhase::Exit => self.cancel_drag(host),
+                DragPhase::Drop => {
+                    if self.drag.is_some() {
+                        self.finish_drag(x_px, y_px, rasterizer, host);
+                    } else if let Some(p) = path {
+                        self.handle_event(InputEvent::OpenPath(p), rasterizer, clipboard, host);
+                    }
+                }
+            },
         }
+    }
+
+    // ========================================================================
+    // Pane drag & drop (sidebar files, Finder files, pane headers)
+    // ========================================================================
+
+    fn begin_drag(&mut self, payload: DragPayload, x: f32, y: f32, started: bool) {
+        self.drag = Some(PaneDrag {
+            payload,
+            origin: (x, y),
+            pos: (x, y),
+            started,
+            external: started,
+            plan: None,
+            chip: PixelRect::ZERO,
+        });
+    }
+
+    /// Whether a drag gesture is currently showing its drop preview.
+    pub fn is_dragging(&self) -> bool {
+        self.drag.as_ref().is_some_and(|d| d.started)
+    }
+
+    /// Current drop plan of an active drag (what releasing now would do).
+    pub fn drag_plan(&self) -> Option<DropPlan> {
+        self.drag.as_ref().and_then(|d| d.plan)
+    }
+
+    fn pane_file_name(&self, id: PaneId) -> &str {
+        if id == self.active_id {
+            return self.doc.file_name();
+        }
+        self.other_panes
+            .iter()
+            .find(|p| p.id == id)
+            .map(|p| p.doc.file_name())
+            .unwrap_or("")
+    }
+
+    fn drag_labels(&self) -> (String, &'static str) {
+        let Some(d) = self.drag.as_ref() else {
+            return (String::new(), "");
+        };
+        let (name, is_pane) = match &d.payload {
+            DragPayload::File(p) => (
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.to_string_lossy().into_owned()),
+                false,
+            ),
+            DragPayload::Pane(id) => (self.pane_file_name(*id).to_string(), true),
+        };
+        let action = match (d.plan.map(|p| p.zone), is_pane) {
+            (None, _) => "Drop on a pane",
+            (Some(DropZone::Center), false) => "Open here",
+            (Some(DropZone::Left), false) => "Open to the left",
+            (Some(DropZone::Right), false) => "Open to the right",
+            (Some(DropZone::Top), false) => "Open above",
+            (Some(DropZone::Bottom), false) => "Open below",
+            (Some(DropZone::Center), true) => "Swap panes",
+            (Some(DropZone::Left), true) => "Move to the left",
+            (Some(DropZone::Right), true) => "Move to the right",
+            (Some(DropZone::Top), true) => "Move above",
+            (Some(DropZone::Bottom), true) => "Move below",
+        };
+        (name, action)
+    }
+
+    /// Floating label chip geometry (identical maths to `draw_drag_overlay`).
+    fn drag_chip_rect(&mut self, x: f32, y: f32, rasterizer: &mut dyn GlyphRasterizer) -> PixelRect {
+        let scale = self.framebuffer.scale;
+        let (name, action) = self.drag_labels();
+        let fs = DRAG_CHIP_FONT_PT * scale;
+        let wn = Painter::measure_text_ui(&name, FontStyle::UiBold, fs, &mut self.atlas, rasterizer);
+        let wa = Painter::measure_text_ui(action, FontStyle::Ui, fs, &mut self.atlas, rasterizer);
+        let w = (wn + wa + (DRAG_CHIP_GAP_PT + 2.0 * DRAG_CHIP_PAD_PT) * scale).ceil() as i32;
+        let h = (DRAG_CHIP_H_PT * scale).round() as i32;
+        let b = self.framebuffer.bounds();
+        let mut cx = (x + 14.0 * scale) as i32;
+        let mut cy = (y + 16.0 * scale) as i32;
+        if cx + w > b.right() {
+            cx = (x - 10.0 * scale) as i32 - w;
+        }
+        if cy + h > b.bottom() {
+            cy = (y - 10.0 * scale) as i32 - h;
+        }
+        PixelRect::new(cx.max(0), cy.max(0), w, h)
+    }
+
+    /// Track the pointer during a drag. Only the old ∪ new chip (and the preview, when the
+    /// target changes) are damaged, so each frame repaints a few small rects.
+    fn update_drag(&mut self, x: f32, y: f32, rasterizer: &mut dyn GlyphRasterizer, host: &mut dyn PlatformHost) {
+        let scale = self.framebuffer.scale;
+        let Some(d) = self.drag.as_mut() else { return };
+        d.pos = (x, y);
+        if !d.started {
+            let (dx, dy) = (x - d.origin.0, y - d.origin.1);
+            let thr = DRAG_THRESHOLD_PT * scale;
+            if dx * dx + dy * dy < thr * thr {
+                return;
+            }
+            d.started = true;
+        }
+        let moving = match d.payload {
+            DragPayload::Pane(id) => Some(id),
+            DragPayload::File(_) => None,
+        };
+        let old_plan = d.plan;
+        let old_chip = d.chip;
+        let plan = panes::plan_drop_at(
+            &self.arrangement,
+            &self.layout.grid,
+            x.round() as i32,
+            y.round() as i32,
+            moving,
+            scale,
+        );
+        if let Some(d) = self.drag.as_mut() {
+            d.plan = plan;
+        }
+        let chip = self.drag_chip_rect(x, y, rasterizer);
+        if let Some(d) = self.drag.as_mut() {
+            d.chip = chip;
+        }
+        if old_plan != plan {
+            if let Some(p) = old_plan {
+                self.mark_dirty_rect(p.preview);
+            }
+            if let Some(p) = plan {
+                self.mark_dirty_rect(p.preview);
+            }
+        }
+        self.mark_dirty_rect(old_chip);
+        self.mark_dirty_rect(chip);
+        host.set_cursor(CursorShape::Grabbing);
+        host.request_redraw();
+    }
+
+    fn cancel_drag(&mut self, host: &mut dyn PlatformHost) {
+        if let Some(d) = self.drag.take() {
+            self.mark_dirty_rect(d.chip);
+            if let Some(p) = d.plan {
+                self.mark_dirty_rect(p.preview);
+            }
+            host.set_cursor(CursorShape::Arrow);
+            host.request_redraw();
+        }
+    }
+
+    fn finish_drag(&mut self, x: f32, y: f32, rasterizer: &mut dyn GlyphRasterizer, host: &mut dyn PlatformHost) {
+        // Recompute at the release point so the outcome always equals the last preview.
+        if self.is_dragging() {
+            self.update_drag(x, y, rasterizer, host);
+        }
+        let Some(d) = self.drag.take() else { return };
+        self.mark_dirty_rect(d.chip);
+        if let Some(p) = d.plan {
+            self.mark_dirty_rect(p.preview);
+        }
+        host.set_cursor(CursorShape::Arrow);
+        if !d.started {
+            // Plain click on a sidebar file: open it in the active pane.
+            if let DragPayload::File(p) = d.payload {
+                self.request_discard_or_run(PendingDiscardAction::OpenPath(p), host);
+            }
+            host.request_redraw();
+            return;
+        }
+        match d.plan {
+            Some(plan) => {
+                self.apply_drop(d.payload, plan, host);
+            }
+            None if d.external => {
+                if let DragPayload::File(p) = d.payload {
+                    self.request_discard_or_run(PendingDiscardAction::OpenPath(p), host);
+                }
+            }
+            None => {}
+        }
+        host.request_redraw();
+    }
+
+    /// Execute a drop plan (shared by mouse drags, Finder drops and the CLI `drop`/`move-pane`).
+    pub fn apply_drop(&mut self, payload: DragPayload, plan: DropPlan, host: &mut dyn PlatformHost) -> bool {
+        match (payload, plan.zone) {
+            (DragPayload::File(p), DropZone::Center) => {
+                self.focus_pane_id(plan.target, host);
+                self.request_discard_or_run(PendingDiscardAction::OpenPath(p), host);
+                true
+            }
+            (DragPayload::File(p), zone) => self.split_pane_at(plan.target, zone, Some(&p), host),
+            (DragPayload::Pane(src), zone) => self.move_pane(src, plan.target, zone, host),
+        }
+    }
+
+    /// Plan a drop onto the pane at reading-order index `idx` with an explicit zone.
+    pub fn plan_drop_on(&self, idx: usize, zone: DropZone, moving: Option<PaneId>) -> Option<DropPlan> {
+        let target = self.arrangement.id_at_index(idx)?;
+        panes::plan_drop(
+            &self.arrangement,
+            &self.layout.grid,
+            target,
+            zone,
+            moving,
+            self.framebuffer.scale,
+        )
     }
 
     fn request_discard_or_run(&mut self, action: PendingDiscardAction, host: &mut dyn PlatformHost) {
@@ -1751,18 +2111,20 @@ impl EditorApp {
             AppCommand::SplitPane => {
                 self.split_pane_with(None, host);
             }
+            AppCommand::SplitPaneDown => {
+                self.split_pane_down(None, host);
+            }
             AppCommand::CloseSplit => {
                 self.request_close_active_pane(host);
             }
             AppCommand::SwapPanes => {
                 self.swap_panes(host);
             }
-            AppCommand::FocusLeftPane => {
-                self.focus_pane(0, host);
-            }
-            AppCommand::FocusRightPane => {
-                self.focus_pane(1, host);
-            }
+            AppCommand::FocusLeftPane => self.focus_direction(Direction::Left, host),
+            AppCommand::FocusRightPane => self.focus_direction(Direction::Right, host),
+            AppCommand::FocusUpPane => self.focus_direction(Direction::Up, host),
+            AppCommand::FocusDownPane => self.focus_direction(Direction::Down, host),
+            AppCommand::FocusNextPane => self.focus_next_pane(host),
             AppCommand::ZoomIn => {
                 self.viewport.zoom_in();
                 self.save_preferences(host);
@@ -2625,7 +2987,11 @@ impl EditorApp {
                     .handle_click(self.fs.as_ref(), self.layout.sidebar, x_px, y_px, scale)
                 {
                     SidebarAction::OpenFile(p) => {
-                        self.request_discard_or_run(PendingDiscardAction::OpenPath(p), host);
+                        // Start a drag candidate: if the user releases within 4pt it opens in the
+                        // active pane; if they drag beyond 4pt it shows the live drop preview!
+                        self.begin_drag(DragPayload::File(p), x_px, y_px, false);
+                        self.mark_dirty_rect(self.layout.sidebar);
+                        host.request_redraw();
                     }
                     SidebarAction::Changed => {
                         self.mark_dirty();
@@ -2702,61 +3068,44 @@ impl EditorApp {
             return;
         }
 
-        // 3. Split pane divider drag, pane header close (`×`) / double-click swap, or focus switch!
-        if self.secondary_pane.is_some() {
+        // 3. Pane grid divider drag, pane header close (`×`) / double-click swap / drag, or focus switch!
+        if !self.other_panes.is_empty() {
             let grab = (5.0 * scale).round() as i32;
-            if (xi - self.layout.split_divider.x).abs() <= grab
-                && yi >= self.layout.split_area.y
-                && yi < self.layout.split_area.bottom()
-            {
-                self.dragging_split_edge = true;
-                host.set_cursor(CursorShape::ResizeHorizontal);
+            if let Some(div) = self.layout.grid.divider_at(xi, yi, grab) {
+                self.dragging_divider = Some(div);
+                let cur = match div.axis {
+                    DividerAxis::Columns => CursorShape::ResizeHorizontal,
+                    DividerAxis::Rows(_) => CursorShape::ResizeVertical,
+                };
+                host.set_cursor(cur);
                 return;
             }
-            let header_h = (24.0 * scale).round() as i32;
             let close_w = (24.0 * scale).round() as i32;
-            let left_hdr = PixelRect::new(
-                self.layout.left_pane.x,
-                self.layout.split_area.y,
-                self.layout.left_pane.w,
-                header_h,
-            );
-            let right_hdr = PixelRect::new(
-                self.layout.right_pane.x,
-                self.layout.split_area.y,
-                self.layout.right_pane.w,
-                header_h,
-            );
-            let left_close = PixelRect::new(left_hdr.right() - close_w, left_hdr.y, close_w, header_h);
-            let right_close =
-                PixelRect::new(right_hdr.right() - close_w, right_hdr.y, close_w, header_h);
-            if left_close.contains(xi, yi) {
-                self.focus_pane(0, host);
-                self.request_close_active_pane(host);
-                return;
-            }
-            if right_close.contains(xi, yi) {
-                self.focus_pane(1, host);
-                self.request_close_active_pane(host);
-                return;
-            }
-            // Double-clicking either pane header swaps left ↔ right panes!
-            if click_count >= 2 && (left_hdr.contains(xi, yi) || right_hdr.contains(xi, yi)) {
-                self.swap_panes(host);
-                return;
-            }
-            let clicked_left = xi >= self.layout.left_pane.x
-                && xi < self.layout.split_divider.x
-                && yi >= self.layout.split_area.y
-                && yi < self.layout.split_area.bottom();
-            let clicked_right = xi >= self.layout.split_divider.right()
-                && xi < self.layout.split_area.right()
-                && yi >= self.layout.split_area.y
-                && yi < self.layout.split_area.bottom();
-            if clicked_left && self.active_pane != 0 {
-                self.focus_pane(0, host);
-            } else if clicked_right && self.active_pane != 1 {
-                self.focus_pane(1, host);
+            if let Some(pr) = self.layout.grid.pane_at(xi, yi).copied() {
+                if pr.header.contains(xi, yi) {
+                    let close_rect = PixelRect::new(
+                        pr.header.right() - close_w,
+                        pr.header.y,
+                        close_w,
+                        pr.header.h,
+                    );
+                    if close_rect.contains(xi, yi) {
+                        self.focus_pane_id(pr.id, host);
+                        self.request_close_active_pane(host);
+                        return;
+                    }
+                    if click_count >= 2 {
+                        self.focus_pane_id(pr.id, host);
+                        self.swap_panes(host);
+                        return;
+                    }
+                    self.focus_pane_id(pr.id, host);
+                    self.begin_drag(DragPayload::Pane(pr.id), x_px, y_px, false);
+                    return;
+                }
+                if pr.id != self.active_id {
+                    self.focus_pane_id(pr.id, host);
+                }
             }
         }
 
@@ -2860,6 +3209,10 @@ impl EditorApp {
         host: &mut dyn PlatformHost,
     ) {
         let scale = self.framebuffer.scale;
+        if self.drag.is_some() {
+            self.update_drag(x_px, y_px, rasterizer, host);
+            return;
+        }
         if self.dragging_sidebar_edge {
             self.sidebar.set_width_pt(x_px / scale);
             self.recompute_layout();
@@ -2867,9 +3220,8 @@ impl EditorApp {
             host.request_redraw();
             return;
         }
-        if self.dragging_split_edge && self.layout.split_area.w > 0 {
-            let rel = (x_px - self.layout.split_area.x as f32) / (self.layout.split_area.w as f32);
-            self.split_ratio = rel.clamp(0.2, 0.8);
+        if let Some(div) = self.dragging_divider {
+            self.arrangement.drag_divider(&div, x_px, y_px);
             self.recompute_layout();
             self.mark_dirty();
             host.request_redraw();
@@ -2983,14 +3335,21 @@ impl EditorApp {
                 return;
             }
         }
-        if self.secondary_pane.is_some() {
+        if !self.other_panes.is_empty() {
             let grab = (5.0 * scale).round() as i32;
-            if (xi - self.layout.split_divider.x).abs() <= grab
-                && yi >= self.layout.split_area.y
-                && yi < self.layout.split_area.bottom()
-            {
-                host.set_cursor(CursorShape::ResizeHorizontal);
+            if let Some(div) = self.layout.grid.divider_at(xi, yi, grab) {
+                let cur = match div.axis {
+                    DividerAxis::Columns => CursorShape::ResizeHorizontal,
+                    DividerAxis::Rows(_) => CursorShape::ResizeVertical,
+                };
+                host.set_cursor(cur);
                 return;
+            }
+            if let Some(pr) = self.layout.grid.pane_at(xi, yi) {
+                if pr.header.contains(xi, yi) {
+                    host.set_cursor(CursorShape::Pointer);
+                    return;
+                }
             }
         }
         let sb = self.viewport.hit_test_scrollbar(x_px, y_px);
@@ -3010,9 +3369,9 @@ impl EditorApp {
             host.set_cursor(CursorShape::Arrow);
         } else if self.viewport.layout.text.contains(xi, yi)
             || self
-                .secondary_pane
-                .as_ref()
-                .is_some_and(|p| p.viewport.layout.text.contains(xi, yi))
+                .other_panes
+                .iter()
+                .any(|p| p.viewport.layout.text.contains(xi, yi))
         {
             host.set_cursor(CursorShape::IBeam);
         } else {
@@ -3038,23 +3397,16 @@ impl EditorApp {
             return;
         }
         let metrics = self.doc_metrics(rasterizer);
-        if self.secondary_pane.is_some() {
-            let inactive_rect = if self.active_pane == 0 {
-                self.layout.right_pane
-            } else {
-                self.layout.left_pane
-            };
-            let over_inactive_col = xi >= inactive_rect.x
-                && xi < inactive_rect.right()
-                && yi >= self.layout.split_area.y
-                && yi < self.layout.split_area.bottom();
-            if over_inactive_col {
-                if let Some(ref mut sec) = self.secondary_pane {
-                    sec.viewport
-                        .scroll_by(dx_px, dy_px, &mut sec.doc, metrics, self.framebuffer.scale);
-                    self.mark_dirty_rect(inactive_rect);
-                    host.request_redraw();
-                    return;
+        if !self.other_panes.is_empty() {
+            if let Some(pr) = self.layout.grid.pane_at(xi, yi).copied() {
+                if pr.id != self.active_id {
+                    if let Some(sec) = self.other_panes.iter_mut().find(|p| p.id == pr.id) {
+                        sec.viewport
+                            .scroll_by(dx_px, dy_px, &mut sec.doc, metrics, self.framebuffer.scale);
+                        self.mark_dirty_rect(pr.body);
+                        host.request_redraw();
+                        return;
+                    }
                 }
             }
         }
@@ -3230,36 +3582,34 @@ impl EditorApp {
         };
         let rev = self.doc.rev();
 
-        let panes_json = if let Some(ref sec) = self.secondary_pane {
-            let active_obj = format!(
-                "{{\"path\":{},\"file_name\":{},\"dirty\":{}}}",
-                path_json,
-                json_quote(self.doc.file_name()),
-                self.doc.is_dirty()
-            );
-            let sec_path = match sec.doc.path() {
-                Some(p) => json_quote(&p.to_string_lossy()),
-                None => "null".to_string(),
-            };
-            let sec_obj = format!(
-                "{{\"path\":{},\"file_name\":{},\"dirty\":{}}}",
-                sec_path,
-                json_quote(sec.doc.file_name()),
-                sec.doc.is_dirty()
-            );
-            if self.active_pane == 0 {
-                format!("[{active_obj},{sec_obj}]")
-            } else {
-                format!("[{sec_obj},{active_obj}]")
+        let (ordered_ids, ordered_n) = self.arrangement.ordered();
+        let mut panes_json = String::from("[");
+        for (idx, &pid) in ordered_ids[..ordered_n].iter().enumerate() {
+            if idx > 0 {
+                panes_json.push(',');
             }
-        } else {
-            format!(
-                "[{{\"path\":{},\"file_name\":{},\"dirty\":{}}}]",
-                path_json,
-                json_quote(self.doc.file_name()),
-                self.doc.is_dirty()
-            )
-        };
+            let slot = self.arrangement.slot_of(pid).unwrap_or_default();
+            let (p_json, fname, dirty) = if pid == self.active_id {
+                (path_json.clone(), self.doc.file_name(), self.doc.is_dirty())
+            } else if let Some(sec) = self.other_panes.iter().find(|p| p.id == pid) {
+                let sp = match sec.doc.path() {
+                    Some(p) => json_quote(&p.to_string_lossy()),
+                    None => "null".to_string(),
+                };
+                (sp, sec.doc.file_name(), sec.doc.is_dirty())
+            } else {
+                ("null".to_string(), "Untitled", false)
+            };
+            panes_json.push_str(&format!(
+                "{{\"index\":{idx},\"col\":{},\"row\":{},\"path\":{},\"file_name\":{},\"dirty\":{}}}",
+                slot.col,
+                slot.row,
+                p_json,
+                json_quote(fname),
+                dirty
+            ));
+        }
+        panes_json.push(']');
 
         format!(
             concat!(
@@ -3282,8 +3632,8 @@ impl EditorApp {
             path_json,
             json_quote(self.doc.file_name()),
             self.doc.is_dirty(),
-            self.secondary_pane.is_some(),
-            self.active_pane,
+            self.is_split(),
+            self.active_pane_index(),
             panes_json,
             self.doc.len_bytes(),
             line_count,
@@ -3580,13 +3930,21 @@ impl EditorApp {
                         self.mark_dirty();
                         host.request_redraw();
                     }
-                    "split" => self.handle_command(AppCommand::SplitPane, rasterizer, clipboard, host),
+                    "split" | "split-right" => {
+                        self.handle_command(AppCommand::SplitPane, rasterizer, clipboard, host)
+                    }
+                    "split-down" => {
+                        self.handle_command(AppCommand::SplitPaneDown, rasterizer, clipboard, host)
+                    }
                     "unsplit" | "close-pane" => {
                         self.handle_command(AppCommand::CloseSplit, rasterizer, clipboard, host)
                     }
                     "swap-panes" => self.handle_command(AppCommand::SwapPanes, rasterizer, clipboard, host),
                     "focus-left" => self.handle_command(AppCommand::FocusLeftPane, rasterizer, clipboard, host),
                     "focus-right" => self.handle_command(AppCommand::FocusRightPane, rasterizer, clipboard, host),
+                    "focus-up" => self.handle_command(AppCommand::FocusUpPane, rasterizer, clipboard, host),
+                    "focus-down" => self.handle_command(AppCommand::FocusDownPane, rasterizer, clipboard, host),
+                    "focus-next" => self.handle_command(AppCommand::FocusNextPane, rasterizer, clipboard, host),
                     "find-next" => self.handle_command(AppCommand::FindNext, rasterizer, clipboard, host),
                     "find-prev" => self.handle_command(AppCommand::FindPrev, rasterizer, clipboard, host),
                     "move-line-up" => self.handle_command(AppCommand::MoveLineUp, rasterizer, clipboard, host),
@@ -3596,6 +3954,99 @@ impl EditorApp {
                     "save-as" => self.handle_command(AppCommand::SaveAs, rasterizer, clipboard, host),
                     "quit" => self.handle_command(AppCommand::Quit, rasterizer, clipboard, host),
                     "focus" => activate = true,
+                    other if other.starts_with("split-down:") => {
+                        let p = PathBuf::from(&other["split-down:".len()..]);
+                        self.split_pane_down(Some(&p), host);
+                        activate = true;
+                    }
+                    other if other.starts_with("drop:") => {
+                        // drop:<target_idx>:<zone>:<path>
+                        let rest = &other["drop:".len()..];
+                        let mut parts = rest.splitn(3, ':');
+                        let (Some(t_str), Some(z_str), Some(p_str)) =
+                            (parts.next(), parts.next(), parts.next())
+                        else {
+                            return (
+                                IpcReply::Error("usage: drop:<pane_idx>:<zone>:<path>".to_string()),
+                                false,
+                                false,
+                            );
+                        };
+                        let Ok(target_idx) = t_str.parse::<usize>() else {
+                            return (
+                                IpcReply::Error(format!("invalid pane index `{t_str}`")),
+                                false,
+                                false,
+                            );
+                        };
+                        let Some(zone) = DropZone::parse(z_str) else {
+                            return (
+                                IpcReply::Error(format!(
+                                    "invalid drop zone `{z_str}` (use center|left|right|top|bottom)"
+                                )),
+                                false,
+                                false,
+                            );
+                        };
+                        let Some(plan) = self.plan_drop_on(target_idx, zone, None) else {
+                            return (
+                                IpcReply::Error(format!("pane index {target_idx} out of range")),
+                                false,
+                                false,
+                            );
+                        };
+                        self.apply_drop(DragPayload::File(PathBuf::from(p_str)), plan, host);
+                        activate = true;
+                    }
+                    other if other.starts_with("move-pane:") => {
+                        // move-pane:<src_idx>:<target_idx>:<zone>
+                        let rest = &other["move-pane:".len()..];
+                        let mut parts = rest.splitn(3, ':');
+                        let (Some(s_str), Some(t_str), Some(z_str)) =
+                            (parts.next(), parts.next(), parts.next())
+                        else {
+                            return (
+                                IpcReply::Error(
+                                    "usage: move-pane:<src_idx>:<target_idx>:<zone>".to_string(),
+                                ),
+                                false,
+                                false,
+                            );
+                        };
+                        let (Ok(src_idx), Ok(target_idx)) =
+                            (s_str.parse::<usize>(), t_str.parse::<usize>())
+                        else {
+                            return (
+                                IpcReply::Error("invalid pane index".to_string()),
+                                false,
+                                false,
+                            );
+                        };
+                        let Some(zone) = DropZone::parse(z_str) else {
+                            return (
+                                IpcReply::Error(format!(
+                                    "invalid drop zone `{z_str}` (use center|left|right|top|bottom)"
+                                )),
+                                false,
+                                false,
+                            );
+                        };
+                        let Some(src_id) = self.arrangement.id_at_index(src_idx) else {
+                            return (
+                                IpcReply::Error(format!("source pane {src_idx} out of range")),
+                                false,
+                                false,
+                            );
+                        };
+                        let Some(plan) = self.plan_drop_on(target_idx, zone, Some(src_id)) else {
+                            return (
+                                IpcReply::Error("illegal pane move".to_string()),
+                                false,
+                                false,
+                            );
+                        };
+                        self.apply_drop(DragPayload::Pane(src_id), plan, host);
+                    }
                     other if other.starts_with("wrap-ext:") => {
                         let spec = &other["wrap-ext:".len()..];
                         if let Some((ext, val)) = spec.split_once('=') {
@@ -3645,6 +4096,80 @@ impl EditorApp {
                 }
             }
         }
+    }
+}
+
+const DRAG_THRESHOLD_PT: f32 = 4.0;
+const DRAG_CHIP_FONT_PT: f32 = 11.5;
+const DRAG_CHIP_H_PT: f32 = 26.0;
+const DRAG_CHIP_PAD_PT: f32 = 10.0;
+const DRAG_CHIP_GAP_PT: f32 = 8.0;
+
+#[allow(clippy::too_many_arguments)]
+fn draw_drag_overlay(
+    painter: &mut Painter,
+    preview: Option<PixelRect>,
+    chip: PixelRect,
+    name: &str,
+    action: &str,
+    theme: &Theme,
+    atlas: &mut GlyphAtlas,
+    rasterizer: &mut dyn GlyphRasterizer,
+) {
+    let scale = painter.scale();
+    let hairline = (1.0 * scale).round().max(1.0) as i32;
+    let clip = painter.current_clip();
+
+    if let Some(p) = preview {
+        let inset = (6.0 * scale).round() as i32;
+        let box_rect = PixelRect::new(
+            p.x + inset,
+            p.y + inset,
+            (p.w - 2 * inset).max(0),
+            (p.h - 2 * inset).max(0),
+        );
+        if !box_rect.is_empty() && !box_rect.intersect(clip).is_empty() {
+            let radius = 6.0 * scale;
+            let fill = theme.selection.with_alpha(if theme.is_dark { 145 } else { 155 });
+            painter.fill_rounded_rect(box_rect, radius, fill);
+            painter.stroke_rounded_rect(
+                box_rect,
+                radius,
+                hairline as f32,
+                theme.border_control,
+            );
+        }
+    }
+
+    if !chip.is_empty() && !chip.intersect(clip).is_empty() {
+        let radius = 6.0 * scale;
+        painter.fill_rounded_rect(chip, radius, theme.page.with_alpha(242));
+        painter.stroke_rounded_rect(chip, radius, hairline as f32, theme.border_control);
+
+        let fs = DRAG_CHIP_FONT_PT * scale;
+        let m_bold = atlas.metrics(rasterizer, FontStyle::UiBold, fs);
+        let baseline = chip.y as f32 + (chip.h as f32 + m_bold.ascent - m_bold.descent) * 0.5;
+        let x0 = chip.x as f32 + DRAG_CHIP_PAD_PT * scale;
+        let pen_after_name = painter.draw_text_ui(
+            x0,
+            baseline,
+            name,
+            FontStyle::UiBold,
+            fs,
+            theme.text,
+            atlas,
+            rasterizer,
+        );
+        painter.draw_text_ui(
+            pen_after_name + DRAG_CHIP_GAP_PT * scale,
+            baseline,
+            action,
+            FontStyle::Ui,
+            fs,
+            theme.text_muted,
+            atlas,
+            rasterizer,
+        );
     }
 }
 

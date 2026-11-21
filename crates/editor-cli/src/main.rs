@@ -89,6 +89,8 @@ fn main() -> ExitCode {
         "batch" => cmd_batch(&fs, &globals, rest, start),
         "open" | "gui" => cmd_open(cmd, &fs, &globals, rest, start),
         "split" => cmd_split(&fs, &globals, rest, start),
+        "drop" => cmd_drop(&fs, &globals, rest, start),
+        "move-pane" => cmd_move_pane(rest, start),
         "unsplit" => send_live_gui_command("unsplit", &editor_platform::ipc::IpcCommand::Unsplit, start),
         "focus-pane" => cmd_focus_pane(rest, start),
         "status" => cmd_status(start),
@@ -130,9 +132,11 @@ fn print_usage() {
                              (--expect REV | --force) [--dry-run] [--in-place]\n\
            editor batch [--file F | --stdin] [--check]\n\
            editor open [--sidebar-root DIR] [PATH]               (launch or focus GUI, alias: gui)\n\
-           editor split [PATH]                                   (open/focus side-by-side split pane)\n\
-           editor unsplit                                        (close split pane)\n\
-           editor focus-pane <left|right|0|1>                    (switch active split pane)\n\
+           editor split [--down] [PATH]                          (split active pane right or down, up to 2x2)\n\
+           editor drop <PATH> [--pane 0..3] [--zone center|left|right|top|bottom]\n\
+           editor move-pane <SRC_IDX> <TARGET_IDX> [center|left|right|top|bottom]\n\
+           editor unsplit                                        (close active split pane)\n\
+           editor focus-pane <0..3|left|right|up|down|next>      (switch active split pane)\n\
            editor status                                         (inspect live GUI state)\n\
            editor goto <LINE[:COL]>                              (jump live GUI caret)\n\
            editor select (<L1[:C1]> <L2[:C2]> | --all)           (set live GUI selection)\n\
@@ -1398,6 +1402,13 @@ fn launch_gui_process(sidebar_root: Option<&Path>, target: Option<&Path>) -> Res
             if !status.success() {
                 return Err(format!("open failed with status {status}"));
             }
+            let sock = editor_platform::ipc::default_socket_path();
+            for _ in 0..80 {
+                if editor_platform::ipc::send_ping(&sock).is_ok() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             return Ok(());
         }
     }
@@ -1519,7 +1530,20 @@ fn cmd_open(
 }
 
 fn cmd_split(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
-    let path = if let Some(arg) = args.first() {
+    let mut down = false;
+    let mut raw_path: Option<&str> = None;
+    for arg in args {
+        match arg.as_str() {
+            "--down" | "-d" => down = true,
+            "--right" | "-r" => down = false,
+            other if !other.starts_with('-') && raw_path.is_none() => raw_path = Some(other),
+            other => {
+                emit_err("split", start, "E_USAGE", &format!("unexpected arg: {other}"), None);
+                return 3;
+            }
+        }
+    }
+    let path = if let Some(arg) = raw_path {
         match resolve_confined(fs, globals, arg) {
             Ok(p) => Some(p),
             Err((c, m)) => {
@@ -1530,9 +1554,100 @@ fn cmd_split(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: 
     } else {
         None
     };
+    if down {
+        let act = match path {
+            Some(p) => format!("split-down:{}", p.to_string_lossy()),
+            None => "split-down".to_string(),
+        };
+        send_live_gui_command(
+            "split",
+            &editor_platform::ipc::IpcCommand::Action(act),
+            start,
+        )
+    } else {
+        send_live_gui_command(
+            "split",
+            &editor_platform::ipc::IpcCommand::Split { path },
+            start,
+        )
+    }
+}
+
+fn cmd_drop(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
+    let mut raw_path: Option<&str> = None;
+    let mut pane_idx: usize = 0;
+    let mut zone = "right";
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--pane" if i + 1 < args.len() => {
+                let Ok(idx) = args[i + 1].parse::<usize>() else {
+                    emit_err("drop", start, "E_USAGE", "invalid --pane index (0..3)", None);
+                    return 3;
+                };
+                pane_idx = idx;
+                i += 2;
+            }
+            "--zone" if i + 1 < args.len() => {
+                zone = args[i + 1].as_str();
+                i += 2;
+            }
+            other if !other.starts_with('-') && raw_path.is_none() => {
+                raw_path = Some(other);
+                i += 1;
+            }
+            other => {
+                emit_err("drop", start, "E_USAGE", &format!("unexpected arg: {other}"), None);
+                return 3;
+            }
+        }
+    }
+    let Some(raw) = raw_path else {
+        emit_err(
+            "drop",
+            start,
+            "E_USAGE",
+            "usage: editor drop <PATH> [--pane 0..3] [--zone center|left|right|top|bottom]",
+            None,
+        );
+        return 3;
+    };
+    let path = match resolve_confined(fs, globals, raw) {
+        Ok(p) => p,
+        Err((c, m)) => {
+            emit_err("drop", start, c, &m, Some(Path::new(raw)));
+            return 2;
+        }
+    };
     send_live_gui_command(
-        "split",
-        &editor_platform::ipc::IpcCommand::Split { path },
+        "drop",
+        &editor_platform::ipc::IpcCommand::Action(format!(
+            "drop:{pane_idx}:{zone}:{}",
+            path.to_string_lossy()
+        )),
+        start,
+    )
+}
+
+fn cmd_move_pane(args: &[String], start: Instant) -> u8 {
+    if args.len() < 2 {
+        emit_err(
+            "move-pane",
+            start,
+            "E_USAGE",
+            "usage: editor move-pane <SRC_IDX> <TARGET_IDX> [center|left|right|top|bottom]",
+            None,
+        );
+        return 3;
+    }
+    let (Ok(src), Ok(dst)) = (args[0].parse::<usize>(), args[1].parse::<usize>()) else {
+        emit_err("move-pane", start, "E_USAGE", "pane indices must be 0..3", None);
+        return 3;
+    };
+    let zone = args.get(2).map(String::as_str).unwrap_or("center");
+    send_live_gui_command(
+        "move-pane",
+        &editor_platform::ipc::IpcCommand::Action(format!("move-pane:{src}:{dst}:{zone}")),
         start,
     )
 }
@@ -1543,30 +1658,68 @@ fn cmd_focus_pane(args: &[String], start: Instant) -> u8 {
             "focus-pane",
             start,
             "E_USAGE",
-            "usage: editor focus-pane <left|right|0|1>",
+            "usage: editor focus-pane <0..3|left|right|up|down|next>",
             None,
         );
         return 3;
     };
-    let idx = match arg.as_str() {
-        "0" | "left" => 0,
-        "1" | "right" => 1,
+    match arg.as_str() {
+        "0" | "tl" | "top-left" => send_live_gui_command(
+            "focus-pane",
+            &editor_platform::ipc::IpcCommand::FocusPane(0),
+            start,
+        ),
+        "1" | "tr" | "top-right" => send_live_gui_command(
+            "focus-pane",
+            &editor_platform::ipc::IpcCommand::FocusPane(1),
+            start,
+        ),
+        "2" | "bl" | "bottom-left" => send_live_gui_command(
+            "focus-pane",
+            &editor_platform::ipc::IpcCommand::FocusPane(2),
+            start,
+        ),
+        "3" | "br" | "bottom-right" => send_live_gui_command(
+            "focus-pane",
+            &editor_platform::ipc::IpcCommand::FocusPane(3),
+            start,
+        ),
+        "left" => send_live_gui_command(
+            "focus-pane",
+            &editor_platform::ipc::IpcCommand::FocusPane(0),
+            start,
+        ),
+        "right" => send_live_gui_command(
+            "focus-pane",
+            &editor_platform::ipc::IpcCommand::FocusPane(1),
+            start,
+        ),
+        "up" | "top" => send_live_gui_command(
+            "focus-pane",
+            &editor_platform::ipc::IpcCommand::Action("focus-up".to_string()),
+            start,
+        ),
+        "down" | "bottom" => send_live_gui_command(
+            "focus-pane",
+            &editor_platform::ipc::IpcCommand::Action("focus-down".to_string()),
+            start,
+        ),
+        "next" => send_live_gui_command(
+            "focus-pane",
+            &editor_platform::ipc::IpcCommand::Action("focus-next".to_string()),
+            start,
+        ),
         _ => {
             emit_err(
                 "focus-pane",
                 start,
                 "E_USAGE",
-                "pane must be left, right, 0, or 1",
+                "pane must be 0..3, left, right, up, down, or next",
                 None,
             );
-            return 3;
+            3
         }
-    };
-    send_live_gui_command(
-        "focus-pane",
-        &editor_platform::ipc::IpcCommand::FocusPane(idx),
-        start,
-    )
+    }
 }
 
 fn cmd_quit(command_name: &str, args: &[String], start: Instant) -> u8 {

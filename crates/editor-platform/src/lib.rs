@@ -19,8 +19,8 @@ pub use fs::{
 };
 pub use host::{Clipboard, HeadlessHost, MemoryClipboard, PlatformHost};
 pub use input::{
-    AppCommand, ConfirmChoice, CursorShape, InputEvent, Key, Modifiers, MouseButton, SystemTheme,
-    ThemePreference,
+    AppCommand, ConfirmChoice, CursorShape, DragPhase, InputEvent, Key, Modifiers, MouseButton,
+    SystemTheme, ThemePreference,
 };
 pub use raster::{
     BuiltinBitmapRasterizer, FontMetrics, FontStyle, GlyphFormat, GlyphRasterizer, RasterizedGlyph,

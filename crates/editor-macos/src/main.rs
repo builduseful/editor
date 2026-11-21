@@ -48,6 +48,7 @@ struct MacCallbacks {
     on_focus: extern "C" fn(*mut c_void, u32),
     on_theme: extern "C" fn(*mut c_void, u32),
     on_open_path: extern "C" fn(*mut c_void, *const c_char),
+    on_drag: extern "C" fn(*mut c_void, u32, f32, f32, *const c_char),
     on_command: extern "C" fn(*mut c_void, u32),
     on_tick: extern "C" fn(*mut c_void, u64),
     on_needs_render: extern "C" fn(*mut c_void, *mut u32, *mut u32, *mut f32) -> c_int,
@@ -279,6 +280,8 @@ impl PlatformHost for MacHost {
             CursorShape::IBeam => 1,
             CursorShape::Pointer => 2,
             CursorShape::ResizeHorizontal => 3,
+            CursorShape::ResizeVertical => 4,
+            CursorShape::Grabbing => 5,
         };
         unsafe { mac_set_cursor(id) };
     }
@@ -431,6 +434,9 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         31 => Some(AppCommand::ToggleComment),
         32 => Some(AppCommand::DuplicateLine),
         33 => Some(AppCommand::DeleteLine),
+        34 => Some(AppCommand::SplitPaneDown),
+        35 => Some(AppCommand::FocusUpPane),
+        36 => Some(AppCommand::FocusDownPane),
         100 => Some(AppCommand::SetTheme(ThemePreference::System)),
         101 => Some(AppCommand::SetTheme(ThemePreference::Light)),
         102 => Some(AppCommand::SetTheme(ThemePreference::Dark)),
@@ -588,6 +594,42 @@ extern "C" fn cb_open_path(ud: *mut c_void, path_ptr: *const c_char) {
     );
 }
 
+extern "C" fn cb_drag(
+    ud: *mut c_void,
+    phase: u32,
+    x: f32,
+    y: f32,
+    path_ptr: *const c_char,
+) {
+    let b = unsafe { &mut *(ud as *mut Bridge) };
+    let ph = match phase {
+        0 => editor_platform::DragPhase::Enter,
+        1 => editor_platform::DragPhase::Move,
+        2 => editor_platform::DragPhase::Exit,
+        _ => editor_platform::DragPhase::Drop,
+    };
+    let path = if path_ptr.is_null() {
+        None
+    } else {
+        Some(PathBuf::from(
+            unsafe { CStr::from_ptr(path_ptr) }
+                .to_string_lossy()
+                .into_owned(),
+        ))
+    };
+    b.app.handle_event(
+        InputEvent::ExternalDrag {
+            phase: ph,
+            x_px: x,
+            y_px: y,
+            path,
+        },
+        &mut b.rasterizer,
+        &mut b.clipboard,
+        &mut b.host,
+    );
+}
+
 extern "C" fn cb_command(ud: *mut c_void, cmd_id: u32) {
     let b = unsafe { &mut *(ud as *mut Bridge) };
     if let Some(cmd) = decode_menu_cmd(cmd_id) {
@@ -722,6 +764,8 @@ fn main() {
     let mut open_quick = false;
     let mut open_project_search: Option<String> = None;
     let mut split_file: Option<PathBuf> = None;
+    let mut grid_files: Vec<PathBuf> = Vec::new();
+    let mut drag_preview_arg: Option<String> = None;
     let mut open_shortcuts = false;
     let mut open_shortcuts_all = false;
     let mut enable_vim = false;
@@ -778,6 +822,18 @@ fn main() {
                 split_file = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
+            "--grid-2x2" if i + 3 < args.len() => {
+                grid_files = vec![
+                    PathBuf::from(&args[i + 1]),
+                    PathBuf::from(&args[i + 2]),
+                    PathBuf::from(&args[i + 3]),
+                ];
+                i += 4;
+            }
+            "--drag-preview" if i + 1 < args.len() => {
+                drag_preview_arg = Some(args[i + 1].clone());
+                i += 2;
+            }
             "--shortcuts" => {
                 open_shortcuts = true;
                 i += 1;
@@ -827,6 +883,75 @@ fn main() {
         }
         if let Some(sp) = split_file {
             app.split_pane_with(Some(&sp), &mut host);
+        }
+        if grid_files.len() == 3 {
+            app.split_pane_with(Some(&grid_files[0]), &mut host);
+            app.focus_pane(0, &mut host);
+            app.split_pane_down(Some(&grid_files[1]), &mut host);
+            app.focus_pane(1, &mut host);
+            app.split_pane_down(Some(&grid_files[2]), &mut host);
+        }
+        if let Some(spec) = drag_preview_arg {
+            // Format: <pane_idx>:<zone>:<path>
+            let mut parts = spec.splitn(3, ':');
+            if let (Some(idx_s), Some(z_s), Some(p_s)) = (parts.next(), parts.next(), parts.next())
+            {
+                if let (Ok(idx), Some(zone)) =
+                    (idx_s.parse::<usize>(), editor_app::DropZone::parse(z_s))
+                {
+                    if let Some(plan) = app.plan_drop_on(idx, zone, None) {
+                        let cx = (plan.preview.x + plan.preview.w / 2) as f32;
+                        let cy = (plan.preview.y + plan.preview.h / 2) as f32;
+                        let p = PathBuf::from(p_s);
+                        app.handle_event(
+                            InputEvent::ExternalDrag {
+                                phase: editor_platform::DragPhase::Enter,
+                                x_px: cx,
+                                y_px: cy,
+                                path: Some(p),
+                            },
+                            &mut rasterizer,
+                            &mut MacClipboard,
+                            &mut host,
+                        );
+                        // Position pointer at the chosen zone of target pane:
+                        let t_frame = app
+                            .layout
+                            .grid
+                            .get(plan.target)
+                            .map(|r| r.frame)
+                            .unwrap_or(plan.preview);
+                        let (px, py) = match zone {
+                            editor_app::DropZone::Center => {
+                                (t_frame.x + t_frame.w / 2, t_frame.y + t_frame.h / 2)
+                            }
+                            editor_app::DropZone::Left => {
+                                (t_frame.x + t_frame.w / 8, t_frame.y + t_frame.h / 2)
+                            }
+                            editor_app::DropZone::Right => {
+                                (t_frame.right() - t_frame.w / 8, t_frame.y + t_frame.h / 2)
+                            }
+                            editor_app::DropZone::Top => {
+                                (t_frame.x + t_frame.w / 2, t_frame.y + t_frame.h / 8)
+                            }
+                            editor_app::DropZone::Bottom => {
+                                (t_frame.x + t_frame.w / 2, t_frame.bottom() - t_frame.h / 8)
+                            }
+                        };
+                        app.handle_event(
+                            InputEvent::ExternalDrag {
+                                phase: editor_platform::DragPhase::Move,
+                                x_px: px as f32,
+                                y_px: py as f32,
+                                path: None,
+                            },
+                            &mut rasterizer,
+                            &mut MacClipboard,
+                            &mut host,
+                        );
+                    }
+                }
+            }
         }
         if open_find {
             app.find_bar.open(true, Some("fn"));
@@ -899,6 +1024,7 @@ fn main() {
         on_focus: cb_focus,
         on_theme: cb_theme,
         on_open_path: cb_open_path,
+        on_drag: cb_drag,
         on_command: cb_command,
         on_tick: cb_tick,
         on_needs_render: cb_needs_render,

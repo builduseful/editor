@@ -63,6 +63,16 @@ pub enum CursorShape {
     IBeam,
     Pointer,
     ResizeHorizontal,
+    ResizeVertical,
+    Grabbing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DragPhase {
+    Enter,
+    Move,
+    Exit,
+    Drop,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -114,10 +124,14 @@ pub enum AppCommand {
     ToggleWrap,
     ToggleSidebar,
     SplitPane,
+    SplitPaneDown,
     CloseSplit,
     SwapPanes,
     FocusLeftPane,
     FocusRightPane,
+    FocusUpPane,
+    FocusDownPane,
+    FocusNextPane,
     ZoomIn,
     ZoomOut,
     ZoomReset,
@@ -173,5 +187,12 @@ pub enum InputEvent {
     /// Periodic caret blink / debounce timer tick (`now_ms` monotonic milliseconds).
     Tick {
         now_ms: u64,
+    },
+    /// External OS file drag lifecycle (e.g. Finder file dragged over the window).
+    ExternalDrag {
+        phase: DragPhase,
+        x_px: f32,
+        y_px: f32,
+        path: Option<PathBuf>,
     },
 }
