@@ -1369,7 +1369,10 @@ fn launch_gui_process(sidebar_root: Option<&Path>, target: Option<&Path>) -> Res
             if !gui_args.is_empty() {
                 cmd.arg("--args").args(&gui_args);
             }
-            cmd.spawn().map_err(|e| e.to_string())?;
+            let status = cmd.status().map_err(|e| e.to_string())?;
+            if !status.success() {
+                return Err(format!("open failed with status {status}"));
+            }
             return Ok(());
         }
     }
