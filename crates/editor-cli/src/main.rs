@@ -93,6 +93,13 @@ fn main() -> ExitCode {
         "move-pane" => cmd_move_pane(rest, start),
         "unsplit" => send_live_gui_command("unsplit", &editor_platform::ipc::IpcCommand::Unsplit, start),
         "focus-pane" => cmd_focus_pane(rest, start),
+        "pin" => cmd_pin(&fs, &globals, rest, start),
+        "unpin" => cmd_unpin(&fs, &globals, rest, start),
+        "pins" => cmd_status(start),
+        "buffers" => cmd_status(start),
+        "zoom" => cmd_action_direct("zoom", start),
+        "new-tab" => cmd_action_direct("new-tab", start),
+        "close-tab" => cmd_action_direct("close-tab", start),
         "status" => cmd_status(start),
         "goto" => cmd_goto(rest, start),
         "select" => cmd_select(rest, start),
@@ -137,6 +144,11 @@ fn print_usage() {
            editor move-pane <SRC_IDX> <TARGET_IDX> [center|left|right|top|bottom]\n\
            editor unsplit                                        (close active split pane)\n\
            editor focus-pane <0..3|left|right|up|down|next>      (switch active split pane)\n\
+           editor pin [PATH]                                     (pin current file or PATH to Harpoon 1..9)\n\
+           editor unpin [SLOT|PATH]                              (unpin current file, slot 1..9, or PATH)\n\
+           editor pins | buffers                                 (inspect Harpoon pins & open buffers)\n\
+           editor zoom                                           (toggle fullscreen zoom on active pane)\n\
+           editor new-tab | close-tab                            (create or close tab in Working-Set Strip)\n\
            editor status                                         (inspect live GUI state)\n\
            editor goto <LINE[:COL]>                              (jump live GUI caret)\n\
            editor select (<L1[:C1]> <L2[:C2]> | --all)           (set live GUI selection)\n\
@@ -324,8 +336,17 @@ fn cmd_schema(args: &[String], start: Instant) -> u8 {
         "open",
         "gui",
         "split",
+        "drop",
+        "move-pane",
         "unsplit",
         "focus-pane",
+        "pin",
+        "unpin",
+        "pins",
+        "buffers",
+        "zoom",
+        "new-tab",
+        "close-tab",
         "status",
         "goto",
         "select",
@@ -1650,6 +1671,52 @@ fn cmd_move_pane(args: &[String], start: Instant) -> u8 {
         &editor_platform::ipc::IpcCommand::Action(format!("move-pane:{src}:{dst}:{zone}")),
         start,
     )
+}
+
+fn cmd_pin(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
+    if let Some(raw) = args.first() {
+        let path = match resolve_confined(fs, globals, raw) {
+            Ok(p) => p,
+            Err((c, m)) => {
+                emit_err("pin", start, c, &m, Some(Path::new(raw)));
+                return 2;
+            }
+        };
+        send_live_gui_command(
+            "pin",
+            &editor_platform::ipc::IpcCommand::Action(format!("pin:{}", path.to_string_lossy())),
+            start,
+        )
+    } else {
+        send_live_gui_command(
+            "pin",
+            &editor_platform::ipc::IpcCommand::Action("pin".to_string()),
+            start,
+        )
+    }
+}
+
+fn cmd_unpin(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
+    if let Some(raw) = args.first() {
+        let arg = if raw.parse::<usize>().is_ok() {
+            raw.clone()
+        } else {
+            resolve_confined(fs, globals, raw)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_else(|_| raw.clone())
+        };
+        send_live_gui_command(
+            "unpin",
+            &editor_platform::ipc::IpcCommand::Action(format!("unpin:{arg}")),
+            start,
+        )
+    } else {
+        send_live_gui_command(
+            "unpin",
+            &editor_platform::ipc::IpcCommand::Action("unpin".to_string()),
+            start,
+        )
+    }
 }
 
 fn cmd_focus_pane(args: &[String], start: Instant) -> u8 {

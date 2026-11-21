@@ -205,6 +205,24 @@ fn cli_ipc_open_close_and_quit_commands() {
                     IpcCommand::Unsplit => {
                         pending.respond(IpcReply::Json("{\"running\":true,\"split\":false}".into()));
                     }
+                    IpcCommand::Action(act) if act.starts_with("pin:") => {
+                        assert!(act.ends_with("hello.rs"));
+                        pending.respond(IpcReply::Json(
+                            "{\"running\":true,\"pins\":[{\"slot\":1,\"file_name\":\"hello.rs\"}]}".into(),
+                        ));
+                    }
+                    IpcCommand::Action(act) if act == "unpin:1" => {
+                        pending.respond(IpcReply::Json("{\"running\":true,\"pins\":[]}".into()));
+                    }
+                    IpcCommand::Action(act) if act == "zoom" => {
+                        pending.respond(IpcReply::Json("{\"running\":true,\"zoomed\":true}".into()));
+                    }
+                    IpcCommand::Action(act) if act == "new-tab" => {
+                        pending.respond(IpcReply::Json("{\"running\":true,\"file_name\":\"Untitled\"}".into()));
+                    }
+                    IpcCommand::Action(act) if act == "close-tab" => {
+                        pending.respond(IpcReply::Json("{\"running\":true,\"file_name\":\"hello.rs\"}".into()));
+                    }
                     IpcCommand::Quit { force: false } => {
                         pending.respond(IpcReply::Prompting);
                     }
@@ -214,13 +232,13 @@ fn cli_ipc_open_close_and_quit_commands() {
                     other => panic!("unexpected ipc command: {other:?}"),
                 }
                 handled += 1;
-                if handled == 8 {
+                if handled == 13 {
                     break;
                 }
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(handled, 8);
+        assert_eq!(handled, 13);
     });
 
     // `editor status`
@@ -278,6 +296,47 @@ fn cli_ipc_open_close_and_quit_commands() {
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8(out.stdout).unwrap().contains("\"split\":false"));
+
+    // `editor pin hello.rs`, `editor unpin 1`, `editor zoom`, `editor new-tab`, `editor close-tab`
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["--root", root.to_str().unwrap(), "pin", "hello.rs"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"slot\":1"));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["unpin", "1"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"pins\":[]"));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .arg("zoom")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"zoomed\":true"));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .arg("new-tab")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"Untitled\""));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .arg("close-tab")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"hello.rs\""));
 
     // `editor close` (mock GUI reports dirty -> prompting: true)
     let out = Command::new(bin)

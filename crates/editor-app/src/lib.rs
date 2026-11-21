@@ -4,6 +4,7 @@
 //! 100% testable headlessly by feeding `InputEvent`s and inspecting document state
 //! and rendered pixels in `Framebuffer`.
 
+pub mod buffers;
 pub mod keymap;
 pub mod panes;
 pub mod vim;
@@ -18,17 +19,20 @@ use editor_core::{
     word_range_at, Document, IdentityCheck, Language, SearchMatch, SearchOptions,
 };
 use editor_platform::{
-    AppCommand, Clipboard, ConfirmChoice, CursorShape, FileSystem, FontStyle, Framebuffer,
-    DragPhase, GlyphRasterizer, InputEvent, Key, Modifiers, MouseButton, PixelRect, PlatformHost, SurfaceMut,
-    SystemTheme, ThemePreference,
+    AppCommand, Clipboard, ConfirmChoice, CursorShape, DragPhase, FileSystem, FontStyle,
+    Framebuffer, GlyphRasterizer, InputEvent, Key, Modifiers, MouseButton, PixelRect, PlatformHost,
+    SurfaceMut, SystemTheme, ThemePreference,
 };
 use editor_render::{
     chrome::{draw_status_bar, status_bar_height_px},
-    A11yNode, A11yRole, CommandPalette, ConfirmModal, FindBarAction, FindBarState, GlyphAtlas,
-    GotoLineState, ImeComposition, Painter, PaletteAction, ScrollbarHit, ShortcutsAction,
-    ShortcutsOverlay, Sidebar, SidebarAction, SidebarHit, StatusBarData, Theme, Viewport,
+    tab_strip_height_px, A11yNode, A11yRole, CommandPalette, ConfirmModal, FindBarAction,
+    FindBarState, GlyphAtlas, GotoLineState, HarpoonAction, HarpoonOverlay, ImeComposition,
+    Painter, PaletteAction, ScrollbarHit, ShortcutsAction, ShortcutsOverlay, Sidebar,
+    SidebarAction, SidebarBadge, SidebarHit, StatusBarData, StripDropTarget, TabStrip, TabStripHit,
+    Theme, Viewport,
 };
 
+pub use buffers::{BufferId, OpenMode, ParkedBuffer, WorkingSet, MAX_PINS};
 pub use keymap::{KeyChord, KeyScope, Keymap, ShortcutEntry};
 pub use panes::{
     Arrangement, Direction, Divider, DividerAxis, DropPlan, DropZone, GridLayout, PaneId,
@@ -39,6 +43,8 @@ pub use vim::{VimMode, VimState};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppLayout {
     pub sidebar: PixelRect,
+    /// Unified top Working-Set Strip (Harpoon `1..9` pins + Open/Preview tabs).
+    pub tab_strip: PixelRect,
     pub find_bar: PixelRect,
     pub goto_bar: PixelRect,
     /// Active pane's document viewport rect (the whole pane area when only one pane is open).
@@ -58,11 +64,13 @@ impl AppLayout {
     }
 }
 
-/// What is being dragged towards the pane grid.
+/// What is being dragged towards the tab strip or pane grid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DragPayload {
     /// A file from the sidebar or from Finder.
     File(PathBuf),
+    /// A tab pill from the top Working-Set Strip.
+    Tab(BufferId),
     /// An existing pane, dragged by its header.
     Pane(PaneId),
 }
@@ -78,7 +86,11 @@ struct PaneDrag {
     started: bool,
     /// Came from outside the app (Finder): releasing off-grid opens in the active pane.
     external: bool,
+    /// Click count at mouse-down (e.g. double-click graduates sidebar preview to a Kept tab).
+    click_count: u8,
     plan: Option<DropPlan>,
+    /// Drop insertion target when hovering over the top Working-Set Strip.
+    strip_drop: Option<(StripDropTarget, i32)>,
     /// Floating label chip rect last drawn (for exact damage tracking).
     chip: PixelRect,
 }
@@ -87,6 +99,7 @@ struct PaneDrag {
 /// `EditorApp::{doc, caret, anchor, viewport, ...}` and is swapped in O(1) on focus change.
 pub struct PaneState {
     pub id: PaneId,
+    pub buf_id: BufferId,
     pub doc: Document,
     pub caret: u64,
     pub anchor: u64,
@@ -97,12 +110,13 @@ pub struct PaneState {
 }
 
 impl PaneState {
-    fn new_from_font(id: PaneId, font_size_pt: f32, word_wrap: bool) -> Self {
+    fn new_from_font(id: PaneId, buf_id: BufferId, font_size_pt: f32, word_wrap: bool) -> Self {
         let mut vp = Viewport::new();
         vp.font_size_pt = font_size_pt;
         vp.word_wrap = word_wrap;
         Self {
             id,
+            buf_id,
             doc: Document::new_untitled(),
             caret: 0,
             anchor: 0,
@@ -126,16 +140,8 @@ impl PaneState {
 
 #[derive(Debug, Clone)]
 enum PendingDiscardAction {
-    NewFile,
-    OpenPath(PathBuf),
-    OpenAt {
-        path: PathBuf,
-        line_0based: Option<usize>,
-        col_bytes: Option<usize>,
-    },
-    OpenFileDialog,
     Reload,
-    CloseActivePane,
+    CloseBuffer(BufferId),
     Quit,
 }
 
@@ -146,6 +152,15 @@ pub struct EditorApp {
     pub anchor: u64,
     preferred_x_px: Option<f32>,
 
+    /// Stable buffer id currently displayed in the active pane (`self.doc`).
+    pub active_buf_id: BufferId,
+    /// Shared in-memory buffer pool + Harpoon `1..9` pins + Kept/Preview working set.
+    pub working_set: WorkingSet,
+    /// Custom-drawn top Working-Set Strip.
+    pub tab_strip: TabStrip,
+    /// Custom-drawn Harpoon & Open Files quick overlay (`⌘E` / `<Space>e`).
+    pub harpoon: HarpoonOverlay,
+
     pub sidebar: Sidebar,
     pub viewport: Viewport,
     /// Inactive panes (0–3). `self.doc`/`self.viewport` ALWAYS hold the active pane.
@@ -155,6 +170,8 @@ pub struct EditorApp {
     next_pane_id: PaneId,
     /// Pane grid model: who lives where (≤ 2 columns × ≤ 2 rows) plus split ratios.
     pub arrangement: Arrangement,
+    /// Temporarily zoom the active split pane to 100% fullscreen (`⇧⌘↵` / `⌃W z`).
+    pub zoomed: bool,
     pub find_bar: FindBarState,
     pub goto_line: GotoLineState,
     pub palette: CommandPalette,
@@ -228,12 +245,17 @@ impl EditorApp {
             caret: 0,
             anchor: 0,
             preferred_x_px: None,
+            active_buf_id: 1,
+            working_set: WorkingSet::new(1),
+            tab_strip: TabStrip::new(),
+            harpoon: HarpoonOverlay::new(),
             sidebar: Sidebar::new(),
             viewport: Viewport::new(),
             other_panes: Vec::new(),
             active_id: 1,
             next_pane_id: 2,
             arrangement: Arrangement::new(1),
+            zoomed: false,
             find_bar: FindBarState::new(),
             goto_line: GotoLineState::new(),
             palette: CommandPalette::new(),
@@ -390,38 +412,512 @@ impl EditorApp {
         self.mark_dirty();
     }
 
-    pub fn open_file(
-        &mut self,
-        path: &Path,
-        host: &mut dyn PlatformHost,
-    ) -> Result<(), String> {
-        let doc = Document::open(self.fs.as_ref(), path).map_err(|e| e.to_string())?;
-        let canonical = doc.path().map(Path::to_path_buf);
+    // ========================================================================
+    // Buffer Pool, Working-Set Strip (Harpoon 1..9 + Open/Preview) & Zoom
+    // ========================================================================
+
+    fn is_initial_empty_untitled(&self) -> bool {
+        self.working_set.len() == 1
+            && !self.is_split()
+            && self.doc.path().is_none()
+            && !self.doc.is_dirty()
+            && self.doc.len_bytes() == 0
+            && !self.working_set.is_pinned(self.active_buf_id)
+    }
+
+    fn other_pane_buf_ids(&self) -> Vec<BufferId> {
+        self.other_panes.iter().map(|p| p.buf_id).collect()
+    }
+
+    fn is_buf_in_other_pane(&self, id: BufferId) -> bool {
+        self.other_panes.iter().any(|p| p.buf_id == id)
+    }
+
+    fn sync_active_buffer_meta(&mut self) {
+        let path = self.doc.path().map(Path::to_path_buf);
+        let name = self.doc.file_name().to_string();
+        let dirty = self.doc.is_dirty();
+        self.working_set
+            .update_meta(self.active_buf_id, path, name, dirty);
+        if dirty && self.working_set.is_preview(self.active_buf_id) {
+            self.working_set.graduate_preview(self.active_buf_id);
+        }
+    }
+
+    fn is_buffer_dirty(&self, id: BufferId) -> bool {
+        if id == self.active_buf_id {
+            return self.doc.is_dirty();
+        }
+        if let Some(p) = self.other_panes.iter().find(|p| p.buf_id == id) {
+            return p.doc.is_dirty();
+        }
+        self.working_set
+            .get_parked(id)
+            .map(|p| p.doc.is_dirty())
+            .or_else(|| self.working_set.get_meta(id).map(|m| m.dirty))
+            .unwrap_or(false)
+    }
+
+    fn any_buffer_dirty(&self) -> bool {
+        if self.doc.is_dirty() || self.other_panes.iter().any(|p| p.doc.is_dirty()) {
+            return true;
+        }
+        self.working_set.any_dirty()
+    }
+
+    fn first_dirty_buffer(&self) -> Option<BufferId> {
+        if self.doc.is_dirty() {
+            return Some(self.active_buf_id);
+        }
+        if let Some(p) = self.other_panes.iter().find(|p| p.doc.is_dirty()) {
+            return Some(p.buf_id);
+        }
+        self.working_set.first_dirty()
+    }
+
+    fn park_active_into_pool(&mut self, drop_current: bool) {
+        let old_id = self.active_buf_id;
+        let old_doc = std::mem::replace(&mut self.doc, Document::new_untitled());
+        if drop_current {
+            if !self.is_buf_in_other_pane(old_id) {
+                self.working_set.remove_buffer(old_id);
+            }
+            return;
+        }
+        if !self.working_set.contains(old_id) {
+            return;
+        }
+        // Only park if no other pane currently holds a live copy (or ours is dirty).
+        if !self.is_buf_in_other_pane(old_id) || old_doc.is_dirty() {
+            self.working_set.park(
+                old_id,
+                ParkedBuffer {
+                    doc: old_doc,
+                    caret: self.caret,
+                    anchor: self.anchor,
+                    preferred_x_px: self.preferred_x_px,
+                    scroll_top_line: self.viewport.scroll_top_line,
+                    scroll_sub_y_px: self.viewport.scroll_sub_y_px,
+                    scroll_x_px: self.viewport.scroll_x_px,
+                },
+            );
+        }
+    }
+
+    fn install_buffer_in_active_pane(&mut self, target_id: BufferId) -> bool {
+        if let Some(parked) = self.working_set.take_parked(target_id) {
+            self.active_buf_id = target_id;
+            self.doc = parked.doc;
+            self.caret = parked.caret.min(self.doc.len_bytes());
+            self.anchor = parked.anchor.min(self.doc.len_bytes());
+            self.preferred_x_px = parked.preferred_x_px;
+            self.viewport.reset_for_document();
+            self.viewport.scroll_top_line = parked.scroll_top_line;
+            self.viewport.scroll_sub_y_px = parked.scroll_sub_y_px;
+            self.viewport.scroll_x_px = parked.scroll_x_px;
+            self.viewport.word_wrap = self.effective_word_wrap(self.doc.path());
+            self.search_matches.clear();
+            self.active_match = None;
+            return true;
+        }
+        // Fallback: open from path recorded in metadata (or create untitled).
+        let path_opt = self
+            .working_set
+            .get_meta(target_id)
+            .and_then(|m| m.path.clone());
+        let doc = match path_opt {
+            Some(ref p) => match Document::open(self.fs.as_ref(), p) {
+                Ok(d) => d,
+                Err(_) => return false,
+            },
+            None => Document::new_untitled(),
+        };
+        self.active_buf_id = target_id;
         self.doc = doc;
         self.caret = 0;
         self.anchor = 0;
         self.preferred_x_px = None;
         self.viewport.reset_for_document();
-        self.viewport.word_wrap = self.effective_word_wrap(canonical.as_deref());
+        self.viewport.word_wrap = self.effective_word_wrap(self.doc.path());
         self.search_matches.clear();
         self.active_match = None;
+        true
+    }
 
-        // Sidebar root is set once (if unset) and never re-rooted on subsequent file opens!
-        if let Some(ref p) = canonical {
-            if self.sidebar.root().is_none() {
-                if let Some(parent) = p.parent() {
-                    self.sidebar.set_root(self.fs.as_ref(), parent);
+    /// Activate `target_id`: if already displayed in another pane, teleports focus there
+    /// (preserving grid layout and zoomed fullscreen seamlessly); otherwise swaps it into
+    /// the active pane while parking the outgoing buffer safely in memory!
+    pub fn activate_buffer(&mut self, target_id: BufferId, host: &mut dyn PlatformHost) -> bool {
+        if !self.working_set.contains(target_id) {
+            return false;
+        }
+        if target_id == self.active_buf_id {
+            self.working_set.touch_mru(target_id);
+            self.sync_title(host);
+            return true;
+        }
+        // Teleport to an existing split pane if it already displays `target_id`.
+        if let Some(pid) = self
+            .other_panes
+            .iter()
+            .find(|p| p.buf_id == target_id)
+            .map(|p| p.id)
+        {
+            self.focus_pane_id(pid, host);
+            self.working_set.touch_mru(target_id);
+            if let Some(p) = self.doc.path().map(Path::to_path_buf) {
+                if self.sidebar.is_under_root(&p) {
+                    self.sidebar.reveal(self.fs.as_ref(), &p);
                 }
             }
+            self.mark_dirty();
+            host.request_redraw();
+            return true;
+        }
+        self.sync_active_buffer_meta();
+        self.park_active_into_pool(false);
+        if !self.install_buffer_in_active_pane(target_id) {
+            return false;
+        }
+        self.working_set.touch_mru(target_id);
+        if self.find_bar.visible {
+            self.refresh_search();
+        }
+        if let Some(p) = self.doc.path().map(Path::to_path_buf) {
+            if self.sidebar.is_under_root(&p) {
+                self.sidebar.reveal(self.fs.as_ref(), &p);
+            }
+        }
+        self.sync_title(host);
+        self.mark_dirty();
+        host.request_redraw();
+        true
+    }
+
+    /// Open a file into the Working-Set Strip (`OpenMode::Preview` for single-click sidebar
+    /// browse; `OpenMode::Keep` for double-click, Quick Open, CLI open, or explicit opens).
+    pub fn open_file_with_mode(
+        &mut self,
+        path: &Path,
+        mode: OpenMode,
+        host: &mut dyn PlatformHost,
+    ) -> Result<BufferId, String> {
+        let canonical = self
+            .fs
+            .canonicalize(path)
+            .unwrap_or_else(|_| path.to_path_buf());
+
+        // Sidebar root is set once (if unset) and never re-rooted on subsequent file opens!
+        if self.sidebar.root().is_none() {
+            if let Some(parent) = canonical.parent() {
+                self.sidebar.set_root(self.fs.as_ref(), parent);
+            }
+        }
+
+        // Reuse existing buffer if already open in the working set!
+        if let Some(existing_id) = self.working_set.find_by_path(&canonical) {
+            if mode == OpenMode::Keep {
+                self.working_set.graduate_preview(existing_id);
+            }
+            self.activate_buffer(existing_id, host);
+            return Ok(existing_id);
+        }
+
+        let doc = Document::open(self.fs.as_ref(), &canonical).map_err(|e| e.to_string())?;
+        let doc_path = doc.path().map(Path::to_path_buf).or(Some(canonical.clone()));
+        let fname = doc.file_name().to_string();
+
+        let target_id = if self.is_initial_empty_untitled() {
+            // Replace the untouched startup Untitled placeholder cleanly.
+            let id = self.active_buf_id;
+            self.doc = doc;
+            self.caret = 0;
+            self.anchor = 0;
+            self.preferred_x_px = None;
+            self.viewport.reset_for_document();
+            self.viewport.word_wrap = self.effective_word_wrap(doc_path.as_deref());
+            self.search_matches.clear();
+            self.active_match = None;
+            self.working_set.update_meta(id, doc_path.clone(), fname, false);
+            if mode == OpenMode::Preview {
+                self.working_set.open.retain(|&b| b != id);
+                self.working_set.preview = Some(id);
+            }
+            id
+        } else {
+            self.sync_active_buffer_meta();
+            let new_id = self.working_set.alloc_buffer(doc_path.clone(), fname, false);
+            let evicted = self.working_set.register_buffer(new_id, mode);
+            let drop_current = evicted == Some(self.active_buf_id);
+            if let Some(old_prev) = evicted {
+                if old_prev != self.active_buf_id && !self.is_buf_in_other_pane(old_prev) {
+                    self.working_set.remove_buffer(old_prev);
+                }
+            }
+            self.park_active_into_pool(drop_current);
+            self.active_buf_id = new_id;
+            self.doc = doc;
+            self.caret = 0;
+            self.anchor = 0;
+            self.preferred_x_px = None;
+            self.viewport.reset_for_document();
+            self.viewport.word_wrap = self.effective_word_wrap(doc_path.as_deref());
+            self.search_matches.clear();
+            self.active_match = None;
+            new_id
+        };
+
+        self.working_set.touch_mru(target_id);
+        if self.find_bar.visible {
+            self.refresh_search();
+        }
+        if let Some(ref p) = doc_path {
             if self.sidebar.is_under_root(p) {
                 self.sidebar.reveal(self.fs.as_ref(), p);
             }
         }
-
         self.sync_title(host);
         self.mark_dirty();
         host.request_redraw();
-        Ok(())
+        Ok(target_id)
+    }
+
+    pub fn open_file(
+        &mut self,
+        path: &Path,
+        host: &mut dyn PlatformHost,
+    ) -> Result<(), String> {
+        self.open_file_with_mode(path, OpenMode::Keep, host)
+            .map(|_| ())
+    }
+
+    /// Create a fresh untitled tab in the Working-Set Strip and switch to it without losing edits.
+    pub fn new_tab(&mut self, host: &mut dyn PlatformHost) -> BufferId {
+        self.sync_active_buffer_meta();
+        self.park_active_into_pool(false);
+        let id = self
+            .working_set
+            .alloc_buffer(None, "Untitled".to_string(), false);
+        self.working_set.register_buffer(id, OpenMode::Keep);
+        self.active_buf_id = id;
+        self.doc = Document::new_untitled();
+        self.caret = 0;
+        self.anchor = 0;
+        self.preferred_x_px = None;
+        self.viewport.reset_for_document();
+        self.viewport.word_wrap = self.effective_word_wrap(None);
+        self.search_matches.clear();
+        self.active_match = None;
+        self.working_set.touch_mru(id);
+        self.sync_title(host);
+        self.mark_dirty();
+        host.request_redraw();
+        id
+    }
+
+    /// Toggle Harpoon pin (`1..9`) on `id`.
+    pub fn toggle_pin_buffer(&mut self, id: BufferId, host: &mut dyn PlatformHost) {
+        if !self.working_set.contains(id) {
+            return;
+        }
+        match self.working_set.toggle_pin(id) {
+            Ok(Some(slot)) => {
+                self.set_notice(format!("Pinned to slot {slot}"), false);
+            }
+            Ok(None) => {
+                self.set_notice("Unpinned", false);
+            }
+            Err(()) => {
+                self.set_notice(format!("Maximum of {MAX_PINS} pinned files"), false);
+            }
+        }
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    /// Jump directly to Harpoon pin slot `1..=9` (`⌘1`..`⌘9` / `<Space>1`..`9`).
+    pub fn jump_to_pin(&mut self, slot_1based: u8, host: &mut dyn PlatformHost) -> bool {
+        let idx = slot_1based.saturating_sub(1) as usize;
+        if let Some(&id) = self.working_set.pinned.get(idx) {
+            self.activate_buffer(id, host)
+        } else {
+            self.set_notice(format!("No file pinned in slot {slot_1based}"), false);
+            host.request_redraw();
+            false
+        }
+    }
+
+    /// Toggle between the two most recently used buffers (`⌃Tab` / `⌃^` / `<Space><Space>`).
+    pub fn toggle_last_buffer(&mut self, host: &mut dyn PlatformHost) -> bool {
+        if let Some(prev) = self.working_set.previous_mru(self.active_buf_id) {
+            self.activate_buffer(prev, host)
+        } else {
+            false
+        }
+    }
+
+    /// Cycle next (`+1`) or previous (`-1`) along the Working-Set Strip (`⇧⌘[` / `⇧⌘]`, `gt` / `gT`).
+    pub fn step_tab(&mut self, delta: isize, host: &mut dyn PlatformHost) -> bool {
+        if let Some(next) = self.working_set.step_strip(self.active_buf_id, delta) {
+            self.activate_buffer(next, host)
+        } else {
+            false
+        }
+    }
+
+    /// Toggle 100% fullscreen zoom on the active pane when split (`⇧⌘↵` / `⌃W z`).
+    pub fn toggle_zoom_pane(&mut self, host: &mut dyn PlatformHost) {
+        if !self.is_split() {
+            self.zoomed = false;
+            return;
+        }
+        self.zoomed = !self.zoomed;
+        self.recompute_layout();
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    /// Close all split panes except the active one (`⌃W o`), parking their buffers safely.
+    pub fn only_active_pane(&mut self, host: &mut dyn PlatformHost) {
+        if self.other_panes.is_empty() {
+            return;
+        }
+        let others = std::mem::take(&mut self.other_panes);
+        for p in others {
+            if p.buf_id != self.active_buf_id && self.working_set.contains(p.buf_id) {
+                self.working_set.park(
+                    p.buf_id,
+                    ParkedBuffer {
+                        doc: p.doc,
+                        caret: p.caret,
+                        anchor: p.anchor,
+                        preferred_x_px: p.preferred_x_px,
+                        scroll_top_line: p.viewport.scroll_top_line,
+                        scroll_sub_y_px: p.viewport.scroll_sub_y_px,
+                        scroll_x_px: p.viewport.scroll_x_px,
+                    },
+                );
+            }
+        }
+        self.arrangement = Arrangement::new(self.active_id);
+        self.zoomed = false;
+        self.recompute_layout();
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    /// Close buffer `id` from the Working-Set Strip, prompting first if it has unsaved changes.
+    pub fn request_close_buffer(&mut self, id: BufferId, host: &mut dyn PlatformHost) {
+        if !self.working_set.contains(id) {
+            return;
+        }
+        if self.is_buffer_dirty(id) {
+            // Focus the dirty buffer so the user sees what they are deciding to save/discard.
+            self.activate_buffer(id, host);
+            self.request_discard_or_run(PendingDiscardAction::CloseBuffer(id), host);
+        } else {
+            self.force_close_buffer(id, host);
+        }
+    }
+
+    fn force_close_buffer(&mut self, id: BufferId, host: &mut dyn PlatformHost) {
+        if !self.working_set.contains(id) {
+            return;
+        }
+        let replacement = self
+            .working_set
+            .previous_mru(id)
+            .or_else(|| self.working_set.step_strip(id, 1))
+            .filter(|&r| r != id);
+
+        self.working_set.remove_buffer(id);
+
+        // Close any inactive split panes displaying `id`.
+        let panes_to_drop: Vec<PaneId> = self
+            .other_panes
+            .iter()
+            .filter(|p| p.buf_id == id)
+            .map(|p| p.id)
+            .collect();
+        for pid in panes_to_drop {
+            self.arrangement.remove(pid);
+            self.other_panes.retain(|p| p.id != pid);
+        }
+        if self.other_panes.is_empty() {
+            self.zoomed = false;
+        }
+
+        if id == self.active_buf_id {
+            if let Some(next_id) = replacement {
+                if let Some(pid) = self
+                    .other_panes
+                    .iter()
+                    .find(|p| p.buf_id == next_id)
+                    .map(|p| p.id)
+                {
+                    // Close the active pane if split, or promote `pid`.
+                    if self.is_split() {
+                        self.arrangement.remove(self.active_id);
+                        let idx = self
+                            .other_panes
+                            .iter()
+                            .position(|p| p.id == pid)
+                            .unwrap_or(0);
+                        let next = self.other_panes.swap_remove(idx);
+                        self.active_id = next.id;
+                        self.active_buf_id = next.buf_id;
+                        self.doc = next.doc;
+                        self.caret = next.caret;
+                        self.anchor = next.anchor;
+                        self.preferred_x_px = next.preferred_x_px;
+                        self.viewport = next.viewport;
+                        self.search_matches = next.search_matches;
+                        self.active_match = next.active_match;
+                        if self.other_panes.is_empty() {
+                            self.zoomed = false;
+                        }
+                    } else {
+                        self.install_buffer_in_active_pane(next_id);
+                    }
+                } else {
+                    self.install_buffer_in_active_pane(next_id);
+                }
+                self.working_set.touch_mru(self.active_buf_id);
+            } else {
+                // Closing the last buffer resets cleanly to a fresh untitled buffer.
+                let fresh = self
+                    .working_set
+                    .alloc_buffer(None, "Untitled".to_string(), false);
+                self.working_set.register_buffer(fresh, OpenMode::Keep);
+                self.active_buf_id = fresh;
+                self.doc = Document::new_untitled();
+                self.caret = 0;
+                self.anchor = 0;
+                self.preferred_x_px = None;
+                self.viewport.reset_for_document();
+                self.viewport.word_wrap = self.effective_word_wrap(None);
+                self.search_matches.clear();
+                self.active_match = None;
+                self.working_set.touch_mru(fresh);
+            }
+        }
+        self.recompute_layout();
+        self.sync_title(host);
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    fn refresh_harpoon_overlay(&mut self, keep_selected_id: Option<u32>) {
+        self.sync_active_buffer_meta();
+        let others = self.other_pane_buf_ids();
+        let entries =
+            self.working_set
+                .to_harpoon_entries(self.active_buf_id, &others, self.sidebar.root());
+        if self.harpoon.visible {
+            self.harpoon.refresh(entries, keep_selected_id);
+        } else {
+            self.harpoon.open(entries);
+        }
     }
 
     pub fn open_path_or_dir(
@@ -512,9 +1008,60 @@ impl EditorApp {
     /// Build a fresh inactive pane, opening `path` (or the active file when `None`).
     fn make_pane(&mut self, path: Option<&Path>) -> Result<PaneState, String> {
         let id = self.alloc_pane_id();
-        let mut pane = PaneState::new_from_font(id, self.viewport.font_size_pt, self.viewport.word_wrap);
-        let src = path.map(Path::to_path_buf).or_else(|| self.doc.path().map(Path::to_path_buf));
-        if let Some(p) = src {
+        if let Some(raw_p) = path {
+            let canonical = self
+                .fs
+                .canonicalize(raw_p)
+                .unwrap_or_else(|_| raw_p.to_path_buf());
+            if let Some(existing_id) = self.working_set.find_by_path(&canonical) {
+                self.working_set.graduate_preview(existing_id);
+                return self.make_pane_for_buffer(id, existing_id);
+            }
+            let doc = Document::open(self.fs.as_ref(), &canonical).map_err(|e| e.to_string())?;
+            let doc_path = doc.path().map(Path::to_path_buf).or(Some(canonical));
+            let fname = doc.file_name().to_string();
+            let buf_id = self.working_set.alloc_buffer(doc_path, fname, false);
+            self.working_set.register_buffer(buf_id, OpenMode::Keep);
+            let mut pane = PaneState::new_from_font(
+                id,
+                buf_id,
+                self.viewport.font_size_pt,
+                self.effective_word_wrap(doc.path()),
+            );
+            pane.doc = doc;
+            return Ok(pane);
+        }
+        // Splitting without an explicit path opens a view of the active buffer.
+        self.make_pane_for_buffer(id, self.active_buf_id)
+    }
+
+    fn make_pane_for_buffer(&mut self, pane_id: PaneId, buf_id: BufferId) -> Result<PaneState, String> {
+        if let Some(parked) = self.working_set.take_parked(buf_id) {
+            let wrap = self.effective_word_wrap(parked.doc.path());
+            let mut pane = PaneState::new_from_font(pane_id, buf_id, self.viewport.font_size_pt, wrap);
+            pane.doc = parked.doc;
+            pane.caret = parked.caret;
+            pane.anchor = parked.anchor;
+            pane.preferred_x_px = parked.preferred_x_px;
+            pane.viewport.scroll_top_line = parked.scroll_top_line;
+            pane.viewport.scroll_sub_y_px = parked.scroll_sub_y_px;
+            pane.viewport.scroll_x_px = parked.scroll_x_px;
+            return Ok(pane);
+        }
+        let path_opt = if buf_id == self.active_buf_id {
+            self.doc.path().map(Path::to_path_buf)
+        } else {
+            self.working_set
+                .get_meta(buf_id)
+                .and_then(|m| m.path.clone())
+        };
+        let mut pane = PaneState::new_from_font(
+            pane_id,
+            buf_id,
+            self.viewport.font_size_pt,
+            self.effective_word_wrap(path_opt.as_deref()),
+        );
+        if let Some(p) = path_opt {
             pane.doc = Document::open(self.fs.as_ref(), &p).map_err(|e| e.to_string())?;
         }
         pane.viewport.word_wrap = self.effective_word_wrap(pane.doc.path());
@@ -544,9 +1091,47 @@ impl EditorApp {
             }
         };
         let id = pane.id;
+        let buf_id = pane.buf_id;
+        self.zoomed = false;
         self.arrangement.insert(target, zone, id);
         self.other_panes.push(pane);
         self.focus_pane_id(id, host);
+        self.working_set.touch_mru(buf_id);
+        self.recompute_layout();
+        self.mark_dirty();
+        host.request_redraw();
+        true
+    }
+
+    /// Create a new split pane displaying an existing buffer `buf_id` (used by tab drag-to-split
+    /// and `⌘Enter` in the Harpoon overlay).
+    pub fn split_buffer_at(
+        &mut self,
+        target: PaneId,
+        zone: DropZone,
+        buf_id: BufferId,
+        host: &mut dyn PlatformHost,
+    ) -> bool {
+        if !self.arrangement.can_insert(target, zone) {
+            if self.arrangement.is_full() {
+                self.set_notice(format!("Maximum of {MAX_PANES} panes"), false);
+            }
+            return false;
+        }
+        let pane_id = self.alloc_pane_id();
+        let pane = match self.make_pane_for_buffer(pane_id, buf_id) {
+            Ok(p) => p,
+            Err(e) => {
+                self.set_notice(e, true);
+                return false;
+            }
+        };
+        self.working_set.graduate_preview(buf_id);
+        self.zoomed = false;
+        self.arrangement.insert(target, zone, pane_id);
+        self.other_panes.push(pane);
+        self.focus_pane_id(pane_id, host);
+        self.working_set.touch_mru(buf_id);
         self.recompute_layout();
         self.mark_dirty();
         host.request_redraw();
@@ -575,13 +1160,19 @@ impl EditorApp {
         self.split_pane_at(a, zone, path, host);
     }
 
-    /// Close the active pane immediately, focusing the pane that takes over its space.
+    /// Close the active split pane immediately, parking its buffer safely in the Working-Set Strip
+    /// and focusing the pane that takes over its space.
     pub fn close_split(&mut self, host: &mut dyn PlatformHost) {
         if self.other_panes.is_empty() {
             return;
         }
+        self.sync_active_buffer_meta();
         let old_frame = self.layout.grid.get(self.active_id).map(|r| r.frame);
+        self.park_active_into_pool(false);
         self.arrangement.remove(self.active_id);
+        if self.other_panes.len() <= 1 {
+            self.zoomed = false;
+        }
         self.recompute_layout();
         // Prefer the pane that now covers the centre of the closed pane's old area.
         let heir = old_frame
@@ -591,6 +1182,7 @@ impl EditorApp {
         let idx = self.other_panes.iter().position(|p| p.id == heir).unwrap_or(0);
         let next = self.other_panes.swap_remove(idx);
         self.active_id = next.id;
+        self.active_buf_id = next.buf_id;
         self.doc = next.doc;
         self.caret = next.caret;
         self.anchor = next.anchor;
@@ -598,18 +1190,19 @@ impl EditorApp {
         self.viewport = next.viewport;
         self.search_matches = next.search_matches;
         self.active_match = next.active_match;
+        self.working_set.touch_mru(self.active_buf_id);
         self.recompute_layout();
         self.sync_title(host);
         self.mark_dirty();
         host.request_redraw();
     }
 
-    /// Close the active pane, prompting to save first if it has unsaved edits.
+    /// Close the active split pane (its buffer stays safely parked in the Working-Set Strip).
     pub fn request_close_active_pane(&mut self, host: &mut dyn PlatformHost) {
         if self.other_panes.is_empty() {
             return;
         }
-        self.request_discard_or_run(PendingDiscardAction::CloseActivePane, host);
+        self.close_split(host);
     }
 
     /// Swap the active pane with its neighbour (right/left first, then below/above).
@@ -680,15 +1273,18 @@ impl EditorApp {
         std::mem::swap(&mut self.search_matches, &mut other.search_matches);
         std::mem::swap(&mut self.active_match, &mut other.active_match);
         std::mem::swap(&mut self.active_id, &mut other.id);
+        std::mem::swap(&mut self.active_buf_id, &mut other.buf_id);
+        self.working_set.touch_mru(self.active_buf_id);
         self.recompute_layout();
         self.sync_title(host);
-        // Only the two affected panes (headers + carets) and the status bar change.
+        // Only the two affected panes (headers + carets), the top tab strip, and the status bar change.
         if let Some(f) = prev_active {
             self.mark_dirty_rect(f);
         }
         if let Some(r) = self.layout.grid.get(self.active_id) {
             self.mark_dirty_rect(r.frame);
         }
+        self.mark_dirty_rect(self.layout.tab_strip);
         self.mark_dirty_rect(self.layout.status_bar);
         host.request_redraw();
     }
@@ -711,8 +1307,11 @@ impl EditorApp {
         let right_x = sidebar_w;
         let right_w = (w - sidebar_w).max(0);
 
+        let strip_h = tab_strip_height_px(scale);
+        let tab_strip = PixelRect::new(right_x, 0, right_w, strip_h);
+
         let find_h = self.find_bar.height_px(scale);
-        let find_bar = PixelRect::new(right_x, 0, right_w, find_h);
+        let find_bar = PixelRect::new(right_x, tab_strip.bottom(), right_w, find_h);
 
         let goto_h = self.goto_line.height_px(scale);
         let goto_bar = PixelRect::new(right_x, find_bar.bottom(), right_w, goto_h);
@@ -720,13 +1319,18 @@ impl EditorApp {
         let vp_y = goto_bar.bottom();
         let vp_h = (main_h - vp_y).max(0);
         let pane_area = PixelRect::new(right_x, vp_y, right_w, vp_h);
-        let grid = self.arrangement.layout(pane_area, scale);
+        let grid = if self.zoomed && self.is_split() {
+            self.arrangement.layout_zoomed(pane_area, self.active_id)
+        } else {
+            self.arrangement.layout(pane_area, scale)
+        };
         let viewport = grid.get(self.active_id).map(|r| r.body).unwrap_or(pane_area);
 
         let status_bar = PixelRect::new(0, main_h, w, status_h);
 
         self.layout = AppLayout {
             sidebar,
+            tab_strip,
             find_bar,
             goto_bar,
             viewport,
@@ -793,6 +1397,7 @@ impl EditorApp {
             || self.confirm_modal.visible
             || self.palette.is_open()
             || self.shortcuts.visible
+            || self.harpoon.visible
         {
             full_bounds
         } else {
@@ -809,6 +1414,7 @@ impl EditorApp {
             return None;
         }
 
+        self.sync_active_buffer_meta();
         let theme = self.active_theme();
         let layout = self.layout;
         let (caret_line, caret_col) = self.doc.byte_to_line_col(self.caret);
@@ -819,6 +1425,7 @@ impl EditorApp {
             && !self.confirm_modal.visible
             && !self.palette.is_open()
             && !self.shortcuts.visible
+            && !self.harpoon.visible
             && !self.sidebar.is_focused()
             && !self.find_bar.is_focused()
             && !self.goto_line.visible;
@@ -835,10 +1442,47 @@ impl EditorApp {
         let mut painter = Painter::from_surface(surf);
         painter.push_clip(effective_clip);
 
-        // 1. Sidebar
+        // 1. Sidebar (with quiet Harpoon `1..9` badges and `•` dirty dots!)
         if !layout.sidebar.intersect(effective_clip).is_empty() {
-            self.sidebar
-                .draw(&mut painter, layout.sidebar, &theme, &mut self.atlas, rasterizer);
+            let ws = &self.working_set;
+            self.sidebar.draw_with_badges(
+                &mut painter,
+                layout.sidebar,
+                &theme,
+                &mut self.atlas,
+                rasterizer,
+                |path| SidebarBadge {
+                    pin_slot: ws.pin_slot_for_path(path),
+                    dirty: ws.is_dirty_path(path),
+                },
+            );
+        }
+
+        // 1b. Unified Top Working-Set Strip (Harpoon `1..9` pins + Open/Preview tabs)
+        if !layout.tab_strip.intersect(effective_clip).is_empty() {
+            let other_ids = self.other_pane_buf_ids();
+            let tab_items = self.working_set.to_tab_items(self.active_buf_id, &other_ids);
+            let is_split = self.is_split();
+            let merge_active = (!is_split || self.zoomed)
+                && !self.find_bar.visible
+                && !self.goto_line.visible;
+            let drop_ix = self
+                .drag
+                .as_ref()
+                .filter(|d| d.started)
+                .and_then(|d| d.strip_drop.map(|(_, ix)| ix));
+            self.tab_strip.draw(
+                &mut painter,
+                layout.tab_strip,
+                &tab_items,
+                is_split,
+                self.zoomed,
+                merge_active,
+                drop_ix,
+                &theme,
+                &mut self.atlas,
+                rasterizer,
+            );
         }
 
         // 2. Find / Replace bar
@@ -865,15 +1509,15 @@ impl EditorApp {
             );
         }
 
-        // 4. Document viewport(s) — 1 to 4 panes in a ≤ 2 × 2 grid.
-        let multi = !self.other_panes.is_empty();
+        // 4. Document viewport(s) — 1 to 4 panes in a ≤ 2 × 2 grid (or 1 zoomed fullscreen pane).
+        let show_pane_headers = !self.other_panes.is_empty() && !self.zoomed;
         for pr in layout.grid.panes() {
             let pr = *pr;
             if pr.frame.intersect(effective_clip).is_empty() {
                 continue;
             }
             if pr.id == self.active_id {
-                if multi && !pr.header.intersect(effective_clip).is_empty() {
+                if show_pane_headers && !pr.header.intersect(effective_clip).is_empty() {
                     draw_pane_header(
                         &mut painter,
                         pr.header,
@@ -905,7 +1549,7 @@ impl EditorApp {
                     self.ime.caret_rect_px = self.viewport.last_caret_rect;
                 }
             } else if let Some(sec) = self.other_panes.iter_mut().find(|p| p.id == pr.id) {
-                if !pr.header.intersect(effective_clip).is_empty() {
+                if show_pane_headers && !pr.header.intersect(effective_clip).is_empty() {
                     draw_pane_header(
                         &mut painter,
                         pr.header,
@@ -1011,6 +1655,12 @@ impl EditorApp {
             );
         }
 
+        // 7b. Optional Harpoon & Open Files Quick Overlay (`Cmd+E`).
+        if self.harpoon.visible {
+            self.harpoon
+                .draw(&mut painter, full_bounds, &theme, &mut self.atlas, rasterizer);
+        }
+
         // 8. Optional in-app confirmation modal overlay.
         if self.confirm_modal.visible {
             self.confirm_modal
@@ -1091,6 +1741,51 @@ impl EditorApp {
                     if let Some(c) = self.confirm_modal.hit_test(x_px, y_px) {
                         self.resolve_confirm_modal(c, host);
                     }
+                    return;
+                }
+                InputEvent::Resize {
+                    width_px,
+                    height_px,
+                    scale,
+                } => {
+                    self.framebuffer.resize(width_px.max(1), height_px.max(1), scale);
+                    self.recompute_layout();
+                    self.mark_dirty();
+                    return;
+                }
+                _ => return,
+            }
+        }
+
+        // Intercept keyboard & mouse when Harpoon & Open Files overlay (`Cmd+E`) is open.
+        if self.harpoon.visible {
+            match event {
+                InputEvent::KeyDown { key, mods, .. } => {
+                    if self.keymap.lookup_command(key, mods) == Some(AppCommand::ShowHarpoon) {
+                        self.harpoon.close();
+                        self.mark_dirty();
+                        host.request_redraw();
+                        return;
+                    }
+                    let act = self.harpoon.handle_key(key, mods);
+                    self.handle_harpoon_action(act, host);
+                    return;
+                }
+                InputEvent::MouseDown {
+                    x_px,
+                    y_px,
+                    button: MouseButton::Left,
+                    mods,
+                    ..
+                } => {
+                    let act = self.harpoon.handle_click(x_px, y_px, mods);
+                    self.handle_harpoon_action(act, host);
+                    return;
+                }
+                InputEvent::Command(AppCommand::ShowHarpoon) => {
+                    self.harpoon.close();
+                    self.mark_dirty();
+                    host.request_redraw();
                     return;
                 }
                 InputEvent::Resize {
@@ -1289,7 +1984,11 @@ impl EditorApp {
                 host.request_redraw();
             }
             InputEvent::OpenPath(path) => {
-                self.request_discard_or_run(PendingDiscardAction::OpenPath(path), host);
+                if let Err(e) = self.open_path_or_dir(&path, host) {
+                    self.set_notice(e, true);
+                } else {
+                    self.sidebar.set_focused(false);
+                }
             }
             InputEvent::Tick { now_ms } => {
                 self.now_ms = now_ms;
@@ -1385,7 +2084,7 @@ impl EditorApp {
                         .as_deref()
                         .is_some_and(|p| self.fs.stat(p).map(|st| !st.is_dir).unwrap_or(false));
                     if let (true, Some(p)) = (is_file, path) {
-                        self.begin_drag(DragPayload::File(p), x_px, y_px, true);
+                        self.begin_drag(DragPayload::File(p), x_px, y_px, true, 1);
                         self.update_drag(x_px, y_px, rasterizer, host);
                     }
                 }
@@ -1410,14 +2109,23 @@ impl EditorApp {
     // Pane drag & drop (sidebar files, Finder files, pane headers)
     // ========================================================================
 
-    fn begin_drag(&mut self, payload: DragPayload, x: f32, y: f32, started: bool) {
+    fn begin_drag(
+        &mut self,
+        payload: DragPayload,
+        x: f32,
+        y: f32,
+        started: bool,
+        click_count: u8,
+    ) {
         self.drag = Some(PaneDrag {
             payload,
             origin: (x, y),
             pos: (x, y),
             started,
             external: started,
+            click_count,
             plan: None,
+            strip_drop: None,
             chip: PixelRect::ZERO,
         });
     }
@@ -1454,8 +2162,22 @@ impl EditorApp {
                     .unwrap_or_else(|| p.to_string_lossy().into_owned()),
                 false,
             ),
+            DragPayload::Tab(buf_id) => (
+                self.working_set
+                    .get_meta(*buf_id)
+                    .map(|m| m.file_name.clone())
+                    .unwrap_or_else(|| "Untitled".to_string()),
+                false,
+            ),
             DragPayload::Pane(id) => (self.pane_file_name(*id).to_string(), true),
         };
+        if let Some((target, _)) = d.strip_drop {
+            let action = match target {
+                StripDropTarget::PinnedAt(_) => "Pin to strip",
+                StripDropTarget::OpenAt(_) => "Move in strip",
+            };
+            return (name, action);
+        }
         let action = match (d.plan.map(|p| p.zone), is_pane) {
             (None, _) => "Drop on a pane",
             (Some(DropZone::Center), false) => "Open here",
@@ -1507,22 +2229,35 @@ impl EditorApp {
             }
             d.started = true;
         }
+        let can_drop_strip = matches!(d.payload, DragPayload::Tab(_) | DragPayload::File(_));
         let moving = match d.payload {
             DragPayload::Pane(id) => Some(id),
-            DragPayload::File(_) => None,
+            DragPayload::File(_) | DragPayload::Tab(_) => None,
         };
         let old_plan = d.plan;
+        let old_strip = d.strip_drop;
         let old_chip = d.chip;
-        let plan = panes::plan_drop_at(
-            &self.arrangement,
-            &self.layout.grid,
-            x.round() as i32,
-            y.round() as i32,
-            moving,
-            scale,
-        );
+
+        let strip_drop = if can_drop_strip {
+            self.tab_strip.drop_target_at(x, y)
+        } else {
+            None
+        };
+        let plan = if strip_drop.is_some() {
+            None
+        } else {
+            panes::plan_drop_at(
+                &self.arrangement,
+                &self.layout.grid,
+                x.round() as i32,
+                y.round() as i32,
+                moving,
+                scale,
+            )
+        };
         if let Some(d) = self.drag.as_mut() {
             d.plan = plan;
+            d.strip_drop = strip_drop;
         }
         let chip = self.drag_chip_rect(x, y, rasterizer);
         if let Some(d) = self.drag.as_mut() {
@@ -1536,6 +2271,9 @@ impl EditorApp {
                 self.mark_dirty_rect(p.preview);
             }
         }
+        if old_strip != strip_drop {
+            self.mark_dirty_rect(self.layout.tab_strip);
+        }
         self.mark_dirty_rect(old_chip);
         self.mark_dirty_rect(chip);
         host.set_cursor(CursorShape::Grabbing);
@@ -1547,6 +2285,9 @@ impl EditorApp {
             self.mark_dirty_rect(d.chip);
             if let Some(p) = d.plan {
                 self.mark_dirty_rect(p.preview);
+            }
+            if d.strip_drop.is_some() {
+                self.mark_dirty_rect(self.layout.tab_strip);
             }
             host.set_cursor(CursorShape::Arrow);
             host.request_redraw();
@@ -1563,11 +2304,54 @@ impl EditorApp {
         if let Some(p) = d.plan {
             self.mark_dirty_rect(p.preview);
         }
+        if d.strip_drop.is_some() {
+            self.mark_dirty_rect(self.layout.tab_strip);
+        }
         host.set_cursor(CursorShape::Arrow);
         if !d.started {
-            // Plain click on a sidebar file: open it in the active pane.
-            if let DragPayload::File(p) = d.payload {
-                self.request_discard_or_run(PendingDiscardAction::OpenPath(p), host);
+            // Plain click (below 4pt threshold):
+            match d.payload {
+                DragPayload::File(p) => {
+                    let mode = if d.click_count >= 2 {
+                        OpenMode::Keep
+                    } else {
+                        OpenMode::Preview
+                    };
+                    if let Err(e) = self.open_file_with_mode(&p, mode, host) {
+                        self.set_notice(e, true);
+                    } else {
+                        self.sidebar.set_focused(false);
+                    }
+                }
+                DragPayload::Tab(buf_id) => {
+                    if d.click_count >= 2 {
+                        self.working_set.graduate_preview(buf_id);
+                    }
+                    self.activate_buffer(buf_id, host);
+                }
+                DragPayload::Pane(_) => {}
+            }
+            host.request_redraw();
+            return;
+        }
+        if let Some((strip_target, _)) = d.strip_drop {
+            let buf_opt = match d.payload {
+                DragPayload::Tab(id) => Some(id),
+                DragPayload::File(p) => self.open_file_with_mode(&p, OpenMode::Keep, host).ok(),
+                DragPayload::Pane(_) => None,
+            };
+            if let Some(buf_id) = buf_opt {
+                match strip_target {
+                    StripDropTarget::PinnedAt(idx) => {
+                        if !self.working_set.move_to_pinned(buf_id, idx) {
+                            self.set_notice(format!("Maximum of {MAX_PINS} pinned files"), false);
+                        }
+                    }
+                    StripDropTarget::OpenAt(idx) => {
+                        self.working_set.move_to_open(buf_id, idx);
+                    }
+                }
+                self.mark_dirty();
             }
             host.request_redraw();
             return;
@@ -1578,7 +2362,9 @@ impl EditorApp {
             }
             None if d.external => {
                 if let DragPayload::File(p) = d.payload {
-                    self.request_discard_or_run(PendingDiscardAction::OpenPath(p), host);
+                    if let Err(e) = self.open_path_or_dir(&p, host) {
+                        self.set_notice(e, true);
+                    }
                 }
             }
             None => {}
@@ -1591,10 +2377,19 @@ impl EditorApp {
         match (payload, plan.zone) {
             (DragPayload::File(p), DropZone::Center) => {
                 self.focus_pane_id(plan.target, host);
-                self.request_discard_or_run(PendingDiscardAction::OpenPath(p), host);
+                if let Err(e) = self.open_file_with_mode(&p, OpenMode::Keep, host) {
+                    self.set_notice(e, true);
+                    return false;
+                }
                 true
             }
             (DragPayload::File(p), zone) => self.split_pane_at(plan.target, zone, Some(&p), host),
+            (DragPayload::Tab(buf_id), DropZone::Center) => {
+                self.focus_pane_id(plan.target, host);
+                self.working_set.graduate_preview(buf_id);
+                self.activate_buffer(buf_id, host)
+            }
+            (DragPayload::Tab(buf_id), zone) => self.split_buffer_at(plan.target, zone, buf_id, host),
             (DragPayload::Pane(src), zone) => self.move_pane(src, plan.target, zone, host),
         }
     }
@@ -1660,70 +2455,13 @@ impl EditorApp {
 
     fn execute_pending_action(&mut self, action: PendingDiscardAction, host: &mut dyn PlatformHost) {
         match action {
-            PendingDiscardAction::NewFile => {
-                self.doc = Document::new_untitled();
-                self.caret = 0;
-                self.anchor = 0;
-                self.viewport.reset_for_document();
-                self.search_matches.clear();
-                self.active_match = None;
-                self.sync_title(host);
-                self.mark_dirty();
-                host.request_redraw();
-            }
-            PendingDiscardAction::OpenPath(path) => {
-                if let Err(e) = self.open_path_or_dir(&path, host) {
-                    self.set_notice(e, true);
-                } else {
-                    self.sidebar.set_focused(false);
-                }
-            }
-            PendingDiscardAction::OpenAt {
-                path,
-                line_0based,
-                col_bytes,
-            } => {
-                let already_open = self.doc.path() == Some(path.as_path());
-                let res = if already_open {
-                    Ok(())
-                } else {
-                    self.open_file(&path, host)
-                };
-                match res {
-                    Ok(()) => {
-                        self.sidebar.set_focused(false);
-                        if let Some(line) = line_0based {
-                            self.doc.tree_mut().ensure_indexed_for_line(line + 16);
-                            let clamped = line.min(self.doc.editable_line_count().saturating_sub(1));
-                            if let Some((start, content_end, _)) = self.doc.line_byte_range(clamped)
-                            {
-                                let off = start
-                                    + (col_bytes.unwrap_or(0) as u64).min(content_end - start);
-                                self.caret = off;
-                                self.anchor = off;
-                                self.viewport.scroll_top_line = clamped.saturating_sub(6);
-                                self.viewport.scroll_sub_y_px = 0.0;
-                            }
-                        }
-                        self.mark_dirty();
-                        host.request_redraw();
-                    }
-                    Err(e) => self.set_notice(e, true),
-                }
-            }
-            PendingDiscardAction::OpenFileDialog => {
-                if let Some(path) = host.open_file_dialog() {
-                    if let Err(e) = self.open_file(&path, host) {
-                        self.set_notice(e, true);
-                    }
-                }
-            }
             PendingDiscardAction::Reload => {
                 if let Err(e) = self.doc.reload(self.fs.as_ref()) {
                     self.set_notice(format!("Reload failed: {e}"), true);
                 } else {
                     self.caret = self.caret.min(self.doc.len_bytes());
                     self.anchor = self.caret;
+                    self.sync_active_buffer_meta();
                     self.refresh_search();
                     self.sync_title(host);
                     self.set_notice("Reloaded", false);
@@ -1731,11 +2469,21 @@ impl EditorApp {
                 self.mark_dirty();
                 host.request_redraw();
             }
-            PendingDiscardAction::CloseActivePane => {
-                self.close_split(host);
+            PendingDiscardAction::CloseBuffer(id) => {
+                self.force_close_buffer(id, host);
             }
             PendingDiscardAction::Quit => {
-                host.request_quit();
+                // If discarding the active dirty buffer during quit, close it and check any other dirty buffers!
+                if self.doc.is_dirty() {
+                    let cur = self.active_buf_id;
+                    self.force_close_buffer(cur, host);
+                }
+                if let Some(next_dirty) = self.first_dirty_buffer() {
+                    self.activate_buffer(next_dirty, host);
+                    self.request_discard_or_run(PendingDiscardAction::Quit, host);
+                } else {
+                    host.request_quit();
+                }
             }
         }
     }
@@ -1751,6 +2499,8 @@ impl EditorApp {
         }
         match self.doc.save(self.fs.as_ref(), None, false) {
             Ok(report) => {
+                // Saving NEVER removes a Kept tab from `open` or `pinned`!
+                self.sync_active_buffer_meta();
                 self.sync_title(host);
                 self.set_notice(format!("Saved ({})", report.method.as_str()), false);
                 host.request_redraw();
@@ -1770,6 +2520,8 @@ impl EditorApp {
         };
         match self.doc.save_as(self.fs.as_ref(), &dst, None, false) {
             Ok(_) => {
+                self.sync_active_buffer_meta();
+                self.working_set.graduate_preview(self.active_buf_id);
                 self.sync_title(host);
                 self.sidebar.refresh(self.fs.as_ref());
                 if let Some(p) = self.doc.path().map(Path::to_path_buf) {
@@ -1786,6 +2538,39 @@ impl EditorApp {
                 host.request_redraw();
                 false
             }
+        }
+    }
+
+    fn open_at_location(
+        &mut self,
+        path: &Path,
+        line_0based: Option<usize>,
+        col_bytes: Option<usize>,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        let res = self.open_file_with_mode(path, OpenMode::Keep, host);
+        match res {
+            Ok(_) => {
+                self.sidebar.set_focused(false);
+                if let Some(line) = line_0based {
+                    self.doc.tree_mut().ensure_indexed_for_line(line + 16);
+                    let clamped = line.min(self.doc.editable_line_count().saturating_sub(1));
+                    if let Some((start, content_end, _)) = self.doc.line_byte_range(clamped) {
+                        let off = start + (col_bytes.unwrap_or(0) as u64).min(content_end - start);
+                        self.caret = off;
+                        self.anchor = off;
+                        self.viewport.scroll_top_line = clamped.saturating_sub(6);
+                        self.viewport.scroll_sub_y_px = 0.0;
+                    }
+                    let m = self.doc_metrics(rasterizer);
+                    self.viewport
+                        .ensure_caret_visible(&mut self.doc, self.caret, m, self.framebuffer.scale);
+                }
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            Err(e) => self.set_notice(e, true),
         }
     }
 
@@ -1806,28 +2591,65 @@ impl EditorApp {
                 line_0based,
                 col_bytes,
             } => {
-                let same_file = self.doc.path() == Some(path.as_path());
-                if same_file {
-                    self.execute_pending_action(
-                        PendingDiscardAction::OpenAt {
-                            path,
-                            line_0based,
-                            col_bytes,
-                        },
-                        host,
-                    );
-                    let m = self.doc_metrics(rasterizer);
-                    self.viewport
-                        .ensure_caret_visible(&mut self.doc, self.caret, m, self.framebuffer.scale);
+                self.open_at_location(&path, line_0based, col_bytes, rasterizer, host);
+            }
+        }
+    }
+
+    fn handle_harpoon_action(&mut self, act: HarpoonAction, host: &mut dyn PlatformHost) {
+        match act {
+            HarpoonAction::None => {}
+            HarpoonAction::Changed | HarpoonAction::Close => {
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            HarpoonAction::JumpToBuffer { id, split_right } => {
+                if split_right {
+                    let a = self.active_id;
+                    let zone = if self.arrangement.can_insert(a, DropZone::Right) {
+                        DropZone::Right
+                    } else {
+                        DropZone::Bottom
+                    };
+                    self.split_buffer_at(a, zone, id, host);
                 } else {
-                    self.request_discard_or_run(
-                        PendingDiscardAction::OpenAt {
-                            path,
-                            line_0based,
-                            col_bytes,
-                        },
-                        host,
-                    );
+                    self.activate_buffer(id, host);
+                }
+            }
+            HarpoonAction::JumpPin(slot) => {
+                self.jump_to_pin(slot, host);
+            }
+            HarpoonAction::MovePin { slot_0based, delta } => {
+                let id_before = self.working_set.pinned.get(slot_0based).copied();
+                if self.working_set.nudge_pin(slot_0based, delta) {
+                    self.refresh_harpoon_overlay(id_before);
+                    self.mark_dirty();
+                    host.request_redraw();
+                }
+            }
+            HarpoonAction::TogglePin(id) => {
+                self.toggle_pin_buffer(id, host);
+                self.refresh_harpoon_overlay(Some(id));
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            HarpoonAction::RemoveOrClose(id) => {
+                if self.working_set.is_pinned(id) {
+                    // In Harpoon modal, `d` on a pinned slot unpins it cleanly without losing the file.
+                    let _ = self.working_set.toggle_pin(id);
+                    self.refresh_harpoon_overlay(None);
+                    self.mark_dirty();
+                    host.request_redraw();
+                } else {
+                    if self.is_buffer_dirty(id) {
+                        self.harpoon.close();
+                        self.request_close_buffer(id, host);
+                    } else {
+                        self.force_close_buffer(id, host);
+                        self.refresh_harpoon_overlay(None);
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
                 }
             }
         }
@@ -1879,11 +2701,23 @@ impl EditorApp {
         host: &mut dyn PlatformHost,
     ) {
         match cmd {
-            AppCommand::NewFile => {
-                self.request_discard_or_run(PendingDiscardAction::NewFile, host);
+            AppCommand::NewFile | AppCommand::NewTab => {
+                self.new_tab(host);
+            }
+            AppCommand::CloseTab => {
+                if self.is_split() && !self.zoomed {
+                    self.request_close_active_pane(host);
+                } else {
+                    let cur = self.active_buf_id;
+                    self.request_close_buffer(cur, host);
+                }
             }
             AppCommand::OpenFile => {
-                self.request_discard_or_run(PendingDiscardAction::OpenFileDialog, host);
+                if let Some(path) = host.open_file_dialog() {
+                    if let Err(e) = self.open_file(&path, host) {
+                        self.set_notice(e, true);
+                    }
+                }
             }
             AppCommand::OpenFolder => {
                 if let Some(dir) = host.open_folder_dialog() {
@@ -2117,6 +2951,40 @@ impl EditorApp {
             AppCommand::CloseSplit => {
                 self.request_close_active_pane(host);
             }
+            AppCommand::OnlyActivePane => {
+                self.only_active_pane(host);
+            }
+            AppCommand::ToggleZoomPane => {
+                self.toggle_zoom_pane(host);
+            }
+            AppCommand::TogglePin => {
+                let id = self.active_buf_id;
+                self.toggle_pin_buffer(id, host);
+            }
+            AppCommand::JumpPin(slot) => {
+                self.jump_to_pin(slot, host);
+            }
+            AppCommand::ShowHarpoon => {
+                if self.harpoon.visible {
+                    self.harpoon.close();
+                } else {
+                    self.palette.close();
+                    self.shortcuts.close();
+                    self.goto_line.close();
+                    self.refresh_harpoon_overlay(None);
+                }
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::NextTab => {
+                self.step_tab(1, host);
+            }
+            AppCommand::PrevTab => {
+                self.step_tab(-1, host);
+            }
+            AppCommand::ToggleLastBuffer => {
+                self.toggle_last_buffer(host);
+            }
             AppCommand::SwapPanes => {
                 self.swap_panes(host);
             }
@@ -2175,7 +3043,12 @@ impl EditorApp {
                 host.request_redraw();
             }
             AppCommand::Quit => {
-                self.request_discard_or_run(PendingDiscardAction::Quit, host);
+                if let Some(dirty_id) = self.first_dirty_buffer() {
+                    self.activate_buffer(dirty_id, host);
+                    self.request_discard_or_run(PendingDiscardAction::Quit, host);
+                } else {
+                    host.request_quit();
+                }
             }
         }
     }
@@ -2311,7 +3184,11 @@ impl EditorApp {
                 .handle_key(self.fs.as_ref(), key, self.layout.sidebar.h)
             {
                 SidebarAction::OpenFile(p) => {
-                    self.request_discard_or_run(PendingDiscardAction::OpenPath(p), host);
+                    if let Err(e) = self.open_file_with_mode(&p, OpenMode::Keep, host) {
+                        self.set_notice(e, true);
+                    } else {
+                        self.sidebar.set_focused(false);
+                    }
                 }
                 SidebarAction::Changed => {
                     self.mark_dirty();
@@ -2835,6 +3712,7 @@ impl EditorApp {
         rasterizer: &mut dyn GlyphRasterizer,
         host: &mut dyn PlatformHost,
     ) {
+        self.sync_active_buffer_meta();
         let metrics = self.doc_metrics(rasterizer);
         self.viewport
             .ensure_caret_visible(&mut self.doc, self.caret, metrics, self.framebuffer.scale);
@@ -2987,9 +3865,9 @@ impl EditorApp {
                     .handle_click(self.fs.as_ref(), self.layout.sidebar, x_px, y_px, scale)
                 {
                     SidebarAction::OpenFile(p) => {
-                        // Start a drag candidate: if the user releases within 4pt it opens in the
-                        // active pane; if they drag beyond 4pt it shows the live drop preview!
-                        self.begin_drag(DragPayload::File(p), x_px, y_px, false);
+                        // Start a drag candidate: if released within 4pt it opens in Preview
+                        // (single-click) or Kept (double-click); dragging beyond 4pt shows the drop preview!
+                        self.begin_drag(DragPayload::File(p), x_px, y_px, false, click_count);
                         self.mark_dirty_rect(self.layout.sidebar);
                         host.request_redraw();
                     }
@@ -3001,6 +3879,38 @@ impl EditorApp {
                 }
                 return;
             }
+        }
+
+        // 1b. Unified Top Working-Set Strip (tabs, close `×`, `+`, zoom toggle, Harpoon menu).
+        if self.layout.tab_strip.contains(xi, yi) {
+            self.sidebar.set_focused(false);
+            self.find_bar.find_input.focused = false;
+            self.find_bar.replace_input.focused = false;
+            match self.tab_strip.hit_test(x_px, y_px) {
+                TabStripHit::Tab(buf_id) => {
+                    self.begin_drag(DragPayload::Tab(buf_id), x_px, y_px, false, click_count);
+                }
+                TabStripHit::CloseTab(buf_id) => {
+                    self.request_close_buffer(buf_id, host);
+                }
+                TabStripHit::NewTab => {
+                    self.new_tab(host);
+                }
+                TabStripHit::ToggleZoom => {
+                    self.toggle_zoom_pane(host);
+                }
+                TabStripHit::OpenMenu => {
+                    self.refresh_harpoon_overlay(None);
+                    self.mark_dirty();
+                    host.request_redraw();
+                }
+                TabStripHit::None => {
+                    if click_count >= 2 {
+                        self.new_tab(host);
+                    }
+                }
+            }
+            return;
         }
 
         // 2. Find / Replace bar click (including mouse caret placement inside inputs!).
@@ -3068,8 +3978,8 @@ impl EditorApp {
             return;
         }
 
-        // 3. Pane grid divider drag, pane header close (`×`) / double-click swap / drag, or focus switch!
-        if !self.other_panes.is_empty() {
+        // 3. Pane grid divider drag, pane header close (`×`) / double-click zoom / drag, or focus switch!
+        if !self.other_panes.is_empty() && !self.zoomed {
             let grab = (5.0 * scale).round() as i32;
             if let Some(div) = self.layout.grid.divider_at(xi, yi, grab) {
                 self.dragging_divider = Some(div);
@@ -3096,11 +4006,11 @@ impl EditorApp {
                     }
                     if click_count >= 2 {
                         self.focus_pane_id(pr.id, host);
-                        self.swap_panes(host);
+                        self.toggle_zoom_pane(host);
                         return;
                     }
                     self.focus_pane_id(pr.id, host);
-                    self.begin_drag(DragPayload::Pane(pr.id), x_px, y_px, false);
+                    self.begin_drag(DragPayload::Pane(pr.id), x_px, y_px, false, click_count);
                     return;
                 }
                 if pr.id != self.active_id {
@@ -3335,7 +4245,23 @@ impl EditorApp {
                 return;
             }
         }
-        if !self.other_panes.is_empty() {
+        if self.layout.tab_strip.contains(xi, yi) {
+            let (changed, hit) = self.tab_strip.set_hovered(x_px, y_px);
+            if changed {
+                self.mark_dirty_rect(self.layout.tab_strip);
+                host.request_redraw();
+            }
+            host.set_cursor(if hit != TabStripHit::None {
+                CursorShape::Pointer
+            } else {
+                CursorShape::Arrow
+            });
+            return;
+        } else if self.tab_strip.clear_hover() {
+            self.mark_dirty_rect(self.layout.tab_strip);
+            host.request_redraw();
+        }
+        if !self.other_panes.is_empty() && !self.zoomed {
             let grab = (5.0 * scale).round() as i32;
             if let Some(div) = self.layout.grid.divider_at(xi, yi, grab) {
                 let cur = match div.axis {
@@ -3397,7 +4323,14 @@ impl EditorApp {
             return;
         }
         let metrics = self.doc_metrics(rasterizer);
-        if !self.other_panes.is_empty() {
+        if self.layout.tab_strip.contains(xi, yi) {
+            let delta = if dx_px.abs() > 0.1 { dx_px } else { dy_px };
+            self.tab_strip.scroll_by(delta);
+            self.mark_dirty_rect(self.layout.tab_strip);
+            host.request_redraw();
+            return;
+        }
+        if !self.other_panes.is_empty() && !self.zoomed {
             if let Some(pr) = self.layout.grid.pane_at(xi, yi).copied() {
                 if pr.id != self.active_id {
                     if let Some(sec) = self.other_panes.iter_mut().find(|p| p.id == pr.id) {
@@ -3611,10 +4544,59 @@ impl EditorApp {
         }
         panes_json.push(']');
 
+        let mut pins_json = String::from("[");
+        for (i, &bid) in self.working_set.pinned.iter().enumerate() {
+            if i > 0 {
+                pins_json.push(',');
+            }
+            if let Some(m) = self.working_set.get_meta(bid) {
+                let p_json = match &m.path {
+                    Some(p) => json_quote(&p.to_string_lossy()),
+                    None => "null".to_string(),
+                };
+                pins_json.push_str(&format!(
+                    "{{\"slot\":{},\"id\":{bid},\"path\":{},\"file_name\":{},\"dirty\":{}}}",
+                    i + 1,
+                    p_json,
+                    json_quote(&m.file_name),
+                    self.is_buffer_dirty(bid)
+                ));
+            }
+        }
+        pins_json.push(']');
+
+        let mut buffers_json = String::from("[");
+        for (i, bid) in self.working_set.ordered_ids().into_iter().enumerate() {
+            if i > 0 {
+                buffers_json.push(',');
+            }
+            if let Some(m) = self.working_set.get_meta(bid) {
+                let p_json = match &m.path {
+                    Some(p) => json_quote(&p.to_string_lossy()),
+                    None => "null".to_string(),
+                };
+                let pin_json = match self.working_set.pin_slot(bid) {
+                    Some(s) => s.to_string(),
+                    None => "null".to_string(),
+                };
+                buffers_json.push_str(&format!(
+                    "{{\"id\":{bid},\"path\":{},\"file_name\":{},\"dirty\":{},\"pin_slot\":{},\"preview\":{},\"active\":{}}}",
+                    p_json,
+                    json_quote(&m.file_name),
+                    self.is_buffer_dirty(bid),
+                    pin_json,
+                    self.working_set.is_preview(bid),
+                    bid == self.active_buf_id
+                ));
+            }
+        }
+        buffers_json.push(']');
+
         format!(
             concat!(
                 "{{\"running\":true,\"path\":{},\"file_name\":{},\"dirty\":{},",
-                "\"split\":{},\"active_pane\":{},\"panes\":{},",
+                "\"split\":{},\"zoomed\":{},\"active_pane\":{},\"panes\":{},",
+                "\"pins\":{},\"buffers\":{},\"harpoon_open\":{},",
                 "\"bytes\":{},\"line_count\":{},\"eol\":{},\"language\":{},",
                 "\"rev\":{{\"dev\":\"{}\",\"ino\":\"{}\",\"size\":\"{}\",\"mtime_ns\":\"{}\",\"ctime_ns\":\"{}\"}},",
                 "\"can_undo\":{},\"can_redo\":{},",
@@ -3633,8 +4615,12 @@ impl EditorApp {
             json_quote(self.doc.file_name()),
             self.doc.is_dirty(),
             self.is_split(),
+            self.zoomed,
             self.active_pane_index(),
             panes_json,
+            pins_json,
+            buffers_json,
+            self.harpoon.visible,
             self.doc.len_bytes(),
             line_count,
             json_quote(self.doc.eol().as_str()),
@@ -3806,6 +4792,7 @@ impl EditorApp {
                 };
                 match res {
                     Ok(rep) => {
+                        self.sync_active_buffer_meta();
                         self.sync_title(host);
                         self.sidebar.refresh(self.fs.as_ref());
                         self.set_notice(format!("Saved ({})", rep.method.as_str()), false);
@@ -3831,6 +4818,41 @@ impl EditorApp {
                 let mut activate = false;
                 match name.as_str() {
                     "new" => self.handle_command(AppCommand::NewFile, rasterizer, clipboard, host),
+                    "new-tab" => self.handle_command(AppCommand::NewTab, rasterizer, clipboard, host),
+                    "close-tab" => self.handle_command(AppCommand::CloseTab, rasterizer, clipboard, host),
+                    "pin" | "pin-file" | "toggle-pin" => {
+                        self.handle_command(AppCommand::TogglePin, rasterizer, clipboard, host)
+                    }
+                    "unpin" => {
+                        let id = self.active_buf_id;
+                        if self.working_set.is_pinned(id) {
+                            self.toggle_pin_buffer(id, host);
+                        }
+                    }
+                    "harpoon" => {
+                        activate = true;
+                        self.handle_command(AppCommand::ShowHarpoon, rasterizer, clipboard, host);
+                    }
+                    "next-tab" => self.handle_command(AppCommand::NextTab, rasterizer, clipboard, host),
+                    "prev-tab" => self.handle_command(AppCommand::PrevTab, rasterizer, clipboard, host),
+                    "last-buffer" => {
+                        self.handle_command(AppCommand::ToggleLastBuffer, rasterizer, clipboard, host)
+                    }
+                    "zoom" | "zoom-pane" | "toggle-zoom" => {
+                        self.handle_command(AppCommand::ToggleZoomPane, rasterizer, clipboard, host)
+                    }
+                    "only-pane" => {
+                        self.handle_command(AppCommand::OnlyActivePane, rasterizer, clipboard, host)
+                    }
+                    "jump-pin-1" => self.handle_command(AppCommand::JumpPin(1), rasterizer, clipboard, host),
+                    "jump-pin-2" => self.handle_command(AppCommand::JumpPin(2), rasterizer, clipboard, host),
+                    "jump-pin-3" => self.handle_command(AppCommand::JumpPin(3), rasterizer, clipboard, host),
+                    "jump-pin-4" => self.handle_command(AppCommand::JumpPin(4), rasterizer, clipboard, host),
+                    "jump-pin-5" => self.handle_command(AppCommand::JumpPin(5), rasterizer, clipboard, host),
+                    "jump-pin-6" => self.handle_command(AppCommand::JumpPin(6), rasterizer, clipboard, host),
+                    "jump-pin-7" => self.handle_command(AppCommand::JumpPin(7), rasterizer, clipboard, host),
+                    "jump-pin-8" => self.handle_command(AppCommand::JumpPin(8), rasterizer, clipboard, host),
+                    "jump-pin-9" => self.handle_command(AppCommand::JumpPin(9), rasterizer, clipboard, host),
                     "reload" => {
                         self.handle_command(AppCommand::Reload, rasterizer, clipboard, host)
                     }
@@ -3954,6 +4976,63 @@ impl EditorApp {
                     "save-as" => self.handle_command(AppCommand::SaveAs, rasterizer, clipboard, host),
                     "quit" => self.handle_command(AppCommand::Quit, rasterizer, clipboard, host),
                     "focus" => activate = true,
+                    other if other.starts_with("pin:") => {
+                        let p = PathBuf::from(&other["pin:".len()..]);
+                        match self.open_file_with_mode(&p, OpenMode::Keep, host) {
+                            Ok(id) => {
+                                if !self.working_set.is_pinned(id) {
+                                    self.toggle_pin_buffer(id, host);
+                                }
+                            }
+                            Err(e) => return (IpcReply::Error(e), false, false),
+                        }
+                    }
+                    other if other.starts_with("unpin:") => {
+                        let arg = &other["unpin:".len()..];
+                        if let Ok(slot) = arg.parse::<usize>() {
+                            if slot >= 1 && slot <= self.working_set.pinned.len() {
+                                let id = self.working_set.pinned[slot - 1];
+                                self.toggle_pin_buffer(id, host);
+                            } else {
+                                return (
+                                    IpcReply::Error(format!("no pinned file in slot {slot}")),
+                                    false,
+                                    false,
+                                );
+                            }
+                        } else {
+                            let canonical = self
+                                .fs
+                                .canonicalize(Path::new(arg))
+                                .unwrap_or_else(|_| PathBuf::from(arg));
+                            if let Some(id) = self.working_set.find_by_path(&canonical) {
+                                if self.working_set.is_pinned(id) {
+                                    self.toggle_pin_buffer(id, host);
+                                }
+                            } else {
+                                return (
+                                    IpcReply::Error(format!("file not pinned: {arg}")),
+                                    false,
+                                    false,
+                                );
+                            }
+                        }
+                    }
+                    other if other.starts_with("jump-pin:") => {
+                        let arg = &other["jump-pin:".len()..];
+                        match arg.parse::<u8>() {
+                            Ok(slot @ 1..=9) => {
+                                self.jump_to_pin(slot, host);
+                            }
+                            _ => {
+                                return (
+                                    IpcReply::Error(format!("pin slot must be 1..9, got `{arg}`")),
+                                    false,
+                                    false,
+                                );
+                            }
+                        }
+                    }
                     other if other.starts_with("split-down:") => {
                         let p = PathBuf::from(&other["split-down:".len()..]);
                         self.split_pane_down(Some(&p), host);
@@ -4088,7 +5167,7 @@ impl EditorApp {
                 (IpcReply::Json(self.status_json()), activate, false)
             }
             IpcCommand::Quit { force } => {
-                if *force || !self.doc.is_dirty() {
+                if *force || !self.any_buffer_dirty() {
                     (IpcReply::Quitting, false, true)
                 } else {
                     self.handle_command(AppCommand::Quit, rasterizer, clipboard, host);

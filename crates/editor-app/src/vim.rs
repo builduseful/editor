@@ -45,12 +45,14 @@ pub enum FindCharKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VimPending {
     None,
-    /// Waiting for second key after `g` (e.g. `gg`).
+    /// Waiting for second key after `g` (e.g. `gg`, `gt`, `gT`, `g1..9`).
     GPrefix,
     /// Waiting for second key after `z` (e.g. `zz`).
     ZPrefix,
     /// Waiting for second key after `Ctrl+W` (pane commands).
     WindowPrefix,
+    /// Waiting for second key after `<Space>` leader (Harpoon / buffer flicking).
+    LeaderPrefix,
     /// Waiting for target character after `f`/`F`/`t`/`T`.
     FindChar(FindCharKind),
     /// Waiting for replacement character after `r`.
@@ -135,12 +137,20 @@ pub enum VimAction {
     SplitRight,
     SplitDown,
     CloseSplit,
+    OnlyActivePane,
+    ToggleZoomPane,
     SwapPanes,
     FocusPaneLeft,
     FocusPaneRight,
     FocusPaneUp,
     FocusPaneDown,
     FocusOtherPane,
+    TogglePin,
+    ShowHarpoon,
+    JumpPin(u8),
+    NextTab,
+    PrevTab,
+    ToggleLastBuffer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,6 +240,7 @@ impl VimState {
             VimPending::GPrefix => suffix.push('g'),
             VimPending::ZPrefix => suffix.push('z'),
             VimPending::WindowPrefix => suffix.push_str("^W"),
+            VimPending::LeaderPrefix => suffix.push_str("SPC"),
             VimPending::FindChar(k) => suffix.push(match k {
                 FindCharKind::Forward => 'f',
                 FindCharKind::Backward => 'F',
@@ -366,11 +377,29 @@ impl VimState {
             }
             VimPending::GPrefix => {
                 self.pending = VimPending::None;
-                if ch_opt == Some('g') {
-                    return self.dispatch_motion(VimMotion::FileTop);
+                match ch_opt {
+                    Some('g') => return self.dispatch_motion(VimMotion::FileTop),
+                    Some('t') => {
+                        self.reset_pending();
+                        return VimAction::NextTab;
+                    }
+                    Some('T') => {
+                        self.reset_pending();
+                        return VimAction::PrevTab;
+                    }
+                    Some(c @ '1'..='9') => {
+                        self.reset_pending();
+                        return VimAction::JumpPin((c as u8) - b'0');
+                    }
+                    Some('m') => {
+                        self.reset_pending();
+                        return VimAction::TogglePin;
+                    }
+                    _ => {
+                        self.reset_pending();
+                        return VimAction::Consumed;
+                    }
                 }
-                self.reset_pending();
-                return VimAction::Consumed;
             }
             VimPending::ZPrefix => {
                 self.pending = VimPending::None;
@@ -391,8 +420,21 @@ impl VimState {
                     Some('w') => VimAction::FocusOtherPane,
                     Some('v') => VimAction::SplitRight,
                     Some('s') => VimAction::SplitDown,
+                    Some('z') | Some('m') => VimAction::ToggleZoomPane,
+                    Some('o') => VimAction::OnlyActivePane,
                     Some('x') | Some('r') => VimAction::SwapPanes,
                     Some('q') | Some('c') => VimAction::CloseSplit,
+                    _ => VimAction::Consumed,
+                };
+            }
+            VimPending::LeaderPrefix => {
+                self.pending = VimPending::None;
+                self.reset_pending();
+                return match ch_opt {
+                    Some('a') | Some('m') => VimAction::TogglePin,
+                    Some('e') => VimAction::ShowHarpoon,
+                    Some(' ') => VimAction::ToggleLastBuffer,
+                    Some(c @ '1'..='9') => VimAction::JumpPin((c as u8) - b'0'),
                     _ => VimAction::Consumed,
                 };
             }
@@ -411,6 +453,10 @@ impl VimState {
                 Some('w') => {
                     self.pending = VimPending::WindowPrefix;
                     VimAction::Consumed
+                }
+                Some('^') | Some('6') => {
+                    self.reset_pending();
+                    VimAction::ToggleLastBuffer
                 }
                 _ => VimAction::Consumed,
             };
@@ -460,6 +506,10 @@ impl VimState {
             '%' => return self.dispatch_motion(VimMotion::MatchingBracket),
             '{' => return self.dispatch_motion(VimMotion::ParagraphPrev),
             '}' => return self.dispatch_motion(VimMotion::ParagraphNext),
+            ' ' if self.mode == VimMode::Normal && self.operator.is_none() => {
+                self.pending = VimPending::LeaderPrefix;
+                return VimAction::Consumed;
+            }
             'g' => {
                 self.pending = VimPending::GPrefix;
                 return VimAction::Consumed;

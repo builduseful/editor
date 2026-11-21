@@ -66,6 +66,10 @@ impl KeyChord {
         Self::new(key, false, false, true, false)
     }
 
+    pub const fn ctrl(key: Key) -> Self {
+        Self::new(key, false, false, false, true)
+    }
+
     pub fn matches(self, key: Key, mods: Modifiers) -> bool {
         if self.primary != mods.primary() || self.shift != mods.shift || self.alt != mods.alt {
             return false;
@@ -351,11 +355,14 @@ fn default_shortcuts() -> Vec<ShortcutEntry> {
     vec![
         // ── Main Shortcuts (featured = true, shown immediately in ⌘K / ⇧⌘/) ──
         bind("quick-open", "Quick open file", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('p'))], None, true, AppCommand::QuickOpen),
+        bind("harpoon", "Pinned & open files (Harpoon)", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('e'))], None, true, AppCommand::ShowHarpoon),
+        bind("pin-file", "Pin or unpin current file (1–9)", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('m'))], None, true, AppCommand::TogglePin),
         bind("project-search", "Search across project", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('f'))], None, true, AppCommand::ProjectSearch),
         bind("find", "Find in file", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('f'))], None, true, AppCommand::Find),
         bind("goto-line", "Go to line", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('g'))], None, true, AppCommand::GoToLine),
         bind("split", "Split editor right", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('\\'))], Some("⌘\\"), true, AppCommand::SplitPane),
-        bind("close-pane", "Close active split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('w')), KeyChord::primary_shift(Key::Char('\\'))], Some("⌘W"), true, AppCommand::CloseSplit),
+        bind("zoom-pane", "Toggle fullscreen pane zoom", "Panes & View", KeyScope::Global, vec![KeyChord::primary_shift(Key::Enter)], Some("⇧⌘↵"), true, AppCommand::ToggleZoomPane),
+        bind("close-tab", "Close tab or active split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('w'))], Some("⌘W"), true, AppCommand::CloseTab),
         bind("toggle-sidebar", "Toggle file sidebar", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('b'))], None, true, AppCommand::ToggleSidebar),
         bind("save", "Save file", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('s'))], None, true, AppCommand::Save),
         bind("toggle-comment", "Toggle line comment", "Editing", KeyScope::Document, vec![KeyChord::primary(Key::Char('/'))], Some("⌘/"), true, AppCommand::ToggleComment),
@@ -363,10 +370,23 @@ fn default_shortcuts() -> Vec<ShortcutEntry> {
         bind("shortcuts", "Show keyboard shortcuts", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('k')), KeyChord::primary_shift(Key::Char('/')), KeyChord::primary_shift(Key::Char('?')), KeyChord::primary(Key::Char('?'))], Some("⌘K"), true, AppCommand::ShowShortcuts),
 
         // ── File & Navigation (extra) ──
+        bind("new-tab", "New untitled tab", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('t'))], None, false, AppCommand::NewTab),
         bind("new", "New untitled file", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('n'))], None, false, AppCommand::NewFile),
         bind("open-dialog", "Open file…", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('o'))], None, false, AppCommand::OpenFile),
         bind("open-folder", "Open folder…", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('o'))], None, false, AppCommand::OpenFolder),
         bind("save-as", "Save file as…", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('s'))], None, false, AppCommand::SaveAs),
+        bind("last-buffer", "Switch to previous file", "File & Navigation", KeyScope::Global, vec![KeyChord::ctrl(Key::Tab)], Some("⌃⇥"), false, AppCommand::ToggleLastBuffer),
+        bind("prev-tab", "Previous tab", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('['))], Some("⇧⌘["), false, AppCommand::PrevTab),
+        bind("next-tab", "Next tab", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char(']'))], Some("⇧⌘]"), false, AppCommand::NextTab),
+        bind("jump-pin-1", "Jump to pinned file 1", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('1'))], Some("⌘1"), false, AppCommand::JumpPin(1)),
+        bind("jump-pin-2", "Jump to pinned file 2", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('2'))], Some("⌘2"), false, AppCommand::JumpPin(2)),
+        bind("jump-pin-3", "Jump to pinned file 3", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('3'))], Some("⌘3"), false, AppCommand::JumpPin(3)),
+        bind("jump-pin-4", "Jump to pinned file 4", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('4'))], Some("⌘4"), false, AppCommand::JumpPin(4)),
+        bind("jump-pin-5", "Jump to pinned file 5", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('5'))], Some("⌘5"), false, AppCommand::JumpPin(5)),
+        bind("jump-pin-6", "Jump to pinned file 6", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('6'))], Some("⌘6"), false, AppCommand::JumpPin(6)),
+        bind("jump-pin-7", "Jump to pinned file 7", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('7'))], Some("⌘7"), false, AppCommand::JumpPin(7)),
+        bind("jump-pin-8", "Jump to pinned file 8", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('8'))], Some("⌘8"), false, AppCommand::JumpPin(8)),
+        bind("jump-pin-9", "Jump to pinned file 9", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('9'))], Some("⌘9"), false, AppCommand::JumpPin(9)),
         bind("replace", "Find and replace", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_alt(Key::Char('f'))], None, false, AppCommand::Replace),
         bind("find-next", "Find next match (when Find is open)", "File & Navigation", KeyScope::FindBar, vec![KeyChord::primary(Key::Char('g'))], Some("⌘G"), false, AppCommand::FindNext),
         bind("find-prev", "Find previous match (when Find is open)", "File & Navigation", KeyScope::FindBar, vec![KeyChord::primary_shift(Key::Char('g'))], Some("⇧⌘G"), false, AppCommand::FindPrev),
@@ -386,6 +406,7 @@ fn default_shortcuts() -> Vec<ShortcutEntry> {
 
         // ── Panes & View ──
         bind("split-down", "Split editor down", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Char('\\'))], Some("⌥⌘\\"), false, AppCommand::SplitPaneDown),
+        bind("close-pane", "Close active split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('\\'))], Some("⇧⌘\\"), false, AppCommand::CloseSplit),
         bind("swap-panes", "Swap split panes", "Panes & View", KeyScope::Global, vec![KeyChord::primary_ctrl(Key::Char('\\'))], Some("⌃⌘\\"), false, AppCommand::SwapPanes),
         bind("focus-left", "Focus left split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Left)], Some("⌥⌘←"), false, AppCommand::FocusLeftPane),
         bind("focus-right", "Focus right split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Right)], Some("⌥⌘→"), false, AppCommand::FocusRightPane),
@@ -419,6 +440,8 @@ fn default_shortcuts() -> Vec<ShortcutEntry> {
         vim_ref("vim.indent", "Indent / outdent line", "Vim Editing & Panes", ">> / <<"),
         vim_ref("vim.undo", "Undo / Redo", "Vim Editing & Panes", "u / ⌃R"),
         vim_ref("vim.visual", "Visual character / visual line mode", "Vim Editing & Panes", "v / V"),
-        vim_ref("vim.panes", "Split / swap / switch / close pane", "Vim Editing & Panes", "⌃W v s / x / h j k l w / q"),
+        vim_ref("vim.harpoon", "Pin / Harpoon menu / jump 1–9 / last file", "Vim Editing & Panes", "Space a / e / 1–9 / Space"),
+        vim_ref("vim.tabs", "Next / prev tab / jump pin / alternate file", "Vim Editing & Panes", "gt / gT / g1–9 / ⌃^"),
+        vim_ref("vim.panes", "Split / zoom / only / swap / switch / close", "Vim Editing & Panes", "⌃W v s / z / o / x / hjklw / q"),
     ]
 }

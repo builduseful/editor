@@ -951,12 +951,16 @@ void mac_activate_app(void) {
     // File Menu
     NSMenuItem* fileItem = [[NSMenuItem alloc] init];
     NSMenu* fileMenu = [[NSMenu alloc] initWithTitle:@"File"];
+    [fileMenu addItem:[self menuItem:@"New Tab" key:@"t" tag:37 mods:NSEventModifierFlagCommand]];
     [fileMenu addItem:[self menuItem:@"New" key:@"n" tag:0 mods:NSEventModifierFlagCommand]];
     [fileMenu addItem:[self menuItem:@"Open…" key:@"o" tag:1 mods:NSEventModifierFlagCommand]];
     [fileMenu addItem:[self menuItem:@"Open Folder…" key:@"o" tag:2
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
     [fileMenu addItem:[self menuItem:@"Quick Open…" key:@"p" tag:22 mods:NSEventModifierFlagCommand]];
+    [fileMenu addItem:[self menuItem:@"Pinned & Open Files…" key:@"e" tag:39 mods:NSEventModifierFlagCommand]];
+    [fileMenu addItem:[self menuItem:@"Pin / Unpin File" key:@"m" tag:40 mods:NSEventModifierFlagCommand]];
     [fileMenu addItem:[NSMenuItem separatorItem]];
+    [fileMenu addItem:[self menuItem:@"Close Tab / Pane" key:@"w" tag:38 mods:NSEventModifierFlagCommand]];
     [fileMenu addItem:[self menuItem:@"Save" key:@"s" tag:3 mods:NSEventModifierFlagCommand]];
     [fileMenu addItem:[self menuItem:@"Save As…" key:@"s" tag:4
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
@@ -1002,9 +1006,19 @@ void mac_activate_app(void) {
     [viewMenu addItem:[self menuItem:@"Split Editor Right" key:@"\\" tag:24 mods:NSEventModifierFlagCommand]];
     [viewMenu addItem:[self menuItem:@"Split Editor Down" key:@"\\" tag:34
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
-    [viewMenu addItem:[self menuItem:@"Close Active Pane" key:@"w" tag:25 mods:NSEventModifierFlagCommand]];
+    [viewMenu addItem:[self menuItem:@"Toggle Fullscreen Zoom" key:@"\r" tag:41
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
+    [viewMenu addItem:[self menuItem:@"Close Active Split Pane" key:@"\\" tag:25
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
     [viewMenu addItem:[self menuItem:@"Swap Split Panes" key:@"\\" tag:28
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagControl]];
+    [viewMenu addItem:[NSMenuItem separatorItem]];
+    [viewMenu addItem:[self menuItem:@"Previous Tab" key:@"[" tag:42
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
+    [viewMenu addItem:[self menuItem:@"Next Tab" key:@"]" tag:43
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
+    [viewMenu addItem:[self menuItem:@"Switch to Previous File" key:@"\t" tag:44
+                                mods:NSEventModifierFlagControl]];
     [viewMenu addItem:[self menuItem:@"Focus Left Pane" key:@"\uF702" tag:29
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
     [viewMenu addItem:[self menuItem:@"Focus Right Pane" key:@"\uF703" tag:30

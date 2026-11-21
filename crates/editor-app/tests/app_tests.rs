@@ -130,7 +130,8 @@ fn full_headless_editing_find_replace_save_and_render_workflow() {
     );
     assert!(!app.find_bar.visible);
 
-    // Unsaved changes guard when opening another file via OpenPath.
+    // Opening another file parks dirty `main.rs` safely without interrupting,
+    // and closing a dirty tab guards with the unsaved-changes confirmation!
     app.handle_event(
         InputEvent::KeyDown {
             key: Key::Char('x'),
@@ -142,14 +143,30 @@ fn full_headless_editing_find_replace_save_and_render_workflow() {
         &mut host,
     );
     assert!(app.doc.is_dirty());
-    host.next_confirm = Some(ConfirmChoice::Cancel);
     app.handle_event(
         InputEvent::OpenPath(PathBuf::from("/work/src/other.rs")),
         &mut raster,
         &mut clip,
         &mut host,
     );
-    assert_eq!(app.doc.file_name(), "main.rs", "Cancel must keep current dirty doc!");
+    assert_eq!(app.doc.file_name(), "other.rs");
+    // Flick back to `main.rs` — dirty edits are still safely preserved in memory!
+    app.handle_event(
+        InputEvent::Command(AppCommand::ToggleLastBuffer),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.file_name(), "main.rs");
+    assert!(app.doc.is_dirty());
+    host.next_confirm = Some(ConfirmChoice::Cancel);
+    app.handle_event(
+        InputEvent::Command(AppCommand::CloseTab),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.file_name(), "main.rs", "Cancel must keep dirty tab open!");
 
     // Accessibility snapshot exposes all key regions.
     let a11y = app.a11y_snapshot();
@@ -283,10 +300,19 @@ fn pro_line_ops_menu_routing_confirm_modal_and_caret_blink_partial_redraw() {
     assert!(!app.framebuffer.dirty.is_full(), "caret blink should use partial dirty rect!");
     assert!(app.render(&mut raster));
 
-    // 7. In-app confirmation modal opens on dirty doc switch and discards when pressing 'd'.
+    // 7. In-app confirmation modal opens on closing a dirty tab and discards when pressing 'd'.
     assert!(app.doc.is_dirty());
+    app.open_file(&PathBuf::from("/work/next.rs"), &mut host).unwrap();
+    assert_eq!(app.doc.file_name(), "next.rs");
     app.handle_event(
-        InputEvent::OpenPath(PathBuf::from("/work/next.rs")),
+        InputEvent::Command(AppCommand::ToggleLastBuffer),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.file_name(), "code.rs");
+    app.handle_event(
+        InputEvent::Command(AppCommand::CloseTab),
         &mut raster,
         &mut clip,
         &mut host,
@@ -1242,4 +1268,558 @@ fn grid_2x2_drag_and_drop_files_and_pane_headers_with_bit_exact_swapchain() {
     assert_eq!(app.active_pane_index(), 3);
     assert_eq!(app.doc.file_name(), "tl.rs");
     verify_frame(&mut app, &mut raster);
+}
+
+#[test]
+fn harpoon_working_set_fullscreen_flicking_zoom_overlay_and_tab_drag_to_split() {
+    use editor_app::OpenMode;
+    use editor_platform::{
+        AppCommand, InputEvent, Key, Modifiers, MouseButton, PixelRect, SurfaceMut,
+    };
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/a.rs", b"fn a() {\n    let x = 1;\n}\n".to_vec());
+    fs.add_file("/repo/b.rs", b"fn b() {\n    let y = 2;\n}\n".to_vec());
+    fs.add_file("/repo/c.rs", b"fn c() {\n    let z = 3;\n}\n".to_vec());
+    fs.add_file("/repo/d.rs", b"fn d() {\n    let w = 4;\n}\n".to_vec());
+    fs.add_file("/repo/e.rs", b"fn e() {}\n".to_vec());
+
+    let (w, h, scale) = (1120u32, 740u32, 2.0f32);
+    let mut app = EditorApp::new(fs.clone(), w, h, scale);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.set_sidebar_root(std::path::Path::new("/repo"));
+
+    // 1. Single-click preview slot reuses cleanly without tab sprawl!
+    let a_id = app
+        .open_file_with_mode(&PathBuf::from("/repo/a.rs"), OpenMode::Preview, &mut host)
+        .unwrap();
+    assert_eq!(app.working_set.preview, Some(a_id));
+    assert_eq!(app.working_set.len(), 1);
+
+    let b_id = app
+        .open_file_with_mode(&PathBuf::from("/repo/b.rs"), OpenMode::Preview, &mut host)
+        .unwrap();
+    assert_eq!(app.working_set.preview, Some(b_id));
+    assert_eq!(app.working_set.len(), 1, "preview click replaces previous clean preview");
+
+    // 2. Editing graduates preview -> Kept open tab, and saving NEVER removes it!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('/'),
+            mods: Modifiers::NONE,
+            text: Some("// edited\n".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.working_set.preview, None);
+    assert!(app.working_set.open.contains(&b_id));
+    app.handle_event(
+        InputEvent::Command(AppCommand::Save),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.doc.is_dirty());
+    assert!(
+        app.working_set.open.contains(&b_id),
+        "saving a Kept tab must NEVER make it disappear"
+    );
+
+    // 3. Pin 3 files into Harpoon slots 1, 2, 3 and flick between them in fullscreen!
+    app.toggle_pin_buffer(b_id, &mut host);
+    let a_id = app
+        .open_file_with_mode(&PathBuf::from("/repo/a.rs"), OpenMode::Keep, &mut host)
+        .unwrap();
+    app.toggle_pin_buffer(a_id, &mut host);
+    let c_id = app
+        .open_file_with_mode(&PathBuf::from("/repo/c.rs"), OpenMode::Keep, &mut host)
+        .unwrap();
+    app.toggle_pin_buffer(c_id, &mut host);
+    assert_eq!(app.working_set.pinned, vec![b_id, a_id, c_id]);
+
+    // Move caret in `c.rs` and type dirty text; flick to Pin 1 (`b.rs`) and back to Pin 3 (`c.rs`):
+    app.caret = 5;
+    app.anchor = 5;
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('!'),
+            mods: Modifiers::NONE,
+            text: Some("/*pin3*/".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let saved_caret = app.caret;
+    app.handle_event(
+        InputEvent::Command(AppCommand::JumpPin(1)),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.file_name(), "b.rs");
+    app.handle_event(
+        InputEvent::Command(AppCommand::JumpPin(3)),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.file_name(), "c.rs");
+    assert_eq!(app.caret, saved_caret, "flicking must restore exact caret position");
+    assert!(app.doc.is_dirty(), "flicking must preserve unsaved edits in memory");
+
+    // 4. `Ctrl+Tab` MRU ping-pong toggles cleanly between `c.rs` and `b.rs`!
+    app.handle_event(
+        InputEvent::Command(AppCommand::ToggleLastBuffer),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.file_name(), "b.rs");
+    app.handle_event(
+        InputEvent::Command(AppCommand::ToggleLastBuffer),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.file_name(), "c.rs");
+
+    // 5. `⌘E` Harpoon Overlay: reorder Pin 1 <-> Pin 2 with `⌥↓`, then jump via `1`!
+    app.handle_event(
+        InputEvent::Command(AppCommand::JumpPin(1)),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::Command(AppCommand::ShowHarpoon),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.harpoon.visible);
+    app.render(&mut raster);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Down,
+            mods: Modifiers {
+                alt: true,
+                ..Modifiers::NONE
+            },
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(
+        app.working_set.pinned,
+        vec![a_id, b_id, c_id],
+        "Option+Down in Harpoon overlay must swap slot 1 and slot 2"
+    );
+    // Press `1` to jump directly to new Pin 1 (`a.rs`) and close overlay!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('1'),
+            mods: Modifiers::NONE,
+            text: Some("1".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.harpoon.visible);
+    assert_eq!(app.doc.file_name(), "a.rs");
+
+    // 6. Fullscreen Zoom on a 1x2 split + `⌘2` teleport + unzoom restores exact grid!
+    app.split_pane_with(Some(&PathBuf::from("/repo/b.rs")), &mut host);
+    assert_eq!(app.pane_count(), 2);
+    assert_eq!(app.doc.file_name(), "b.rs");
+
+    // `⌘1` teleports focus to left pane (`a.rs`) when unzoomed!
+    app.handle_event(
+        InputEvent::Command(AppCommand::JumpPin(1)),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.active_pane_index(), 0);
+    assert_eq!(app.doc.file_name(), "a.rs");
+
+    // Zoom (`⇧⌘Enter`): layout shows only 1 fullscreen pane with zero pane header!
+    app.handle_event(
+        InputEvent::Command(AppCommand::ToggleZoomPane),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.zoomed);
+    assert_eq!(app.layout.grid.panes().len(), 1);
+    assert!(app.layout.grid.panes()[0].header.is_empty());
+
+    // While zoomed, pressing `⌘2` smoothly switches fullscreen to `b.rs`!
+    app.handle_event(
+        InputEvent::Command(AppCommand::JumpPin(2)),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.zoomed);
+    assert_eq!(app.doc.file_name(), "b.rs");
+
+    // Unzooming restores the 2-pane split cleanly!
+    app.handle_event(
+        InputEvent::Command(AppCommand::ToggleZoomPane),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.zoomed);
+    assert_eq!(app.layout.grid.panes().len(), 2);
+
+    // 7. Double-buffered swapchain bit-exact check while dragging a tab pill down onto a pane edge!
+    let mut slots = [vec![0u32; (w * h) as usize], vec![0u32; (w * h) as usize]];
+    let mut needs_full = [true, true];
+    let mut dmg = [PixelRect::ZERO, PixelRect::ZERO];
+    let mut front = 1usize;
+    let mut verify = |app: &mut EditorApp, raster: &mut BuiltinBitmapRasterizer| {
+        let back = 1 - front;
+        let surf = SurfaceMut {
+            width: w,
+            height: h,
+            stride: w as usize,
+            scale,
+            pixels: &mut slots[back],
+        };
+        if let Some(painted) =
+            app.render_into_with_damage(surf, raster, dmg[back], needs_full[back])
+        {
+            needs_full[back] = false;
+            dmg[back] = PixelRect::ZERO;
+            if !needs_full[front] {
+                dmg[front] = dmg[front].union(painted);
+            }
+            front = back;
+        }
+        let mut ref_buf = vec![0u32; (w * h) as usize];
+        let ref_surf = SurfaceMut {
+            width: w,
+            height: h,
+            stride: w as usize,
+            scale,
+            pixels: &mut ref_buf,
+        };
+        app.render_into_with_damage(ref_surf, raster, PixelRect::ZERO, true)
+            .expect("ref full render");
+        assert_eq!(slots[front], ref_buf, "tab strip + drag swapchain must be bit-exact");
+    };
+    verify(&mut app, &mut raster);
+
+    // Find tab 3 (`c.rs`) in the top strip and drag it onto the bottom edge of pane 1 -> 3 panes!
+    let strip = app.layout.tab_strip;
+    let tab3_x = (strip.x + 280) as f32;
+    let tab_y = (strip.y + strip.h / 2) as f32;
+    let p1 = app
+        .layout
+        .grid
+        .get(app.arrangement.id_at_index(1).unwrap())
+        .unwrap()
+        .frame;
+    let (drop_x, drop_y) = ((p1.x + p1.w / 2) as f32, (p1.bottom() - 24) as f32);
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: tab3_x,
+            y_px: tab_y,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: drop_x,
+            y_px: drop_y,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    verify(&mut app, &mut raster);
+    app.handle_event(
+        InputEvent::MouseUp {
+            x_px: drop_x,
+            y_px: drop_y,
+            button: MouseButton::Left,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    verify(&mut app, &mut raster);
+
+    // 8. Verify Neovim `<Space>a`, `<Space>1`, `<Space><Space>`, `gt`, `⌃W z`, `⌃W o`!
+    app.vim.set_enabled(true);
+    let send_ch = |app: &mut EditorApp,
+                   ch: char,
+                   raster: &mut BuiltinBitmapRasterizer,
+                   clip: &mut MemoryClipboard,
+                   host: &mut HeadlessHost| {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            raster,
+            clip,
+            host,
+        );
+    };
+    send_ch(&mut app, ' ', &mut raster, &mut clip, &mut host);
+    send_ch(&mut app, '1', &mut raster, &mut clip, &mut host);
+    assert_eq!(app.doc.file_name(), "a.rs");
+
+    // `Ctrl+W o` collapses to single pane cleanly!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('w'),
+            mods: Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    send_ch(&mut app, 'o', &mut raster, &mut clip, &mut host);
+    assert_eq!(app.pane_count(), 1);
+    assert!(!app.zoomed);
+    verify(&mut app, &mut raster);
+}
+
+#[test]
+fn buffer_pool_dirty_quit_guard_strip_drag_reordering_and_ipc_pins() {
+    use editor_platform::ipc::{IpcCommand, IpcReply};
+    use editor_platform::{AppCommand, InputEvent, Key, Modifiers, MouseButton};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/one.rs", b"fn one() {}\n".to_vec());
+    fs.add_file("/repo/two.rs", b"fn two() {}\n".to_vec());
+    fs.add_file("/repo/three.rs", b"fn three() {}\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1120, 740, 2.0);
+    app.use_in_app_modal = true;
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.set_sidebar_root(std::path::Path::new("/repo"));
+
+    // 1. Open and pin `one.rs` (slot 1) & `two.rs` (slot 2) via IPC, plus keep `three.rs` unpinned!
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Action("pin:/repo/one.rs".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let IpcReply::Json(s) = reply else { panic!("expected json") };
+    assert!(s.contains("\"slot\":1"));
+
+    app.execute_ipc(
+        &IpcCommand::Action("pin:/repo/two.rs".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.open_file(&PathBuf::from("/repo/three.rs"), &mut host).unwrap();
+    app.render(&mut raster);
+    assert_eq!(app.working_set.pinned.len(), 2);
+    assert_eq!(app.working_set.open.len(), 1);
+
+    // 2. Drag unpinned `three.rs` horizontally across `│` to the far left of the strip -> pins as slot 1!
+    let strip = app.layout.tab_strip;
+    let cy = (strip.y + strip.h / 2) as f32;
+    let mut three_x = None;
+    for probe in (strip.x + 10..strip.right() - 120).step_by(8) {
+        if let editor_render::TabStripHit::Tab(id) = app.tab_strip.hit_test(probe as f32, cy) {
+            if app.working_set.get_meta(id).is_some_and(|m| m.file_name == "three.rs") {
+                three_x = Some(probe as f32);
+                break;
+            }
+        }
+    }
+    let sx = three_x.expect("three.rs tab must be hit-testable in top strip");
+    let dst_x = (strip.x + 12) as f32;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: sx,
+            y_px: cy,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: dst_x,
+            y_px: cy,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.is_dragging());
+    app.handle_event(
+        InputEvent::MouseUp {
+            x_px: dst_x,
+            y_px: cy,
+            button: MouseButton::Left,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.working_set.pinned.len(), 3);
+    assert_eq!(
+        app.working_set
+            .get_meta(app.working_set.pinned[0])
+            .unwrap()
+            .file_name,
+        "three.rs",
+        "dragging unpinned tab to left edge of strip must pin it into slot 1"
+    );
+
+    // 3. IPC `unpin:1`, `jump-pin:1`, `zoom`, `new-tab`, `close-tab`!
+    app.execute_ipc(
+        &IpcCommand::Action("unpin:1".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.working_set.pinned.len(), 2);
+    app.execute_ipc(
+        &IpcCommand::Action("jump-pin:1".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.file_name(), "one.rs");
+
+    // 4. Split `two.rs`, edit it so it's dirty, then close split pane (`⌘W`):
+    //    split closes cleanly AND dirty edits stay safely parked in memory!
+    app.split_pane_with(Some(&PathBuf::from("/repo/two.rs")), &mut host);
+    app.execute_ipc(
+        &IpcCommand::Action("zoom".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.zoomed);
+    app.execute_ipc(
+        &IpcCommand::Action("zoom".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.zoomed);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('/'),
+            mods: Modifiers::NONE,
+            text: Some("// dirty_split\n".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.doc.is_dirty());
+    app.handle_event(
+        InputEvent::Command(AppCommand::CloseTab),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.is_split(), "Cmd+W in unzoomed split closes split pane");
+    assert_eq!(app.doc.file_name(), "one.rs");
+
+    // Also make `one.rs` dirty, then switch to clean `three.rs`!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('/'),
+            mods: Modifiers::NONE,
+            text: Some("// dirty_one\n".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.open_file(&PathBuf::from("/repo/three.rs"), &mut host).unwrap();
+    assert!(!app.doc.is_dirty(), "active buffer three.rs is clean");
+
+    // 5. Quitting while TWO backgrounded buffers (`one.rs` & `two.rs`) are dirty MUST prompt for EACH!
+    let (reply, _, quit_now) = app.execute_ipc(
+        &IpcCommand::Quit { force: false },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!quit_now);
+    assert_eq!(reply, IpcReply::Prompting);
+    assert!(app.confirm_modal.visible);
+    assert!(app.doc.is_dirty(), "quit guard must activate first dirty parked buffer");
+
+    // Discard first dirty buffer -> modal automatically advances to second dirty buffer!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('d'),
+            mods: Modifiers::NONE,
+            text: Some("d".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.confirm_modal.visible, "must prompt for second dirty parked buffer too");
+    assert!(!host.quit_requested);
+
+    // Discard second dirty buffer -> all buffers clean -> quits!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('d'),
+            mods: Modifiers::NONE,
+            text: Some("d".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.confirm_modal.visible);
+    assert!(host.quit_requested);
+
+    // 6. Closing the last remaining buffer (`three.rs`) resets cleanly to a fresh Untitled buffer!
+    app.handle_event(
+        InputEvent::Command(AppCommand::CloseTab),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.working_set.len(), 1);
+    assert_eq!(app.doc.file_name(), "Untitled");
 }

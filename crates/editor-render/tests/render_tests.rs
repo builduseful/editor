@@ -161,3 +161,176 @@ fn viewport_vertical_scroll_clamps_flush_to_bottom_with_no_excess_whitespace() {
         "scroll={cur_scroll} expected={expected_max} (should leave zero bottom void)"
     );
 }
+
+#[test]
+fn tab_strip_hit_testing_drop_targets_and_overflow_scroll() {
+    use editor_render::{StripDropTarget, TabDisplayItem, TabStrip, TabStripHit};
+
+    let mut fb = Framebuffer::new(900, 80, 1.0);
+    let mut atlas = GlyphAtlas::new();
+    let mut raster = BuiltinBitmapRasterizer;
+    let theme = Theme::light();
+    let rect = PixelRect::new(0, 0, 900, 30);
+
+    let items = vec![
+        TabDisplayItem {
+            id: 1,
+            label: "alpha.rs".into(),
+            pin_slot: Some(1),
+            dirty: false,
+            is_preview: false,
+            is_active: true,
+            in_other_pane: false,
+        },
+        TabDisplayItem {
+            id: 2,
+            label: "beta.rs".into(),
+            pin_slot: Some(2),
+            dirty: true,
+            is_preview: false,
+            is_active: false,
+            in_other_pane: true,
+        },
+        TabDisplayItem {
+            id: 3,
+            label: "gamma.rs".into(),
+            pin_slot: None,
+            dirty: false,
+            is_preview: false,
+            is_active: false,
+            in_other_pane: false,
+        },
+        TabDisplayItem {
+            id: 4,
+            label: "preview.md".into(),
+            pin_slot: None,
+            dirty: false,
+            is_preview: true,
+            is_active: false,
+            in_other_pane: false,
+        },
+    ];
+
+    let mut strip = TabStrip::new();
+    {
+        let mut p = Painter::new(&mut fb);
+        strip.draw(&mut p, rect, &items, true, false, false, None, &theme, &mut atlas, &mut raster);
+    }
+
+    // First tab hit & right-edge utility buttons (menu, zoom, new tab) all hit-test accurately!
+    assert_eq!(strip.hit_test(35.0, 15.0), TabStripHit::Tab(1));
+    assert_eq!(strip.hit_test(884.0, 15.0), TabStripHit::OpenMenu);
+    assert_eq!(strip.hit_test(858.0, 15.0), TabStripHit::ToggleZoom);
+    assert_eq!(strip.hit_test(832.0, 15.0), TabStripHit::NewTab);
+
+    // Drop target left of divider resolves PinnedAt, right of divider resolves OpenAt!
+    let (left_target, _) = strip.drop_target_at(20.0, 15.0).expect("left drop");
+    assert_eq!(left_target, StripDropTarget::PinnedAt(0));
+    let (right_target, _) = strip.drop_target_at(380.0, 15.0).expect("right drop");
+    assert!(matches!(right_target, StripDropTarget::OpenAt(_)));
+
+    // Overflow scroll clamps cleanly when many tabs are open.
+    let many: Vec<TabDisplayItem> = (1..=16)
+        .map(|i| TabDisplayItem {
+            id: i,
+            label: format!("module_{i:02}.rs"),
+            pin_slot: None,
+            dirty: false,
+            is_preview: false,
+            is_active: i == 1,
+            in_other_pane: false,
+        })
+        .collect();
+    {
+        let mut p = Painter::new(&mut fb);
+        strip.draw(&mut p, rect, &many, false, false, true, None, &theme, &mut atlas, &mut raster);
+    }
+    strip.scroll_by(10_000.0);
+    assert!(strip.scroll_x_px > 0.0);
+    strip.scroll_by(-10_000.0);
+    assert_eq!(strip.scroll_x_px, 0.0);
+}
+
+#[test]
+fn harpoon_overlay_navigation_reorder_split_and_remove() {
+    use editor_render::{HarpoonAction, HarpoonEntry, HarpoonOverlay};
+
+    let entries = vec![
+        HarpoonEntry {
+            id: 10,
+            name: "a.rs".into(),
+            rel_path: "src/a.rs".into(),
+            pin_slot: Some(1),
+            dirty: false,
+            is_preview: false,
+            is_active: true,
+            in_other_pane: false,
+        },
+        HarpoonEntry {
+            id: 20,
+            name: "b.rs".into(),
+            rel_path: "src/b.rs".into(),
+            pin_slot: Some(2),
+            dirty: true,
+            is_preview: false,
+            is_active: false,
+            in_other_pane: false,
+        },
+        HarpoonEntry {
+            id: 30,
+            name: "c.rs".into(),
+            rel_path: "src/c.rs".into(),
+            pin_slot: None,
+            dirty: false,
+            is_preview: true,
+            is_active: false,
+            in_other_pane: false,
+        },
+    ];
+
+    let mut overlay = HarpoonOverlay::new();
+    overlay.open(entries);
+    assert!(overlay.visible);
+
+    // Move down with `j`, then `J` reorders slot 2 up/down (`MovePin { slot_0based: 1, delta: 1 }`).
+    assert_eq!(overlay.handle_key(Key::Char('j'), Modifiers::NONE), HarpoonAction::Changed);
+    assert_eq!(
+        overlay.handle_key(
+            Key::Char('J'),
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            }
+        ),
+        HarpoonAction::MovePin {
+            slot_0based: 1,
+            delta: 1,
+        }
+    );
+    // `p` toggles pin on selected row (id 20); `d` removes/unpins it.
+    assert_eq!(
+        overlay.handle_key(Key::Char('p'), Modifiers::NONE),
+        HarpoonAction::TogglePin(20)
+    );
+    assert_eq!(
+        overlay.handle_key(Key::Char('d'), Modifiers::NONE),
+        HarpoonAction::RemoveOrClose(20)
+    );
+
+    // `⌘Enter` splits right and closes overlay!
+    let primary = Modifiers {
+        #[cfg(target_os = "macos")]
+        meta: true,
+        #[cfg(not(target_os = "macos"))]
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    assert_eq!(
+        overlay.handle_key(Key::Enter, primary),
+        HarpoonAction::JumpToBuffer {
+            id: 20,
+            split_right: true,
+        }
+    );
+    assert!(!overlay.visible);
+}

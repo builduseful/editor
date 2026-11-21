@@ -354,12 +354,36 @@ impl EditorApp {
             VimAction::SplitRight => self.split_pane_with(None, host),
             VimAction::SplitDown => self.split_pane_down(None, host),
             VimAction::CloseSplit => self.request_close_active_pane(host),
+            VimAction::OnlyActivePane => {
+                self.handle_command(AppCommand::OnlyActivePane, rasterizer, clipboard, host)
+            }
+            VimAction::ToggleZoomPane => {
+                self.handle_command(AppCommand::ToggleZoomPane, rasterizer, clipboard, host)
+            }
             VimAction::SwapPanes => self.swap_panes(host),
             VimAction::FocusPaneLeft => self.focus_direction(crate::Direction::Left, host),
             VimAction::FocusPaneRight => self.focus_direction(crate::Direction::Right, host),
             VimAction::FocusPaneUp => self.focus_direction(crate::Direction::Up, host),
             VimAction::FocusPaneDown => self.focus_direction(crate::Direction::Down, host),
             VimAction::FocusOtherPane => self.focus_next_pane(host),
+            VimAction::TogglePin => {
+                self.handle_command(AppCommand::TogglePin, rasterizer, clipboard, host)
+            }
+            VimAction::ShowHarpoon => {
+                self.handle_command(AppCommand::ShowHarpoon, rasterizer, clipboard, host)
+            }
+            VimAction::JumpPin(slot) => {
+                self.handle_command(AppCommand::JumpPin(slot), rasterizer, clipboard, host)
+            }
+            VimAction::NextTab => {
+                self.handle_command(AppCommand::NextTab, rasterizer, clipboard, host)
+            }
+            VimAction::PrevTab => {
+                self.handle_command(AppCommand::PrevTab, rasterizer, clipboard, host)
+            }
+            VimAction::ToggleLastBuffer => {
+                self.handle_command(AppCommand::ToggleLastBuffer, rasterizer, clipboard, host)
+            }
         }
     }
 

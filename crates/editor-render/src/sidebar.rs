@@ -31,6 +31,12 @@ pub struct FlatRow {
     pub expanded: bool,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SidebarBadge {
+    pub pin_slot: Option<u8>,
+    pub dirty: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SidebarAction {
     None,
@@ -473,6 +479,20 @@ impl Sidebar {
         atlas: &mut GlyphAtlas,
         rasterizer: &mut dyn GlyphRasterizer,
     ) {
+        self.draw_with_badges(painter, rect, theme, atlas, rasterizer, |_| SidebarBadge::default());
+    }
+
+    pub fn draw_with_badges<F>(
+        &mut self,
+        painter: &mut Painter,
+        rect: PixelRect,
+        theme: &Theme,
+        atlas: &mut GlyphAtlas,
+        rasterizer: &mut dyn GlyphRasterizer,
+        badge_for: F,
+    ) where
+        F: Fn(&Path) -> SidebarBadge,
+    {
         if !self.visible || rect.is_empty() {
             return;
         }
@@ -519,7 +539,9 @@ impl Sidebar {
         painter.push_clip(list_rect);
 
         let font_px = 12.5 * scale;
+        let badge_px = 10.0 * scale;
         let metrics = atlas.metrics(rasterizer, FontStyle::Ui, font_px);
+        let bmetrics = atlas.metrics(rasterizer, FontStyle::UiBold, badge_px);
         let first_row = (self.scroll_y_px / self.row_height_px as f32).floor().max(0.0) as usize;
         let visible_rows = (list_rect.h / self.row_height_px) as usize + 2;
         let end_row = (first_row + visible_rows).min(self.rows.len());
@@ -530,6 +552,11 @@ impl Sidebar {
             let row_rect = PixelRect::new(list_rect.x, ry, list_rect.w, self.row_height_px);
             let is_selected = self.selected.as_deref() == Some(row.path.as_path());
             let is_hovered = self.hovered_row == Some(idx);
+            let badge = if row.kind == EntryKind::Directory {
+                SidebarBadge::default()
+            } else {
+                badge_for(&row.path)
+            };
 
             if is_selected {
                 let pill = PixelRect::new(
@@ -561,7 +588,7 @@ impl Sidebar {
 
             let baseline =
                 row_rect.y as f32 + (row_rect.h as f32 + metrics.ascent - metrics.descent) * 0.5;
-            let label_color = if row.kind == EntryKind::Directory || is_selected {
+            let label_color = if row.kind == EntryKind::Directory || is_selected || badge.pin_slot.is_some() {
                 theme.text
             } else {
                 theme.text_muted
@@ -571,11 +598,18 @@ impl Sidebar {
             } else {
                 FontStyle::Ui
             };
-            let max_text_right = if row.kind == EntryKind::Directory {
-                row_rect.right() - px(24.0, scale)
+            let mut right_reserve = px(8.0, scale);
+            if row.kind == EntryKind::Directory {
+                right_reserve = px(24.0, scale);
             } else {
-                row_rect.right() - px(8.0, scale)
-            };
+                if badge.pin_slot.is_some() {
+                    right_reserve += px(20.0, scale);
+                }
+                if badge.dirty {
+                    right_reserve += px(10.0, scale);
+                }
+            }
+            let max_text_right = row_rect.right() - right_reserve;
             painter.push_clip(PixelRect::new(
                 row_rect.x,
                 row_rect.y,
@@ -593,6 +627,42 @@ impl Sidebar {
                 rasterizer,
             );
             painter.pop_clip();
+
+            // Quiet right-aligned dirty dot & Harpoon slot badge (`1`..`9`) on file rows.
+            if row.kind != EntryKind::Directory {
+                let mut rx = row_rect.right() - px(8.0, scale);
+                if let Some(slot) = badge.pin_slot {
+                    let bsz = px(15.0, scale);
+                    rx -= bsz;
+                    let brect = PixelRect::new(rx, (cy - bsz as f32 * 0.5).round() as i32, bsz, bsz);
+                    let bg = if is_selected { theme.surface } else { theme.current_line };
+                    painter.fill_rounded_rect(brect, 3.0 * scale, bg);
+                    painter.stroke_rounded_rect(brect, 3.0 * scale, hairline as f32, theme.border_subtle);
+                    let s = slot.to_string();
+                    let sw = Painter::measure_text_ui(&s, FontStyle::UiBold, badge_px, atlas, rasterizer);
+                    let bbase = brect.y as f32 + (brect.h as f32 + bmetrics.ascent - bmetrics.descent) * 0.5;
+                    painter.draw_text_ui(
+                        brect.x as f32 + (brect.w as f32 - sw) * 0.5,
+                        bbase,
+                        &s,
+                        FontStyle::UiBold,
+                        badge_px,
+                        theme.text_muted,
+                        atlas,
+                        rasterizer,
+                    );
+                    rx -= px(5.0, scale);
+                }
+                if badge.dirty {
+                    let dot = px(4.0, scale).max(2);
+                    rx -= dot;
+                    painter.fill_rounded_rect(
+                        PixelRect::new(rx, (cy - dot as f32 * 0.5).round() as i32, dot, dot),
+                        dot as f32 * 0.5,
+                        theme.text,
+                    );
+                }
+            }
 
             // Right-edge enter-folder affordance on hovered/selected directory rows.
             if row.kind == EntryKind::Directory && (is_hovered || is_selected) {

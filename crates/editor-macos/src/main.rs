@@ -390,11 +390,13 @@ fn decode_key(keycode: u16, text: &str) -> Option<Key> {
         119 => Some(Key::End),
         116 => Some(Key::PageUp),
         121 => Some(Key::PageDown),
-        // Normalize physical macOS punctuation keys so shifted chords (⇧⌘/, ⇧⌘\, ⇧⌘=) always match!
+        // Normalize physical macOS punctuation keys so shifted chords (⇧⌘/, ⇧⌘\, ⇧⌘=, ⇧⌘[, ⇧⌘]) always match!
         44 => Some(Key::Char('/')),
         42 => Some(Key::Char('\\')),
         24 => Some(Key::Char('=')),
         27 => Some(Key::Char('-')),
+        33 => Some(Key::Char('[')),
+        30 => Some(Key::Char(']')),
         _ => text.chars().next().map(Key::Char),
     }
 }
@@ -437,6 +439,14 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         34 => Some(AppCommand::SplitPaneDown),
         35 => Some(AppCommand::FocusUpPane),
         36 => Some(AppCommand::FocusDownPane),
+        37 => Some(AppCommand::NewTab),
+        38 => Some(AppCommand::CloseTab),
+        39 => Some(AppCommand::ShowHarpoon),
+        40 => Some(AppCommand::TogglePin),
+        41 => Some(AppCommand::ToggleZoomPane),
+        42 => Some(AppCommand::PrevTab),
+        43 => Some(AppCommand::NextTab),
+        44 => Some(AppCommand::ToggleLastBuffer),
         100 => Some(AppCommand::SetTheme(ThemePreference::System)),
         101 => Some(AppCommand::SetTheme(ThemePreference::Light)),
         102 => Some(AppCommand::SetTheme(ThemePreference::Dark)),
@@ -769,6 +779,11 @@ fn main() {
     let mut open_shortcuts = false;
     let mut open_shortcuts_all = false;
     let mut enable_vim = false;
+    let mut pin_files: Vec<PathBuf> = Vec::new();
+    let mut preview_file: Option<PathBuf> = None;
+    let mut open_harpoon = false;
+    let mut zoom_pane = false;
+    let mut hide_sidebar = false;
     let mut positional: Option<PathBuf> = None;
 
     let mut i = 0;
@@ -847,6 +862,26 @@ fn main() {
                 enable_vim = true;
                 i += 1;
             }
+            "--pin" if i + 1 < args.len() => {
+                pin_files.push(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--preview" if i + 1 < args.len() => {
+                preview_file = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--harpoon" => {
+                open_harpoon = true;
+                i += 1;
+            }
+            "--zoom" => {
+                zoom_pane = true;
+                i += 1;
+            }
+            "--no-sidebar" => {
+                hide_sidebar = true;
+                i += 1;
+            }
             arg if !arg.starts_with('-') => {
                 positional = Some(PathBuf::from(arg));
                 i += 1;
@@ -881,6 +916,19 @@ fn main() {
                 eprintln!("warning: could not open {}: {e}", p.display());
             }
         }
+        for pf in &pin_files {
+            if let Ok(id) = app.open_file_with_mode(pf, editor_app::OpenMode::Keep, &mut host) {
+                if !app.working_set.is_pinned(id) {
+                    app.toggle_pin_buffer(id, &mut host);
+                }
+            }
+        }
+        if let Some(ref pv) = preview_file {
+            let _ = app.open_file_with_mode(pv, editor_app::OpenMode::Preview, &mut host);
+        } else if !pin_files.is_empty() {
+            // Focus pin 1 by default so snapshots highlight slot 1 cleanly.
+            app.jump_to_pin(1, &mut host);
+        }
         if let Some(sp) = split_file {
             app.split_pane_with(Some(&sp), &mut host);
         }
@@ -890,6 +938,13 @@ fn main() {
             app.split_pane_down(Some(&grid_files[1]), &mut host);
             app.focus_pane(1, &mut host);
             app.split_pane_down(Some(&grid_files[2]), &mut host);
+        }
+        if zoom_pane {
+            app.toggle_zoom_pane(&mut host);
+        }
+        if hide_sidebar {
+            app.sidebar.set_visible(false);
+            app.recompute_layout();
         }
         if let Some(spec) = drag_preview_arg {
             // Format: <pane_idx>:<zone>:<path>
@@ -973,6 +1028,14 @@ fn main() {
             if open_shortcuts_all {
                 app.shortcuts.toggle_expanded();
             }
+        }
+        if open_harpoon {
+            app.handle_event(
+                InputEvent::Command(AppCommand::ShowHarpoon),
+                &mut rasterizer,
+                &mut MacClipboard,
+                &mut host,
+            );
         }
         app.mark_dirty();
         app.render(&mut rasterizer);

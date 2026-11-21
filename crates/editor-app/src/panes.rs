@@ -404,7 +404,7 @@ impl Arrangement {
             return out;
         }
         let hair = scale.round().max(1.0) as i32;
-        let header_h = if self.len > 1 { (24.0 * scale).round() as i32 } else { 0 };
+        let header_h = if self.len > 1 { (22.0 * scale).round() as i32 } else { 0 };
         let min_w = (120.0 * scale) as i32;
         let min_h = (72.0 * scale) as i32 + header_h;
 
@@ -452,6 +452,27 @@ impl Arrangement {
                 out.rect_count += 1;
             }
         }
+        out
+    }
+
+    /// Resolve a single fullscreen-zoomed pane covering the entire `area` with zero pane header.
+    pub fn layout_zoomed(&self, area: PixelRect, active_id: PaneId) -> GridLayout {
+        let mut out = GridLayout {
+            area,
+            ..GridLayout::default()
+        };
+        if area.is_empty() {
+            return out;
+        }
+        let slot = self.slot_of(active_id).unwrap_or_default();
+        out.rects[0] = PaneRect {
+            id: active_id,
+            slot,
+            frame: area,
+            header: PixelRect::ZERO,
+            body: area,
+        };
+        out.rect_count = 1;
         out
     }
 
