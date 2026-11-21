@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use editor_core::{
     next_grapheme_boundary, next_word_boundary, prev_grapheme_boundary, prev_word_boundary,
-    word_range_at, Document, IdentityCheck, Language, SearchMatch, SearchOptions,
+    word_range_at, Document, IdentityCheck, Language, LanguageRegistry, SearchMatch, SearchOptions,
+    TokenKind,
 };
 use editor_platform::{
     AppCommand, Clipboard, ConfirmChoice, CursorShape, DragPhase, FileSystem, FontStyle,
@@ -25,11 +26,12 @@ use editor_platform::{
 };
 use editor_render::{
     chrome::{draw_status_bar, status_bar_height_px},
-    tab_strip_height_px, A11yNode, A11yRole, CommandPalette, ConfirmModal, FindBarAction,
-    FindBarState, GlyphAtlas, GotoLineState, HarpoonAction, HarpoonOverlay, ImeComposition,
-    Painter, PaletteAction, ScrollbarHit, ShortcutsAction, ShortcutsOverlay, Sidebar,
-    SidebarAction, SidebarBadge, SidebarHit, StatusBarData, StripDropTarget, TabStrip, TabStripHit,
-    Theme, Viewport,
+    parse_mono_style, tab_strip_height_px, A11yNode, A11yRole, Color, CommandPalette, ConfirmModal,
+    FindBarAction, FindBarState, GlyphAtlas, GotoLineState, HarpoonAction, HarpoonOverlay,
+    ImeComposition, Painter, PaletteAction, ScrollbarHit, ShortcutsAction, ShortcutsOverlay,
+    Sidebar, SidebarAction, SidebarBadge, SidebarHit, StatusBarData, StripDropTarget,
+    SyntaxPalette, SyntaxStylePreference, SyntaxThemeConfig, SyntaxThemePreset, TabStrip,
+    TabStripHit, Theme, TokenOverride, Viewport,
 };
 
 pub use buffers::{BufferId, OpenMode, ParkedBuffer, WorkingSet, MAX_PINS};
@@ -188,6 +190,13 @@ pub struct EditorApp {
 
     pub theme_pref: ThemePreference,
     pub system_theme: SystemTheme,
+    /// Customizable syntax theme configuration (preset + per-polarity token overrides).
+    pub syntax_theme: SyntaxThemeConfig,
+    /// Pre-baked 95-byte Light & Dark flat lookup palettes (updated only on theme edits, O(1) per frame!).
+    resolved_light_syntax: SyntaxPalette,
+    resolved_dark_syntax: SyntaxPalette,
+    /// User/agent-configured extension -> language id overrides (e.g. `"ino" => "cpp"`).
+    pub syntax_ext_map: BTreeMap<String, String>,
     /// Global fallback word wrap for files without a per-extension override.
     pub default_word_wrap: bool,
     /// Per-file-extension word wrap overrides (lowercase extension without dot, e.g. `"md" => true`).
@@ -270,6 +279,10 @@ impl EditorApp {
             active_match: None,
             theme_pref: ThemePreference::System,
             system_theme: SystemTheme::Light,
+            syntax_theme: SyntaxThemeConfig::default(),
+            resolved_light_syntax: SyntaxPalette::editorial_light(),
+            resolved_dark_syntax: SyntaxPalette::editorial_dark(),
+            syntax_ext_map: BTreeMap::new(),
             default_word_wrap: false,
             wrap_by_ext: default_wrap_by_ext(),
             atlas: GlyphAtlas::new(),
@@ -317,10 +330,28 @@ impl EditorApp {
                 _ => ThemePreference::System,
             };
         }
+        if let Some(preset) = host
+            .load_pref("SyntaxTheme")
+            .or_else(|| host.load_pref("SyntaxStyle"))
+            .and_then(|s| SyntaxThemePreset::parse(&s))
+        {
+            self.syntax_theme.preset = preset;
+        }
+        if let Some(ov) = host.load_pref("SyntaxLightOverrides") {
+            self.syntax_theme.light_overrides = SyntaxThemeConfig::decode_overrides(&ov);
+        }
+        if let Some(ov) = host.load_pref("SyntaxDarkOverrides") {
+            self.syntax_theme.dark_overrides = SyntaxThemeConfig::decode_overrides(&ov);
+        }
+        self.rebuild_syntax_palettes();
+        if let Some(ext_map) = host.load_pref("SyntaxExtMap") {
+            self.syntax_ext_map = parse_str_map(&ext_map);
+        }
         if let Some(vim) = host.load_pref("VimMode") {
             self.vim.set_enabled(vim == "1" || vim == "true");
         }
         self.sync_wrap_for_panes();
+        self.sync_languages_for_panes();
         self.recompute_layout();
         self.mark_dirty();
     }
@@ -336,6 +367,16 @@ impl EditorApp {
             ThemePreference::Dark => "dark",
         };
         host.save_pref("Theme", t);
+        host.save_pref("SyntaxTheme", self.syntax_theme.preset.as_str());
+        host.save_pref(
+            "SyntaxLightOverrides",
+            &SyntaxThemeConfig::encode_overrides(&self.syntax_theme.light_overrides),
+        );
+        host.save_pref(
+            "SyntaxDarkOverrides",
+            &SyntaxThemeConfig::encode_overrides(&self.syntax_theme.dark_overrides),
+        );
+        host.save_pref("SyntaxExtMap", &format_str_map(&self.syntax_ext_map));
         host.save_pref("VimMode", if self.vim.enabled { "1" } else { "0" });
     }
 
@@ -394,17 +435,298 @@ impl EditorApp {
         }
     }
 
-    pub fn active_theme(&self) -> Theme {
+    #[inline]
+    pub fn active_is_dark(&self) -> bool {
         match self.theme_pref {
-            ThemePreference::System => Theme::for_system(self.system_theme),
-            ThemePreference::Light => Theme::light(),
-            ThemePreference::Dark => Theme::dark(),
+            ThemePreference::System => matches!(self.system_theme, SystemTheme::Dark),
+            ThemePreference::Light => false,
+            ThemePreference::Dark => true,
         }
+    }
+
+    #[inline]
+    pub fn active_theme(&self) -> Theme {
+        if self.active_is_dark() {
+            Theme::dark().with_syntax_palette(self.resolved_dark_syntax)
+        } else {
+            Theme::light().with_syntax_palette(self.resolved_light_syntax)
+        }
+    }
+
+    pub fn rebuild_syntax_palettes(&mut self) {
+        self.resolved_light_syntax = self.syntax_theme.resolve(false);
+        self.resolved_dark_syntax = self.syntax_theme.resolve(true);
+    }
+
+    pub fn set_syntax_preset_headless(&mut self, preset: SyntaxThemePreset) {
+        self.syntax_theme.preset = preset;
+        self.rebuild_syntax_palettes();
+        self.mark_dirty();
     }
 
     pub fn set_theme_preference(&mut self, pref: ThemePreference) {
         self.theme_pref = pref;
         self.mark_dirty();
+    }
+
+    fn apply_language_override(&self, doc: &mut Document) {
+        if self.syntax_ext_map.is_empty() {
+            return;
+        }
+        if let Some(p) = doc.path().map(Path::to_path_buf) {
+            let lang = Language::from_path_with_overrides(Some(p.as_path()), &self.syntax_ext_map);
+            doc.set_language(lang);
+        }
+    }
+
+    fn sync_languages_for_panes(&mut self) {
+        if let Some(p) = self.doc.path().map(Path::to_path_buf) {
+            let lang = Language::from_path_with_overrides(Some(p.as_path()), &self.syntax_ext_map);
+            self.doc.set_language(lang);
+        }
+        for pane in &mut self.other_panes {
+            if let Some(p) = pane.doc.path().map(Path::to_path_buf) {
+                let lang = Language::from_path_with_overrides(Some(p.as_path()), &self.syntax_ext_map);
+                pane.doc.set_language(lang);
+            }
+        }
+    }
+
+    pub fn set_syntax_style(
+        &mut self,
+        style: SyntaxStylePreference,
+        host: &mut dyn PlatformHost,
+    ) {
+        self.syntax_theme.preset = style;
+        self.rebuild_syntax_palettes();
+        self.save_preferences(host);
+        self.set_notice(
+            match style {
+                SyntaxThemePreset::Editorial => "Syntax theme: Editorial",
+                SyntaxThemePreset::Monochrome => "Syntax theme: Monochrome",
+                SyntaxThemePreset::Studio => "Syntax theme: Studio",
+                SyntaxThemePreset::Warm => "Syntax theme: Warm",
+            },
+            false,
+        );
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    pub fn set_syntax_token_override(
+        &mut self,
+        mode: &str,
+        token_name: &str,
+        color_spec: &str,
+        style_spec: &str,
+        host: &mut dyn PlatformHost,
+    ) -> Result<(), String> {
+        let kind = TokenKind::parse(token_name).ok_or_else(|| {
+            format!("unknown syntax token `{token_name}` (run `editor syntax theme` to see all 19 tokens)")
+        })?;
+        let apply_targets: [bool; 2] = match mode.trim().to_ascii_lowercase().as_str() {
+            "" | "active" => [!self.active_is_dark(), self.active_is_dark()],
+            "light" => [true, false],
+            "dark" => [false, true],
+            "both" | "all" => [true, true],
+            other => {
+                return Err(format!(
+                    "invalid mode `{other}` (use active|light|dark|both)"
+                ));
+            }
+        };
+
+        let reset = color_spec.eq_ignore_ascii_case("reset")
+            || color_spec.eq_ignore_ascii_case("default");
+        let parsed_color = if reset
+            || color_spec.is_empty()
+            || color_spec == "-"
+            || color_spec.eq_ignore_ascii_case("keep")
+        {
+            None
+        } else {
+            Some(Color::parse_hex(color_spec).ok_or_else(|| {
+                format!("invalid hex colour `{color_spec}` (expected #RRGGBB)")
+            })?)
+        };
+        let parsed_font = if style_spec.is_empty()
+            || style_spec == "-"
+            || style_spec.eq_ignore_ascii_case("keep")
+        {
+            None
+        } else {
+            Some(parse_mono_style(style_spec).ok_or_else(|| {
+                format!("invalid font style `{style_spec}` (use normal|bold|italic)")
+            })?)
+        };
+
+        if !reset && parsed_color.is_none() && parsed_font.is_none() {
+            return Err("provide a #RRGGBB colour, font style, or `reset`".to_string());
+        }
+
+        for (is_dark, enabled) in [(false, apply_targets[0]), (true, apply_targets[1])] {
+            if !enabled {
+                continue;
+            }
+            let map = if is_dark {
+                &mut self.syntax_theme.dark_overrides
+            } else {
+                &mut self.syntax_theme.light_overrides
+            };
+            if reset {
+                map.remove(&kind);
+            } else {
+                let entry = map.entry(kind).or_insert(TokenOverride::default());
+                if let Some(c) = parsed_color {
+                    entry.color = Some(c);
+                }
+                if let Some(f) = parsed_font {
+                    entry.font = Some(f);
+                }
+            }
+        }
+        self.rebuild_syntax_palettes();
+        self.save_preferences(host);
+        self.set_notice(format!("Updated syntax token `{}`", kind.as_str()), false);
+        self.mark_dirty();
+        host.request_redraw();
+        Ok(())
+    }
+
+    pub fn reset_syntax_overrides(&mut self, mode: &str, host: &mut dyn PlatformHost) -> Result<(), String> {
+        match mode.trim().to_ascii_lowercase().as_str() {
+            "" | "all" | "both" => {
+                self.syntax_theme.light_overrides.clear();
+                self.syntax_theme.dark_overrides.clear();
+            }
+            "light" => self.syntax_theme.light_overrides.clear(),
+            "dark" => self.syntax_theme.dark_overrides.clear(),
+            "active" => {
+                if self.active_is_dark() {
+                    self.syntax_theme.dark_overrides.clear();
+                } else {
+                    self.syntax_theme.light_overrides.clear();
+                }
+            }
+            other => {
+                return Err(format!(
+                    "invalid reset mode `{other}` (use all|light|dark|active)"
+                ));
+            }
+        }
+        self.rebuild_syntax_palettes();
+        self.save_preferences(host);
+        self.set_notice("Reset custom syntax colours", false);
+        self.mark_dirty();
+        host.request_redraw();
+        Ok(())
+    }
+
+    pub fn apply_syntax_theme_json(
+        &mut self,
+        json: &str,
+        host: &mut dyn PlatformHost,
+    ) -> Result<(), String> {
+        let mut next = self.syntax_theme.clone();
+        next.apply_json(json)?;
+        self.syntax_theme = next;
+        self.rebuild_syntax_palettes();
+        self.save_preferences(host);
+        self.set_notice(
+            format!("Applied syntax theme ({})", self.syntax_theme.preset.as_str()),
+            false,
+        );
+        self.mark_dirty();
+        host.request_redraw();
+        Ok(())
+    }
+
+    pub fn syntax_theme_json(&self) -> String {
+        self.syntax_theme.to_json(self.active_is_dark())
+    }
+
+    pub fn set_active_language(
+        &mut self,
+        id_or_alias: &str,
+        host: &mut dyn PlatformHost,
+    ) -> Result<Language, String> {
+        let lang = Language::from_id(id_or_alias).ok_or_else(|| {
+            format!("unknown language `{id_or_alias}` (run `editor syntax list` to see available plugins)")
+        })?;
+        self.doc.set_language(lang);
+        self.set_notice(format!("Language: {}", lang.display_name()), false);
+        self.mark_dirty();
+        host.request_redraw();
+        Ok(lang)
+    }
+
+    pub fn set_syntax_ext_map(
+        &mut self,
+        ext: &str,
+        lang_spec: Option<&str>,
+        host: &mut dyn PlatformHost,
+    ) -> Result<(), String> {
+        let key = ext.trim().trim_start_matches('.').to_ascii_lowercase();
+        if key.is_empty() {
+            return Err("extension cannot be empty".to_string());
+        }
+        match lang_spec {
+            Some(spec) => {
+                let lang = Language::from_id(spec).ok_or_else(|| {
+                    format!("unknown language `{spec}` (run `editor syntax list` to see available plugins)")
+                })?;
+                self.syntax_ext_map.insert(key.clone(), lang.id().to_string());
+                self.set_notice(format!("Mapped .{key} to {}", lang.display_name()), false);
+            }
+            None => {
+                self.syntax_ext_map.remove(&key);
+                self.set_notice(format!("Reset .{key} language mapping"), false);
+            }
+        }
+        self.sync_languages_for_panes();
+        self.save_preferences(host);
+        self.mark_dirty();
+        host.request_redraw();
+        Ok(())
+    }
+
+    pub fn languages_json() -> String {
+        let reg = LanguageRegistry::global();
+        let mut out = String::from("{\"languages\":[");
+        for (i, lang) in reg.all().enumerate() {
+            if i > 0 {
+                out.push(',');
+            }
+            let m = lang.meta();
+            out.push_str("{\"id\":");
+            out.push_str(&json_quote(m.id));
+            out.push_str(",\"name\":");
+            out.push_str(&json_quote(m.name));
+            out.push_str(",\"extensions\":[");
+            for (j, ext) in m.extensions.iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                out.push_str(&json_quote(ext));
+            }
+            out.push_str("],\"aliases\":[");
+            for (j, alias) in m.aliases.iter().enumerate() {
+                if j > 0 {
+                    out.push(',');
+                }
+                out.push_str(&json_quote(alias));
+            }
+            out.push_str("],\"line_comment\":");
+            match m.line_comment {
+                Some(lc) => out.push_str(&json_quote(lc)),
+                None => out.push_str("null"),
+            }
+            out.push_str(",\"default_word_wrap\":");
+            out.push_str(if m.default_word_wrap { "true" } else { "false" });
+            out.push('}');
+        }
+        out.push_str("]}");
+        out
     }
 
     pub fn set_sidebar_root(&mut self, dir: &Path) {
@@ -525,13 +847,14 @@ impl EditorApp {
             .working_set
             .get_meta(target_id)
             .and_then(|m| m.path.clone());
-        let doc = match path_opt {
+        let mut doc = match path_opt {
             Some(ref p) => match Document::open(self.fs.as_ref(), p) {
                 Ok(d) => d,
                 Err(_) => return false,
             },
             None => Document::new_untitled(),
         };
+        self.apply_language_override(&mut doc);
         self.active_buf_id = target_id;
         self.doc = doc;
         self.caret = 0;
@@ -623,7 +946,8 @@ impl EditorApp {
             return Ok(existing_id);
         }
 
-        let doc = Document::open(self.fs.as_ref(), &canonical).map_err(|e| e.to_string())?;
+        let mut doc = Document::open(self.fs.as_ref(), &canonical).map_err(|e| e.to_string())?;
+        self.apply_language_override(&mut doc);
         let doc_path = doc.path().map(Path::to_path_buf).or(Some(canonical.clone()));
         let fname = doc.file_name().to_string();
 
@@ -1017,7 +1341,8 @@ impl EditorApp {
                 self.working_set.graduate_preview(existing_id);
                 return self.make_pane_for_buffer(id, existing_id);
             }
-            let doc = Document::open(self.fs.as_ref(), &canonical).map_err(|e| e.to_string())?;
+            let mut doc = Document::open(self.fs.as_ref(), &canonical).map_err(|e| e.to_string())?;
+            self.apply_language_override(&mut doc);
             let doc_path = doc.path().map(Path::to_path_buf).or(Some(canonical));
             let fname = doc.file_name().to_string();
             let buf_id = self.working_set.alloc_buffer(doc_path, fname, false);
@@ -1063,6 +1388,7 @@ impl EditorApp {
         );
         if let Some(p) = path_opt {
             pane.doc = Document::open(self.fs.as_ref(), &p).map_err(|e| e.to_string())?;
+            self.apply_language_override(&mut pane.doc);
         }
         pane.viewport.word_wrap = self.effective_word_wrap(pane.doc.path());
         Ok(pane)
@@ -3017,6 +3343,13 @@ impl EditorApp {
                 self.mark_dirty();
                 host.request_redraw();
             }
+            AppCommand::ToggleSyntaxStyle => {
+                let next = match self.syntax_theme.preset {
+                    SyntaxThemePreset::Monochrome => SyntaxThemePreset::Editorial,
+                    _ => SyntaxThemePreset::Monochrome,
+                };
+                self.set_syntax_style(next, host);
+            }
             AppCommand::ShowShortcuts => {
                 if self.shortcuts.visible {
                     self.shortcuts.close();
@@ -3308,11 +3641,9 @@ impl EditorApp {
         rasterizer: &mut dyn GlyphRasterizer,
         host: &mut dyn PlatformHost,
     ) {
-        let prefix = match self.doc.language() {
-            Language::Python | Language::Shell | Language::Toml => "# ",
-            _ => "// ",
-        };
-        let prefix_trim = prefix.trim();
+        let prefix_trim = self.doc.language().line_comment().unwrap_or("//");
+        let prefix_owned = format!("{prefix_trim} ");
+        let prefix = prefix_owned.as_str();
         let (start_line, end_line) = self.selected_line_span();
         let Some((span_start, _, _)) = self.doc.line_byte_range(start_line) else { return };
         let Some((_, span_end, _)) = self.doc.line_byte_range(end_line) else { return };
@@ -4597,7 +4928,7 @@ impl EditorApp {
                 "{{\"running\":true,\"path\":{},\"file_name\":{},\"dirty\":{},",
                 "\"split\":{},\"zoomed\":{},\"active_pane\":{},\"panes\":{},",
                 "\"pins\":{},\"buffers\":{},\"harpoon_open\":{},",
-                "\"bytes\":{},\"line_count\":{},\"eol\":{},\"language\":{},",
+                "\"bytes\":{},\"line_count\":{},\"eol\":{},\"language\":{},\"language_id\":{},",
                 "\"rev\":{{\"dev\":\"{}\",\"ino\":\"{}\",\"size\":\"{}\",\"mtime_ns\":\"{}\",\"ctime_ns\":\"{}\"}},",
                 "\"can_undo\":{},\"can_redo\":{},",
                 "\"cursor\":{{\"line\":{},\"col\":{},\"byte_offset\":{}}},",
@@ -4609,7 +4940,7 @@ impl EditorApp {
                 "\"shortcuts_open\":{},",
                 "\"vim\":{{\"enabled\":{},\"mode\":{}}},",
                 "\"confirm_modal_visible\":{},",
-                "\"view\":{{\"word_wrap\":{},\"default_word_wrap\":{},\"word_wrap_by_ext\":{},\"font_size_pt\":{:.1},\"theme_preference\":{},\"active_theme\":{}}}}}"
+                "\"view\":{{\"word_wrap\":{},\"default_word_wrap\":{},\"word_wrap_by_ext\":{},\"font_size_pt\":{:.1},\"theme_preference\":{},\"active_theme\":{},\"syntax_style\":{},\"syntax_ext_map\":{}}}}}"
             ),
             path_json,
             json_quote(self.doc.file_name()),
@@ -4625,6 +4956,7 @@ impl EditorApp {
             line_count,
             json_quote(self.doc.eol().as_str()),
             json_quote(self.doc.language().display_name()),
+            json_quote(self.doc.language().id()),
             rev.dev,
             rev.ino,
             rev.size,
@@ -4662,6 +4994,8 @@ impl EditorApp {
             self.viewport.font_size_pt,
             json_quote(theme_pref),
             json_quote(active_theme),
+            json_quote(self.syntax_theme.preset.as_str()),
+            str_map_json(&self.syntax_ext_map),
         )
     }
 
@@ -5126,6 +5460,102 @@ impl EditorApp {
                         };
                         self.apply_drop(DragPayload::Pane(src_id), plan, host);
                     }
+                    "toggle-syntax-style" => {
+                        self.handle_command(
+                            AppCommand::ToggleSyntaxStyle,
+                            rasterizer,
+                            clipboard,
+                            host,
+                        );
+                    }
+                    "syntax-list" => {
+                        return (IpcReply::Json(Self::languages_json()), false, false);
+                    }
+                    "syntax-theme" => {
+                        return (IpcReply::Json(self.syntax_theme_json()), false, false);
+                    }
+                    other if other.starts_with("syntax-set:") => {
+                        let lang_id = &other["syntax-set:".len()..];
+                        if let Err(e) = self.set_active_language(lang_id, host) {
+                            return (IpcReply::Error(e), false, false);
+                        }
+                    }
+                    other if other.starts_with("syntax-style:") || other.starts_with("syntax-theme-preset:") => {
+                        let val = other
+                            .strip_prefix("syntax-style:")
+                            .or_else(|| other.strip_prefix("syntax-theme-preset:"))
+                            .unwrap_or("");
+                        match SyntaxThemePreset::parse(val) {
+                            Some(style) => self.set_syntax_style(style, host),
+                            None => {
+                                return (
+                                    IpcReply::Error(format!(
+                                        "invalid syntax preset `{val}` (use editorial|monochrome|studio|warm)"
+                                    )),
+                                    false,
+                                    false,
+                                );
+                            }
+                        }
+                        return (IpcReply::Json(self.syntax_theme_json()), false, false);
+                    }
+                    other if other.starts_with("syntax-theme-json:") => {
+                        let json = &other["syntax-theme-json:".len()..];
+                        if let Err(e) = self.apply_syntax_theme_json(json, host) {
+                            return (IpcReply::Error(e), false, false);
+                        }
+                        return (IpcReply::Json(self.syntax_theme_json()), false, false);
+                    }
+                    other if other.starts_with("syntax-color:") => {
+                        // syntax-color:<mode>:<token>:<color_or_reset>:<style_or_keep>
+                        let rest = &other["syntax-color:".len()..];
+                        let parts: Vec<&str> = rest.splitn(4, ':').collect();
+                        if parts.len() < 3 {
+                            return (
+                                IpcReply::Error(
+                                    "usage: syntax-color:<mode>:<token>:<#RRGGBB|reset>[:<normal|bold|italic|keep>]"
+                                        .to_string(),
+                                ),
+                                false,
+                                false,
+                            );
+                        }
+                        let style_spec = parts.get(3).copied().unwrap_or("keep");
+                        if let Err(e) =
+                            self.set_syntax_token_override(parts[0], parts[1], parts[2], style_spec, host)
+                        {
+                            return (IpcReply::Error(e), false, false);
+                        }
+                        return (IpcReply::Json(self.syntax_theme_json()), false, false);
+                    }
+                    other if other.starts_with("syntax-reset:") => {
+                        let mode = &other["syntax-reset:".len()..];
+                        if let Err(e) = self.reset_syntax_overrides(mode, host) {
+                            return (IpcReply::Error(e), false, false);
+                        }
+                        return (IpcReply::Json(self.syntax_theme_json()), false, false);
+                    }
+                    other if other.starts_with("syntax-map:") => {
+                        let spec = &other["syntax-map:".len()..];
+                        if let Some((ext, val)) = spec.split_once('=') {
+                            let val_trim = val.trim();
+                            let lang_opt = match val_trim.to_ascii_lowercase().as_str() {
+                                "default" | "reset" | "none" | "" => None,
+                                _ => Some(val_trim),
+                            };
+                            if let Err(e) = self.set_syntax_ext_map(ext, lang_opt, host) {
+                                return (IpcReply::Error(e), false, false);
+                            }
+                        } else {
+                            return (
+                                IpcReply::Error(
+                                    "usage: syntax-map:<ext>=<language_id|default>".to_string(),
+                                ),
+                                false,
+                                false,
+                            );
+                        }
+                    }
                     other if other.starts_with("wrap-ext:") => {
                         let spec = &other["wrap-ext:".len()..];
                         if let Some((ext, val)) = spec.split_once('=') {
@@ -5365,6 +5795,48 @@ fn wrap_by_ext_json(map: &BTreeMap<String, bool>) -> String {
         out.push_str(&json_quote(k));
         out.push(':');
         out.push_str(if v { "true" } else { "false" });
+    }
+    out.push('}');
+    out
+}
+
+fn parse_str_map(raw: &str) -> BTreeMap<String, String> {
+    let mut m = BTreeMap::new();
+    for pair in raw.split(',') {
+        let pair = pair.trim();
+        if let Some((k, v)) = pair.split_once('=') {
+            let ext = k.trim().trim_start_matches('.').to_ascii_lowercase();
+            let val = v.trim().to_ascii_lowercase();
+            if !ext.is_empty() && !val.is_empty() {
+                m.insert(ext, val);
+            }
+        }
+    }
+    m
+}
+
+fn format_str_map(map: &BTreeMap<String, String>) -> String {
+    let mut out = String::new();
+    for (idx, (k, v)) in map.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(k);
+        out.push('=');
+        out.push_str(v);
+    }
+    out
+}
+
+fn str_map_json(map: &BTreeMap<String, String>) -> String {
+    let mut out = String::from("{");
+    for (idx, (k, v)) in map.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&json_quote(k));
+        out.push(':');
+        out.push_str(&json_quote(v));
     }
     out.push('}');
     out

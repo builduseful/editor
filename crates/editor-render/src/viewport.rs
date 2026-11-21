@@ -726,6 +726,7 @@ impl Viewport {
         }
 
         let mut tokens: Vec<TokenSpan> = Vec::with_capacity(64);
+        let mut syntax_prepared = false;
         let mut cur_y = layout.text.y as f32 - self.scroll_sub_y_px;
         let view_bottom = (layout.text.bottom().min(clip.bottom())) as f32;
         let clip_top = clip.y as f32;
@@ -767,6 +768,10 @@ impl Viewport {
                 };
 
             if !is_windowed {
+                if !syntax_prepared {
+                    doc.prepare_syntax_to(line_idx);
+                    syntax_prepared = true;
+                }
                 doc.lex_line(line_idx, &line_text, &mut tokens);
             } else {
                 tokens.clear();
@@ -1000,19 +1005,15 @@ impl Viewport {
                             })
                             .map(|t| t.kind)
                             .unwrap_or(TokenKind::Plain);
-                        let (fg, bold) = theme.syntax_style(tok_kind);
+                        let (fg, font_style) = theme.syntax_font_style(tok_kind);
 
                         let bytes = cluster.as_bytes();
                         if bytes.len() == 1 && bytes[0] >= 0x20 && bytes[0] <= 0x7E {
-                            let glyph = atlas.get_ascii_mono(rasterizer, bold, font_px, bytes[0]);
+                            let glyph =
+                                atlas.get_ascii_mono_styled(rasterizer, font_style, font_px, bytes[0]);
                             painter.draw_glyph(pen_x, baseline, glyph, fg, atlas);
                         } else {
-                            let style = if bold {
-                                FontStyle::MonoBold
-                            } else {
-                                FontStyle::Mono
-                            };
-                            let glyph = atlas.get_or_rasterize(rasterizer, style, font_px, cluster);
+                            let glyph = atlas.get_or_rasterize(rasterizer, font_style, font_px, cluster);
                             painter.draw_glyph(pen_x, baseline, glyph, fg, atlas);
                         }
                     }

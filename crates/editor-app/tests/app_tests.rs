@@ -1823,3 +1823,150 @@ fn buffer_pool_dirty_quit_guard_strip_drag_reordering_and_ipc_pins() {
     assert_eq!(app.working_set.len(), 1);
     assert_eq!(app.doc.file_name(), "Untitled");
 }
+
+#[test]
+fn syntax_cli_ipc_overrides_styles_ext_map_and_plugin_line_comments() {
+    use editor_platform::ipc::{IpcCommand, IpcReply};
+    use editor_platform::{AppCommand, InputEvent};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/query.sql", b"SELECT 1;\n".to_vec());
+    fs.add_file("/repo/sketch.ino", b"void setup() { int x = 42; }\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 900, 600, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    // 1. SQL file auto-detects `sql` plugin and `⌘/` uses `-- ` from LanguageMeta!
+    app.open_file(&PathBuf::from("/repo/query.sql"), &mut host).unwrap();
+    assert_eq!(app.doc.language().id(), "sql");
+    app.handle_event(
+        InputEvent::Command(AppCommand::ToggleComment),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(0).unwrap(), "-- SELECT 1;");
+    app.handle_event(
+        InputEvent::Command(AppCommand::ToggleComment),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(0).unwrap(), "SELECT 1;");
+
+    // 2. IPC `syntax-list` returns compiled plugins JSON.
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Action("syntax-list".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    match reply {
+        IpcReply::Json(j) => {
+            assert!(j.contains("\"id\":\"cpp\""));
+            assert!(j.contains("\"id\":\"csharp\""));
+            assert!(j.contains("\"id\":\"typescript\""));
+            assert!(j.contains("\"id\":\"powershell\""));
+            assert!(j.contains("\"id\":\"kotlin\""));
+        }
+        other => panic!("expected Json reply, got {other:?}"),
+    }
+
+    // 3. IPC `syntax-map:ino=cpp` maps custom `.ino` extension to C++ and persists preference!
+    app.open_file(&PathBuf::from("/repo/sketch.ino"), &mut host).unwrap();
+    assert_eq!(app.doc.language().id(), "plaintext");
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Action("syntax-map:ino=cpp".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(matches!(reply, IpcReply::Json(_)));
+    assert_eq!(app.doc.language().id(), "cpp");
+
+    // 4. IPC `syntax-style:studio` switches curated preset and persists.
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Action("syntax-style:studio".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    match reply {
+        IpcReply::Json(j) => assert!(j.contains("\"preset\":\"studio\"")),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+    assert_eq!(app.syntax_theme.preset, editor_render::SyntaxThemePreset::Studio);
+
+    // 5. IPC `syntax-color` customizes individual token colour + font style cleanly per mode!
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Action("syntax-color:dark:comment:#55aa77:italic".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    match reply {
+        IpcReply::Json(j) => assert!(j.contains("\"#55aa77:italic\"")),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+
+    // 6. IPC `syntax-theme-json` atomically applies a complete custom theme in one call!
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Action(
+            "syntax-theme-json:{\"preset\":\"warm\",\"light\":{\"keyword\":\"#772244 bold\",\"string\":{\"color\":\"#115533\",\"style\":\"normal\"}},\"dark\":{\"keyword\":\"#ffaa88 bold\"}}".into(),
+        ),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    match reply {
+        IpcReply::Json(j) => {
+            assert!(j.contains("\"preset\":\"warm\""));
+            assert!(j.contains("\"#772244\""));
+            assert!(j.contains("\"#ffaa88\""));
+        }
+        other => panic!("unexpected reply: {other:?}"),
+    }
+    assert!(app.render(&mut raster));
+
+    // Verify O(1) flat palette lookup reflects the exact custom colour & style!
+    app.set_theme_preference(editor_platform::ThemePreference::Light);
+    let (kw_col, kw_font) = app.active_theme().syntax_font_style(editor_core::TokenKind::Keyword);
+    assert_eq!(kw_col, editor_render::Color::rgb(0x77, 0x22, 0x44));
+    assert_eq!(kw_font, editor_platform::FontStyle::MonoBold);
+
+    // 7. Reloading preferences into a fresh EditorApp restores preset, overrides, AND ext map!
+    let mut app2 = EditorApp::new(fs, 900, 600, 2.0);
+    app2.load_preferences(&host);
+    assert_eq!(app2.syntax_theme.preset, editor_render::SyntaxThemePreset::Warm);
+    app2.set_theme_preference(editor_platform::ThemePreference::Light);
+    let (kw2, _) = app2.active_theme().syntax_font_style(editor_core::TokenKind::Keyword);
+    assert_eq!(kw2, editor_render::Color::rgb(0x77, 0x22, 0x44));
+    app2.set_theme_preference(editor_platform::ThemePreference::Dark);
+    let (cm2, cm2_font) = app2.active_theme().syntax_font_style(editor_core::TokenKind::Comment);
+    assert_eq!(cm2, editor_render::Color::rgb(0x55, 0xaa, 0x77));
+    assert_eq!(cm2_font, editor_platform::FontStyle::MonoItalic);
+    app2.open_file(&PathBuf::from("/repo/sketch.ino"), &mut host).unwrap();
+    assert_eq!(app2.doc.language().id(), "cpp");
+
+    // 8. IPC `syntax-reset:all` clears custom overrides cleanly, and `syntax-set:rust` overrides language.
+    let (reply, _, _) = app2.execute_ipc(
+        &IpcCommand::Action("syntax-reset:all".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(matches!(reply, IpcReply::Json(_)));
+    assert!(app2.syntax_theme.light_overrides.is_empty());
+    assert!(app2.syntax_theme.dark_overrides.is_empty());
+
+    let (reply, _, _) = app2.execute_ipc(
+        &IpcCommand::Action("syntax-set:rust".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(matches!(reply, IpcReply::Json(_)));
+    assert_eq!(app2.doc.language().id(), "rust");
+}

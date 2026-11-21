@@ -116,6 +116,7 @@ pub struct GlyphAtlas {
     fast_mono_size_q4: u32,
     fast_mono: [Option<AtlasGlyph>; 96],
     fast_mono_bold: [Option<AtlasGlyph>; 96],
+    fast_mono_italic: [Option<AtlasGlyph>; 96],
 }
 
 impl Default for GlyphAtlas {
@@ -135,6 +136,7 @@ impl GlyphAtlas {
             fast_mono_size_q4: 0,
             fast_mono: [None; 96],
             fast_mono_bold: [None; 96],
+            fast_mono_italic: [None; 96],
         }
     }
 
@@ -146,6 +148,7 @@ impl GlyphAtlas {
         self.fast_mono_size_q4 = 0;
         self.fast_mono = [None; 96];
         self.fast_mono_bold = [None; 96];
+        self.fast_mono_italic = [None; 96];
     }
 
     #[inline]
@@ -177,33 +180,51 @@ impl GlyphAtlas {
         size_px: f32,
         ascii_byte: u8,
     ) -> AtlasGlyph {
-        let q = Self::quantize_size(size_px);
-        if self.fast_mono_size_q4 != q {
-            self.fast_mono_size_q4 = q;
-            self.fast_mono = [None; 96];
-            self.fast_mono_bold = [None; 96];
-        }
-        let idx = (ascii_byte.saturating_sub(0x20) as usize).min(95);
-        let table = if bold {
-            &self.fast_mono_bold
-        } else {
-            &self.fast_mono
-        };
-        if let Some(g) = table[idx] {
-            return g;
-        }
-        let buf = [ascii_byte];
-        let s = std::str::from_utf8(&buf).unwrap_or(" ");
         let style = if bold {
             FontStyle::MonoBold
         } else {
             FontStyle::Mono
         };
-        let g = self.get_or_rasterize(rasterizer, style, size_px, s);
-        if bold {
-            self.fast_mono_bold[idx] = Some(g);
-        } else {
-            self.fast_mono[idx] = Some(g);
+        self.get_ascii_mono_styled(rasterizer, style, size_px, ascii_byte)
+    }
+
+    /// Ultra-fast direct-indexed ASCII glyph fetch for `Mono`, `MonoBold`, or `MonoItalic`.
+    #[inline]
+    pub fn get_ascii_mono_styled(
+        &mut self,
+        rasterizer: &mut dyn GlyphRasterizer,
+        style: FontStyle,
+        size_px: f32,
+        ascii_byte: u8,
+    ) -> AtlasGlyph {
+        let q = Self::quantize_size(size_px);
+        if self.fast_mono_size_q4 != q {
+            self.fast_mono_size_q4 = q;
+            self.fast_mono = [None; 96];
+            self.fast_mono_bold = [None; 96];
+            self.fast_mono_italic = [None; 96];
+        }
+        let idx = (ascii_byte.saturating_sub(0x20) as usize).min(95);
+        let cached = match style {
+            FontStyle::MonoBold => self.fast_mono_bold[idx],
+            FontStyle::MonoItalic => self.fast_mono_italic[idx],
+            _ => self.fast_mono[idx],
+        };
+        if let Some(g) = cached {
+            return g;
+        }
+        let buf = [ascii_byte];
+        let s = std::str::from_utf8(&buf).unwrap_or(" ");
+        let resolved_style = match style {
+            FontStyle::MonoBold => FontStyle::MonoBold,
+            FontStyle::MonoItalic => FontStyle::MonoItalic,
+            _ => FontStyle::Mono,
+        };
+        let g = self.get_or_rasterize(rasterizer, resolved_style, size_px, s);
+        match resolved_style {
+            FontStyle::MonoBold => self.fast_mono_bold[idx] = Some(g),
+            FontStyle::MonoItalic => self.fast_mono_italic[idx] = Some(g),
+            _ => self.fast_mono[idx] = Some(g),
         }
         g
     }

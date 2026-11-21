@@ -148,7 +148,7 @@ impl Document {
             path: None,
             tree: PieceTree::new_empty(),
             undo: UndoStack::new(),
-            syntax: SyntaxCache::new(Language::PlainText),
+            syntax: SyntaxCache::new(Language::PLAIN_TEXT),
             rev: FileRev::default(),
             bom: false,
             dominant_eol: Eol::Lf,
@@ -259,6 +259,17 @@ impl Document {
     #[inline]
     pub fn language(&self) -> Language {
         self.syntax.language()
+    }
+
+    pub fn set_language(&mut self, language: Language) {
+        self.syntax.set_language(language);
+        self.generation += 1;
+    }
+
+    pub fn prepare_syntax_to(&mut self, target_line: usize) {
+        let tree = &mut self.tree;
+        self.syntax
+            .catch_up_to(target_line, |l| tree.line_content(l));
     }
 
     #[inline]
@@ -498,6 +509,10 @@ impl Document {
         }
         let after = offset + inserted.len() as u64;
 
+        let added_nl = inserted.iter().filter(|&&b| b == b'\n').count() as isize;
+        let removed_nl = deleted.iter().filter(|&&b| b == b'\n').count() as isize;
+        let delta_lines = added_nl - removed_nl;
+
         self.undo.record(
             EditOp {
                 offset,
@@ -509,7 +524,7 @@ impl Document {
             timestamp_ms,
             coalescable,
         );
-        self.syntax.invalidate_from(start_line);
+        self.syntax.notify_edit(start_line, delta_lines);
         self.generation += 1;
         Ok(after)
     }

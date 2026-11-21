@@ -447,6 +447,7 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         42 => Some(AppCommand::PrevTab),
         43 => Some(AppCommand::NextTab),
         44 => Some(AppCommand::ToggleLastBuffer),
+        45 => Some(AppCommand::ToggleSyntaxStyle),
         100 => Some(AppCommand::SetTheme(ThemePreference::System)),
         101 => Some(AppCommand::SetTheme(ThemePreference::Light)),
         102 => Some(AppCommand::SetTheme(ThemePreference::Dark)),
@@ -766,6 +767,7 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut snapshot_path: Option<PathBuf> = None;
     let mut theme_override: Option<ThemePreference> = None;
+    let mut syntax_style_override: Option<editor_render::SyntaxStylePreference> = None;
     let mut size: (u32, u32) = (1120, 740);
     let mut scale: f32 = 2.0;
     let mut sidebar_root: Option<PathBuf> = None;
@@ -799,6 +801,10 @@ fn main() {
                     "dark" => Some(ThemePreference::Dark),
                     _ => Some(ThemePreference::System),
                 };
+                i += 2;
+            }
+            "--syntax-style" | "--syntax-theme" if i + 1 < args.len() => {
+                syntax_style_override = editor_render::SyntaxThemePreset::parse(&args[i + 1]);
                 i += 2;
             }
             "--size" if i + 1 < args.len() => {
@@ -904,6 +910,9 @@ fn main() {
         let mut app = EditorApp::new(fs, w_px, h_px, scale);
         if let Some(pref) = theme_override {
             app.set_theme_preference(pref);
+        }
+        if let Some(style) = syntax_style_override {
+            app.set_syntax_preset_headless(style);
         }
         if wrap {
             app.viewport.word_wrap = true;
@@ -1066,6 +1075,9 @@ fn main() {
     bridge.app.load_preferences(&bridge.host);
     if let Some(pref) = theme_override {
         bridge.app.set_theme_preference(pref);
+    }
+    if let Some(style) = syntax_style_override {
+        bridge.app.set_syntax_preset_headless(style);
     }
     if wrap {
         bridge.app.viewport.word_wrap = true;

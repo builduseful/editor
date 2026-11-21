@@ -31,5 +31,8 @@ pub use tab_strip::{
     TAB_STRIP_HEIGHT_PT,
 };
 pub use text_input::TextInput;
-pub use theme::{Color, Theme};
+pub use theme::{
+    mono_style_str, parse_mono_style, px, Color, SyntaxPalette, SyntaxStylePreference,
+    SyntaxThemeConfig, SyntaxThemePreset, Theme, TokenOverride, TokenStyle,
+};
 pub use viewport::{DocHit, ScrollbarHit, Viewport, ViewportLayout};

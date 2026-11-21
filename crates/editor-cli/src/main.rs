@@ -108,6 +108,8 @@ fn main() -> ExitCode {
         "save" => cmd_save(&fs, &globals, rest, start),
         "undo" => cmd_action_direct("undo", start),
         "redo" => cmd_action_direct("redo", start),
+        "syntax" => cmd_syntax(&fs, &globals, rest, start),
+        "languages" => cmd_syntax_list(start),
         "action" => cmd_action(&fs, &globals, rest, start),
         "close" | "quit" => cmd_quit(cmd, rest, start),
         other => {
@@ -156,6 +158,13 @@ fn print_usage() {
            editor find <QUERY> [--replace T] [--case-sensitive] [--replace-all] [--close]\n\
            editor save [--as PATH]                               (save live GUI document)\n\
            editor undo | redo                                    (undo/redo in live GUI)\n\
+           editor syntax list                                    (list compiled Rust syntax plugins, alias: languages)\n\
+           editor syntax set <LANG_ID>                           (override active buffer language in live GUI)\n\
+           editor syntax map <EXT> <LANG_ID|default>             (map file extension to plugin in live GUI)\n\
+           editor syntax theme [PRESET|@FILE|--json J|--stdin]   (inspect or apply syntax theme/colors)\n\
+           editor syntax color <TOK> <#HEX|reset> [STYLE] [--mode active|light|dark|both]\n\
+           editor syntax reset [--mode all|light|dark]           (clear custom syntax colour overrides)\n\
+           editor syntax style <editorial|monochrome|studio|warm>\n\
            editor action <NAME> [ARG]                            (run any UI command)\n\
            editor close [--force]   (alias: quit)\n\
            editor version\n\
@@ -355,6 +364,8 @@ fn cmd_schema(args: &[String], start: Instant) -> u8 {
         "save",
         "undo",
         "redo",
+        "syntax",
+        "languages",
         "action",
         "close",
         "quit",
@@ -374,7 +385,14 @@ fn cmd_schema(args: &[String], start: Instant) -> u8 {
         return 0;
     }
     let mut jb = JsonBuf::new();
-    jb.push_raw("[{\"commands\":[\"read\",\"write\",\"edit\",\"info\",\"validate\",\"batch\",\"open\",\"gui\",\"status\",\"goto\",\"select\",\"insert\",\"find\",\"save\",\"undo\",\"redo\",\"action\",\"close\",\"quit\",\"version\",\"schema\"]}]");
+    jb.push_raw("[{\"commands\":[");
+    for (idx, name) in all.iter().enumerate() {
+        if idx > 0 {
+            jb.push_raw(",");
+        }
+        jb.push_str(name);
+    }
+    jb.push_raw("]}]");
     emit_ok("schema", start, &jb.into_string());
     0
 }
@@ -2058,6 +2076,228 @@ fn cmd_save(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: I
         &editor_platform::ipc::IpcCommand::Save { as_path },
         start,
     )
+}
+
+fn cmd_syntax_list(start: Instant) -> u8 {
+    let reg = editor_core::LanguageRegistry::global();
+    let mut jb = JsonBuf::new();
+    jb.push_raw("[{\"languages\":[");
+    for (i, lang) in reg.all().enumerate() {
+        if i > 0 {
+            jb.push_raw(",");
+        }
+        let m = lang.meta();
+        jb.push_raw("{\"id\":");
+        jb.push_str(m.id);
+        jb.push_raw(",\"name\":");
+        jb.push_str(m.name);
+        jb.push_raw(",\"extensions\":[");
+        for (j, ext) in m.extensions.iter().enumerate() {
+            if j > 0 {
+                jb.push_raw(",");
+            }
+            jb.push_str(ext);
+        }
+        jb.push_raw("],\"aliases\":[");
+        for (j, alias) in m.aliases.iter().enumerate() {
+            if j > 0 {
+                jb.push_raw(",");
+            }
+            jb.push_str(alias);
+        }
+        jb.push_raw("],\"line_comment\":");
+        match m.line_comment {
+            Some(lc) => jb.push_str(lc),
+            None => jb.push_raw("null"),
+        }
+        jb.push_raw(",\"default_word_wrap\":");
+        jb.push_bool(m.default_word_wrap);
+        jb.push_raw("}");
+    }
+    jb.push_raw("]}]");
+    emit_ok("syntax", start, &jb.into_string());
+    0
+}
+
+fn cmd_syntax(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
+    let Some(sub) = args.first().map(|s| s.as_str()) else {
+        emit_err(
+            "syntax",
+            start,
+            "E_USAGE",
+            "usage: editor syntax <list|set|map|theme|color|reset|style>",
+            None,
+        );
+        return 3;
+    };
+    match sub {
+        "list" => cmd_syntax_list(start),
+        "set" => {
+            let Some(lang_id) = args.get(1) else {
+                emit_err("syntax", start, "E_USAGE", "usage: editor syntax set <LANG_ID>", None);
+                return 3;
+            };
+            send_live_gui_command(
+                "syntax",
+                &editor_platform::ipc::IpcCommand::Action(format!("syntax-set:{lang_id}")),
+                start,
+            )
+        }
+        "style" => {
+            let Some(style) = args.get(1) else {
+                emit_err(
+                    "syntax",
+                    start,
+                    "E_USAGE",
+                    "usage: editor syntax style <editorial|monochrome|studio|warm>",
+                    None,
+                );
+                return 3;
+            };
+            send_live_gui_command(
+                "syntax",
+                &editor_platform::ipc::IpcCommand::Action(format!("syntax-style:{style}")),
+                start,
+            )
+        }
+        "theme" => {
+            let rest = &args[1..];
+            if rest.is_empty() {
+                return send_live_gui_command(
+                    "syntax",
+                    &editor_platform::ipc::IpcCommand::Action("syntax-theme".to_string()),
+                    start,
+                );
+            }
+            if rest[0] == "--json" {
+                let Some(raw) = rest.get(1) else {
+                    emit_err("syntax", start, "E_USAGE", "usage: editor syntax theme --json <JSON>", None);
+                    return 3;
+                };
+                return send_live_gui_command(
+                    "syntax",
+                    &editor_platform::ipc::IpcCommand::Action(format!("syntax-theme-json:{raw}")),
+                    start,
+                );
+            }
+            if rest[0] == "--stdin" || rest[0] == "-" || rest[0].starts_with('@') {
+                let raw_arg = if rest[0] == "--stdin" { "-" } else { rest[0].as_str() };
+                let payload = match load_text_arg(fs, globals, raw_arg) {
+                    Ok(s) => s,
+                    Err((c, m)) => {
+                        emit_err("syntax", start, c, &m, None);
+                        return 2;
+                    }
+                };
+                return send_live_gui_command(
+                    "syntax",
+                    &editor_platform::ipc::IpcCommand::Action(format!("syntax-theme-json:{payload}")),
+                    start,
+                );
+            }
+            let arg = rest[0].trim();
+            if arg.starts_with('{') {
+                return send_live_gui_command(
+                    "syntax",
+                    &editor_platform::ipc::IpcCommand::Action(format!("syntax-theme-json:{arg}")),
+                    start,
+                );
+            }
+            send_live_gui_command(
+                "syntax",
+                &editor_platform::ipc::IpcCommand::Action(format!("syntax-theme-preset:{arg}")),
+                start,
+            )
+        }
+        "color" | "colour" => {
+            let mut mode = "active".to_string();
+            let mut pos: Vec<&str> = Vec::new();
+            let mut i = 1;
+            while i < args.len() {
+                if args[i] == "--mode" && i + 1 < args.len() {
+                    mode = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    pos.push(args[i].as_str());
+                    i += 1;
+                }
+            }
+            if pos.len() < 2 {
+                emit_err(
+                    "syntax",
+                    start,
+                    "E_USAGE",
+                    "usage: editor syntax color <TOKEN> <#RRGGBB|reset> [normal|bold|italic] [--mode active|light|dark|both]",
+                    None,
+                );
+                return 3;
+            }
+            let token = pos[0];
+            let (color, style) = if pos.len() >= 3 {
+                (pos[1], pos[2])
+            } else if matches!(
+                pos[1].to_ascii_lowercase().as_str(),
+                "normal" | "regular" | "plain" | "bold" | "italic" | "italics"
+            ) {
+                ("keep", pos[1])
+            } else {
+                (pos[1], "keep")
+            };
+            send_live_gui_command(
+                "syntax",
+                &editor_platform::ipc::IpcCommand::Action(format!(
+                    "syntax-color:{mode}:{token}:{color}:{style}"
+                )),
+                start,
+            )
+        }
+        "reset" => {
+            let mut mode = "all";
+            if args.get(1).map(|s| s.as_str()) == Some("--mode") {
+                if let Some(m) = args.get(2) {
+                    mode = m.as_str();
+                }
+            } else if let Some(m) = args.get(1) {
+                mode = m.as_str();
+            }
+            send_live_gui_command(
+                "syntax",
+                &editor_platform::ipc::IpcCommand::Action(format!("syntax-reset:{mode}")),
+                start,
+            )
+        }
+        "map" => {
+            let spec = match (args.get(1), args.get(2)) {
+                (Some(ext), Some(lang)) => format!("{ext}={lang}"),
+                (Some(pair), None) if pair.contains('=') => pair.clone(),
+                _ => {
+                    emit_err(
+                        "syntax",
+                        start,
+                        "E_USAGE",
+                        "usage: editor syntax map <EXT> <LANG_ID|default>",
+                        None,
+                    );
+                    return 3;
+                }
+            };
+            send_live_gui_command(
+                "syntax",
+                &editor_platform::ipc::IpcCommand::Action(format!("syntax-map:{spec}")),
+                start,
+            )
+        }
+        other => {
+            emit_err(
+                "syntax",
+                start,
+                "E_USAGE",
+                &format!("unknown syntax subcommand `{other}` (use list|set|map|theme|color|reset|style)"),
+                None,
+            );
+            3
+        }
+    }
 }
 
 fn cmd_action_direct(name: &str, start: Instant) -> u8 {

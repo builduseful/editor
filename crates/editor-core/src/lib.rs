@@ -26,5 +26,8 @@ pub use grapheme::{
 };
 pub use piece_tree::{PieceTree, Summary};
 pub use search::{find_all_matches, find_next_match, SearchMatch, SearchOptions};
-pub use syntax::{Language, LineState, SyntaxCache, TokenKind, TokenSpan};
+pub use syntax::{
+    Language, LanguageMeta, LanguageRegistry, LexState, LineState, SyntaxCache, SyntaxPlugin,
+    TokenKind, TokenSpan,
+};
 pub use undo::{EditOp, UndoStack};

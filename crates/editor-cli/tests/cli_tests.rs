@@ -223,6 +223,24 @@ fn cli_ipc_open_close_and_quit_commands() {
                     IpcCommand::Action(act) if act == "close-tab" => {
                         pending.respond(IpcReply::Json("{\"running\":true,\"file_name\":\"hello.rs\"}".into()));
                     }
+                    IpcCommand::Action(act) if act == "syntax-set:ts" => {
+                        pending.respond(IpcReply::Json("{\"running\":true,\"language_id\":\"typescript\"}".into()));
+                    }
+                    IpcCommand::Action(act) if act == "syntax-style:monochrome" => {
+                        pending.respond(IpcReply::Json("{\"running\":true,\"view\":{\"syntax_style\":\"monochrome\"}}".into()));
+                    }
+                    IpcCommand::Action(act) if act == "syntax-map:ino=cpp" => {
+                        pending.respond(IpcReply::Json("{\"running\":true,\"view\":{\"syntax_ext_map\":{\"ino\":\"cpp\"}}}".into()));
+                    }
+                    IpcCommand::Action(act) if act == "syntax-theme" => {
+                        pending.respond(IpcReply::Json("{\"preset\":\"editorial\",\"active_mode\":\"light\"}".into()));
+                    }
+                    IpcCommand::Action(act) if act == "syntax-color:dark:comment:#55aa77:italic" => {
+                        pending.respond(IpcReply::Json("{\"preset\":\"editorial\",\"dark_overrides\":{\"comment\":\"#55aa77:italic\"}}".into()));
+                    }
+                    IpcCommand::Action(act) if act == "syntax-reset:all" => {
+                        pending.respond(IpcReply::Json("{\"preset\":\"editorial\",\"dark_overrides\":{}}".into()));
+                    }
                     IpcCommand::Quit { force: false } => {
                         pending.respond(IpcReply::Prompting);
                     }
@@ -232,13 +250,13 @@ fn cli_ipc_open_close_and_quit_commands() {
                     other => panic!("unexpected ipc command: {other:?}"),
                 }
                 handled += 1;
-                if handled == 13 {
+                if handled == 19 {
                     break;
                 }
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(handled, 13);
+        assert_eq!(handled, 19);
     });
 
     // `editor status`
@@ -337,6 +355,70 @@ fn cli_ipc_open_close_and_quit_commands() {
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8(out.stdout).unwrap().contains("\"hello.rs\""));
+
+    // Offline `editor syntax list` / `editor languages`
+    let out = Command::new(bin).args(["syntax", "list"]).output().unwrap();
+    assert!(out.status.success());
+    let langs_json = String::from_utf8(out.stdout).unwrap();
+    for id in [
+        "cpp", "csharp", "rust", "markdown", "html", "css", "javascript", "typescript",
+        "python", "java", "shell", "powershell", "go", "sql", "php", "c", "kotlin",
+    ] {
+        assert!(langs_json.contains(&format!("\"id\":\"{id}\"")), "missing {id} in syntax list");
+    }
+
+    let out = Command::new(bin).arg("languages").output().unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"id\":\"rust\""));
+
+    // Live GUI IPC `editor syntax set|style|map`
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["syntax", "set", "ts"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"typescript\""));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["syntax", "style", "monochrome"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"monochrome\""));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["syntax", "map", "ino", "cpp"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"ino\":\"cpp\""));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["syntax", "theme"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"preset\":\"editorial\""));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["syntax", "color", "comment", "#55aa77", "italic", "--mode", "dark"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("#55aa77:italic"));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["syntax", "reset"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"dark_overrides\":{}"));
 
     // `editor close` (mock GUI reports dirty -> prompting: true)
     let out = Command::new(bin)

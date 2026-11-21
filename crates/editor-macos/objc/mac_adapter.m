@@ -38,7 +38,11 @@ static CTFontRef resolve_ct_font(uint32_t style, float size_px) {
             ns_font = [NSFont monospacedSystemFontOfSize:sz weight:NSFontWeightSemibold];
             break;
         case 2: // MonoItalic
-            ns_font = [NSFont monospacedSystemFontOfSize:sz weight:NSFontWeightRegular];
+            {
+                NSFont* base = [NSFont monospacedSystemFontOfSize:sz weight:NSFontWeightRegular];
+                ns_font = [[NSFontManager sharedFontManager] convertFont:base toHaveTrait:NSItalicFontMask];
+                if (!ns_font) ns_font = base;
+            }
             break;
         case 4: // UiBold
             ns_font = [NSFont systemFontOfSize:sz weight:NSFontWeightSemibold];
@@ -1035,6 +1039,8 @@ void mac_activate_app(void) {
     [viewMenu addItem:[self menuItem:@"Theme: System" key:@"" tag:100 mods:0]];
     [viewMenu addItem:[self menuItem:@"Theme: Light" key:@"" tag:101 mods:0]];
     [viewMenu addItem:[self menuItem:@"Theme: Dark" key:@"" tag:102 mods:0]];
+    [viewMenu addItem:[NSMenuItem separatorItem]];
+    [viewMenu addItem:[self menuItem:@"Toggle Syntax Colour" key:@"" tag:45 mods:0]];
     viewItem.submenu = viewMenu;
     [mainMenu addItem:viewItem];
 
