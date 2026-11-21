@@ -8,6 +8,10 @@ license.workspace = true
 name = "editor-gui"
 path = "src/main.rs"
 
+[[bin]]
+name = "bundle-app"
+path = "src/bin/bundle_app.rs"
+
 [dependencies]
 editor-platform = { path = "../editor-platform" }
 editor-core = { path = "../editor-core" }

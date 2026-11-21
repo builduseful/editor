@@ -241,6 +241,26 @@ void mac_free_cstr(char* p) {
     if (p) free(p);
 }
 
+char* mac_pref_get(const char* key) {
+    if (!key) return NULL;
+    @autoreleasepool {
+        NSString* k = [NSString stringWithUTF8String:key];
+        NSString* v = [[NSUserDefaults standardUserDefaults] stringForKey:k];
+        if (!v) return NULL;
+        const char* utf8 = [v UTF8String];
+        return utf8 ? strdup(utf8) : NULL;
+    }
+}
+
+void mac_pref_set(const char* key, const char* val) {
+    if (!key || !val) return;
+    @autoreleasepool {
+        NSString* k = [NSString stringWithUTF8String:key];
+        NSString* v = [NSString stringWithUTF8String:val];
+        [[NSUserDefaults standardUserDefaults] setObject:v forKey:k];
+    }
+}
+
 char* mac_open_file_dialog(int choose_dir) {
     @autoreleasepool {
         NSOpenPanel* panel = [NSOpenPanel openPanel];
@@ -298,7 +318,9 @@ int mac_confirm_discard(const char* file_name) {
 typedef struct {
     void* userdata;
     void (*on_resize)(void* ud, uint32_t w, uint32_t h, float scale);
-    void (*on_key)(void* ud, uint16_t keycode, uint32_t mods, const uint8_t* text, size_t len);
+    void (*on_key)(void* ud, uint16_t keycode, uint32_t mods,
+                   const uint8_t* key_utf8, size_t key_len,
+                   const uint8_t* text_utf8, size_t text_len);
     void (*on_mouse)(void* ud, uint32_t kind, float x, float y, uint8_t button, uint8_t clicks, uint32_t mods);
     void (*on_scroll)(void* ud, float dx, float dy, float x, float y, uint32_t mods);
     void (*on_focus)(void* ud, uint32_t focused);
@@ -345,8 +367,32 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
 - (void)viewDidMoveToWindow {
     [super viewDidMoveToWindow];
     self.wantsLayer = YES;
+    [self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
     [self notifyResize];
     [self presentFramebuffer];
+}
+
+- (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
+    NSPasteboard* pb = [sender draggingPasteboard];
+    if ([pb canReadObjectForClasses:@[[NSURL class]] options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}]) {
+        return NSDragOperationCopy;
+    }
+    return NSDragOperationNone;
+}
+
+- (BOOL)performDragOperation:(id<NSDraggingInfo>)sender {
+    NSPasteboard* pb = [sender draggingPasteboard];
+    NSArray<NSURL*>* urls = [pb readObjectsForClasses:@[[NSURL class]]
+                                              options:@{NSPasteboardURLReadingFileURLsOnlyKey: @YES}];
+    if (urls.count > 0 && self.cb.on_open_path) {
+        NSURL* url = urls.firstObject;
+        if (url.path) {
+            self.cb.on_open_path(self.cb.userdata, [url.path UTF8String]);
+            [self presentFramebuffer];
+            return YES;
+        }
+    }
+    return NO;
 }
 
 - (void)updateTrackingAreas {
@@ -422,11 +468,17 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
 
 - (void)keyDown:(NSEvent*)event {
     if (!self.cb.on_key) return;
+    NSString* rawKey = event.charactersIgnoringModifiers;
+    const char* key_utf8 = rawKey ? [rawKey UTF8String] : "";
+    size_t key_len = key_utf8 ? strlen(key_utf8) : 0;
+
     NSString* chars = event.characters;
-    const char* utf8 = chars ? [chars UTF8String] : "";
-    size_t len = utf8 ? strlen(utf8) : 0;
+    const char* text_utf8 = chars ? [chars UTF8String] : "";
+    size_t text_len = text_utf8 ? strlen(text_utf8) : 0;
+
     self.cb.on_key(self.cb.userdata, event.keyCode, encode_mods(event.modifierFlags),
-                   (const uint8_t*)utf8, len);
+                   (const uint8_t*)key_utf8, key_len,
+                   (const uint8_t*)text_utf8, text_len);
     [self presentFramebuffer];
 }
 
@@ -577,6 +629,17 @@ void mac_request_quit(void) {
         return YES;
     }
     return NO;
+}
+
+- (void)application:(NSApplication*)sender openFiles:(NSArray<NSString*>*)filenames {
+    (void)sender;
+    if (filenames.count > 0 && self.cb.on_open_path) {
+        self.cb.on_open_path(self.cb.userdata, [filenames.firstObject UTF8String]);
+        if (g_view) [g_view presentFramebuffer];
+        [NSApp replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
+        return;
+    }
+    [NSApp replyToOpenOrPrint:NSApplicationDelegateReplyFailure];
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {

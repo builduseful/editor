@@ -42,7 +42,7 @@ struct MacRasterGlyph {
 struct MacCallbacks {
     userdata: *mut c_void,
     on_resize: extern "C" fn(*mut c_void, u32, u32, f32),
-    on_key: extern "C" fn(*mut c_void, u16, u32, *const u8, usize),
+    on_key: extern "C" fn(*mut c_void, u16, u32, *const u8, usize, *const u8, usize),
     on_mouse: extern "C" fn(*mut c_void, u32, f32, f32, u8, u8, u32),
     on_scroll: extern "C" fn(*mut c_void, f32, f32, f32, f32, u32),
     on_focus: extern "C" fn(*mut c_void, u32),
@@ -67,6 +67,8 @@ extern "C" {
     fn mac_clipboard_get() -> *mut c_char;
     fn mac_clipboard_set(utf8: *const u8, len: usize);
     fn mac_free_cstr(ptr: *mut c_char);
+    fn mac_pref_get(key: *const c_char) -> *mut c_char;
+    fn mac_pref_set(key: *const c_char, val: *const c_char);
     fn mac_open_file_dialog(choose_dir: c_int) -> *mut c_char;
     fn mac_save_file_dialog(default_name: *const c_char) -> *mut c_char;
     fn mac_confirm_discard(file_name: *const c_char) -> c_int;
@@ -311,6 +313,23 @@ impl PlatformHost for MacHost {
     fn request_quit(&mut self) {
         unsafe { mac_request_quit() };
     }
+
+    fn load_pref(&self, key: &str) -> Option<String> {
+        let k = CString::new(key).ok()?;
+        let ptr = unsafe { mac_pref_get(k.as_ptr()) };
+        if ptr.is_null() {
+            return None;
+        }
+        let s = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+        unsafe { mac_free_cstr(ptr) };
+        Some(s)
+    }
+
+    fn save_pref(&mut self, key: &str, value: &str) {
+        if let (Ok(k), Ok(v)) = (CString::new(key), CString::new(value)) {
+            unsafe { mac_pref_set(k.as_ptr(), v.as_ptr()) };
+        }
+    }
 }
 
 // ============================================================================
@@ -396,15 +415,29 @@ extern "C" fn cb_resize(ud: *mut c_void, w: u32, h: u32, scale: f32) {
     );
 }
 
-extern "C" fn cb_key(ud: *mut c_void, keycode: u16, mods: u32, text_ptr: *const u8, len: usize) {
+extern "C" fn cb_key(
+    ud: *mut c_void,
+    keycode: u16,
+    mods: u32,
+    key_ptr: *const u8,
+    key_len: usize,
+    text_ptr: *const u8,
+    text_len: usize,
+) {
     let b = unsafe { &mut *(ud as *mut Bridge) };
-    let text_str = if !text_ptr.is_null() && len > 0 {
-        let slice = unsafe { std::slice::from_raw_parts(text_ptr, len) };
+    let key_str = if !key_ptr.is_null() && key_len > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
         std::str::from_utf8(slice).unwrap_or("")
     } else {
         ""
     };
-    let Some(key) = decode_key(keycode, text_str) else {
+    let text_str = if !text_ptr.is_null() && text_len > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(text_ptr, text_len) };
+        std::str::from_utf8(slice).unwrap_or("")
+    } else {
+        ""
+    };
+    let Some(key) = decode_key(keycode, if key_str.is_empty() { text_str } else { key_str }) else {
         return;
     };
     let text_opt = if text_str.is_empty() {
@@ -671,6 +704,7 @@ fn main() {
         clipboard: MacClipboard,
         host: MacHost,
     });
+    bridge.app.load_preferences(&bridge.host);
     if let Some(pref) = theme_override {
         bridge.app.set_theme_preference(pref);
     }
