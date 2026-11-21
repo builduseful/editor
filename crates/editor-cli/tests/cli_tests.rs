@@ -137,3 +137,89 @@ fn cli_round_trip_write_info_read_edit_validate_and_batch() {
 
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[test]
+fn cli_ipc_open_close_and_quit_commands() {
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::Duration;
+
+    use editor_platform::ipc::{IpcCommand, IpcReply, IpcServer};
+
+    let bin = env!("CARGO_BIN_EXE_editor");
+    let root = std::env::temp_dir().join(format!("editor_cli_ipc_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let sample = root.join("hello.rs");
+    std::fs::write(&sample, "fn main() {}\n").unwrap();
+    let sock = root.join("test.sock");
+
+    // 1. `editor close` when no GUI is running -> E_NOT_RUNNING (exit 2).
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .arg("close")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("E_NOT_RUNNING"));
+
+    // 2. Start a mock IPC server mimicking a running GUI and verify `open`, `close`, `quit --force`.
+    let server = IpcServer::bind(sock.clone(), Arc::new(|| {})).unwrap();
+    let srv_thread = thread::spawn(move || {
+        let mut handled = 0;
+        for _ in 0..400 {
+            if let Some(pending) = server.try_recv() {
+                match &pending.cmd {
+                    IpcCommand::Open(p) => {
+                        assert!(p.ends_with("hello.rs"));
+                        pending.respond(IpcReply::Opened);
+                    }
+                    IpcCommand::Quit { force: false } => {
+                        pending.respond(IpcReply::Prompting);
+                    }
+                    IpcCommand::Quit { force: true } => {
+                        pending.respond(IpcReply::Quitting);
+                    }
+                }
+                handled += 1;
+                if handled == 3 {
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(handled, 3);
+    });
+
+    // `editor open hello.rs`
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["--root", root.to_str().unwrap(), "open", "hello.rs"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "open failed: {}", String::from_utf8_lossy(&out.stdout));
+    let s = String::from_utf8(out.stdout).unwrap();
+    assert!(s.contains("\"launched\":false"));
+    assert!(s.contains("\"status\":\"opened\""));
+
+    // `editor close` (mock GUI reports dirty -> prompting: true)
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .arg("close")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"prompting\":true"));
+
+    // `editor quit --force` (mock GUI reports quitting -> closed: true)
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["quit", "--force"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"closed\":true"));
+
+    srv_thread.join().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+}

@@ -87,6 +87,9 @@ fn main() -> ExitCode {
         "write" => cmd_write(&fs, &globals, rest, start),
         "edit" => cmd_edit(&fs, &globals, rest, start),
         "batch" => cmd_batch(&fs, &globals, rest, start),
+        "open" => cmd_open(&fs, &globals, rest, start),
+        "gui" => cmd_gui(&fs, &globals, rest, start),
+        "close" | "quit" => cmd_quit(cmd, rest, start),
         other => {
             emit_err(
                 other,
@@ -115,6 +118,9 @@ fn print_usage() {
                              | --at LINE[:COL] --op insert|replace|delete [--text T] [--length L])\n\
                              (--expect REV | --force) [--dry-run] [--in-place]\n\
            editor batch [--file F | --stdin] [--check]\n\
+           editor open <path>\n\
+           editor gui [--sidebar-root DIR] [PATH]\n\
+           editor close [--force]   (alias: quit)\n\
            editor version\n\
            editor schema [COMMAND]"
     );
@@ -283,7 +289,10 @@ fn push_doc_fields(jb: &mut JsonBuf, info: &editor_core::DocumentInfo, include_r
 }
 
 fn cmd_schema(args: &[String], start: Instant) -> u8 {
-    let all = ["read", "write", "edit", "info", "validate", "batch", "version", "schema"];
+    let all = [
+        "read", "write", "edit", "info", "validate", "batch", "open", "gui", "close", "quit",
+        "version", "schema",
+    ];
     if let Some(target) = args.first() {
         if !all.contains(&target.as_str()) {
             emit_err("schema", start, "E_USAGE", &format!("unknown command: {target}"), None);
@@ -297,7 +306,7 @@ fn cmd_schema(args: &[String], start: Instant) -> u8 {
         return 0;
     }
     let mut jb = JsonBuf::new();
-    jb.push_raw("[{\"commands\":[\"read\",\"write\",\"edit\",\"info\",\"validate\",\"batch\",\"version\",\"schema\"]}]");
+    jb.push_raw("[{\"commands\":[\"read\",\"write\",\"edit\",\"info\",\"validate\",\"batch\",\"open\",\"gui\",\"close\",\"quit\",\"version\",\"schema\"]}]");
     emit_ok("schema", start, &jb.into_string());
     0
 }
@@ -1312,4 +1321,224 @@ fn cmd_batch(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: 
     results_json.push_raw("]");
     emit_ok_extra("batch", start, &results_json.into_string(), "\"rolled_back\":false");
     0
+}
+
+// ============================================================================
+// GUI IPC Control Commands: `open`, `gui`, `close` / `quit`
+// ============================================================================
+
+fn launch_gui_process(sidebar_root: Option<&Path>, target: Option<&Path>) -> Result<(), String> {
+    // Prefer sibling `Editor.app` bundle if present next to `editor`, else sibling `editor-gui`.
+    let exe_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf));
+
+    let mut gui_args: Vec<String> = Vec::new();
+    if let Some(root) = sidebar_root {
+        gui_args.push("--sidebar-root".to_string());
+        gui_args.push(root.to_string_lossy().into_owned());
+    }
+    if let Some(t) = target {
+        gui_args.push(t.to_string_lossy().into_owned());
+    }
+
+    #[cfg(target_os = "macos")]
+    if let Some(ref dir) = exe_dir {
+        let app_bundle = dir.join("Editor.app");
+        if app_bundle.exists() {
+            let mut cmd = std::process::Command::new("/usr/bin/open");
+            cmd.arg("-n").arg(&app_bundle);
+            if !gui_args.is_empty() {
+                cmd.arg("--args").args(&gui_args);
+            }
+            cmd.spawn().map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
+
+    let gui_bin = exe_dir
+        .map(|d| d.join("editor-gui"))
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| PathBuf::from("editor-gui"));
+    std::process::Command::new(&gui_bin)
+        .args(&gui_args)
+        .spawn()
+        .map_err(|e| format!("failed to launch {}: {e}", gui_bin.display()))?;
+    Ok(())
+}
+
+fn cmd_open(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
+    let Some(path_arg) = args.first() else {
+        emit_err("open", start, "E_USAGE", "missing <path>", None);
+        return 3;
+    };
+    let path = match resolve_confined(fs, globals, path_arg) {
+        Ok(p) => p,
+        Err((code, msg)) => {
+            emit_err("open", start, code, &msg, Some(Path::new(path_arg)));
+            return 2;
+        }
+    };
+
+    let sock = editor_platform::ipc::default_socket_path();
+    let (launched, status) = match editor_platform::ipc::send_command(
+        &sock,
+        &editor_platform::ipc::IpcCommand::Open(path.clone()),
+    ) {
+        Ok(editor_platform::ipc::IpcReply::Opened) => (false, "opened"),
+        Ok(editor_platform::ipc::IpcReply::Error(m)) => {
+            emit_err("open", start, "E_IO", &m, Some(&path));
+            return 2;
+        }
+        Ok(_) => (false, "opened"),
+        Err(_) => {
+            // No running GUI -> launch a fresh instance on this path!
+            if let Err(e) = launch_gui_process(Some(&globals.root), Some(&path)) {
+                emit_err("open", start, "E_IO", &e, Some(&path));
+                return 2;
+            }
+            (true, "launched")
+        }
+    };
+
+    let mut jb = JsonBuf::new();
+    jb.push_raw("[{\"path\":");
+    jb.push_str(&path.to_string_lossy());
+    jb.push_raw(",\"launched\":");
+    jb.push_bool(launched);
+    jb.push_raw(",\"status\":");
+    jb.push_str(status);
+    jb.push_raw("}]");
+    emit_ok("open", start, &jb.into_string());
+    0
+}
+
+fn cmd_gui(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: Instant) -> u8 {
+    let mut sidebar_root: Option<PathBuf> = None;
+    let mut target: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--sidebar-root" if i + 1 < args.len() => {
+                match resolve_confined(fs, globals, &args[i + 1]) {
+                    Ok(p) => sidebar_root = Some(p),
+                    Err((c, m)) => {
+                        emit_err("gui", start, c, &m, Some(Path::new(&args[i + 1])));
+                        return 2;
+                    }
+                }
+                i += 2;
+            }
+            other if !other.starts_with('-') => {
+                match resolve_confined(fs, globals, other) {
+                    Ok(p) => target = Some(p),
+                    Err((c, m)) => {
+                        emit_err("gui", start, c, &m, Some(Path::new(other)));
+                        return 2;
+                    }
+                }
+                i += 1;
+            }
+            other => {
+                emit_err("gui", start, "E_USAGE", &format!("unexpected arg: {other}"), None);
+                return 3;
+            }
+        }
+    }
+
+    let sock = editor_platform::ipc::default_socket_path();
+    let mut launched = false;
+    if let Some(ref p) = target {
+        if editor_platform::ipc::send_command(
+            &sock,
+            &editor_platform::ipc::IpcCommand::Open(p.clone()),
+        )
+        .is_err()
+        {
+            if let Err(e) =
+                launch_gui_process(sidebar_root.as_deref().or(Some(&globals.root)), Some(p))
+            {
+                emit_err("gui", start, "E_IO", &e, Some(p));
+                return 2;
+            }
+            launched = true;
+        }
+    } else if editor_platform::ipc::send_ping(&sock).is_err() {
+        if let Err(e) = launch_gui_process(sidebar_root.as_deref().or(Some(&globals.root)), None) {
+            emit_err("gui", start, "E_IO", &e, None);
+            return 2;
+        }
+        launched = true;
+    }
+
+    let mut jb = JsonBuf::new();
+    jb.push_raw("[{\"launched\":");
+    jb.push_bool(launched);
+    jb.push_raw("}]");
+    emit_ok("gui", start, &jb.into_string());
+    0
+}
+
+fn cmd_quit(command_name: &str, args: &[String], start: Instant) -> u8 {
+    let mut force = false;
+    for arg in args {
+        match arg.as_str() {
+            "--force" => force = true,
+            other => {
+                emit_err(
+                    command_name,
+                    start,
+                    "E_USAGE",
+                    &format!("unexpected flag: {other}"),
+                    None,
+                );
+                return 3;
+            }
+        }
+    }
+
+    let sock = editor_platform::ipc::default_socket_path();
+    match editor_platform::ipc::send_command(
+        &sock,
+        &editor_platform::ipc::IpcCommand::Quit { force },
+    ) {
+        Ok(editor_platform::ipc::IpcReply::Quitting) => {
+            emit_ok(
+                command_name,
+                start,
+                "[{\"closed\":true,\"prompting\":false}]",
+            );
+            0
+        }
+        Ok(editor_platform::ipc::IpcReply::Prompting) => {
+            emit_ok(
+                command_name,
+                start,
+                "[{\"closed\":false,\"prompting\":true}]",
+            );
+            0
+        }
+        Ok(editor_platform::ipc::IpcReply::Error(m)) => {
+            emit_err(command_name, start, "E_IO", &m, None);
+            2
+        }
+        Ok(_) => {
+            emit_ok(
+                command_name,
+                start,
+                "[{\"closed\":true,\"prompting\":false}]",
+            );
+            0
+        }
+        Err(_) => {
+            emit_err(
+                command_name,
+                start,
+                "E_NOT_RUNNING",
+                "no running editor GUI instance found",
+                None,
+            );
+            2
+        }
+    }
 }

@@ -85,6 +85,8 @@ extern "C" {
     fn mac_set_cursor(cursor_id: u32);
     fn mac_request_redraw();
     fn mac_request_quit();
+    fn mac_activate_app();
+    fn mac_wake_main_loop();
     fn mac_run_app(cb: MacCallbacks);
 }
 
@@ -350,6 +352,7 @@ struct Bridge {
     rasterizer: MacGlyphRasterizer,
     clipboard: MacClipboard,
     host: MacHost,
+    ipc: Option<editor_platform::ipc::IpcServer>,
 }
 
 fn decode_mods(bits: u32) -> Modifiers {
@@ -576,6 +579,41 @@ extern "C" fn cb_command(ud: *mut c_void, cmd_id: u32) {
 
 extern "C" fn cb_tick(ud: *mut c_void, now_ms: u64) {
     let b = unsafe { &mut *(ud as *mut Bridge) };
+    // Drain any incoming CLI IPC commands (`editor open`, `editor close` / `editor quit`).
+    while let Some(pending) = b.ipc.as_ref().and_then(|s| s.try_recv()) {
+        match &pending.cmd {
+            editor_platform::ipc::IpcCommand::Open(path) => {
+                let p = path.clone();
+                unsafe { mac_activate_app() };
+                b.app.handle_event(
+                    InputEvent::OpenPath(p),
+                    &mut b.rasterizer,
+                    &mut b.clipboard,
+                    &mut b.host,
+                );
+                pending.respond(editor_platform::ipc::IpcReply::Opened);
+            }
+            editor_platform::ipc::IpcCommand::Quit { force } => {
+                if *force || !b.app.doc.is_dirty() {
+                    pending.respond(editor_platform::ipc::IpcReply::Quitting);
+                    // Drop IPC server so socket file is removed before NSApp terminates.
+                    b.ipc = None;
+                    b.host.request_quit();
+                    return;
+                } else {
+                    // Dirty document without --force: bring window to front & show custom confirm modal!
+                    unsafe { mac_activate_app() };
+                    b.app.handle_event(
+                        InputEvent::Command(AppCommand::Quit),
+                        &mut b.rasterizer,
+                        &mut b.clipboard,
+                        &mut b.host,
+                    );
+                    pending.respond(editor_platform::ipc::IpcReply::Prompting);
+                }
+            }
+        }
+    }
     b.app.handle_event(
         InputEvent::Tick { now_ms },
         &mut b.rasterizer,
@@ -736,12 +774,20 @@ fn main() {
         return;
     }
 
+    // Bind per-user 0600 local IPC socket so `editor open` / `editor close` / `editor quit` work.
+    let ipc = editor_platform::ipc::IpcServer::bind(
+        editor_platform::ipc::default_socket_path(),
+        Arc::new(|| unsafe { mac_wake_main_loop() }),
+    )
+    .ok();
+
     // Live native macOS GUI launch.
     let mut bridge = Box::new(Bridge {
         app: EditorApp::new(fs, size.0 * 2, size.1 * 2, 2.0),
         rasterizer: MacGlyphRasterizer,
         clipboard: MacClipboard,
         host: MacHost,
+        ipc,
     });
     // Use our 100% custom-drawn Build Useful confirmation modal instead of native NSAlert.
     bridge.app.use_in_app_modal = true;

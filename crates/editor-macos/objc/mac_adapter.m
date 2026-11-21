@@ -607,6 +607,15 @@ void mac_request_quit(void) {
     [NSApp terminate:nil];
 }
 
+void mac_activate_app(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [NSApp activateIgnoringOtherApps:YES];
+        if (g_window) {
+            [g_window makeKeyAndOrderFront:nil];
+        }
+    });
+}
+
 @interface EditorAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @property (nonatomic) MacCallbacks cb;
 @property (nonatomic, strong) NSTimer* timer;
@@ -787,13 +796,25 @@ void mac_request_quit(void) {
 
 @end
 
+static EditorAppDelegate* g_delegate = nil;
+
+void mac_wake_main_loop(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_delegate) {
+            [g_delegate onTick:nil];
+        }
+    });
+}
+
 void mac_run_app(MacCallbacks cb) {
     @autoreleasepool {
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         EditorAppDelegate* del = [[EditorAppDelegate alloc] init];
         del.cb = cb;
+        g_delegate = del;
         [NSApp setDelegate:del];
         [NSApp run];
+        g_delegate = nil;
     }
 }

@@ -9,6 +9,7 @@
 pub mod fs;
 pub mod host;
 pub mod input;
+pub mod ipc;
 pub mod raster;
 pub mod surface;
 
