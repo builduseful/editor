@@ -7,6 +7,7 @@
 pub mod atlas;
 pub mod chrome;
 pub mod painter;
+pub mod palette;
 pub mod sidebar;
 pub mod text_input;
 pub mod theme;
@@ -18,6 +19,7 @@ pub use chrome::{
     ImeComposition, StatusBarData,
 };
 pub use painter::Painter;
+pub use palette::{fuzzy_score, CommandPalette, PaletteAction, PaletteItem, PaletteMode};
 pub use sidebar::{Sidebar, SidebarAction, SidebarHit};
 pub use text_input::TextInput;
 pub use theme::{Color, Theme};

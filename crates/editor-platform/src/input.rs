@@ -102,6 +102,8 @@ pub enum AppCommand {
     Find,
     Replace,
     GoToLine,
+    QuickOpen,
+    ProjectSearch,
     ToggleWrap,
     ToggleSidebar,
     ZoomIn,

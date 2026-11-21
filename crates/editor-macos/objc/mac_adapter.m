@@ -736,6 +736,7 @@ void mac_request_quit(void) {
     [fileMenu addItem:[self menuItem:@"Open…" key:@"o" tag:1 mods:NSEventModifierFlagCommand]];
     [fileMenu addItem:[self menuItem:@"Open Folder…" key:@"o" tag:2
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
+    [fileMenu addItem:[self menuItem:@"Quick Open…" key:@"p" tag:22 mods:NSEventModifierFlagCommand]];
     [fileMenu addItem:[NSMenuItem separatorItem]];
     [fileMenu addItem:[self menuItem:@"Save" key:@"s" tag:3 mods:NSEventModifierFlagCommand]];
     [fileMenu addItem:[self menuItem:@"Save As…" key:@"s" tag:4
@@ -757,6 +758,8 @@ void mac_request_quit(void) {
     [editMenu addItem:[self menuItem:@"Select All" key:@"a" tag:11 mods:NSEventModifierFlagCommand]];
     [editMenu addItem:[NSMenuItem separatorItem]];
     [editMenu addItem:[self menuItem:@"Find…" key:@"f" tag:12 mods:NSEventModifierFlagCommand]];
+    [editMenu addItem:[self menuItem:@"Find in Folder…" key:@"f" tag:23
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
     [editMenu addItem:[self menuItem:@"Replace…" key:@"f" tag:13
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
     [editMenu addItem:[self menuItem:@"Go to Line…" key:@"g" tag:14 mods:NSEventModifierFlagCommand]];

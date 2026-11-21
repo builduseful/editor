@@ -403,6 +403,8 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         18 => Some(AppCommand::ZoomOut),
         19 => Some(AppCommand::ZoomReset),
         21 => Some(AppCommand::Quit),
+        22 => Some(AppCommand::QuickOpen),
+        23 => Some(AppCommand::ProjectSearch),
         100 => Some(AppCommand::SetTheme(ThemePreference::System)),
         101 => Some(AppCommand::SetTheme(ThemePreference::Light)),
         102 => Some(AppCommand::SetTheme(ThemePreference::Dark)),

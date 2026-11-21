@@ -18,9 +18,9 @@ use editor_platform::{
 };
 use editor_render::{
     chrome::{draw_status_bar, status_bar_height_px},
-    A11yNode, A11yRole, ConfirmModal, FindBarAction, FindBarState, GlyphAtlas, GotoLineState,
-    ImeComposition, Painter, ScrollbarHit, Sidebar, SidebarAction, SidebarHit, StatusBarData,
-    Theme, Viewport,
+    A11yNode, A11yRole, CommandPalette, ConfirmModal, FindBarAction, FindBarState, GlyphAtlas,
+    GotoLineState, ImeComposition, Painter, PaletteAction, ScrollbarHit, Sidebar, SidebarAction,
+    SidebarHit, StatusBarData, Theme, Viewport,
 };
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -36,6 +36,11 @@ pub struct AppLayout {
 enum PendingDiscardAction {
     NewFile,
     OpenPath(PathBuf),
+    OpenAt {
+        path: PathBuf,
+        line_0based: Option<usize>,
+        col_bytes: Option<usize>,
+    },
     OpenFileDialog,
     Reload,
     Quit,
@@ -52,6 +57,7 @@ pub struct EditorApp {
     pub viewport: Viewport,
     pub find_bar: FindBarState,
     pub goto_line: GotoLineState,
+    pub palette: CommandPalette,
     pub confirm_modal: ConfirmModal,
     pub ime: ImeComposition,
     pending_discard: Option<PendingDiscardAction>,
@@ -97,6 +103,7 @@ impl EditorApp {
             viewport: Viewport::new(),
             find_bar: FindBarState::new(),
             goto_line: GotoLineState::new(),
+            palette: CommandPalette::new(),
             confirm_modal: ConfirmModal::default(),
             ime: ImeComposition::default(),
             pending_discard: None,
@@ -325,7 +332,8 @@ impl EditorApp {
         self.recompute_layout();
         let full_bounds = self.framebuffer.bounds();
         let dirty_clip = self.framebuffer.dirty.bounding_rect(full_bounds);
-        let full_redraw = self.framebuffer.dirty.is_full() || self.confirm_modal.visible;
+        let full_redraw =
+            self.framebuffer.dirty.is_full() || self.confirm_modal.visible || self.palette.is_open();
         let effective_clip = if full_redraw { full_bounds } else { dirty_clip };
 
         let theme = self.active_theme();
@@ -336,6 +344,7 @@ impl EditorApp {
         let notice = self.notice.as_ref().map(|(m, e, _)| (m.as_str(), *e));
         let doc_focused = self.window_focused
             && !self.confirm_modal.visible
+            && !self.palette.is_open()
             && !self.sidebar.is_focused()
             && !self.find_bar.is_focused()
             && !self.goto_line.visible;
@@ -423,7 +432,19 @@ impl EditorApp {
             );
         }
 
-        // 6. Optional in-app confirmation modal overlay.
+        // 6. Optional Quick Open / Project Search palette overlay.
+        if self.palette.is_open() {
+            self.palette.draw(
+                &mut painter,
+                full_bounds,
+                &theme,
+                &mut self.atlas,
+                rasterizer,
+                self.caret_visible,
+            );
+        }
+
+        // 7. Optional in-app confirmation modal overlay.
         if self.confirm_modal.visible {
             self.confirm_modal
                 .draw(&mut painter, full_bounds, &theme, &mut self.atlas, rasterizer);
@@ -513,6 +534,74 @@ impl EditorApp {
                     self.framebuffer.resize(width_px.max(1), height_px.max(1), scale);
                     self.recompute_layout();
                     self.mark_dirty();
+                    return;
+                }
+                _ => return,
+            }
+        }
+
+        // Intercept keyboard & mouse when Quick Open / Project Search palette is open.
+        if self.palette.is_open() {
+            match event {
+                InputEvent::KeyDown { key, mods, text } => {
+                    self.caret_visible = true;
+                    self.last_blink_ms = self.now_ms;
+                    let clip = clipboard.get_text();
+                    let (act, copied) = self.palette.handle_key(
+                        self.fs.as_ref(),
+                        key,
+                        mods,
+                        text.as_deref(),
+                        clip.as_deref(),
+                    );
+                    if let Some(c) = copied {
+                        clipboard.set_text(&c);
+                    }
+                    self.handle_palette_action(act, rasterizer, host);
+                    return;
+                }
+                InputEvent::MouseDown {
+                    x_px,
+                    y_px,
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    let act = self.palette.handle_click(x_px, y_px);
+                    self.handle_palette_action(act, rasterizer, host);
+                    return;
+                }
+                InputEvent::Command(cmd)
+                    if matches!(
+                        cmd,
+                        AppCommand::Copy
+                            | AppCommand::Cut
+                            | AppCommand::Paste
+                            | AppCommand::SelectAll
+                            | AppCommand::QuickOpen
+                            | AppCommand::ProjectSearch
+                    ) =>
+                {
+                    self.handle_command(cmd, rasterizer, clipboard, host);
+                    return;
+                }
+                InputEvent::Resize {
+                    width_px,
+                    height_px,
+                    scale,
+                } => {
+                    self.framebuffer.resize(width_px.max(1), height_px.max(1), scale);
+                    self.recompute_layout();
+                    self.mark_dirty();
+                    return;
+                }
+                InputEvent::Tick { now_ms } => {
+                    self.now_ms = now_ms;
+                    if self.window_focused && now_ms.saturating_sub(self.last_blink_ms) >= 530 {
+                        self.caret_visible = !self.caret_visible;
+                        self.last_blink_ms = now_ms;
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
                     return;
                 }
                 _ => return,
@@ -702,6 +791,39 @@ impl EditorApp {
                     self.sidebar.set_focused(false);
                 }
             }
+            PendingDiscardAction::OpenAt {
+                path,
+                line_0based,
+                col_bytes,
+            } => {
+                let already_open = self.doc.path() == Some(path.as_path());
+                let res = if already_open {
+                    Ok(())
+                } else {
+                    self.open_file(&path, host)
+                };
+                match res {
+                    Ok(()) => {
+                        self.sidebar.set_focused(false);
+                        if let Some(line) = line_0based {
+                            self.doc.tree_mut().ensure_indexed_for_line(line + 16);
+                            let clamped = line.min(self.doc.editable_line_count().saturating_sub(1));
+                            if let Some((start, content_end, _)) = self.doc.line_byte_range(clamped)
+                            {
+                                let off = start
+                                    + (col_bytes.unwrap_or(0) as u64).min(content_end - start);
+                                self.caret = off;
+                                self.anchor = off;
+                                self.viewport.scroll_top_line = clamped.saturating_sub(6);
+                                self.viewport.scroll_sub_y_px = 0.0;
+                            }
+                        }
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    Err(e) => self.set_notice(e, true),
+                }
+            }
             PendingDiscardAction::OpenFileDialog => {
                 if let Some(path) = host.open_file_dialog() {
                     if let Err(e) = self.open_file(&path, host) {
@@ -777,8 +899,54 @@ impl EditorApp {
         }
     }
 
+    fn handle_palette_action(
+        &mut self,
+        act: PaletteAction,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        match act {
+            PaletteAction::None => {}
+            PaletteAction::Close | PaletteAction::Changed => {
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            PaletteAction::Open {
+                path,
+                line_0based,
+                col_bytes,
+            } => {
+                let same_file = self.doc.path() == Some(path.as_path());
+                if same_file {
+                    self.execute_pending_action(
+                        PendingDiscardAction::OpenAt {
+                            path,
+                            line_0based,
+                            col_bytes,
+                        },
+                        host,
+                    );
+                    let m = self.doc_metrics(rasterizer);
+                    self.viewport
+                        .ensure_caret_visible(&mut self.doc, self.caret, m, self.framebuffer.scale);
+                } else {
+                    self.request_discard_or_run(
+                        PendingDiscardAction::OpenAt {
+                            path,
+                            line_0based,
+                            col_bytes,
+                        },
+                        host,
+                    );
+                }
+            }
+        }
+    }
+
     fn active_text_input_mut(&mut self) -> Option<&mut editor_render::TextInput> {
-        if self.goto_line.visible {
+        if self.palette.is_open() {
+            Some(&mut self.palette.input)
+        } else if self.goto_line.visible {
             Some(&mut self.goto_line.input)
         } else if self.find_bar.visible && self.find_bar.find_input.focused {
             Some(&mut self.find_bar.find_input)
@@ -850,12 +1018,15 @@ impl EditorApp {
             }
             AppCommand::Cut => {
                 let in_find = self.find_bar.visible && self.find_bar.find_input.focused;
+                let in_palette = self.palette.is_open();
                 if let Some(inp) = self.active_text_input_mut() {
                     if inp.has_selection() {
                         let s = inp.selected_text().to_string();
                         clipboard.set_text(&s);
                         inp.delete_selection();
-                        if in_find {
+                        if in_palette {
+                            self.palette.refresh_results(self.fs.as_ref());
+                        } else if in_find {
                             self.refresh_search();
                         }
                         self.mark_dirty();
@@ -875,10 +1046,13 @@ impl EditorApp {
             }
             AppCommand::Paste => {
                 let in_find = self.find_bar.visible && self.find_bar.find_input.focused;
+                let in_palette = self.palette.is_open();
                 if let Some(clip) = clipboard.get_text() {
                     if let Some(inp) = self.active_text_input_mut() {
                         inp.insert_str(&clip);
-                        if in_find {
+                        if in_palette {
+                            self.palette.refresh_results(self.fs.as_ref());
+                        } else if in_find {
                             self.refresh_search();
                         }
                         self.mark_dirty();
@@ -931,10 +1105,37 @@ impl EditorApp {
             }
             AppCommand::GoToLine => {
                 self.find_bar.close();
+                self.palette.close();
                 self.sidebar.set_focused(false);
                 let (line, _) = self.doc.byte_to_line_col(self.caret);
                 self.goto_line.open(line + 1);
                 self.recompute_layout();
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::QuickOpen => {
+                self.goto_line.close();
+                self.sidebar.set_focused(false);
+                let root = self
+                    .sidebar
+                    .root()
+                    .map(Path::to_path_buf)
+                    .or_else(|| self.doc.path().and_then(|p| p.parent()).map(Path::to_path_buf));
+                self.palette.open_quick_open(self.fs.as_ref(), root.as_deref());
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::ProjectSearch => {
+                self.goto_line.close();
+                self.sidebar.set_focused(false);
+                let seed = self.selected_text();
+                let root = self
+                    .sidebar
+                    .root()
+                    .map(Path::to_path_buf)
+                    .or_else(|| self.doc.path().and_then(|p| p.parent()).map(Path::to_path_buf));
+                self.palette
+                    .open_project_search(self.fs.as_ref(), root.as_deref(), seed.as_deref());
                 self.mark_dirty();
                 host.request_redraw();
             }
@@ -1015,12 +1216,18 @@ impl EditorApp {
                     return;
                 }
                 Key::Char('f') | Key::Char('F') => {
-                    let cmd = if mods.alt {
+                    let cmd = if mods.shift {
+                        AppCommand::ProjectSearch
+                    } else if mods.alt {
                         AppCommand::Replace
                     } else {
                         AppCommand::Find
                     };
                     self.handle_command(cmd, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('p') | Key::Char('P') => {
+                    self.handle_command(AppCommand::QuickOpen, rasterizer, clipboard, host);
                     return;
                 }
                 Key::Char('g') | Key::Char('G') => {

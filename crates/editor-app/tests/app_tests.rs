@@ -306,3 +306,95 @@ fn pro_line_ops_menu_routing_confirm_modal_and_caret_blink_partial_redraw() {
     assert!(!app.confirm_modal.visible);
     assert_eq!(app.doc.file_name(), "next.rs");
 }
+
+#[test]
+fn quick_open_and_project_wide_swar_search() {
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/src/alpha.rs", b"fn alpha() {}\n".to_vec());
+    fs.add_file(
+        "/repo/src/nested/swar_engine.rs",
+        b"line 1\nline 2\npub fn fast_needle_match() {}\n".to_vec(),
+    );
+    fs.add_file("/repo/target/ignored.rs", b"pub fn fast_needle_match() {}\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1200, 800, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.set_sidebar_root(&PathBuf::from("/repo"));
+    app.open_file(&PathBuf::from("/repo/src/alpha.rs"), &mut host).unwrap();
+
+    // 1. Quick Open (Cmd+P) fuzzy-matches `swar_engine.rs` and ignores `target/`.
+    app.handle_event(
+        InputEvent::Command(AppCommand::QuickOpen),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.palette.is_open());
+    assert!(
+        !app.palette.items.iter().any(|it| it.secondary.contains("target")),
+        "target/ should be skipped!"
+    );
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('s'),
+            mods: Modifiers::NONE,
+            text: Some("swar".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.palette.items.len(), 1);
+    assert_eq!(app.palette.items[0].primary, "swar_engine.rs");
+    app.render(&mut raster);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.palette.is_open());
+    assert_eq!(app.doc.file_name(), "swar_engine.rs");
+
+    // 2. Project Search (Cmd+Shift+F) finds `fast_needle_match` on line 3 and jumps right to it!
+    app.open_file(&PathBuf::from("/repo/src/alpha.rs"), &mut host).unwrap();
+    app.handle_event(
+        InputEvent::Command(AppCommand::ProjectSearch),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('f'),
+            mods: Modifiers::NONE,
+            text: Some("fast_needle".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.palette.items.len(), 1);
+    assert_eq!(app.palette.items[0].line_0based, Some(2));
+    app.render(&mut raster);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.file_name(), "swar_engine.rs");
+    let (line, _) = app.doc.byte_to_line_col(app.caret);
+    assert_eq!(line, 2, "must jump directly to line 3 (0-based 2)!");
+}
