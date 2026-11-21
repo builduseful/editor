@@ -25,4 +25,4 @@ pub use input::{
 pub use raster::{
     BuiltinBitmapRasterizer, FontMetrics, FontStyle, GlyphFormat, GlyphRasterizer, RasterizedGlyph,
 };
-pub use surface::{DirtyRegion, Framebuffer, PixelRect};
+pub use surface::{DirtyRegion, Framebuffer, PixelRect, SurfaceMut};

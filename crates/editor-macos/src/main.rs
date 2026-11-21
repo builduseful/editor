@@ -50,16 +50,8 @@ struct MacCallbacks {
     on_open_path: extern "C" fn(*mut c_void, *const c_char),
     on_command: extern "C" fn(*mut c_void, u32),
     on_tick: extern "C" fn(*mut c_void, u64),
-    on_render: extern "C" fn(
-        *mut c_void,
-        *mut *const u8,
-        *mut u32,
-        *mut u32,
-        *mut i32,
-        *mut i32,
-        *mut i32,
-        *mut i32,
-    ) -> c_int,
+    on_needs_render: extern "C" fn(*mut c_void, *mut u32, *mut u32, *mut f32) -> c_int,
+    on_render_into: extern "C" fn(*mut c_void, *mut u32, u32, u32, usize, f32, c_int) -> c_int,
 }
 
 extern "C" {
@@ -606,32 +598,53 @@ extern "C" fn cb_tick(ud: *mut c_void, now_ms: u64) {
     );
 }
 
-extern "C" fn cb_render(
+extern "C" fn cb_needs_render(
     ud: *mut c_void,
-    out_pixels: *mut *const u8,
     out_w: *mut u32,
     out_h: *mut u32,
-    dirty_x: *mut i32,
-    dirty_y: *mut i32,
-    dirty_w: *mut i32,
-    dirty_h: *mut i32,
+    out_scale: *mut f32,
 ) -> c_int {
     let b = unsafe { &mut *(ud as *mut Bridge) };
-    if !b.app.render(&mut b.rasterizer) {
+    if !b.app.is_dirty_frame() {
         return 0;
     }
-    let bytes = b.app.framebuffer.as_bgra_bytes();
-    let dr = b.app.last_rendered_dirty;
     unsafe {
-        *out_pixels = bytes.as_ptr();
         *out_w = b.app.framebuffer.width;
         *out_h = b.app.framebuffer.height;
-        *dirty_x = dr.x;
-        *dirty_y = dr.y;
-        *dirty_w = dr.w;
-        *dirty_h = dr.h;
+        *out_scale = b.app.framebuffer.scale;
     }
     1
+}
+
+extern "C" fn cb_render_into(
+    ud: *mut c_void,
+    dst_pixels: *mut u32,
+    w: u32,
+    h: u32,
+    stride_u32: usize,
+    scale: f32,
+    force_full: c_int,
+) -> c_int {
+    let b = unsafe { &mut *(ud as *mut Bridge) };
+    if dst_pixels.is_null() || w == 0 || h == 0 || stride_u32 < w as usize {
+        return 0;
+    }
+    if force_full != 0 {
+        b.app.mark_dirty();
+    }
+    let slice = unsafe { std::slice::from_raw_parts_mut(dst_pixels, stride_u32 * (h as usize)) };
+    let surf = editor_platform::SurfaceMut {
+        width: w,
+        height: h,
+        stride: stride_u32,
+        scale,
+        pixels: slice,
+    };
+    if b.app.render_into(surf, &mut b.rasterizer) {
+        1
+    } else {
+        0
+    }
 }
 
 // ============================================================================
@@ -765,9 +778,9 @@ fn main() {
     )
     .ok();
 
-    // Live native macOS GUI launch.
+    // Live native macOS GUI launch (0-byte virtual CPU framebuffer: paints directly into IOSurface!).
     let mut bridge = Box::new(Bridge {
-        app: EditorApp::new(fs, size.0 * 2, size.1 * 2, 2.0),
+        app: EditorApp::new_zero_copy(fs, size.0 * 2, size.1 * 2, 2.0),
         rasterizer: MacGlyphRasterizer,
         clipboard: MacClipboard,
         host: MacHost,
@@ -801,7 +814,8 @@ fn main() {
         on_open_path: cb_open_path,
         on_command: cb_command,
         on_tick: cb_tick,
-        on_render: cb_render,
+        on_needs_render: cb_needs_render,
+        on_render_into: cb_render_into,
     };
 
     unsafe { mac_run_app(cbs) };

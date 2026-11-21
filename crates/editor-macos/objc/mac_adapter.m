@@ -329,9 +329,10 @@ typedef struct {
     void (*on_open_path)(void* ud, const char* path);
     void (*on_command)(void* ud, uint32_t cmd_id);
     void (*on_tick)(void* ud, uint64_t now_ms);
-    // Rust fills out pointer, framebuffer dimensions, and the dirty rect to upload into IOSurface.
-    int (*on_render)(void* ud, const uint8_t** out_pixels, uint32_t* out_w, uint32_t* out_h,
-                     int32_t* dirty_x, int32_t* dirty_y, int32_t* dirty_w, int32_t* dirty_h);
+    // Zero-copy render: Rust paints directly into the locked IOSurface memory (no duplicate framebuffer!).
+    int (*on_needs_render)(void* ud, uint32_t* out_w, uint32_t* out_h, float* out_scale);
+    int (*on_render_into)(void* ud, uint32_t* dst_pixels, uint32_t w, uint32_t h,
+                          size_t stride_u32, float scale, int force_full);
 } MacCallbacks;
 
 static uint32_t encode_mods(NSEventModifierFlags f) {
@@ -470,48 +471,36 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
 }
 
 - (void)presentFramebuffer {
-    if (!self.cb.on_render) return;
-    const uint8_t* pixels = NULL;
+    if (!self.cb.on_needs_render || !self.cb.on_render_into) return;
     uint32_t w = 0, h = 0;
-    int32_t dx = 0, dy = 0, dw = 0, dh = 0;
-    int updated = self.cb.on_render(self.cb.userdata, &pixels, &w, &h, &dx, &dy, &dw, &dh);
-    if (!updated || !pixels || w == 0 || h == 0) return;
+    float scale = 1.0f;
+    if (!self.cb.on_needs_render(self.cb.userdata, &w, &h, &scale) || w == 0 || h == 0) {
+        return;
+    }
 
     BOOL recreated = (!_surface || _surfW != w || _surfH != h);
     [self ensureSurfaceWidth:w height:h];
     if (!_surface) return;
 
-    if (recreated || dw <= 0 || dh <= 0) {
-        dx = 0; dy = 0; dw = (int32_t)w; dh = (int32_t)h;
-    } else {
-        if (dx < 0) { dw += dx; dx = 0; }
-        if (dy < 0) { dh += dy; dy = 0; }
-        if (dx + dw > (int32_t)w) dw = (int32_t)w - dx;
-        if (dy + dh > (int32_t)h) dh = (int32_t)h - dy;
-    }
-
+    int painted = 0;
     if (IOSurfaceLock(_surface, 0, NULL) == kIOReturnSuccess) {
-        uint8_t* dst_base = (uint8_t*)IOSurfaceGetBaseAddress(_surface);
-        size_t dst_bpr = IOSurfaceGetBytesPerRow(_surface);
-        size_t src_bpr = (size_t)w * 4;
-        size_t copy_bytes = (size_t)dw * 4;
-        if (dst_base && copy_bytes > 0) {
-            for (int32_t row = dy; row < dy + dh; row++) {
-                memcpy(dst_base + (size_t)row * dst_bpr + (size_t)dx * 4,
-                       pixels + (size_t)row * src_bpr + (size_t)dx * 4,
-                       copy_bytes);
-            }
+        uint32_t* dst = (uint32_t*)IOSurfaceGetBaseAddress(_surface);
+        size_t stride_u32 = IOSurfaceGetBytesPerRow(_surface) / 4;
+        if (dst && stride_u32 >= w) {
+            painted = self.cb.on_render_into(
+                self.cb.userdata, dst, w, h, stride_u32, scale, recreated ? 1 : 0);
         }
         IOSurfaceUnlock(_surface, 0, NULL);
     }
 
-    [CATransaction begin];
-    [CATransaction setDisableActions:YES];
-    self.layer.contentsScale = self.window.backingScaleFactor > 0 ? self.window.backingScaleFactor : 1.0;
-    // Re-assigning the IOSurface notifies WindowServer to composite the updated dirty region.
-    self.layer.contents = nil;
-    self.layer.contents = (__bridge id)_surface;
-    [CATransaction commit];
+    if (painted) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        self.layer.contentsScale = self.window.backingScaleFactor > 0 ? self.window.backingScaleFactor : 1.0;
+        self.layer.contents = nil;
+        self.layer.contents = (__bridge id)_surface;
+        [CATransaction commit];
+    }
 }
 
 - (NSPoint)pixelPointFromEvent:(NSEvent*)event {
@@ -655,11 +644,25 @@ void mac_activate_app(void) {
     [g_view notifyResize];
     [g_view presentFramebuffer];
 
-    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.06
+    [self startBlinkTimer];
+}
+
+- (void)startBlinkTimer {
+    if (self.timer) return;
+    // Quiet 530ms caret-blink timer (paused completely while unfocused -> 0.00% idle CPU!).
+    self.timer = [NSTimer scheduledTimerWithTimeInterval:0.53
                                                   target:self
                                                 selector:@selector(onTick:)
                                                 userInfo:nil
                                                  repeats:YES];
+    self.timer.tolerance = 0.05;
+}
+
+- (void)stopBlinkTimer {
+    if (self.timer) {
+        [self.timer invalidate];
+        self.timer = nil;
+    }
 }
 
 - (void)onTick:(NSTimer*)t {
@@ -674,12 +677,14 @@ void mac_activate_app(void) {
 
 - (void)windowDidBecomeKey:(NSNotification*)note {
     (void)note;
+    [self startBlinkTimer];
     if (self.cb.on_focus) self.cb.on_focus(self.cb.userdata, 1);
     if (g_view) [g_view presentFramebuffer];
 }
 
 - (void)windowDidResignKey:(NSNotification*)note {
     (void)note;
+    [self stopBlinkTimer];
     if (self.cb.on_focus) self.cb.on_focus(self.cb.userdata, 0);
     if (g_view) [g_view presentFramebuffer];
 }

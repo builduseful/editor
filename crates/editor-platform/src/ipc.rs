@@ -318,7 +318,6 @@ impl IpcServer {
 
         let listener = UnixListener::bind(&socket_path)?;
         let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o600));
-        listener.set_nonblocking(true)?;
 
         let queue: Arc<Mutex<VecDeque<PendingIpc>>> = Arc::new(Mutex::new(VecDeque::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -326,19 +325,22 @@ impl IpcServer {
         let q_clone = Arc::clone(&queue);
         let stop_clone = Arc::clone(&stop);
 
+        // Blocking `accept()` -> ZERO idle CPU wakeups (0.00% idle CPU)!
         thread::spawn(move || {
             while !stop_clone.load(Ordering::Relaxed) {
                 match listener.accept() {
                     Ok((stream, _)) => {
-                        let _ = stream.set_nonblocking(false);
+                        if stop_clone.load(Ordering::Relaxed) {
+                            break;
+                        }
                         let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(3)));
                         handle_client(stream, &q_clone, &on_wake);
                     }
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        thread::sleep(Duration::from_millis(15));
-                    }
                     Err(_) => {
+                        if stop_clone.load(Ordering::Relaxed) {
+                            break;
+                        }
                         thread::sleep(Duration::from_millis(50));
                     }
                 }
@@ -364,6 +366,9 @@ impl IpcServer {
 impl Drop for IpcServer {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
+        // Unblock blocking `accept()` cleanly, then remove the socket file.
+        #[cfg(unix)]
+        let _ = UnixStream::connect(&self.socket_path);
         let _ = std::fs::remove_file(&self.socket_path);
     }
 }

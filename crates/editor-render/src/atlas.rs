@@ -64,6 +64,12 @@ impl ShelfPacker {
         if w == 0 || h == 0 {
             return Some((0, 0));
         }
+        // Lazy allocation for atlases that start at 0x0 (e.g. color emoji atlas when no emojis are drawn).
+        if self.width == 0 || self.height == 0 {
+            self.width = 256;
+            self.height = 256;
+            self.pixels = vec![0u8; 256 * 256 * self.bytes_per_pixel];
+        }
         let pad = 1u32;
         if self.cursor_x + w + pad > self.width {
             self.cursor_x = 1;
@@ -121,10 +127,11 @@ impl Default for GlyphAtlas {
 impl GlyphAtlas {
     pub fn new() -> Self {
         Self {
-            alpha: ShelfPacker::new(512, 512, 1),
-            color: ShelfPacker::new(512, 256, 4),
-            cache: HashMap::with_capacity(512),
-            metrics_cache: HashMap::with_capacity(16),
+            // Compact 64 KB initial alpha atlas (grows on demand); 0-byte lazy color emoji atlas!
+            alpha: ShelfPacker::new(256, 256, 1),
+            color: ShelfPacker::new(0, 0, 4),
+            cache: HashMap::with_capacity(128),
+            metrics_cache: HashMap::with_capacity(8),
             fast_mono_size_q4: 0,
             fast_mono: [None; 96],
             fast_mono_bold: [None; 96],

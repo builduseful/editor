@@ -13,7 +13,7 @@ use editor_core::{
 };
 use editor_platform::{
     AppCommand, Clipboard, ConfirmChoice, CursorShape, FileSystem, FontStyle, Framebuffer,
-    GlyphRasterizer, InputEvent, Key, Modifiers, MouseButton, PixelRect, PlatformHost,
+    GlyphRasterizer, InputEvent, Key, Modifiers, MouseButton, PixelRect, PlatformHost, SurfaceMut,
     SystemTheme, ThemePreference,
 };
 use editor_render::{
@@ -93,6 +93,26 @@ pub struct EditorApp {
 
 impl EditorApp {
     pub fn new(fs: Arc<dyn FileSystem>, width_px: u32, height_px: u32, scale: f32) -> Self {
+        Self::with_framebuffer(
+            fs,
+            Framebuffer::new(width_px.max(1), height_px.max(1), scale),
+        )
+    }
+
+    /// Construct with a 0-byte virtual framebuffer for zero-copy OS surfaces (`IOSurface` / `wl_shm`).
+    pub fn new_zero_copy(
+        fs: Arc<dyn FileSystem>,
+        width_px: u32,
+        height_px: u32,
+        scale: f32,
+    ) -> Self {
+        Self::with_framebuffer(
+            fs,
+            Framebuffer::new_virtual(width_px.max(1), height_px.max(1), scale),
+        )
+    }
+
+    fn with_framebuffer(fs: Arc<dyn FileSystem>, framebuffer: Framebuffer) -> Self {
         let mut app = Self {
             fs,
             doc: Document::new_untitled(),
@@ -113,7 +133,7 @@ impl EditorApp {
             theme_pref: ThemePreference::System,
             system_theme: SystemTheme::Light,
             atlas: GlyphAtlas::new(),
-            framebuffer: Framebuffer::new(width_px.max(1), height_px.max(1), scale),
+            framebuffer,
             layout: AppLayout::default(),
             last_rendered_dirty: PixelRect::ZERO,
             window_focused: true,
@@ -323,14 +343,44 @@ impl EditorApp {
         };
     }
 
-    /// Render the current frame into `self.framebuffer`. Returns `true` if pixels were updated.
-    /// Uses dirty-rect clipping so caret-blink frames repaint only the tiny caret strip (< 0.05 ms)!
+    /// Render into the owned CPU `Framebuffer` (used by headless tests & PNG snapshots).
     pub fn render(&mut self, rasterizer: &mut dyn GlyphRasterizer) -> bool {
         if !self.dirty_frame {
             return false;
         }
+        self.framebuffer.ensure_pixels();
+        // Split borrow cleanly via local raw slice from our own Vec<u32> (valid for duration of paint).
+        let w = self.framebuffer.width;
+        let h = self.framebuffer.height;
+        let scale = self.framebuffer.scale;
+        let ptr = self.framebuffer.pixels.as_mut_ptr();
+        let len = self.framebuffer.pixels.len();
+        let surf = SurfaceMut {
+            width: w,
+            height: h,
+            stride: w as usize,
+            scale,
+            pixels: unsafe { std::slice::from_raw_parts_mut(ptr, len) },
+        };
+        self.render_into(surf, rasterizer)
+    }
+
+    /// Zero-copy render directly into an OS-owned surface (e.g. a locked macOS `IOSurface`).
+    /// Never allocates a CPU framebuffer copy!
+    pub fn render_into(
+        &mut self,
+        surf: SurfaceMut<'_>,
+        rasterizer: &mut dyn GlyphRasterizer,
+    ) -> bool {
+        if !self.dirty_frame {
+            return false;
+        }
+        self.framebuffer.width = surf.width;
+        self.framebuffer.height = surf.height;
+        self.framebuffer.scale = surf.scale;
         self.recompute_layout();
-        let full_bounds = self.framebuffer.bounds();
+
+        let full_bounds = surf.bounds();
         let dirty_clip = self.framebuffer.dirty.bounding_rect(full_bounds);
         let full_redraw =
             self.framebuffer.dirty.is_full() || self.confirm_modal.visible || self.palette.is_open();
@@ -354,7 +404,7 @@ impl EditorApp {
             None
         };
 
-        let mut painter = Painter::new(&mut self.framebuffer);
+        let mut painter = Painter::from_surface(surf);
         painter.push_clip(effective_clip);
 
         // 1. Sidebar

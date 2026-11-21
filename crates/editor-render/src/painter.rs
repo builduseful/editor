@@ -7,33 +7,37 @@
 //! - In-place vertical scroll-blit for sub-millisecond scrolling
 
 use editor_core::grapheme_clusters;
-use editor_platform::{FontStyle, Framebuffer, GlyphFormat, GlyphRasterizer, PixelRect};
+use editor_platform::{FontStyle, Framebuffer, GlyphFormat, GlyphRasterizer, PixelRect, SurfaceMut};
 
 use crate::atlas::{AtlasGlyph, GlyphAtlas};
 use crate::theme::Color;
 
 pub struct Painter<'a> {
-    fb: &'a mut Framebuffer,
+    surf: SurfaceMut<'a>,
     clip_stack: Vec<PixelRect>,
 }
 
 impl<'a> Painter<'a> {
     pub fn new(fb: &'a mut Framebuffer) -> Self {
-        let full = fb.bounds();
+        Self::from_surface(fb.as_surface_mut())
+    }
+
+    pub fn from_surface(surf: SurfaceMut<'a>) -> Self {
+        let full = surf.bounds();
         Self {
-            fb,
+            surf,
             clip_stack: vec![full],
         }
     }
 
     #[inline]
     pub fn bounds(&self) -> PixelRect {
-        self.fb.bounds()
+        self.surf.bounds()
     }
 
     #[inline]
     pub fn scale(&self) -> f32 {
-        self.fb.scale
+        self.surf.scale
     }
 
     #[inline]
@@ -64,14 +68,14 @@ impl<'a> Painter<'a> {
         if clipped.is_empty() {
             return;
         }
-        let stride = self.fb.width as usize;
+        let stride = self.surf.stride;
         let x0 = clipped.x as usize;
         let x1 = clipped.right() as usize;
         if color.a == 255 {
             let packed = color.to_premul_u32();
             for y in clipped.y..clipped.bottom() {
                 let row = (y as usize) * stride;
-                self.fb.pixels[row + x0..row + x1].fill(packed);
+                self.surf.pixels[row + x0..row + x1].fill(packed);
             }
         } else {
             let sr = color.r as u32;
@@ -81,7 +85,7 @@ impl<'a> Painter<'a> {
             let inv_a = 255 - sa;
             for y in clipped.y..clipped.bottom() {
                 let row = (y as usize) * stride;
-                for px in &mut self.fb.pixels[row + x0..row + x1] {
+                for px in &mut self.surf.pixels[row + x0..row + x1] {
                     *px = blend_over_rgb(*px, sr, sg, sb, sa, inv_a);
                 }
             }
@@ -136,7 +140,7 @@ impl<'a> Painter<'a> {
             );
         }
 
-        let stride = self.fb.width as usize;
+        let stride = self.surf.stride;
         let sr = color.r as u32;
         let sg = color.g as u32;
         let sb = color.b as u32;
@@ -175,7 +179,7 @@ impl<'a> Painter<'a> {
                         0.0
                     };
                     if dx == 0.0 && dy == 0.0 {
-                        let dst = &mut self.fb.pixels[row_off + x as usize];
+                        let dst = &mut self.surf.pixels[row_off + x as usize];
                         if color.a == 255 {
                             *dst = color.to_premul_u32();
                         } else {
@@ -189,7 +193,7 @@ impl<'a> Painter<'a> {
                     if cov > 0.0 {
                         let sa = (cov * base_a).round() as u32;
                         if sa > 0 {
-                            let dst = &mut self.fb.pixels[row_off + x as usize];
+                            let dst = &mut self.surf.pixels[row_off + x as usize];
                             *dst = blend_over_rgb(*dst, sr, sg, sb, sa, 255 - sa);
                         }
                     }
@@ -224,7 +228,7 @@ impl<'a> Painter<'a> {
         let bx = half_w - r;
         let by = half_h - r;
 
-        let stride = self.fb.width as usize;
+        let stride = self.surf.stride;
         let sr = color.r as u32;
         let sg = color.g as u32;
         let sb = color.b as u32;
@@ -249,7 +253,7 @@ impl<'a> Painter<'a> {
                 if cov > 0.0 {
                     let sa = (cov * base_a).round() as u32;
                     if sa > 0 {
-                        let dst = &mut self.fb.pixels[row + x as usize];
+                        let dst = &mut self.surf.pixels[row + x as usize];
                         *dst = blend_over_rgb(*dst, sr, sg, sb, sa, 255 - sa);
                     }
                 }
@@ -276,7 +280,7 @@ impl<'a> Painter<'a> {
         let vy = y1 - y0;
         let len_sq = (vx * vx + vy * vy).max(1e-6);
         let half_t = thickness * 0.5;
-        let stride = self.fb.width as usize;
+        let stride = self.surf.stride;
         let sr = color.r as u32;
         let sg = color.g as u32;
         let sb = color.b as u32;
@@ -295,7 +299,7 @@ impl<'a> Painter<'a> {
                 if cov > 0.0 {
                     let sa = (cov * base_a).round() as u32;
                     if sa > 0 {
-                        let dst = &mut self.fb.pixels[row + x as usize];
+                        let dst = &mut self.surf.pixels[row + x as usize];
                         *dst = blend_over_rgb(*dst, sr, sg, sb, sa, 255 - sa);
                     }
                 }
@@ -341,7 +345,7 @@ impl<'a> Painter<'a> {
         let sy0 = (clipped.y - gy) as usize;
         let draw_w = clipped.w as usize;
         let draw_h = clipped.h as usize;
-        let fb_stride = self.fb.width as usize;
+        let fb_stride = self.surf.stride;
 
         match glyph.format {
             GlyphFormat::Alpha8 => {
@@ -357,7 +361,7 @@ impl<'a> Painter<'a> {
                         ((glyph.atlas_y as usize) + sy0 + row) * alpha_stride + (glyph.atlas_x as usize) + sx0;
                     let dst_row = ((clipped.y as usize) + row) * fb_stride + (clipped.x as usize);
                     let src_slice = &alpha_buf[src_row..src_row + draw_w];
-                    let dst_slice = &mut self.fb.pixels[dst_row..dst_row + draw_w];
+                    let dst_slice = &mut self.surf.pixels[dst_row..dst_row + draw_w];
 
                     if fg_a == 255 {
                         for (dst, &cov) in dst_slice.iter_mut().zip(src_slice.iter()) {
@@ -400,7 +404,7 @@ impl<'a> Painter<'a> {
                         if sa == 0 {
                             continue;
                         }
-                        let dst = &mut self.fb.pixels[dst_row + col];
+                        let dst = &mut self.surf.pixels[dst_row + col];
                         if sa == 255 {
                             *dst = (0xFFu32 << 24) | (sr << 16) | (sg << 8) | sb;
                         } else {
@@ -464,11 +468,11 @@ impl<'a> Painter<'a> {
     /// Shift a sub-rectangle of the framebuffer vertically by `dy` pixels (positive = move down).
     /// Enables sub-millisecond scrolling by reusing 95% of already-rasterized pixels!
     pub fn scroll_rect_vertical(&mut self, rect: PixelRect, dy: i32) {
-        let r = rect.intersect(self.fb.bounds());
+        let r = rect.intersect(self.surf.bounds());
         if r.is_empty() || dy == 0 || dy.abs() >= r.h {
             return;
         }
-        let stride = self.fb.width as usize;
+        let stride = self.surf.stride;
         let x0 = r.x as usize;
         let x1 = r.right() as usize;
         if dy > 0 {
@@ -477,7 +481,7 @@ impl<'a> Painter<'a> {
                 let src_y = dst_y - dy;
                 let src_start = (src_y as usize) * stride + x0;
                 let dst_start = (dst_y as usize) * stride + x0;
-                self.fb
+                self.surf
                     .pixels
                     .copy_within(src_start..src_start + (x1 - x0), dst_start);
             }
@@ -488,7 +492,7 @@ impl<'a> Painter<'a> {
                 let src_y = dst_y + shift;
                 let src_start = (src_y as usize) * stride + x0;
                 let dst_start = (dst_y as usize) * stride + x0;
-                self.fb
+                self.surf
                     .pixels
                     .copy_within(src_start..src_start + (x1 - x0), dst_start);
             }
