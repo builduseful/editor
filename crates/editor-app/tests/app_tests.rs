@@ -562,3 +562,117 @@ fn split_panes_independent_editing_and_ipc() {
     assert!(!app.is_split());
     assert!(s.contains("\"split\":false"));
 }
+
+#[test]
+fn split_pane_double_buffer_damage_tracking_is_bit_exact() {
+    use editor_platform::{InputEvent, PixelRect, SurfaceMut};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    let mut left_text = String::new();
+    let mut right_text = String::new();
+    for i in 1..=120 {
+        left_text.push_str(&format!("fn left_line_{i}() -> usize {{ {i} }}\n"));
+        right_text.push_str(&format!("fn right_line_{i}() -> usize {{ {} }}\n", i * 10));
+    }
+    fs.add_file("/repo/left.rs", left_text.into_bytes());
+    fs.add_file("/repo/right.rs", right_text.into_bytes());
+
+    let (w, h, scale) = (800u32, 500u32, 2.0f32);
+    let mut app = EditorApp::new(fs.clone(), w, h, scale);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_path_or_dir(&PathBuf::from("/repo/left.rs"), &mut host)
+        .unwrap();
+    app.split_pane_with(Some(&PathBuf::from("/repo/right.rs")), &mut host);
+
+    // Simulate a 2-slot double-buffered swapchain + buffer-age damage propagation.
+    let mut slots = [vec![0u32; (w * h) as usize], vec![0u32; (w * h) as usize]];
+    let mut needs_full = [true, true];
+    let mut dmg = [PixelRect::ZERO, PixelRect::ZERO];
+    let mut front = 1usize;
+
+    let mut present_and_verify = |app: &mut EditorApp, raster: &mut BuiltinBitmapRasterizer| {
+        let back = 1 - front;
+        let surf = SurfaceMut {
+            width: w,
+            height: h,
+            stride: w as usize,
+            scale,
+            pixels: &mut slots[back],
+        };
+        let painted = app
+            .render_into_with_damage(surf, raster, dmg[back], needs_full[back])
+            .expect("frame should paint");
+        needs_full[back] = false;
+        dmg[back] = PixelRect::ZERO;
+        if !needs_full[front] {
+            dmg[front] = dmg[front].union(painted);
+        }
+        front = back;
+
+        // Compare bit-for-bit against a fresh full-redraw reference surface!
+        let mut ref_buf = vec![0u32; (w * h) as usize];
+        let ref_surf = SurfaceMut {
+            width: w,
+            height: h,
+            stride: w as usize,
+            scale,
+            pixels: &mut ref_buf,
+        };
+        app.render_into_with_damage(ref_surf, raster, PixelRect::ZERO, true)
+            .expect("reference full render");
+        assert_eq!(slots[front], ref_buf, "swapchain back-buffer must match full redraw bit-for-bit");
+    };
+
+    // Frame 0: initial split render.
+    present_and_verify(&mut app, &mut raster);
+
+    // Frame 1: scroll right (active) pane down.
+    let rx = (app.layout.right_pane.x + 40) as f32;
+    let ry = (app.layout.right_pane.y + 40) as f32;
+    app.handle_event(
+        InputEvent::Scroll {
+            dx_px: 0.0,
+            dy_px: 120.0,
+            x_px: rx,
+            y_px: ry,
+            mods: Default::default(),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    present_and_verify(&mut app, &mut raster);
+
+    // Frame 2: scroll left (inactive) pane down while pointer is over left pane!
+    let lx = (app.layout.left_pane.x + 40) as f32;
+    let ly = (app.layout.left_pane.y + 40) as f32;
+    app.handle_event(
+        InputEvent::Scroll {
+            dx_px: 0.0,
+            dy_px: 95.0,
+            x_px: lx,
+            y_px: ly,
+            mods: Default::default(),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    present_and_verify(&mut app, &mut raster);
+
+    // Frame 3: caret blink partial dirty rect in active right pane.
+    app.handle_event(
+        InputEvent::Tick { now_ms: 1000 },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    present_and_verify(&mut app, &mut raster);
+
+    // Frame 4: click to focus left pane + scroll again.
+    app.focus_pane(0, &mut host);
+    present_and_verify(&mut app, &mut raster);
+}

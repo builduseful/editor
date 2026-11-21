@@ -514,8 +514,24 @@ impl EditorApp {
         surf: SurfaceMut<'_>,
         rasterizer: &mut dyn GlyphRasterizer,
     ) -> bool {
-        if !self.dirty_frame {
-            return false;
+        self.render_into_with_damage(surf, rasterizer, PixelRect::ZERO, false)
+            .is_some()
+    }
+
+    /// Zero-copy render with swapchain buffer-age damage tracking.
+    ///
+    /// - `extra_dirty`: damage accumulated on this swapchain buffer slot since it was last painted.
+    /// - `force_full`: force a full-surface paint (newly allocated, resized, or purged surface).
+    /// Returns `Some(painted_rect)` when pixels were written, or `None` if nothing needed painting.
+    pub fn render_into_with_damage(
+        &mut self,
+        surf: SurfaceMut<'_>,
+        rasterizer: &mut dyn GlyphRasterizer,
+        extra_dirty: PixelRect,
+        force_full: bool,
+    ) -> Option<PixelRect> {
+        if !self.dirty_frame && !force_full {
+            return None;
         }
         self.framebuffer.width = surf.width;
         self.framebuffer.height = surf.height;
@@ -523,10 +539,24 @@ impl EditorApp {
         self.recompute_layout();
 
         let full_bounds = surf.bounds();
-        let dirty_clip = self.framebuffer.dirty.bounding_rect(full_bounds);
-        let full_redraw =
-            self.framebuffer.dirty.is_full() || self.confirm_modal.visible || self.palette.is_open();
-        let effective_clip = if full_redraw { full_bounds } else { dirty_clip };
+        let app_dirty = if self.framebuffer.dirty.is_full()
+            || self.confirm_modal.visible
+            || self.palette.is_open()
+        {
+            full_bounds
+        } else {
+            self.framebuffer.dirty.bounding_rect(full_bounds)
+        };
+        let effective_clip = if force_full {
+            full_bounds
+        } else {
+            app_dirty.union(extra_dirty).intersect(full_bounds)
+        };
+        if effective_clip.is_empty() {
+            self.framebuffer.dirty.clear();
+            self.dirty_frame = false;
+            return None;
+        }
 
         let theme = self.active_theme();
         let layout = self.layout;
@@ -599,27 +629,31 @@ impl EditorApp {
             };
 
             // Draw quiet pane headers (Build Useful tokens: page bg, hairline bottom, bold active name).
-            draw_pane_header(
-                &mut painter,
-                active_hdr,
-                self.doc.file_name(),
-                self.doc.is_dirty(),
-                true,
-                &theme,
-                &mut self.atlas,
-                rasterizer,
-            );
-            if let Some(ref mut sec) = self.secondary_pane {
+            if !active_hdr.intersect(effective_clip).is_empty() {
                 draw_pane_header(
                     &mut painter,
-                    inactive_hdr,
-                    sec.doc.file_name(),
-                    sec.doc.is_dirty(),
-                    false,
+                    active_hdr,
+                    self.doc.file_name(),
+                    self.doc.is_dirty(),
+                    true,
                     &theme,
                     &mut self.atlas,
                     rasterizer,
                 );
+            }
+            if let Some(ref mut sec) = self.secondary_pane {
+                if !inactive_hdr.intersect(effective_clip).is_empty() {
+                    draw_pane_header(
+                        &mut painter,
+                        inactive_hdr,
+                        sec.doc.file_name(),
+                        sec.doc.is_dirty(),
+                        false,
+                        &theme,
+                        &mut self.atlas,
+                        rasterizer,
+                    );
+                }
                 if !inactive_rect.intersect(effective_clip).is_empty() {
                     let sec_sel = sec.selection();
                     sec.viewport.draw(
@@ -660,10 +694,15 @@ impl EditorApp {
                 self.ime.caret_rect_px = self.viewport.last_caret_rect;
             }
             // Crisp 1px vertical split hairline divider.
-            painter.fill_rect(
-                PixelRect::new(layout.split_divider.x, layout.split_area.y, hairline, layout.split_area.h),
-                theme.border_subtle,
+            let div_rect = PixelRect::new(
+                layout.split_divider.x,
+                layout.split_area.y,
+                hairline,
+                layout.split_area.h,
             );
+            if !div_rect.intersect(effective_clip).is_empty() {
+                painter.fill_rect(div_rect, theme.border_subtle);
+            }
         } else if !layout.viewport.intersect(effective_clip).is_empty() {
             self.viewport.draw(
                 &mut painter,
@@ -727,10 +766,10 @@ impl EditorApp {
         }
 
         painter.pop_clip();
-        self.last_rendered_dirty = effective_clip;
+        self.last_rendered_dirty = app_dirty;
         self.framebuffer.dirty.clear();
         self.dirty_frame = false;
-        true
+        Some(app_dirty)
     }
 
     /// Snapshot of logical UI regions for future OS accessibility bridges.
@@ -2777,11 +2816,15 @@ impl EditorApp {
             } else {
                 self.layout.left_pane
             };
-            if inactive_rect.contains(xi, yi) {
+            let over_inactive_col = xi >= inactive_rect.x
+                && xi < inactive_rect.right()
+                && yi >= self.layout.split_area.y
+                && yi < self.layout.split_area.bottom();
+            if over_inactive_col {
                 if let Some(ref mut sec) = self.secondary_pane {
                     sec.viewport
                         .scroll_by(dx_px, dy_px, &mut sec.doc, metrics, self.framebuffer.scale);
-                    self.mark_dirty();
+                    self.mark_dirty_rect(inactive_rect);
                     host.request_redraw();
                     return;
                 }
@@ -2789,7 +2832,7 @@ impl EditorApp {
         }
         self.viewport
             .scroll_by(dx_px, dy_px, &mut self.doc, metrics, self.framebuffer.scale);
-        self.mark_dirty();
+        self.mark_dirty_rect(self.layout.viewport);
         host.request_redraw();
     }
 

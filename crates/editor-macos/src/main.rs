@@ -51,7 +51,23 @@ struct MacCallbacks {
     on_command: extern "C" fn(*mut c_void, u32),
     on_tick: extern "C" fn(*mut c_void, u64),
     on_needs_render: extern "C" fn(*mut c_void, *mut u32, *mut u32, *mut f32) -> c_int,
-    on_render_into: extern "C" fn(*mut c_void, *mut u32, u32, u32, usize, f32, c_int) -> c_int,
+    on_render_into: extern "C" fn(
+        *mut c_void,
+        *mut u32,
+        u32,
+        u32,
+        usize,
+        f32,
+        c_int,
+        i32,
+        i32,
+        i32,
+        i32,
+        *mut i32,
+        *mut i32,
+        *mut i32,
+        *mut i32,
+    ) -> c_int,
 }
 
 extern "C" {
@@ -626,13 +642,18 @@ extern "C" fn cb_render_into(
     stride_u32: usize,
     scale: f32,
     force_full: c_int,
+    extra_x: i32,
+    extra_y: i32,
+    extra_w: i32,
+    extra_h: i32,
+    out_x: *mut i32,
+    out_y: *mut i32,
+    out_w: *mut i32,
+    out_h: *mut i32,
 ) -> c_int {
     let b = unsafe { &mut *(ud as *mut Bridge) };
     if dst_pixels.is_null() || w == 0 || h == 0 || stride_u32 < w as usize {
         return 0;
-    }
-    if force_full != 0 {
-        b.app.mark_dirty();
     }
     let slice = unsafe { std::slice::from_raw_parts_mut(dst_pixels, stride_u32 * (h as usize)) };
     let surf = editor_platform::SurfaceMut {
@@ -642,7 +663,25 @@ extern "C" fn cb_render_into(
         scale,
         pixels: slice,
     };
-    if b.app.render_into(surf, &mut b.rasterizer) {
+    let extra_dirty = editor_platform::PixelRect::new(extra_x, extra_y, extra_w, extra_h);
+    if let Some(painted) =
+        b.app
+            .render_into_with_damage(surf, &mut b.rasterizer, extra_dirty, force_full != 0)
+    {
+        unsafe {
+            if !out_x.is_null() {
+                *out_x = painted.x;
+            }
+            if !out_y.is_null() {
+                *out_y = painted.y;
+            }
+            if !out_w.is_null() {
+                *out_w = painted.w;
+            }
+            if !out_h.is_null() {
+                *out_h = painted.h;
+            }
+        }
         1
     } else {
         0

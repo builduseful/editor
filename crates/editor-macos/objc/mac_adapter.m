@@ -329,10 +329,13 @@ typedef struct {
     void (*on_open_path)(void* ud, const char* path);
     void (*on_command)(void* ud, uint32_t cmd_id);
     void (*on_tick)(void* ud, uint64_t now_ms);
-    // Zero-copy render: Rust paints directly into the locked IOSurface memory (no duplicate framebuffer!).
+    // Zero-copy swapchain render: Rust paints directly into a free back-buffer IOSurface
+    // with buffer-age damage tracking (zero duplicate CPU framebuffer, zero tearing/flicker).
     int (*on_needs_render)(void* ud, uint32_t* out_w, uint32_t* out_h, float* out_scale);
     int (*on_render_into)(void* ud, uint32_t* dst_pixels, uint32_t w, uint32_t h,
-                          size_t stride_u32, float scale, int force_full);
+                          size_t stride_u32, float scale, int force_full,
+                          int32_t extra_x, int32_t extra_y, int32_t extra_w, int32_t extra_h,
+                          int32_t* out_x, int32_t* out_y, int32_t* out_w, int32_t* out_h);
 } MacCallbacks;
 
 static uint32_t encode_mods(NSEventModifierFlags f) {
@@ -356,34 +359,115 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
     return [match isEqualToString:NSAppearanceNameDarkAqua] ? 1 : 0;
 }
 
+#define MAX_SWAP_SLOTS 3
+
+typedef struct {
+    IOSurfaceRef surface;
+    BOOL needs_full;
+    BOOL is_volatile;
+    int32_t dmg_x;
+    int32_t dmg_y;
+    int32_t dmg_w;
+    int32_t dmg_h;
+} SwapSlot;
+
+static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
+                            int32_t rx, int32_t ry, int32_t rw, int32_t rh) {
+    if (rw <= 0 || rh <= 0) return;
+    if (*dw <= 0 || *dh <= 0) {
+        *dx = rx;
+        *dy = ry;
+        *dw = rw;
+        *dh = rh;
+        return;
+    }
+    int32_t x0 = *dx < rx ? *dx : rx;
+    int32_t y0 = *dy < ry ? *dy : ry;
+    int32_t r0 = *dx + *dw;
+    int32_t r1 = rx + rw;
+    int32_t b0 = *dy + *dh;
+    int32_t b1 = ry + rh;
+    int32_t x1 = r0 > r1 ? r0 : r1;
+    int32_t y1 = b0 > b1 ? b0 : b1;
+    *dx = x0;
+    *dy = y0;
+    *dw = x1 - x0;
+    *dh = y1 - y0;
+}
+
 @interface EditorSurfaceView : NSView {
-    IOSurfaceRef _surface;
+    SwapSlot _slots[MAX_SWAP_SLOTS];
+    int _frontIdx;
     uint32_t _surfW;
     uint32_t _surfH;
+    BOOL _inPresent;
 }
 @property (nonatomic) MacCallbacks cb;
+- (void)scheduleRedraw;
 - (void)presentFramebuffer;
+- (void)reclaimSpareSurfaces;
 - (void)notifyResize;
 @end
 
 @implementation EditorSurfaceView
 
-- (void)dealloc {
-    if (_surface) {
-        CFRelease(_surface);
-        _surface = NULL;
+- (instancetype)initWithFrame:(NSRect)frameRect {
+    self = [super initWithFrame:frameRect];
+    if (self) {
+        memset(_slots, 0, sizeof(_slots));
+        _frontIdx = -1;
+        _surfW = 0;
+        _surfH = 0;
+        _inPresent = NO;
+        self.wantsLayer = YES;
+        self.layerContentsRedrawPolicy = NSViewLayerContentsRedrawDuringViewResize;
     }
+    return self;
+}
+
+- (void)releaseAllSlots {
+    for (int i = 0; i < MAX_SWAP_SLOTS; i++) {
+        if (_slots[i].surface) {
+            CFRelease(_slots[i].surface);
+            _slots[i].surface = NULL;
+        }
+        _slots[i].needs_full = YES;
+        _slots[i].is_volatile = NO;
+        _slots[i].dmg_x = 0;
+        _slots[i].dmg_y = 0;
+        _slots[i].dmg_w = 0;
+        _slots[i].dmg_h = 0;
+    }
+    _frontIdx = -1;
+    _surfW = 0;
+    _surfH = 0;
+}
+
+- (void)dealloc {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self];
+    [self releaseAllSlots];
 }
 
 - (BOOL)isFlipped { return YES; }
+- (BOOL)isOpaque { return YES; }
+- (BOOL)wantsUpdateLayer { return YES; }
 - (BOOL)acceptsFirstResponder { return YES; }
+
+- (void)updateLayer {
+    [self presentFramebuffer];
+}
+
+- (void)scheduleRedraw {
+    [self setNeedsDisplay:YES];
+}
 
 - (void)viewDidMoveToWindow {
     [super viewDidMoveToWindow];
     self.wantsLayer = YES;
+    self.layer.opaque = YES;
     [self registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
     [self notifyResize];
-    [self presentFramebuffer];
+    [self scheduleRedraw];
 }
 
 - (NSDragOperation)draggingEntered:(id<NSDraggingInfo>)sender {
@@ -402,7 +486,7 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
         NSURL* url = urls.firstObject;
         if (url.path) {
             self.cb.on_open_path(self.cb.userdata, [url.path UTF8String]);
-            [self presentFramebuffer];
+            [self scheduleRedraw];
             return YES;
         }
     }
@@ -425,7 +509,7 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
 - (void)setFrameSize:(NSSize)newSize {
     [super setFrameSize:newSize];
     [self notifyResize];
-    [self presentFramebuffer];
+    [self scheduleRedraw];
 }
 
 - (void)viewDidChangeEffectiveAppearance {
@@ -433,7 +517,7 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
     if (self.cb.on_theme) {
         self.cb.on_theme(self.cb.userdata, detect_is_dark(self.effectiveAppearance));
     }
-    [self presentFramebuffer];
+    [self scheduleRedraw];
 }
 
 - (void)notifyResize {
@@ -446,12 +530,7 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
     }
 }
 
-- (void)ensureSurfaceWidth:(uint32_t)w height:(uint32_t)h {
-    if (_surface && _surfW == w && _surfH == h) return;
-    if (_surface) {
-        CFRelease(_surface);
-        _surface = NULL;
-    }
+- (IOSurfaceRef)createSurfaceWidth:(uint32_t)w height:(uint32_t)h {
     size_t bpr = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, (size_t)w * 4);
     size_t alloc_size = IOSurfaceAlignProperty(kIOSurfaceAllocSize, bpr * (size_t)h);
     NSDictionary* props = @{
@@ -462,45 +541,130 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
         (id)kIOSurfaceAllocSize: @(alloc_size),
         (id)kIOSurfacePixelFormat: @(0x42475241u), // 'BGRA'
     };
-    _surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
-    if (_surface) {
-        IOSurfaceSetValue(_surface, kIOSurfaceColorSpace, kCGColorSpaceSRGB);
+    IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+    if (surf) {
+        IOSurfaceSetValue(surf, kIOSurfaceColorSpace, kCGColorSpaceSRGB);
     }
-    _surfW = w;
-    _surfH = h;
+    return surf;
+}
+
+- (int)acquireBackSlotWidth:(uint32_t)w height:(uint32_t)h {
+    if (_surfW != w || _surfH != h) {
+        [self releaseAllSlots];
+        _surfW = w;
+        _surfH = h;
+    }
+
+    // 1. Prefer an already-allocated non-front slot that WindowServer is NOT currently scanning out.
+    for (int i = 0; i < MAX_SWAP_SLOTS; i++) {
+        if (i == _frontIdx) continue;
+        if (_slots[i].surface && !IOSurfaceIsInUse(_slots[i].surface)) {
+            return i;
+        }
+    }
+
+    // 2. Otherwise allocate the first empty slot (lazily grows 1 -> 2 -> 3 only if GPU is busy).
+    for (int i = 0; i < MAX_SWAP_SLOTS; i++) {
+        if (!_slots[i].surface) {
+            _slots[i].surface = [self createSurfaceWidth:w height:h];
+            _slots[i].needs_full = YES;
+            _slots[i].is_volatile = NO;
+            _slots[i].dmg_x = 0;
+            _slots[i].dmg_y = 0;
+            _slots[i].dmg_w = 0;
+            _slots[i].dmg_h = 0;
+            return _slots[i].surface ? i : -1;
+        }
+    }
+
+    // 3. Fallback if all 3 slots are somehow in use: pick the oldest non-front slot (never _frontIdx).
+    return (_frontIdx + 1) % MAX_SWAP_SLOTS;
+}
+
+- (void)reclaimSpareSurfaces {
+    // Mark non-front swapchain surfaces volatile after idle so macOS excludes them from phys_footprint
+    // while keeping them hot for <5us re-acquisition on the next scroll or keystroke!
+    for (int i = 0; i < MAX_SWAP_SLOTS; i++) {
+        if (i == _frontIdx) continue;
+        if (_slots[i].surface && !_slots[i].is_volatile && !IOSurfaceIsInUse(_slots[i].surface)) {
+            if (IOSurfaceSetPurgeable(_slots[i].surface, kIOSurfacePurgeableVolatile, NULL) == kIOReturnSuccess) {
+                _slots[i].is_volatile = YES;
+            }
+        }
+    }
 }
 
 - (void)presentFramebuffer {
-    if (!self.cb.on_needs_render || !self.cb.on_render_into) return;
+    if (_inPresent || !self.cb.on_needs_render || !self.cb.on_render_into) return;
     uint32_t w = 0, h = 0;
     float scale = 1.0f;
     if (!self.cb.on_needs_render(self.cb.userdata, &w, &h, &scale) || w == 0 || h == 0) {
         return;
     }
 
-    BOOL recreated = (!_surface || _surfW != w || _surfH != h);
-    [self ensureSurfaceWidth:w height:h];
-    if (!_surface) return;
+    _inPresent = YES;
+    int slotIdx = [self acquireBackSlotWidth:w height:h];
+    if (slotIdx < 0 || !_slots[slotIdx].surface) {
+        _inPresent = NO;
+        return;
+    }
+
+    SwapSlot* slot = &_slots[slotIdx];
+    if (slot->is_volatile) {
+        uint32_t oldState = kIOSurfacePurgeableNonVolatile;
+        IOSurfaceSetPurgeable(slot->surface, kIOSurfacePurgeableNonVolatile, &oldState);
+        slot->is_volatile = NO;
+        if (oldState == kIOSurfacePurgeableEmpty) {
+            slot->needs_full = YES;
+        }
+    }
 
     int painted = 0;
-    if (IOSurfaceLock(_surface, 0, NULL) == kIOReturnSuccess) {
-        uint32_t* dst = (uint32_t*)IOSurfaceGetBaseAddress(_surface);
-        size_t stride_u32 = IOSurfaceGetBytesPerRow(_surface) / 4;
+    int32_t px = 0, py = 0, pw = 0, ph = 0;
+    if (IOSurfaceLock(slot->surface, 0, NULL) == kIOReturnSuccess) {
+        uint32_t* dst = (uint32_t*)IOSurfaceGetBaseAddress(slot->surface);
+        size_t stride_u32 = IOSurfaceGetBytesPerRow(slot->surface) / 4;
         if (dst && stride_u32 >= w) {
             painted = self.cb.on_render_into(
-                self.cb.userdata, dst, w, h, stride_u32, scale, recreated ? 1 : 0);
+                self.cb.userdata, dst, w, h, stride_u32, scale,
+                slot->needs_full ? 1 : 0,
+                slot->dmg_x, slot->dmg_y, slot->dmg_w, slot->dmg_h,
+                &px, &py, &pw, &ph);
         }
-        IOSurfaceUnlock(_surface, 0, NULL);
+        IOSurfaceUnlock(slot->surface, 0, NULL);
     }
 
     if (painted) {
+        slot->needs_full = NO;
+        slot->dmg_x = 0;
+        slot->dmg_y = 0;
+        slot->dmg_w = 0;
+        slot->dmg_h = 0;
+
+        // Propagate this frame's painted damage to every other slot so buffer-age stays bit-exact!
+        for (int j = 0; j < MAX_SWAP_SLOTS; j++) {
+            if (j == slotIdx || !_slots[j].surface || _slots[j].needs_full) continue;
+            rect_union_into(&_slots[j].dmg_x, &_slots[j].dmg_y,
+                            &_slots[j].dmg_w, &_slots[j].dmg_h,
+                            px, py, pw, ph);
+        }
+
+        // Atomic GPU flip onto the newly painted distinct IOSurface (NEVER set contents = nil!).
         [CATransaction begin];
         [CATransaction setDisableActions:YES];
+        self.layer.opaque = YES;
         self.layer.contentsScale = self.window.backingScaleFactor > 0 ? self.window.backingScaleFactor : 1.0;
-        self.layer.contents = nil;
-        self.layer.contents = (__bridge id)_surface;
+        self.layer.contents = (__bridge id)slot->surface;
         [CATransaction commit];
+        _frontIdx = slotIdx;
+
+        // Schedule idle reclamation of spare back-buffer(s) 1.5s after activity stops.
+        [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                                 selector:@selector(reclaimSpareSurfaces)
+                                                   object:nil];
+        [self performSelector:@selector(reclaimSpareSurfaces) withObject:nil afterDelay:1.5];
     }
+    _inPresent = NO;
 }
 
 - (NSPoint)pixelPointFromEvent:(NSEvent*)event {
@@ -522,7 +686,6 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
     self.cb.on_key(self.cb.userdata, event.keyCode, encode_mods(event.modifierFlags),
                    (const uint8_t*)key_utf8, key_len,
                    (const uint8_t*)text_utf8, text_len);
-    [self presentFramebuffer];
 }
 
 - (void)mouseDown:(NSEvent*)event {
@@ -530,28 +693,24 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
     NSPoint p = [self pixelPointFromEvent:event];
     self.cb.on_mouse(self.cb.userdata, 0, (float)p.x, (float)p.y, 0,
                      (uint8_t)MIN(event.clickCount, 3), encode_mods(event.modifierFlags));
-    [self presentFramebuffer];
 }
 
 - (void)mouseDragged:(NSEvent*)event {
     NSPoint p = [self pixelPointFromEvent:event];
     self.cb.on_mouse(self.cb.userdata, 1, (float)p.x, (float)p.y, 0, 1,
                      encode_mods(event.modifierFlags));
-    [self presentFramebuffer];
 }
 
 - (void)mouseMoved:(NSEvent*)event {
     NSPoint p = [self pixelPointFromEvent:event];
     self.cb.on_mouse(self.cb.userdata, 1, (float)p.x, (float)p.y, 0, 0,
                      encode_mods(event.modifierFlags));
-    [self presentFramebuffer];
 }
 
 - (void)mouseUp:(NSEvent*)event {
     NSPoint p = [self pixelPointFromEvent:event];
     self.cb.on_mouse(self.cb.userdata, 2, (float)p.x, (float)p.y, 0, 1,
                      encode_mods(event.modifierFlags));
-    [self presentFramebuffer];
 }
 
 - (void)scrollWheel:(NSEvent*)event {
@@ -562,7 +721,6 @@ static uint32_t detect_is_dark(NSAppearance* appearance) {
     float dy = (float)(-event.scrollingDeltaY * mult);
     self.cb.on_scroll(self.cb.userdata, dx, dy, (float)p.x, (float)p.y,
                       encode_mods(event.modifierFlags));
-    [self presentFramebuffer];
 }
 
 @end
@@ -587,8 +745,9 @@ void mac_set_cursor(uint32_t cursor_id) {
 }
 
 void mac_request_redraw(void) {
+    // Non-reentrant, vsync-coalesced invalidation: CoreAnimation invokes updateLayer once per frame!
     if (g_view) {
-        [g_view presentFramebuffer];
+        [g_view scheduleRedraw];
     }
 }
 
@@ -637,12 +796,13 @@ void mac_activate_app(void) {
     }
 
     [g_window center];
+    [g_view notifyResize];
+    [g_view scheduleRedraw];
+    [g_view displayIfNeeded];
+
     [g_window makeKeyAndOrderFront:nil];
     [g_window makeFirstResponder:g_view];
     [NSApp activateIgnoringOtherApps:YES];
-
-    [g_view notifyResize];
-    [g_view presentFramebuffer];
 
     [self startBlinkTimer];
 }
@@ -670,30 +830,25 @@ void mac_activate_app(void) {
     if (self.cb.on_tick) {
         self.cb.on_tick(self.cb.userdata, monotonic_ms());
     }
-    if (g_view) {
-        [g_view presentFramebuffer];
-    }
 }
 
 - (void)windowDidBecomeKey:(NSNotification*)note {
     (void)note;
     [self startBlinkTimer];
     if (self.cb.on_focus) self.cb.on_focus(self.cb.userdata, 1);
-    if (g_view) [g_view presentFramebuffer];
 }
 
 - (void)windowDidResignKey:(NSNotification*)note {
     (void)note;
     [self stopBlinkTimer];
     if (self.cb.on_focus) self.cb.on_focus(self.cb.userdata, 0);
-    if (g_view) [g_view presentFramebuffer];
+    if (g_view) [g_view reclaimSpareSurfaces];
 }
 
 - (BOOL)application:(NSApplication*)sender openFile:(NSString*)filename {
     (void)sender;
     if (self.cb.on_open_path && filename) {
         self.cb.on_open_path(self.cb.userdata, [filename UTF8String]);
-        if (g_view) [g_view presentFramebuffer];
         return YES;
     }
     return NO;
@@ -703,7 +858,6 @@ void mac_activate_app(void) {
     (void)sender;
     if (filenames.count > 0 && self.cb.on_open_path) {
         self.cb.on_open_path(self.cb.userdata, [filenames.firstObject UTF8String]);
-        if (g_view) [g_view presentFramebuffer];
         [NSApp replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
         return;
     }
@@ -719,7 +873,6 @@ void mac_activate_app(void) {
     if (self.cb.on_command) {
         self.cb.on_command(self.cb.userdata, (uint32_t)item.tag);
     }
-    if (g_view) [g_view presentFramebuffer];
 }
 
 - (NSMenuItem*)menuItem:(NSString*)title key:(NSString*)key tag:(NSInteger)tag
