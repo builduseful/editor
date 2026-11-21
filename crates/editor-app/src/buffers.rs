@@ -22,6 +22,18 @@ pub type BufferId = u32;
 
 /// Maximum number of numbered Harpoon pin slots (`1..=9`).
 pub const MAX_PINS: usize = 9;
+/// Default LRU cap for clean, unpinned Kept open tabs (`0` = unlimited).
+/// Pinned (`1..9`), dirty (unsaved), and split-visible tabs are never evicted.
+pub const DEFAULT_MAX_OPEN_TABS: usize = 8;
+
+/// Compact cursor + scroll memory retained when a clean unpinned buffer is LRU-evicted.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct SavedViewState {
+    pub caret: u64,
+    pub scroll_top_line: usize,
+    pub scroll_sub_y_px: f32,
+    pub scroll_x_px: f32,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenMode {
@@ -377,6 +389,53 @@ impl WorkingSet {
         self.meta.remove(&id);
     }
 
+    /// Enforce an LRU cap on unpinned Kept (`open`) tabs.
+    ///
+    /// Evicts least-recently-used clean tabs that are NOT in `protected_ids` (active or visible
+    /// split panes), NEVER evicting pinned (`1..9`) or dirty (unsaved) buffers.
+    /// Returns each evicted buffer's `(id, path, saved_view_state)` so the app can retain
+    /// lightweight cursor/scroll memory if the file is re-opened later.
+    pub fn evict_lru_open(
+        &mut self,
+        max_open: usize,
+        protected_ids: &[BufferId],
+    ) -> Vec<(BufferId, Option<PathBuf>, Option<SavedViewState>)> {
+        let mut evicted = Vec::new();
+        if max_open == 0 || self.open.len() <= max_open {
+            return evicted;
+        }
+        while self.open.len() > max_open {
+            // Find the least-recently-used evictable unpinned clean open buffer.
+            let candidate = self
+                .open
+                .iter()
+                .copied()
+                .filter(|id| {
+                    !protected_ids.contains(id)
+                        && !self.meta.get(id).is_some_and(|m| m.dirty)
+                })
+                .max_by_key(|id| {
+                    self.mru
+                        .iter()
+                        .position(|&m| m == *id)
+                        .unwrap_or(usize::MAX)
+                });
+            let Some(victim) = candidate else {
+                break;
+            };
+            let path = self.meta.get(&victim).and_then(|m| m.path.clone());
+            let view = self.parked.get(&victim).map(|p| SavedViewState {
+                caret: p.caret,
+                scroll_top_line: p.scroll_top_line,
+                scroll_sub_y_px: p.scroll_sub_y_px,
+                scroll_x_px: p.scroll_x_px,
+            });
+            self.remove_buffer(victim);
+            evicted.push((victim, path, view));
+        }
+        evicted
+    }
+
     /// Disambiguated short labels for all tabs (e.g. `app/lib.rs` vs `render/lib.rs` on collision).
     fn disambiguated_labels(&self) -> HashMap<BufferId, String> {
         let mut counts: HashMap<&str, usize> = HashMap::new();
@@ -544,5 +603,42 @@ mod tests {
         let items = ws.to_tab_items(a, &[]);
         assert!(items.iter().any(|it| it.id == a && it.label == "app/lib.rs"));
         assert!(items.iter().any(|it| it.id == b && it.label == "render/lib.rs"));
+    }
+
+    #[test]
+    fn evicts_oldest_clean_unpinned_tab_never_pins_dirty_or_visible() {
+        let mut ws = WorkingSet::new(1);
+        ws.remove_buffer(1);
+
+        let p = ws.alloc_buffer(Some(PathBuf::from("/r/pin.rs")), "pin.rs".into(), false);
+        ws.register_buffer(p, OpenMode::Keep);
+        ws.toggle_pin(p).unwrap();
+
+        let d = ws.alloc_buffer(Some(PathBuf::from("/r/dirty.rs")), "dirty.rs".into(), true);
+        ws.register_buffer(d, OpenMode::Keep);
+        ws.touch_mru(d);
+
+        let a = ws.alloc_buffer(Some(PathBuf::from("/r/a.rs")), "a.rs".into(), false);
+        ws.register_buffer(a, OpenMode::Keep);
+        ws.touch_mru(a);
+
+        let b = ws.alloc_buffer(Some(PathBuf::from("/r/b.rs")), "b.rs".into(), false);
+        ws.register_buffer(b, OpenMode::Keep);
+        ws.touch_mru(b);
+
+        let c = ws.alloc_buffer(Some(PathBuf::from("/r/c.rs")), "c.rs".into(), false);
+        ws.register_buffer(c, OpenMode::Keep);
+        ws.touch_mru(c);
+
+        // Cap open tabs to 2 while `c` (active) and `a` (visible in split) are protected!
+        // `d` is dirty so it must NOT be evicted; `b` is the only clean non-visible candidate -> evicted!
+        let evicted = ws.evict_lru_open(2, &[c, a]);
+        assert_eq!(evicted.len(), 1);
+        assert_eq!(evicted[0].0, b);
+        assert!(ws.contains(p), "pinned buffer must never be evicted");
+        assert!(ws.contains(d), "dirty buffer must never be evicted");
+        assert!(ws.contains(a), "split-visible buffer must never be evicted");
+        assert!(ws.contains(c), "active buffer must never be evicted");
+        assert!(!ws.contains(b));
     }
 }

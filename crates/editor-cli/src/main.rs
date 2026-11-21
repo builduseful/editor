@@ -2319,6 +2319,23 @@ fn cmd_action(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start:
         );
         return 3;
     };
+    if name == "max-tabs" {
+        let Some(n) = args.get(1) else {
+            emit_err(
+                "action",
+                start,
+                "E_USAGE",
+                "usage: editor action max-tabs <N> (0 = unlimited)",
+                None,
+            );
+            return 3;
+        };
+        return send_live_gui_command(
+            "action",
+            &editor_platform::ipc::IpcCommand::Action(format!("max-tabs:{n}")),
+            start,
+        );
+    }
     if name == "wrap-ext" {
         let spec = match (args.get(1), args.get(2)) {
             (Some(a), Some(b)) => format!("{a}={b}"),

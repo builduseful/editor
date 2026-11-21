@@ -2224,3 +2224,114 @@ fn sidebar_hover_exit_and_caret_blink_never_desync_swapchain() {
     assert!(app.is_dirty_frame(), "window mouseExited must clear sidebar hover");
     present_if_dirty_and_verify(&mut app, &mut raster, "mouse_exited_window");
 }
+
+#[test]
+fn per_folder_session_restore_lru_tab_cap_and_cursor_memory() {
+    use editor_platform::ipc::IpcCommand;
+    use editor_platform::{InputEvent, Key, Modifiers};
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    for i in 1..=10 {
+        fs.add_file(
+            &format!("/ws/proj_a/f{i}.rs"),
+            format!("// file {i}\nline two of f{i}\nline three of f{i}\n").into_bytes(),
+        );
+    }
+    fs.add_file("/ws/proj_b/app.ts", b"const x = 1;\nconst y = 2;\n".to_vec());
+    fs.add_file("/ws/proj_b/util.ts", b"export const z = 3;\n".to_vec());
+
+    let mut host = HeadlessHost::new();
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+
+    // 1. Open Project A, pin f1 & f2, move cursor in f3 to line 2, and open f1..f10 (default cap = 8)!
+    let mut app1 = EditorApp::new(fs.clone(), 900, 600, 2.0);
+    assert_eq!(app1.max_open_tabs, 8);
+    app1.open_folder(Path::new("/ws/proj_a"), &mut host);
+
+    let f1 = app1
+        .open_file_with_mode(Path::new("/ws/proj_a/f1.rs"), editor_app::OpenMode::Keep, &mut host)
+        .unwrap();
+    app1.toggle_pin_buffer(f1, &mut host);
+    let f2 = app1
+        .open_file_with_mode(Path::new("/ws/proj_a/f2.rs"), editor_app::OpenMode::Keep, &mut host)
+        .unwrap();
+    app1.toggle_pin_buffer(f2, &mut host);
+
+    // Open f3 and move caret onto line 2 (byte offset 15), then open f4..f10 -> f3 gets LRU-evicted
+    // when 9th unpinned tab opens (wait: f3..f10 = 8 unpinned tabs! Let's add f11 to trigger eviction!).
+    fs.add_file("/ws/proj_a/f11.rs", b"// file 11\n".to_vec());
+    app1.open_file(Path::new("/ws/proj_a/f3.rs"), &mut host).unwrap();
+    app1.caret = 15;
+    app1.anchor = 15;
+
+    // Make f4 dirty so it must NEVER be evicted even if oldest!
+    app1.open_file(Path::new("/ws/proj_a/f4.rs"), &mut host).unwrap();
+    app1.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('x'),
+            mods: Modifiers::NONE,
+            text: Some("// dirty\n".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app1.doc.is_dirty());
+
+    for i in 5..=11 {
+        app1.open_file(&PathBuf::from(format!("/ws/proj_a/f{i}.rs")), &mut host)
+            .unwrap();
+    }
+    // Unpinned clean `f3.rs` was oldest MRU and evicted to enforce cap=8, while pinned f1/f2 and dirty f4 stayed!
+    assert_eq!(app1.working_set.pinned.len(), 2);
+    assert_eq!(app1.working_set.open.len(), 8);
+    assert!(app1.working_set.find_by_path(Path::new("/ws/proj_a/f3.rs")).is_none());
+    assert!(app1.working_set.find_by_path(Path::new("/ws/proj_a/f4.rs")).is_some());
+
+    // Re-opening LRU-evicted `f3.rs` restores its remembered cursor position (offset 15)!
+    app1.open_file(Path::new("/ws/proj_a/f3.rs"), &mut host).unwrap();
+    assert_eq!(app1.caret, 15, "evicted clean file should recall cursor position on reopen");
+
+    // Save dirty f4 so we can switch cleanly between Project A and Project B.
+    let f4_id = app1.working_set.find_by_path(Path::new("/ws/proj_a/f4.rs")).unwrap();
+    app1.activate_buffer(f4_id, &mut host);
+    app1.doc.save(fs.as_ref(), None, false).unwrap();
+    app1.activate_buffer(f1, &mut host);
+    app1.caret = 12; // line 1, col 2
+    app1.anchor = 12;
+    app1.save_session(&mut host);
+
+    // 2. Switch to Project B, pin `app.ts`, open `util.ts`, then switch BACK to Project A!
+    app1.open_folder(Path::new("/ws/proj_b"), &mut host);
+    let b_app = app1
+        .open_file_with_mode(Path::new("/ws/proj_b/app.ts"), editor_app::OpenMode::Keep, &mut host)
+        .unwrap();
+    app1.toggle_pin_buffer(b_app, &mut host);
+    app1.open_file(Path::new("/ws/proj_b/util.ts"), &mut host).unwrap();
+
+    app1.open_folder(Path::new("/ws/proj_a"), &mut host);
+    assert_eq!(app1.working_set.pinned.len(), 2, "switching back to Project A restores its Harpoon pins");
+    assert_eq!(app1.doc.path(), Some(Path::new("/ws/proj_a/f1.rs")));
+
+    // 3. Simulate full app restart (`EditorApp::new` + `load_preferences`):
+    //    restores LastFolder (Project A), pins f1/f2 in exact order, open tabs, active file & cursor!
+    let mut app2 = EditorApp::new(fs.clone(), 900, 600, 2.0);
+    app2.load_preferences(&host);
+    assert_eq!(app2.sidebar.root(), Some(Path::new("/ws/proj_a")));
+    assert_eq!(app2.working_set.pinned.len(), 2);
+    assert_eq!(app2.doc.path(), Some(Path::new("/ws/proj_a/f1.rs")));
+    assert_eq!(app2.doc.byte_to_line_col(app2.caret), (1, 2));
+
+    // 4. Configurable max-tabs via IPC (`max-tabs:4`) immediately trims clean unpinned open tabs to 4!
+    let _ = app2.execute_ipc(
+        &IpcCommand::Action("max-tabs:4".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app2.max_open_tabs, 4);
+    assert!(app2.working_set.open.len() <= 4);
+    assert_eq!(app2.working_set.pinned.len(), 2, "lowering max-tabs must never evict pins");
+}

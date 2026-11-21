@@ -7,6 +7,7 @@
 pub mod buffers;
 pub mod keymap;
 pub mod panes;
+pub mod session;
 pub mod vim;
 mod vim_exec;
 
@@ -34,12 +35,15 @@ use editor_render::{
     TabStripHit, Theme, TokenOverride, Viewport,
 };
 
-pub use buffers::{BufferId, OpenMode, ParkedBuffer, WorkingSet, MAX_PINS};
+pub use buffers::{
+    BufferId, OpenMode, ParkedBuffer, SavedViewState, WorkingSet, DEFAULT_MAX_OPEN_TABS, MAX_PINS,
+};
 pub use keymap::{KeyChord, KeyScope, Keymap, ShortcutEntry};
 pub use panes::{
     Arrangement, Direction, Divider, DividerAxis, DropPlan, DropZone, GridLayout, PaneId,
     PaneRect, PaneSlot, MAX_PANES,
 };
+pub use session::{FolderSession, SessionStore, MAX_RECENT_FOLDERS};
 pub use vim::{VimMode, VimState};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -158,6 +162,12 @@ pub struct EditorApp {
     pub active_buf_id: BufferId,
     /// Shared in-memory buffer pool + Harpoon `1..9` pins + Kept/Preview working set.
     pub working_set: WorkingSet,
+    /// LRU cap on clean unpinned Kept open tabs (`0` = unlimited; default = 8).
+    pub max_open_tabs: usize,
+    /// Per-folder persisted session store (pins, open files, active file & cursor for last 12 folders).
+    pub session_store: SessionStore,
+    /// Lightweight in-memory cursor/scroll recall (last 64 paths) when clean tabs are LRU-evicted.
+    view_memory: Vec<(PathBuf, SavedViewState)>,
     /// Custom-drawn top Working-Set Strip.
     pub tab_strip: TabStrip,
     /// Custom-drawn Harpoon & Open Files quick overlay (`⌘E` / `<Space>e`).
@@ -256,6 +266,9 @@ impl EditorApp {
             preferred_x_px: None,
             active_buf_id: 1,
             working_set: WorkingSet::new(1),
+            max_open_tabs: DEFAULT_MAX_OPEN_TABS,
+            session_store: SessionStore::default(),
+            view_memory: Vec::new(),
             tab_strip: TabStrip::new(),
             harpoon: HarpoonOverlay::new(),
             sidebar: Sidebar::new(),
@@ -317,13 +330,26 @@ impl EditorApp {
         if let Some(vis) = host.load_pref("SidebarVisible") {
             self.sidebar.set_visible(vis == "1" || vis == "true");
         }
+        if let Some(max_tabs) = host
+            .load_pref("MaxOpenTabs")
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            self.max_open_tabs = max_tabs;
+        }
+        if let Some(raw_sessions) = host.load_pref("FolderSessions") {
+            self.session_store = SessionStore::decode(&raw_sessions);
+        }
         if self.sidebar.root().is_none() {
             if let Some(raw_dir) = host.load_pref("LastFolder") {
                 let dir = PathBuf::from(raw_dir.trim());
                 if !dir.as_os_str().is_empty()
                     && self.fs.stat(&dir).map(|s| s.is_dir).unwrap_or(false)
                 {
-                    self.sidebar.set_root(self.fs.as_ref(), &dir);
+                    let canonical = self.fs.canonicalize(&dir).unwrap_or(dir);
+                    self.sidebar.set_root(self.fs.as_ref(), &canonical);
+                    if self.is_initial_empty_untitled() {
+                        self.restore_folder_session_internal(&canonical);
+                    }
                 }
             }
         }
@@ -372,7 +398,9 @@ impl EditorApp {
     pub fn save_preferences(&self, host: &mut dyn PlatformHost) {
         host.save_pref("SidebarWidth", &format!("{:.0}", self.sidebar.width_pt()));
         host.save_pref("SidebarVisible", if self.sidebar.is_visible() { "1" } else { "0" });
+        host.save_pref("MaxOpenTabs", &self.max_open_tabs.to_string());
         self.persist_last_folder(host);
+        host.save_pref("FolderSessions", &self.session_store.encode());
         host.save_pref("FontSize", &format!("{:.1}", self.viewport.font_size_pt));
         host.save_pref("WordWrap", if self.default_word_wrap { "1" } else { "0" });
         host.save_pref("WordWrapByExt", &format_wrap_by_ext(&self.wrap_by_ext));
@@ -750,6 +778,254 @@ impl EditorApp {
         }
     }
 
+    fn remember_view(&mut self, path: PathBuf, view: SavedViewState) {
+        self.view_memory.retain(|(p, _)| p != &path);
+        self.view_memory.insert(0, (path, view));
+        if self.view_memory.len() > 64 {
+            self.view_memory.truncate(64);
+        }
+    }
+
+    fn take_remembered_view(&mut self, path: &Path) -> Option<SavedViewState> {
+        let pos = self.view_memory.iter().position(|(p, _)| p == path)?;
+        Some(self.view_memory.remove(pos).1)
+    }
+
+    fn protected_buffer_ids(&self) -> Vec<BufferId> {
+        let mut ids = Vec::with_capacity(1 + self.other_panes.len());
+        ids.push(self.active_buf_id);
+        for p in &self.other_panes {
+            ids.push(p.buf_id);
+        }
+        ids
+    }
+
+    /// Enforce `self.max_open_tabs` by LRU-evicting oldest clean unpinned non-visible tabs,
+    /// retaining lightweight cursor/scroll memory for seamless re-open.
+    fn enforce_open_tab_limit(&mut self) {
+        let protected = self.protected_buffer_ids();
+        let evicted = self
+            .working_set
+            .evict_lru_open(self.max_open_tabs, &protected);
+        for (_, path_opt, view_opt) in evicted {
+            if let (Some(p), Some(v)) = (path_opt, view_opt) {
+                self.remember_view(p, v);
+            }
+        }
+    }
+
+    pub fn set_max_open_tabs(&mut self, max_tabs: usize, host: &mut dyn PlatformHost) {
+        self.max_open_tabs = max_tabs;
+        self.enforce_open_tab_limit();
+        self.save_session(host);
+        self.save_preferences(host);
+        let msg = if max_tabs == 0 {
+            "Open tab limit: unlimited".to_string()
+        } else {
+            format!("Open tab limit: {max_tabs}")
+        };
+        self.set_notice(msg, false);
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    /// Capture the active workspace folder's Harpoon pins, Kept open files, and active cursor.
+    pub fn capture_current_folder_session(&mut self) -> Option<FolderSession> {
+        let folder = self.sidebar.root()?.to_path_buf();
+        self.sync_active_buffer_meta();
+        let pins: Vec<PathBuf> = self
+            .working_set
+            .pinned
+            .iter()
+            .filter_map(|id| self.working_set.get_meta(*id).and_then(|m| m.path.clone()))
+            .collect();
+        let open: Vec<PathBuf> = self
+            .working_set
+            .open
+            .iter()
+            .filter_map(|id| self.working_set.get_meta(*id).and_then(|m| m.path.clone()))
+            .collect();
+        let active = self.doc.path().map(Path::to_path_buf);
+        let (active_line, active_col) = if active.is_some() {
+            self.doc.byte_to_line_col(self.caret)
+        } else {
+            (0, 0)
+        };
+        Some(FolderSession {
+            folder,
+            pins,
+            open,
+            active,
+            active_line,
+            active_col,
+        })
+    }
+
+    /// Persist the current workspace folder's session (pins, open tabs, active file & cursor).
+    pub fn save_session(&mut self, host: &mut dyn PlatformHost) {
+        if let Some(session) = self.capture_current_folder_session() {
+            self.session_store.upsert(session);
+        }
+        self.persist_last_folder(host);
+        host.save_pref("FolderSessions", &self.session_store.encode());
+    }
+
+    /// Restore saved pins, open tabs, and active file + cursor for `folder` cleanly.
+    /// Gracefully skips any files that were deleted or moved since the last session.
+    fn restore_folder_session_internal(&mut self, folder: &Path) {
+        let Some(session) = self.session_store.get(folder).cloned() else {
+            return;
+        };
+
+        // Reset working set to a fresh empty Untitled before populating saved files.
+        self.other_panes.clear();
+        self.arrangement = Arrangement::new(self.active_id);
+        self.zoomed = false;
+        self.working_set = WorkingSet::new(1);
+        self.active_buf_id = 1;
+        self.doc = Document::new_untitled();
+        self.caret = 0;
+        self.anchor = 0;
+        self.preferred_x_px = None;
+        self.viewport.reset_for_document();
+        self.search_matches.clear();
+        self.active_match = None;
+
+        let mut restored_any = false;
+        let mut active_target: Option<BufferId> = None;
+
+        let open_one = |app: &mut Self, p: &Path, pin: bool| -> Option<BufferId> {
+            let canonical = app.fs.canonicalize(p).ok()?;
+            if app.fs.stat(&canonical).map(|s| s.is_dir).unwrap_or(true) {
+                return None;
+            }
+            if let Some(existing) = app.working_set.find_by_path(&canonical) {
+                if pin && !app.working_set.is_pinned(existing) {
+                    let _ = app.working_set.toggle_pin(existing);
+                }
+                return Some(existing);
+            }
+            let mut doc = Document::open(app.fs.as_ref(), &canonical).ok()?;
+            app.apply_language_override(&mut doc);
+            let doc_path = doc.path().map(Path::to_path_buf).or(Some(canonical));
+            let fname = doc.file_name().to_string();
+            let id = if app.is_initial_empty_untitled() {
+                let id = app.active_buf_id;
+                app.doc = doc;
+                app.caret = 0;
+                app.anchor = 0;
+                app.viewport.reset_for_document();
+                app.viewport.word_wrap = app.effective_word_wrap(doc_path.as_deref());
+                app.working_set.update_meta(id, doc_path, fname, false);
+                id
+            } else {
+                let id = app.working_set.alloc_buffer(doc_path, fname, false);
+                app.working_set.register_buffer(id, OpenMode::Keep);
+                app.working_set.park(
+                    id,
+                    ParkedBuffer {
+                        doc,
+                        caret: 0,
+                        anchor: 0,
+                        preferred_x_px: None,
+                        scroll_top_line: 0,
+                        scroll_sub_y_px: 0.0,
+                        scroll_x_px: 0.0,
+                    },
+                );
+                id
+            };
+            if pin {
+                let _ = app.working_set.toggle_pin(id);
+            }
+            app.working_set.touch_mru(id);
+            Some(id)
+        };
+
+        for p in &session.pins {
+            if let Some(id) = open_one(self, p, true) {
+                restored_any = true;
+                if session.active.as_deref() == Some(p.as_path()) {
+                    active_target = Some(id);
+                }
+            }
+        }
+        let open_cap = if self.max_open_tabs == 0 {
+            usize::MAX
+        } else {
+            self.max_open_tabs
+        };
+        let mut restored_open = 0usize;
+        for p in &session.open {
+            if restored_open >= open_cap {
+                break;
+            }
+            if let Some(id) = open_one(self, p, false) {
+                restored_any = true;
+                restored_open += 1;
+                if session.active.as_deref() == Some(p.as_path()) {
+                    active_target = Some(id);
+                }
+            }
+        }
+
+        if let Some(target_id) = active_target {
+            if target_id != self.active_buf_id {
+                self.sync_active_buffer_meta();
+                self.park_active_into_pool(false);
+                let _ = self.install_buffer_in_active_pane(target_id);
+            }
+            self.working_set.touch_mru(target_id);
+            // Restore saved cursor line & col cleanly!
+            self.doc.tree_mut().ensure_indexed_for_line(session.active_line + 16);
+            let clamped_line = session
+                .active_line
+                .min(self.doc.editable_line_count().saturating_sub(1));
+            if let Some((ls, le, _)) = self.doc.line_byte_range(clamped_line) {
+                let off = ls + (session.active_col as u64).min(le - ls);
+                self.caret = off;
+                self.anchor = off;
+                self.viewport.scroll_top_line = clamped_line.saturating_sub(6);
+            }
+        } else if restored_any {
+            if let Some(p) = self.doc.path().map(Path::to_path_buf) {
+                if self.sidebar.is_under_root(&p) {
+                    self.sidebar.reveal(self.fs.as_ref(), &p);
+                }
+            }
+        }
+
+        if let Some(p) = self.doc.path().map(Path::to_path_buf) {
+            if self.sidebar.is_under_root(&p) {
+                self.sidebar.reveal(self.fs.as_ref(), &p);
+            }
+        }
+    }
+
+    /// Open a workspace folder, saving the outgoing folder's session and restoring the new folder's
+    /// saved pins/open files cleanly (when no unsaved dirty buffers would be disturbed).
+    pub fn open_folder(&mut self, dir: &Path, host: &mut dyn PlatformHost) {
+        let canonical = self
+            .fs
+            .canonicalize(dir)
+            .unwrap_or_else(|_| dir.to_path_buf());
+        let same_folder = self.sidebar.root() == Some(canonical.as_path());
+        if !same_folder {
+            self.save_session(host);
+        }
+        self.sidebar.set_visible(true);
+        self.sidebar.set_root(self.fs.as_ref(), &canonical);
+        if !same_folder && !self.any_buffer_dirty() && self.session_store.get(&canonical).is_some() {
+            self.restore_folder_session_internal(&canonical);
+        }
+        self.save_session(host);
+        self.save_preferences(host);
+        self.sync_title(host);
+        self.recompute_layout();
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
     pub fn set_sidebar_root(&mut self, dir: &Path) {
         self.sidebar.set_root(self.fs.as_ref(), dir);
         self.mark_dirty();
@@ -933,6 +1209,7 @@ impl EditorApp {
             }
         }
         self.sync_title(host);
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
         true
@@ -961,8 +1238,8 @@ impl EditorApp {
 
         // Reuse existing buffer if already open in the working set!
         if let Some(existing_id) = self.working_set.find_by_path(&canonical) {
-            if mode == OpenMode::Keep {
-                self.working_set.graduate_preview(existing_id);
+            if mode == OpenMode::Keep && self.working_set.graduate_preview(existing_id) {
+                self.enforce_open_tab_limit();
             }
             self.activate_buffer(existing_id, host);
             return Ok(existing_id);
@@ -972,6 +1249,9 @@ impl EditorApp {
         self.apply_language_override(&mut doc);
         let doc_path = doc.path().map(Path::to_path_buf).or(Some(canonical.clone()));
         let fname = doc.file_name().to_string();
+        let remembered = doc_path
+            .as_deref()
+            .and_then(|p| self.take_remembered_view(p));
 
         let target_id = if self.is_initial_empty_untitled() {
             // Replace the untouched startup Untitled placeholder cleanly.
@@ -1013,7 +1293,19 @@ impl EditorApp {
             new_id
         };
 
+        if let Some(view) = remembered {
+            let clamped = view.caret.min(self.doc.len_bytes());
+            self.caret = clamped;
+            self.anchor = clamped;
+            self.viewport.scroll_top_line = view.scroll_top_line;
+            self.viewport.scroll_sub_y_px = view.scroll_sub_y_px;
+            self.viewport.scroll_x_px = view.scroll_x_px;
+        }
+
         self.working_set.touch_mru(target_id);
+        if mode == OpenMode::Keep {
+            self.enforce_open_tab_limit();
+        }
         if self.find_bar.visible {
             self.refresh_search();
         }
@@ -1023,6 +1315,7 @@ impl EditorApp {
             }
         }
         self.sync_title(host);
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
         Ok(target_id)
@@ -1055,7 +1348,9 @@ impl EditorApp {
         self.search_matches.clear();
         self.active_match = None;
         self.working_set.touch_mru(id);
+        self.enforce_open_tab_limit();
         self.sync_title(host);
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
         id
@@ -1071,12 +1366,14 @@ impl EditorApp {
                 self.set_notice(format!("Pinned to slot {slot}"), false);
             }
             Ok(None) => {
+                self.enforce_open_tab_limit();
                 self.set_notice("Unpinned", false);
             }
             Err(()) => {
                 self.set_notice(format!("Maximum of {MAX_PINS} pinned files"), false);
             }
         }
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
     }
@@ -1249,6 +1546,7 @@ impl EditorApp {
         }
         self.recompute_layout();
         self.sync_title(host);
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
     }
@@ -1273,11 +1571,7 @@ impl EditorApp {
     ) -> Result<(), String> {
         if let Ok(st) = self.fs.stat(path) {
             if st.is_dir {
-                self.sidebar.set_visible(true);
-                self.sidebar.set_root(self.fs.as_ref(), path);
-                self.save_preferences(host);
-                self.mark_dirty();
-                host.request_redraw();
+                self.open_folder(path, host);
                 return Ok(());
             }
         }
@@ -1542,6 +1836,7 @@ impl EditorApp {
         self.working_set.touch_mru(self.active_buf_id);
         self.recompute_layout();
         self.sync_title(host);
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
     }
@@ -3075,12 +3370,7 @@ impl EditorApp {
             }
             AppCommand::OpenFolder => {
                 if let Some(dir) = host.open_folder_dialog() {
-                    self.sidebar.set_visible(true);
-                    self.sidebar.set_root(self.fs.as_ref(), &dir);
-                    self.save_preferences(host);
-                    self.recompute_layout();
-                    self.mark_dirty();
-                    host.request_redraw();
+                    self.open_folder(&dir, host);
                 }
             }
             AppCommand::Save => {
@@ -3410,6 +3700,7 @@ impl EditorApp {
                     self.activate_buffer(dirty_id, host);
                     self.request_discard_or_run(PendingDiscardAction::Quit, host);
                 } else {
+                    self.save_session(host);
                     host.request_quit();
                 }
             }
@@ -5016,7 +5307,7 @@ impl EditorApp {
                 "\"shortcuts_open\":{},",
                 "\"vim\":{{\"enabled\":{},\"mode\":{}}},",
                 "\"confirm_modal_visible\":{},",
-                "\"view\":{{\"word_wrap\":{},\"default_word_wrap\":{},\"word_wrap_by_ext\":{},\"font_size_pt\":{:.1},\"theme_preference\":{},\"active_theme\":{},\"syntax_style\":{},\"syntax_ext_map\":{}}}}}"
+                "\"view\":{{\"word_wrap\":{},\"default_word_wrap\":{},\"word_wrap_by_ext\":{},\"font_size_pt\":{:.1},\"theme_preference\":{},\"active_theme\":{},\"syntax_style\":{},\"syntax_ext_map\":{},\"max_open_tabs\":{}}}}}"
             ),
             path_json,
             json_quote(self.doc.file_name()),
@@ -5072,6 +5363,7 @@ impl EditorApp {
             json_quote(active_theme),
             json_quote(self.syntax_theme.preset.as_str()),
             str_map_json(&self.syntax_ext_map),
+            self.max_open_tabs,
         )
     }
 
@@ -5106,12 +5398,7 @@ impl EditorApp {
                 (IpcReply::Json(self.status_json()), true, false)
             }
             IpcCommand::OpenFolder(dir) => {
-                self.sidebar.set_visible(true);
-                self.sidebar.set_root(self.fs.as_ref(), dir);
-                self.save_preferences(host);
-                self.recompute_layout();
-                self.mark_dirty();
-                host.request_redraw();
+                self.open_folder(dir, host);
                 (IpcReply::Json(self.status_json()), true, false)
             }
             IpcCommand::Goto {
@@ -5635,6 +5922,21 @@ impl EditorApp {
                             );
                         }
                     }
+                    other if other.starts_with("max-tabs:") => {
+                        let raw = &other["max-tabs:".len()..];
+                        match raw.trim().parse::<usize>() {
+                            Ok(n) => self.set_max_open_tabs(n, host),
+                            Err(_) => {
+                                return (
+                                    IpcReply::Error(format!(
+                                        "invalid max-tabs value `{raw}` (use integer >= 0; 0 = unlimited)"
+                                    )),
+                                    false,
+                                    false,
+                                );
+                            }
+                        }
+                    }
                     other if other.starts_with("wrap-ext:") => {
                         let spec = &other["wrap-ext:".len()..];
                         if let Some((ext, val)) = spec.split_once('=') {
@@ -5677,6 +5979,7 @@ impl EditorApp {
             }
             IpcCommand::Quit { force } => {
                 if *force || !self.any_buffer_dirty() {
+                    self.save_session(host);
                     (IpcReply::Quitting, false, true)
                 } else {
                     self.handle_command(AppCommand::Quit, rasterizer, clipboard, host);
