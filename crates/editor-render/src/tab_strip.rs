@@ -313,7 +313,7 @@ impl TabStrip {
             } else {
                 theme.text_muted
             };
-            draw_sidebar_panel_icon(painter, self.sidebar_btn_rect, side, sb_col, scale);
+            draw_sidebar_panel_icon(painter, self.sidebar_btn_rect, side, false, sb_col, scale);
         }
 
         // Right-side utility buttons (right-to-left): [Zoom (if split)] [Menu ⌘E] [+]

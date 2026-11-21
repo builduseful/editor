@@ -241,6 +241,15 @@ fn cli_ipc_open_close_and_quit_commands() {
                     IpcCommand::Action(act) if act == "syntax-reset:all" => {
                         pending.respond(IpcReply::Json("{\"preset\":\"editorial\",\"dark_overrides\":{}}".into()));
                     }
+                    IpcCommand::Action(act) if act == "sidebar-width:320" => {
+                        pending.respond(IpcReply::Json("{\"running\":true,\"sidebar\":{\"width_pt\":320}}".into()));
+                    }
+                    IpcCommand::Action(act) if act == "pane-ratio:cols=35%" => {
+                        pending.respond(IpcReply::Json("{\"running\":true,\"split_ratios\":{\"col\":0.350}}".into()));
+                    }
+                    IpcCommand::Action(act) if act == "pane-ratio:reset" => {
+                        pending.respond(IpcReply::Json("{\"running\":true,\"split_ratios\":{\"col\":0.500}}".into()));
+                    }
                     IpcCommand::Quit { force: false } => {
                         pending.respond(IpcReply::Prompting);
                     }
@@ -250,13 +259,13 @@ fn cli_ipc_open_close_and_quit_commands() {
                     other => panic!("unexpected ipc command: {other:?}"),
                 }
                 handled += 1;
-                if handled == 19 {
+                if handled == 22 {
                     break;
                 }
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(handled, 19);
+        assert_eq!(handled, 22);
     });
 
     // `editor status`
@@ -419,6 +428,31 @@ fn cli_ipc_open_close_and_quit_commands() {
         .unwrap();
     assert!(out.status.success());
     assert!(String::from_utf8(out.stdout).unwrap().contains("\"dark_overrides\":{}"));
+
+    // Live GUI IPC `editor resize sidebar|cols|reset`
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["resize", "sidebar", "320"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"width_pt\":320"));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["resize", "cols", "35%"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"col\":0.350"));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .args(["resize", "reset"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"col\":0.500"));
 
     // `editor close` (mock GUI reports dirty -> prompting: true)
     let out = Command::new(bin)

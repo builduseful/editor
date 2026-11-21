@@ -480,14 +480,33 @@ impl Arrangement {
     pub fn drag_divider(&mut self, div: &Divider, x: f32, y: f32) {
         match div.axis {
             DividerAxis::Columns if div.span.w > 0 => {
-                self.col_ratio = ((x - div.span.x as f32) / div.span.w as f32).clamp(0.15, 0.85);
+                self.set_col_ratio((x - div.span.x as f32) / div.span.w as f32);
             }
             DividerAxis::Rows(col) if div.span.h > 0 => {
-                self.row_ratio[col.min(1) as usize] =
-                    ((y - div.span.y as f32) / div.span.h as f32).clamp(0.15, 0.85);
+                self.set_row_ratio(col as usize, (y - div.span.y as f32) / div.span.h as f32);
             }
             _ => {}
         }
+    }
+
+    pub fn set_col_ratio(&mut self, ratio: f32) {
+        self.col_ratio = ratio.clamp(0.15, 0.85);
+    }
+
+    pub fn set_row_ratio(&mut self, col: usize, ratio: f32) {
+        self.row_ratio[col.min(1)] = ratio.clamp(0.15, 0.85);
+    }
+
+    pub fn reset_divider(&mut self, axis: DividerAxis) {
+        match axis {
+            DividerAxis::Columns => self.col_ratio = 0.5,
+            DividerAxis::Rows(col) => self.row_ratio[col.min(1) as usize] = 0.5,
+        }
+    }
+
+    pub fn reset_ratios(&mut self) {
+        self.col_ratio = 0.5;
+        self.row_ratio = [0.5, 0.5];
     }
 }
 

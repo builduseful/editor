@@ -2609,3 +2609,261 @@ fn sidebar_moves_left_right_minimizes_and_auto_minimizes_on_narrow_window() {
     );
     assert_eq!(app2.sidebar.side(), SidebarSide::Left);
 }
+
+#[test]
+fn pane_dividers_and_sidebar_resize_handles_double_click_reset_and_ipc() {
+    use editor_platform::ipc::{IpcCommand, IpcReply};
+    use editor_platform::{CursorShape, InputEvent, Modifiers, MouseButton};
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/repo/a.rs", b"fn a() {}\n".to_vec());
+    fs.add_file("/repo/b.rs", b"fn b() {}\n".to_vec());
+    fs.add_file("/repo/c.rs", b"fn c() {}\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 2000, 1200, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_file(Path::new("/repo/a.rs"), &mut host).unwrap();
+    app.split_pane_with(Some(Path::new("/repo/b.rs")), &mut host);
+    app.split_pane_down(Some(Path::new("/repo/c.rs")), &mut host);
+    app.render(&mut raster);
+    assert_eq!(app.layout.grid.dividers().len(), 2);
+
+    // 1. Hovering the column divider sets ResizeHorizontal cursor and marks dirty for handle highlight!
+    let col_div = app
+        .layout
+        .grid
+        .dividers()
+        .iter()
+        .copied()
+        .find(|d| d.axis == editor_app::DividerAxis::Columns)
+        .expect("column divider");
+    let dx = col_div.rect.x as f32;
+    let dy = (col_div.rect.y + col_div.rect.h / 2) as f32;
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: dx,
+            y_px: dy,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(host.cursor, Some(CursorShape::ResizeHorizontal));
+    assert!(app.is_dirty_frame());
+    app.render(&mut raster);
+
+    // Drag column divider to ~30% and release!
+    let target_x = col_div.span.x as f32 + col_div.span.w as f32 * 0.30;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: dx,
+            y_px: dy,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: target_x,
+            y_px: dy,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseUp {
+            x_px: target_x,
+            y_px: dy,
+            button: MouseButton::Left,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!((app.arrangement.col_ratio - 0.30).abs() < 0.02);
+
+    // Double-clicking the column divider resets it cleanly back to 50/50!
+    let new_col_div = app
+        .layout
+        .grid
+        .dividers()
+        .iter()
+        .copied()
+        .find(|d| d.axis == editor_app::DividerAxis::Columns)
+        .unwrap();
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: new_col_div.rect.x as f32,
+            y_px: dy,
+            button: MouseButton::Left,
+            click_count: 2,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!((app.arrangement.col_ratio - 0.50).abs() < 0.001);
+    assert_eq!(host.cursor, Some(CursorShape::Arrow));
+
+    // Also verify horizontal (row) divider drag + double-click reset back to 50/50!
+    let row_div = app
+        .layout
+        .grid
+        .dividers()
+        .iter()
+        .copied()
+        .find(|d| matches!(d.axis, editor_app::DividerAxis::Rows(_)))
+        .expect("row divider");
+    let rx = (row_div.rect.x + row_div.rect.w / 2) as f32;
+    let ry = row_div.rect.y as f32;
+    let target_y = row_div.span.y as f32 + row_div.span.h as f32 * 0.72;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: rx,
+            y_px: ry,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: rx,
+            y_px: target_y,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseUp {
+            x_px: rx,
+            y_px: target_y,
+            button: MouseButton::Left,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let row_col = match row_div.axis {
+        editor_app::DividerAxis::Rows(c) => c as usize,
+        _ => unreachable!(),
+    };
+    assert!((app.arrangement.row_ratio[row_col] - 0.72).abs() < 0.02);
+    let new_row_div = app
+        .layout
+        .grid
+        .dividers()
+        .iter()
+        .copied()
+        .find(|d| d.axis == row_div.axis)
+        .unwrap();
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: rx,
+            y_px: new_row_div.rect.y as f32,
+            button: MouseButton::Left,
+            click_count: 2,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!((app.arrangement.row_ratio[row_col] - 0.50).abs() < 0.001);
+    assert_eq!(host.cursor, Some(CursorShape::Arrow));
+
+    // 2. Agent/IPC resize commands for sidebar width & pane split ratios + status_json inspection!
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Action("sidebar-width:340".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    match reply {
+        IpcReply::Json(j) => assert!(j.contains("\"width_pt\":340")),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+    assert!((app.sidebar.width_pt() - 340.0).abs() < 0.5);
+
+    // Double-clicking sidebar edge resets width back to 220 pt and restores arrow cursor!
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: app.layout.sidebar.right() as f32,
+            y_px: 200.0,
+            button: MouseButton::Left,
+            click_count: 2,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!((app.sidebar.width_pt() - 220.0).abs() < 0.5);
+    assert_eq!(host.cursor, Some(CursorShape::Arrow));
+
+    // Clicking the sidebar header's single minimize icon hides the sidebar cleanly.
+    app.render(&mut raster);
+    let min_x = (app.layout.sidebar.right() - 24) as f32;
+    let min_y = (app.layout.sidebar.y + 30) as f32;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: min_x,
+            y_px: min_y,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.sidebar.is_visible(), "clicking header minimize icon hides sidebar");
+    app.toggle_sidebar(&mut host);
+    assert!(app.sidebar.is_visible());
+
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Action("pane-ratio:cols=35%".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    match reply {
+        IpcReply::Json(j) => assert!(j.contains("\"col\":0.350")),
+        other => panic!("unexpected reply: {other:?}"),
+    }
+    let _ = app.execute_ipc(
+        &IpcCommand::Action("pane-ratio:rows:1=0.7".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!((app.arrangement.row_ratio[1] - 0.70).abs() < 0.001);
+
+    let _ = app.execute_ipc(
+        &IpcCommand::Action("pane-ratio:reset".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!((app.arrangement.col_ratio - 0.5).abs() < 0.001);
+    assert!((app.arrangement.row_ratio[1] - 0.5).abs() < 0.001);
+}

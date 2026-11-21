@@ -93,6 +93,7 @@ fn main() -> ExitCode {
         "move-pane" => cmd_move_pane(rest, start),
         "unsplit" => send_live_gui_command("unsplit", &editor_platform::ipc::IpcCommand::Unsplit, start),
         "focus-pane" => cmd_focus_pane(rest, start),
+        "resize" => cmd_resize(rest, start),
         "pin" => cmd_pin(&fs, &globals, rest, start),
         "unpin" => cmd_unpin(&fs, &globals, rest, start),
         "pins" => cmd_status(start),
@@ -146,6 +147,10 @@ fn print_usage() {
            editor move-pane <SRC_IDX> <TARGET_IDX> [center|left|right|top|bottom]\n\
            editor unsplit                                        (close active split pane)\n\
            editor focus-pane <0..3|left|right|up|down|next>      (switch active split pane)\n\
+           editor resize sidebar <WIDTH_PT|reset>                (resize sidebar width, 160..480 pt)\n\
+           editor resize cols <RATIO|50%|reset>                  (resize left/right split ratio)\n\
+           editor resize rows [0|1] <RATIO|50%|reset>            (resize top/bottom split ratio)\n\
+           editor resize reset                                   (reset all pane split ratios to 50/50)\n\
            editor pin [PATH]                                     (pin current file or PATH to Harpoon 1..9)\n\
            editor unpin [SLOT|PATH]                              (unpin current file, slot 1..9, or PATH)\n\
            editor pins | buffers                                 (inspect Harpoon pins & open buffers)\n\
@@ -349,6 +354,7 @@ fn cmd_schema(args: &[String], start: Instant) -> u8 {
         "move-pane",
         "unsplit",
         "focus-pane",
+        "resize",
         "pin",
         "unpin",
         "pins",
@@ -2300,6 +2306,59 @@ fn cmd_syntax(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start:
     }
 }
 
+fn cmd_resize(args: &[String], start: Instant) -> u8 {
+    let Some(target) = args.first().map(|s| s.as_str()) else {
+        emit_err(
+            "resize",
+            start,
+            "E_USAGE",
+            "usage: editor resize <sidebar <WIDTH_PT|reset> | cols <RATIO|reset> | rows [0|1] <RATIO|reset> | reset>",
+            None,
+        );
+        return 3;
+    };
+    let action = match target {
+        "sidebar" | "menu" => {
+            let Some(val) = args.get(1) else {
+                emit_err("resize", start, "E_USAGE", "usage: editor resize sidebar <WIDTH_PT|reset>", None);
+                return 3;
+            };
+            format!("sidebar-width:{val}")
+        }
+        "cols" | "col" | "horizontal" => {
+            let Some(val) = args.get(1) else {
+                emit_err("resize", start, "E_USAGE", "usage: editor resize cols <RATIO|50%|reset>", None);
+                return 3;
+            };
+            format!("pane-ratio:cols={val}")
+        }
+        "rows" | "row" | "vertical" => match (args.get(1), args.get(2)) {
+            (Some(col), Some(val)) if col == "0" || col == "1" => format!("pane-ratio:rows:{col}={val}"),
+            (Some(val), None) => format!("pane-ratio:rows:all={val}"),
+            _ => {
+                emit_err("resize", start, "E_USAGE", "usage: editor resize rows [0|1] <RATIO|50%|reset>", None);
+                return 3;
+            }
+        },
+        "reset" => "pane-ratio:reset".to_string(),
+        other => {
+            emit_err(
+                "resize",
+                start,
+                "E_USAGE",
+                &format!("unknown resize target `{other}` (use sidebar|cols|rows|reset)"),
+                None,
+            );
+            return 3;
+        }
+    };
+    send_live_gui_command(
+        "resize",
+        &editor_platform::ipc::IpcCommand::Action(action),
+        start,
+    )
+}
+
 fn cmd_action_direct(name: &str, start: Instant) -> u8 {
     send_live_gui_command(
         name,
@@ -2319,6 +2378,23 @@ fn cmd_action(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start:
         );
         return 3;
     };
+    if name == "sidebar-width" {
+        let Some(w) = args.get(1) else {
+            emit_err(
+                "action",
+                start,
+                "E_USAGE",
+                "usage: editor action sidebar-width <WIDTH_PT|reset>",
+                None,
+            );
+            return 3;
+        };
+        return send_live_gui_command(
+            "action",
+            &editor_platform::ipc::IpcCommand::Action(format!("sidebar-width:{w}")),
+            start,
+        );
+    }
     if name == "max-tabs" {
         let Some(n) = args.get(1) else {
             emit_err(

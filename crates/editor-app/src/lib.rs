@@ -239,6 +239,7 @@ pub struct EditorApp {
     drag_word_anchor: (u64, u64),
     dragging_sidebar_edge: bool,
     dragging_divider: Option<Divider>,
+    hovered_divider: Option<DividerAxis>,
     drag: Option<PaneDrag>,
     dirty_frame: bool,
 }
@@ -325,6 +326,7 @@ impl EditorApp {
             drag_word_anchor: (0, 0),
             dragging_sidebar_edge: false,
             dragging_divider: None,
+            hovered_divider: None,
             drag: None,
             dirty_frame: true,
         };
@@ -2005,6 +2007,35 @@ impl EditorApp {
         host.request_redraw();
     }
 
+    pub fn set_sidebar_width_pt(&mut self, width_pt: f32, host: &mut dyn PlatformHost) {
+        self.sidebar.set_width_pt(width_pt);
+        self.save_preferences(host);
+        self.recompute_layout();
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    pub fn set_pane_col_ratio(&mut self, ratio: f32, host: &mut dyn PlatformHost) {
+        self.arrangement.set_col_ratio(ratio);
+        self.recompute_layout();
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    pub fn set_pane_row_ratio(&mut self, col: usize, ratio: f32, host: &mut dyn PlatformHost) {
+        self.arrangement.set_row_ratio(col, ratio);
+        self.recompute_layout();
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    pub fn reset_pane_ratios(&mut self, host: &mut dyn PlatformHost) {
+        self.arrangement.reset_ratios();
+        self.recompute_layout();
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
     pub fn toggle_sidebar_side(&mut self, host: &mut dyn PlatformHost) {
         let next = self.sidebar.side().toggle();
         self.set_sidebar_side(next, host);
@@ -2309,10 +2340,19 @@ impl EditorApp {
                 }
             }
         }
-        // Crisp 1px hairline dividers between columns / rows.
+        // Crisp 1px hairline dividers + quiet centered drag handles between columns / rows.
         for d in layout.grid.dividers() {
-            if !d.rect.intersect(effective_clip).is_empty() {
-                painter.fill_rect(d.rect, theme.border_subtle);
+            let active = self.hovered_divider == Some(d.axis)
+                || self.dragging_divider.is_some_and(|dd| dd.axis == d.axis);
+            let pad = (4.0 * painter.scale()).round() as i32;
+            let hit_band = PixelRect::new(
+                d.rect.x - pad,
+                d.rect.y - pad,
+                d.rect.w + 2 * pad,
+                d.rect.h + 2 * pad,
+            );
+            if !hit_band.intersect(effective_clip).is_empty() {
+                draw_pane_divider(&mut painter, *d, active, &theme);
             }
         }
 
@@ -2694,6 +2734,7 @@ impl EditorApp {
                 if !focused {
                     let _ = self.sidebar.clear_hover();
                     let _ = self.tab_strip.clear_hover();
+                    self.hovered_divider = None;
                     self.viewport.v_bar_hovered = false;
                     self.viewport.h_bar_hovered = false;
                 } else {
@@ -2781,7 +2822,10 @@ impl EditorApp {
                 x_px, y_px, button, ..
             } => {
                 if button == MouseButton::Left {
-                    if self.dragging_sidebar_edge {
+                    let released_edge = self.dragging_sidebar_edge;
+                    let released_div = self.dragging_divider.is_some();
+                    if released_edge {
+                        self.sidebar.set_edge_active(false);
                         self.save_preferences(host);
                     }
                     if self.drag.is_some() {
@@ -2794,6 +2838,14 @@ impl EditorApp {
                     self.dragging_sidebar_edge = false;
                     self.dragging_divider = None;
                     self.viewport.end_scrollbar_drag();
+                    if released_edge {
+                        self.mark_dirty_rect(self.layout.sidebar);
+                        host.request_redraw();
+                    }
+                    if released_div {
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
                 }
             }
             InputEvent::Scroll {
@@ -3952,9 +4004,6 @@ impl EditorApp {
                         self.sidebar.set_focused(false);
                     }
                 }
-                SidebarAction::ToggleSide => {
-                    self.toggle_sidebar_side(host);
-                }
                 SidebarAction::Minimize => {
                     self.set_sidebar_visible_user(false, host);
                 }
@@ -4621,8 +4670,19 @@ impl EditorApp {
         if self.sidebar.is_visible() {
             let sb_hit = self.sidebar.hit_test(self.layout.sidebar, x_px, y_px, scale);
             if sb_hit == SidebarHit::ResizeEdge {
+                if click_count >= 2 {
+                    self.dragging_sidebar_edge = false;
+                    self.sidebar.set_edge_active(false);
+                    self.sidebar.clear_hover();
+                    self.set_sidebar_width_pt(editor_render::sidebar::SIDEBAR_DEFAULT_WIDTH_PT, host);
+                    host.set_cursor(CursorShape::Arrow);
+                    return;
+                }
                 self.dragging_sidebar_edge = true;
+                self.sidebar.set_edge_active(true);
                 host.set_cursor(CursorShape::ResizeHorizontal);
+                self.mark_dirty_rect(self.layout.sidebar);
+                host.request_redraw();
                 return;
             }
             if sb_hit != SidebarHit::None {
@@ -4640,9 +4700,6 @@ impl EditorApp {
                         self.begin_drag(DragPayload::File(p), x_px, y_px, false, click_count);
                         self.mark_dirty_rect(self.layout.sidebar);
                         host.request_redraw();
-                    }
-                    SidebarAction::ToggleSide => {
-                        self.toggle_sidebar_side(host);
                     }
                     SidebarAction::Minimize => {
                         self.set_sidebar_visible_user(false, host);
@@ -4760,16 +4817,28 @@ impl EditorApp {
             return;
         }
 
-        // 3. Pane grid divider drag, pane header close (`×`) / double-click zoom / drag, or focus switch!
+        // 3. Pane grid divider drag (or double-click to reset 50/50), pane header close (`×`) / zoom / drag, or focus switch!
         if !self.other_panes.is_empty() && !self.zoomed {
-            let grab = (5.0 * scale).round() as i32;
+            let grab = (6.0 * scale).round() as i32;
             if let Some(div) = self.layout.grid.divider_at(xi, yi, grab) {
+                if click_count >= 2 {
+                    self.dragging_divider = None;
+                    self.hovered_divider = None;
+                    self.arrangement.reset_divider(div.axis);
+                    self.recompute_layout();
+                    host.set_cursor(CursorShape::Arrow);
+                    self.mark_dirty();
+                    host.request_redraw();
+                    return;
+                }
                 self.dragging_divider = Some(div);
                 let cur = match div.axis {
                     DividerAxis::Columns => CursorShape::ResizeHorizontal,
                     DividerAxis::Rows(_) => CursorShape::ResizeVertical,
                 };
                 host.set_cursor(cur);
+                self.mark_dirty();
+                host.request_redraw();
                 return;
             }
             let close_w = (24.0 * scale).round() as i32;
@@ -5080,6 +5149,26 @@ impl EditorApp {
             needs_redraw = true;
         }
 
+        // 3b. Pane split divider handle hover (unconditionally reconciled so leaving clears cleanly!)
+        let div_hit = if !overlay_open
+            && sb_hit == SidebarHit::None
+            && !in_tab_strip
+            && !self.other_panes.is_empty()
+            && !self.zoomed
+        {
+            self.layout
+                .grid
+                .divider_at(xi, yi, (6.0 * scale).round() as i32)
+        } else {
+            None
+        };
+        let new_div_axis = div_hit.map(|d| d.axis);
+        if new_div_axis != self.hovered_divider {
+            self.hovered_divider = new_div_axis;
+            self.mark_dirty();
+            needs_redraw = true;
+        }
+
         // 4. Resolve cursor shape cleanly from active hit region.
         let cursor = if overlay_open {
             CursorShape::Arrow
@@ -5093,10 +5182,7 @@ impl EditorApp {
             } else {
                 CursorShape::Arrow
             }
-        } else if let Some(div) = (!self.other_panes.is_empty() && !self.zoomed)
-            .then(|| self.layout.grid.divider_at(xi, yi, (5.0 * scale).round() as i32))
-            .flatten()
-        {
+        } else if let Some(div) = div_hit {
             match div.axis {
                 DividerAxis::Columns => CursorShape::ResizeHorizontal,
                 DividerAxis::Rows(_) => CursorShape::ResizeVertical,
@@ -5357,13 +5443,17 @@ impl EditorApp {
             } else {
                 ("null".to_string(), "Untitled", false)
             };
+            let scale = self.framebuffer.scale.max(1.0);
+            let frame_r = self.layout.grid.get(pid).map(|r| r.frame).unwrap_or_default();
             panes_json.push_str(&format!(
-                "{{\"index\":{idx},\"col\":{},\"row\":{},\"path\":{},\"file_name\":{},\"dirty\":{}}}",
+                "{{\"index\":{idx},\"col\":{},\"row\":{},\"path\":{},\"file_name\":{},\"dirty\":{},\"width_pt\":{:.0},\"height_pt\":{:.0}}}",
                 slot.col,
                 slot.row,
                 p_json,
                 json_quote(fname),
-                dirty
+                dirty,
+                frame_r.w as f32 / scale,
+                frame_r.h as f32 / scale,
             ));
         }
         panes_json.push(']');
@@ -5419,7 +5509,7 @@ impl EditorApp {
         format!(
             concat!(
                 "{{\"running\":true,\"path\":{},\"file_name\":{},\"dirty\":{},",
-                "\"split\":{},\"zoomed\":{},\"active_pane\":{},\"panes\":{},",
+                "\"split\":{},\"zoomed\":{},\"active_pane\":{},\"split_ratios\":{{\"col\":{:.3},\"rows\":[{:.3},{:.3}]}},\"panes\":{},",
                 "\"pins\":{},\"buffers\":{},\"harpoon_open\":{},",
                 "\"bytes\":{},\"line_count\":{},\"eol\":{},\"language\":{},\"language_id\":{},",
                 "\"rev\":{{\"dev\":\"{}\",\"ino\":\"{}\",\"size\":\"{}\",\"mtime_ns\":\"{}\",\"ctime_ns\":\"{}\"}},",
@@ -5441,6 +5531,9 @@ impl EditorApp {
             self.is_split(),
             self.zoomed,
             self.active_pane_index(),
+            self.arrangement.col_ratio,
+            self.arrangement.row_ratio[0],
+            self.arrangement.row_ratio[1],
             panes_json,
             pins_json,
             buffers_json,
@@ -6049,6 +6142,85 @@ impl EditorApp {
                             );
                         }
                     }
+                    other if other.starts_with("sidebar-width:") => {
+                        let raw = other["sidebar-width:".len()..].trim();
+                        if raw.eq_ignore_ascii_case("reset") || raw.eq_ignore_ascii_case("default")
+                        {
+                            self.set_sidebar_width_pt(
+                                editor_render::sidebar::SIDEBAR_DEFAULT_WIDTH_PT,
+                                host,
+                            );
+                        } else if let Ok(w) = raw.parse::<f32>() {
+                            self.set_sidebar_width_pt(w, host);
+                        } else {
+                            return (
+                                IpcReply::Error(format!(
+                                    "invalid sidebar width `{raw}` (use 160..480 or `reset`)"
+                                )),
+                                false,
+                                false,
+                            );
+                        }
+                    }
+                    other if other.starts_with("pane-ratio:") => {
+                        let spec = other["pane-ratio:".len()..].trim();
+                        if spec.eq_ignore_ascii_case("reset") {
+                            self.reset_pane_ratios(host);
+                        } else if let Some((target, val)) = spec.split_once('=') {
+                            let parse_ratio = |s: &str| -> Result<f32, String> {
+                                let t = s.trim();
+                                if t.eq_ignore_ascii_case("reset") {
+                                    return Ok(0.5);
+                                }
+                                if let Some(pct) = t.strip_suffix('%') {
+                                    let v = pct.trim().parse::<f32>().map_err(|_| {
+                                        format!("invalid ratio `{s}` (use 0.15..0.85, 15%..85%, or reset)")
+                                    })?;
+                                    Ok(v / 100.0)
+                                } else {
+                                    let v = t.parse::<f32>().map_err(|_| {
+                                        format!("invalid ratio `{s}` (use 0.15..0.85, 15%..85%, or reset)")
+                                    })?;
+                                    Ok(if v > 1.0 { v / 100.0 } else { v })
+                                }
+                            };
+                            match parse_ratio(val) {
+                                Ok(r) => match target.trim().to_ascii_lowercase().as_str() {
+                                    "col" | "cols" | "horizontal" | "h" => {
+                                        self.set_pane_col_ratio(r, host);
+                                    }
+                                    "row" | "rows" | "row:0" | "rows:0" | "left" => {
+                                        self.set_pane_row_ratio(0, r, host);
+                                    }
+                                    "row:1" | "rows:1" | "right" => {
+                                        self.set_pane_row_ratio(1, r, host);
+                                    }
+                                    "rows:all" | "vertical" | "v" => {
+                                        self.arrangement.set_row_ratio(0, r);
+                                        self.set_pane_row_ratio(1, r, host);
+                                    }
+                                    other_t => {
+                                        return (
+                                            IpcReply::Error(format!(
+                                                "unknown pane-ratio target `{other_t}` (use cols|rows:0|rows:1|rows:all|reset)"
+                                            )),
+                                            false,
+                                            false,
+                                        );
+                                    }
+                                },
+                                Err(e) => return (IpcReply::Error(e), false, false),
+                            }
+                        } else {
+                            return (
+                                IpcReply::Error(
+                                    "usage: pane-ratio:<cols=R|rows:0=R|rows:1=R|reset>".to_string(),
+                                ),
+                                false,
+                                false,
+                            );
+                        }
+                    }
                     other if other.starts_with("max-tabs:") => {
                         let raw = &other["max-tabs:".len()..];
                         match raw.trim().parse::<usize>() {
@@ -6122,6 +6294,64 @@ const DRAG_CHIP_FONT_PT: f32 = 11.5;
 const DRAG_CHIP_H_PT: f32 = 26.0;
 const DRAG_CHIP_PAD_PT: f32 = 10.0;
 const DRAG_CHIP_GAP_PT: f32 = 8.0;
+
+/// Draw a quiet Build Useful split divider hairline + centered tactile grab handle pill.
+fn draw_pane_divider(painter: &mut Painter, d: Divider, active: bool, theme: &Theme) {
+    let scale = painter.scale();
+    let hair = (1.0 * scale).round().max(1.0) as i32;
+    let line_col = if active {
+        theme.border_control
+    } else {
+        theme.border_subtle
+    };
+    let grip_col = if active {
+        theme.text_muted
+    } else {
+        theme.border_control.with_alpha(130)
+    };
+    match d.axis {
+        DividerAxis::Columns => {
+            let lw = if active { (2.0 * scale).round().max(2.0) as i32 } else { hair };
+            let lx = d.rect.x - (lw - d.rect.w) / 2;
+            painter.fill_rect(PixelRect::new(lx, d.rect.y, lw, d.rect.h), line_col);
+            if d.rect.h > (48.0 * scale) as i32 {
+                let gw = if active {
+                    (4.0 * scale).round().max(3.0) as i32
+                } else {
+                    (3.0 * scale).round().max(2.0) as i32
+                };
+                let gh = if active {
+                    (32.0 * scale).round() as i32
+                } else {
+                    (24.0 * scale).round() as i32
+                };
+                let gx = d.rect.x + d.rect.w / 2 - gw / 2;
+                let gy = d.rect.y + (d.rect.h - gh) / 2;
+                painter.fill_rounded_rect(PixelRect::new(gx, gy, gw, gh), gw as f32 * 0.5, grip_col);
+            }
+        }
+        DividerAxis::Rows(_) => {
+            let lh = if active { (2.0 * scale).round().max(2.0) as i32 } else { hair };
+            let ly = d.rect.y - (lh - d.rect.h) / 2;
+            painter.fill_rect(PixelRect::new(d.rect.x, ly, d.rect.w, lh), line_col);
+            if d.rect.w > (48.0 * scale) as i32 {
+                let gw = if active {
+                    (32.0 * scale).round() as i32
+                } else {
+                    (24.0 * scale).round() as i32
+                };
+                let gh = if active {
+                    (4.0 * scale).round().max(3.0) as i32
+                } else {
+                    (3.0 * scale).round().max(2.0) as i32
+                };
+                let gx = d.rect.x + (d.rect.w - gw) / 2;
+                let gy = d.rect.y + d.rect.h / 2 - gh / 2;
+                painter.fill_rounded_rect(PixelRect::new(gx, gy, gw, gh), gh as f32 * 0.5, grip_col);
+            }
+        }
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 fn draw_drag_overlay(
