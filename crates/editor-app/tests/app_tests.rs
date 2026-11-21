@@ -2335,3 +2335,84 @@ fn per_folder_session_restore_lru_tab_cap_and_cursor_memory() {
     assert!(app2.working_set.open.len() <= 4);
     assert_eq!(app2.working_set.pinned.len(), 2, "lowering max-tabs must never evict pins");
 }
+
+#[test]
+fn close_window_respects_dirty_guard_saves_session_and_uses_os_host_policy() {
+    use editor_platform::{AppCommand, InputEvent, Key, Modifiers};
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/ws/a.rs", b"fn main() {}\n".to_vec());
+
+    // 1. macOS policy (`stay_alive_on_close = true`): CloseWindow hides window WITHOUT quitting,
+    //    while checking dirty buffers first and saving session!
+    let mut mac_host = HeadlessHost::new();
+    mac_host.stay_alive_on_close = true;
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+
+    let mut app = EditorApp::new(fs.clone(), 900, 600, 2.0);
+    app.use_in_app_modal = true;
+    app.open_file(Path::new("/ws/a.rs"), &mut mac_host).unwrap();
+
+    // Make dirty -> CloseWindow MUST prompt instead of closing immediately!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('a'),
+            mods: Modifiers::NONE,
+            text: Some("// edit\n".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut mac_host,
+    );
+    app.handle_event(
+        InputEvent::Command(AppCommand::CloseWindow),
+        &mut raster,
+        &mut clip,
+        &mut mac_host,
+    );
+    assert!(app.confirm_modal.visible, "CloseWindow must guard dirty buffers");
+    assert!(!mac_host.close_window_requested);
+    assert!(!mac_host.quit_requested);
+
+    // Discard -> closes window while keeping app resident in Dock!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('d'),
+            mods: Modifiers::NONE,
+            text: Some("d".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut mac_host,
+    );
+    assert!(!app.confirm_modal.visible);
+    assert!(mac_host.close_window_requested);
+    assert!(!mac_host.quit_requested, "macOS CloseWindow must stay alive in Dock");
+
+    // Explicit Cmd+Q (`Quit`) terminates the process!
+    app.handle_event(
+        InputEvent::Command(AppCommand::Quit),
+        &mut raster,
+        &mut clip,
+        &mut mac_host,
+    );
+    assert!(mac_host.quit_requested);
+
+    // 2. Default Linux/Windows policy (`stay_alive_on_close = false`):
+    //    Final Cmd+W on a clean empty Untitled buffer closes the window AND quits the app!
+    let mut win_linux_host = HeadlessHost::new();
+    let mut app2 = EditorApp::new(fs, 900, 600, 2.0);
+    app2.handle_event(
+        InputEvent::Command(AppCommand::CloseTab),
+        &mut raster,
+        &mut clip,
+        &mut win_linux_host,
+    );
+    assert!(win_linux_host.close_window_requested);
+    assert!(
+        win_linux_host.quit_requested,
+        "non-macOS hosts default to quitting when closing the last window"
+    );
+}

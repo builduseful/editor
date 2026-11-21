@@ -100,6 +100,7 @@ pub enum AppCommand {
     NewFile,
     NewTab,
     CloseTab,
+    CloseWindow,
     OpenFile,
     OpenFolder,
     Save,

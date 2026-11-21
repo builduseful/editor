@@ -39,6 +39,14 @@ pub trait PlatformHost {
     fn confirm_discard(&mut self, file_name: &str) -> ConfirmChoice;
     fn request_redraw(&mut self);
     fn request_quit(&mut self);
+    /// Close the host window using OS-idiomatic semantics.
+    ///
+    /// Default (Windows/Linux/headless): closing the last window terminates the app.
+    /// macOS overrides this to hide the window, stop idle timers, and release GPU surfaces
+    /// while remaining resident in the Dock until `request_quit()` (`⌘Q`) is invoked.
+    fn request_close_window(&mut self) {
+        self.request_quit();
+    }
     fn load_pref(&self, _key: &str) -> Option<String> {
         None
     }
@@ -51,6 +59,9 @@ pub struct HeadlessHost {
     pub cursor: Option<CursorShape>,
     pub redraw_requests: u64,
     pub quit_requested: bool,
+    pub close_window_requested: bool,
+    /// Test knob: when `true`, mimics macOS stay-in-Dock semantics (`request_close_window` does not quit).
+    pub stay_alive_on_close: bool,
     pub next_open_file: Option<PathBuf>,
     pub next_open_folder: Option<PathBuf>,
     pub next_save_file: Option<PathBuf>,
@@ -95,6 +106,13 @@ impl PlatformHost for HeadlessHost {
 
     fn request_quit(&mut self) {
         self.quit_requested = true;
+    }
+
+    fn request_close_window(&mut self) {
+        self.close_window_requested = true;
+        if !self.stay_alive_on_close {
+            self.quit_requested = true;
+        }
     }
 
     fn load_pref(&self, key: &str) -> Option<String> {

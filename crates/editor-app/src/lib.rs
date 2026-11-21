@@ -148,6 +148,7 @@ impl PaneState {
 enum PendingDiscardAction {
     Reload,
     CloseBuffer(BufferId),
+    CloseWindow,
     Quit,
 }
 
@@ -3121,6 +3122,19 @@ impl EditorApp {
             PendingDiscardAction::CloseBuffer(id) => {
                 self.force_close_buffer(id, host);
             }
+            PendingDiscardAction::CloseWindow => {
+                if self.doc.is_dirty() {
+                    let cur = self.active_buf_id;
+                    self.force_close_buffer(cur, host);
+                }
+                if let Some(next_dirty) = self.first_dirty_buffer() {
+                    self.activate_buffer(next_dirty, host);
+                    self.request_discard_or_run(PendingDiscardAction::CloseWindow, host);
+                } else {
+                    self.save_session(host);
+                    host.request_close_window();
+                }
+            }
             PendingDiscardAction::Quit => {
                 // If discarding the active dirty buffer during quit, close it and check any other dirty buffers!
                 if self.doc.is_dirty() {
@@ -3131,6 +3145,7 @@ impl EditorApp {
                     self.activate_buffer(next_dirty, host);
                     self.request_discard_or_run(PendingDiscardAction::Quit, host);
                 } else {
+                    self.save_session(host);
                     host.request_quit();
                 }
             }
@@ -3356,9 +3371,20 @@ impl EditorApp {
             AppCommand::CloseTab => {
                 if self.is_split() && !self.zoomed {
                     self.request_close_active_pane(host);
+                } else if self.is_initial_empty_untitled() {
+                    self.handle_command(AppCommand::CloseWindow, rasterizer, clipboard, host);
                 } else {
                     let cur = self.active_buf_id;
                     self.request_close_buffer(cur, host);
+                }
+            }
+            AppCommand::CloseWindow => {
+                if let Some(dirty_id) = self.first_dirty_buffer() {
+                    self.activate_buffer(dirty_id, host);
+                    self.request_discard_or_run(PendingDiscardAction::CloseWindow, host);
+                } else {
+                    self.save_session(host);
+                    host.request_close_window();
                 }
             }
             AppCommand::OpenFile => {
@@ -5518,6 +5544,9 @@ impl EditorApp {
                     "new" => self.handle_command(AppCommand::NewFile, rasterizer, clipboard, host),
                     "new-tab" => self.handle_command(AppCommand::NewTab, rasterizer, clipboard, host),
                     "close-tab" => self.handle_command(AppCommand::CloseTab, rasterizer, clipboard, host),
+                    "close-window" => {
+                        self.handle_command(AppCommand::CloseWindow, rasterizer, clipboard, host)
+                    }
                     "pin" | "pin-file" | "toggle-pin" => {
                         self.handle_command(AppCommand::TogglePin, rasterizer, clipboard, host)
                     }

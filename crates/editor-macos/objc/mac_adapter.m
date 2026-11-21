@@ -411,6 +411,7 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
 - (void)scheduleRedraw;
 - (void)presentFramebuffer;
 - (void)reclaimSpareSurfaces;
+- (void)releaseAllSlots;
 - (void)notifyResize;
 @end
 
@@ -814,6 +815,30 @@ void mac_request_redraw(void) {
     }
 }
 
+@interface EditorAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
+@property (nonatomic) MacCallbacks cb;
+@property (nonatomic, strong) NSTimer* timer;
+- (void)startBlinkTimer;
+- (void)stopBlinkTimer;
+- (void)showWindow;
+@end
+
+static EditorAppDelegate* g_delegate = nil;
+
+void mac_close_window(void) {
+    // macOS document-app convention: close/hide window while staying alive in Dock (white dot)
+    // with 0.00% idle CPU and zero retained IOSurface GPU buffers.
+    if (g_delegate) {
+        [g_delegate stopBlinkTimer];
+    }
+    if (g_view) {
+        [g_view releaseAllSlots];
+    }
+    if (g_window) {
+        [g_window orderOut:nil];
+    }
+}
+
 void mac_request_quit(void) {
     [NSApp terminate:nil];
 }
@@ -821,16 +846,13 @@ void mac_request_quit(void) {
 void mac_activate_app(void) {
     dispatch_async(dispatch_get_main_queue(), ^{
         [NSApp activateIgnoringOtherApps:YES];
-        if (g_window) {
+        if (g_delegate) {
+            [g_delegate showWindow];
+        } else if (g_window) {
             [g_window makeKeyAndOrderFront:nil];
         }
     });
 }
-
-@interface EditorAppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
-@property (nonatomic) MacCallbacks cb;
-@property (nonatomic, strong) NSTimer* timer;
-@end
 
 @implementation EditorAppDelegate
 
@@ -908,9 +930,34 @@ void mac_activate_app(void) {
     if (g_view) [g_view reclaimSpareSurfaces];
 }
 
+- (void)showWindow {
+    if (!g_window) return;
+    if (!g_window.visible) {
+        [g_window makeKeyAndOrderFront:nil];
+        if (g_view) {
+            [g_window makeFirstResponder:g_view];
+            [g_view notifyResize];
+            [g_view scheduleRedraw];
+        }
+        [self startBlinkTimer];
+    } else {
+        [g_window makeKeyAndOrderFront:nil];
+    }
+}
+
+- (BOOL)windowShouldClose:(NSWindow*)sender {
+    (void)sender;
+    // Route red close button through Rust's portable dirty-buffer guard & `request_close_window()`.
+    if (self.cb.on_command) {
+        self.cb.on_command(self.cb.userdata, 46); // AppCommand::CloseWindow
+    }
+    return NO;
+}
+
 - (BOOL)application:(NSApplication*)sender openFile:(NSString*)filename {
     (void)sender;
     if (self.cb.on_open_path && filename) {
+        [self showWindow];
         self.cb.on_open_path(self.cb.userdata, [filename UTF8String]);
         return YES;
     }
@@ -920,6 +967,7 @@ void mac_activate_app(void) {
 - (void)application:(NSApplication*)sender openFiles:(NSArray<NSString*>*)filenames {
     (void)sender;
     if (filenames.count > 0 && self.cb.on_open_path) {
+        [self showWindow];
         self.cb.on_open_path(self.cb.userdata, [filenames.firstObject UTF8String]);
         [NSApp replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
         return;
@@ -929,12 +977,26 @@ void mac_activate_app(void) {
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication*)sender {
     (void)sender;
+    // Standard macOS document-app behavior: keep running in Dock (white dot) until Cmd+Q.
+    return NO;
+}
+
+- (BOOL)applicationShouldHandleReopen:(NSApplication*)sender hasVisibleWindows:(BOOL)flag {
+    (void)sender;
+    if (!flag) {
+        [self showWindow];
+    }
     return YES;
 }
 
 - (void)dispatchMenuCommand:(NSMenuItem*)item {
+    NSInteger tag = item.tag;
+    // If the window was hidden in the Dock and the user triggers New / Open from the menu bar, show it!
+    if (g_window && !g_window.visible && (tag == 0 || tag == 1 || tag == 2 || tag == 37)) {
+        [self showWindow];
+    }
     if (self.cb.on_command) {
-        self.cb.on_command(self.cb.userdata, (uint32_t)item.tag);
+        self.cb.on_command(self.cb.userdata, (uint32_t)tag);
     }
 }
 
@@ -1063,8 +1125,6 @@ void mac_activate_app(void) {
 }
 
 @end
-
-static EditorAppDelegate* g_delegate = nil;
 
 void mac_wake_main_loop(void) {
     dispatch_async(dispatch_get_main_queue(), ^{

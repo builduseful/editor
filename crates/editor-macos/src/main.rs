@@ -93,6 +93,7 @@ extern "C" {
     fn mac_set_title(title: *const c_char);
     fn mac_set_cursor(cursor_id: u32);
     fn mac_request_redraw();
+    fn mac_close_window();
     fn mac_request_quit();
     fn mac_activate_app();
     fn mac_wake_main_loop();
@@ -336,6 +337,12 @@ impl PlatformHost for MacHost {
         unsafe { mac_request_quit() };
     }
 
+    fn request_close_window(&mut self) {
+        // macOS document-app convention: hide window, stop blink timer, free IOSurfaces,
+        // and stay resident in the Dock until explicit Cmd+Q (`request_quit`).
+        unsafe { mac_close_window() };
+    }
+
     fn load_pref(&self, key: &str) -> Option<String> {
         let k = CString::new(key).ok()?;
         let ptr = unsafe { mac_pref_get(k.as_ptr()) };
@@ -448,6 +455,7 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         43 => Some(AppCommand::NextTab),
         44 => Some(AppCommand::ToggleLastBuffer),
         45 => Some(AppCommand::ToggleSyntaxStyle),
+        46 => Some(AppCommand::CloseWindow),
         100 => Some(AppCommand::SetTheme(ThemePreference::System)),
         101 => Some(AppCommand::SetTheme(ThemePreference::Light)),
         102 => Some(AppCommand::SetTheme(ThemePreference::Dark)),
