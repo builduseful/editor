@@ -1,0 +1,1784 @@
+//! Platform-agnostic application state machine and event controller.
+//!
+//! Connects `editor-core`, `editor-render`, and the minimal `editor-platform` traits.
+//! 100% testable headlessly by feeding `InputEvent`s and inspecting document state
+//! and rendered pixels in `Framebuffer`.
+
+use std::path::Path;
+use std::sync::Arc;
+
+use editor_core::{
+    next_grapheme_boundary, next_word_boundary, prev_grapheme_boundary, prev_word_boundary,
+    word_range_at, Document, SearchMatch, SearchOptions,
+};
+use editor_platform::{
+    AppCommand, Clipboard, ConfirmChoice, CursorShape, FileSystem, FontStyle, Framebuffer,
+    GlyphRasterizer, InputEvent, Key, Modifiers, MouseButton, PixelRect, PlatformHost,
+    SystemTheme, ThemePreference,
+};
+use editor_render::{
+    chrome::{draw_status_bar, status_bar_height_px},
+    A11yNode, A11yRole, FindBarAction, FindBarState, GlyphAtlas, GotoLineState, ImeComposition,
+    Painter, ScrollbarHit, Sidebar, SidebarAction, SidebarHit, StatusBarData, Theme, Viewport,
+};
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AppLayout {
+    pub sidebar: PixelRect,
+    pub find_bar: PixelRect,
+    pub goto_bar: PixelRect,
+    pub viewport: PixelRect,
+    pub status_bar: PixelRect,
+}
+
+pub struct EditorApp {
+    fs: Arc<dyn FileSystem>,
+    pub doc: Document,
+    pub caret: u64,
+    pub anchor: u64,
+    preferred_x_px: Option<f32>,
+
+    pub sidebar: Sidebar,
+    pub viewport: Viewport,
+    pub find_bar: FindBarState,
+    pub goto_line: GotoLineState,
+    pub ime: ImeComposition,
+
+    pub search_matches: Vec<SearchMatch>,
+    pub active_match: Option<usize>,
+
+    pub theme_pref: ThemePreference,
+    pub system_theme: SystemTheme,
+
+    pub atlas: GlyphAtlas,
+    pub framebuffer: Framebuffer,
+    pub layout: AppLayout,
+
+    window_focused: bool,
+    caret_visible: bool,
+    last_blink_ms: u64,
+    now_ms: u64,
+    notice: Option<(String, bool, u64)>,
+
+    dragging_selection: bool,
+    drag_click_count: u8,
+    drag_word_anchor: (u64, u64),
+    dragging_sidebar_edge: bool,
+    dirty_frame: bool,
+}
+
+impl EditorApp {
+    pub fn new(fs: Arc<dyn FileSystem>, width_px: u32, height_px: u32, scale: f32) -> Self {
+        let mut app = Self {
+            fs,
+            doc: Document::new_untitled(),
+            caret: 0,
+            anchor: 0,
+            preferred_x_px: None,
+            sidebar: Sidebar::new(),
+            viewport: Viewport::new(),
+            find_bar: FindBarState::new(),
+            goto_line: GotoLineState::new(),
+            ime: ImeComposition::default(),
+            search_matches: Vec::new(),
+            active_match: None,
+            theme_pref: ThemePreference::System,
+            system_theme: SystemTheme::Light,
+            atlas: GlyphAtlas::new(),
+            framebuffer: Framebuffer::new(width_px.max(1), height_px.max(1), scale),
+            layout: AppLayout::default(),
+            window_focused: true,
+            caret_visible: true,
+            last_blink_ms: 0,
+            now_ms: 0,
+            notice: None,
+            dragging_selection: false,
+            drag_click_count: 1,
+            drag_word_anchor: (0, 0),
+            dragging_sidebar_edge: false,
+            dirty_frame: true,
+        };
+        app.recompute_layout();
+        app
+    }
+
+    pub fn active_theme(&self) -> Theme {
+        match self.theme_pref {
+            ThemePreference::System => Theme::for_system(self.system_theme),
+            ThemePreference::Light => Theme::light(),
+            ThemePreference::Dark => Theme::dark(),
+        }
+    }
+
+    pub fn set_theme_preference(&mut self, pref: ThemePreference) {
+        self.theme_pref = pref;
+        self.mark_dirty();
+    }
+
+    pub fn set_sidebar_root(&mut self, dir: &Path) {
+        self.sidebar.set_root(self.fs.as_ref(), dir);
+        self.mark_dirty();
+    }
+
+    pub fn open_file(
+        &mut self,
+        path: &Path,
+        host: &mut dyn PlatformHost,
+    ) -> Result<(), String> {
+        let doc = Document::open(self.fs.as_ref(), path).map_err(|e| e.to_string())?;
+        let canonical = doc.path().map(Path::to_path_buf);
+        self.doc = doc;
+        self.caret = 0;
+        self.anchor = 0;
+        self.preferred_x_px = None;
+        self.viewport.reset_for_document();
+        self.search_matches.clear();
+        self.active_match = None;
+
+        // Sidebar root is set once (if unset) and never re-rooted on subsequent file opens!
+        if let Some(ref p) = canonical {
+            if self.sidebar.root().is_none() {
+                if let Some(parent) = p.parent() {
+                    self.sidebar.set_root(self.fs.as_ref(), parent);
+                }
+            }
+            if self.sidebar.is_under_root(p) {
+                self.sidebar.reveal(self.fs.as_ref(), p);
+            }
+        }
+
+        self.sync_title(host);
+        self.mark_dirty();
+        host.request_redraw();
+        Ok(())
+    }
+
+    pub fn open_path_or_dir(
+        &mut self,
+        path: &Path,
+        host: &mut dyn PlatformHost,
+    ) -> Result<(), String> {
+        if let Ok(st) = self.fs.stat(path) {
+            if st.is_dir {
+                self.sidebar.set_visible(true);
+                self.sidebar.set_root(self.fs.as_ref(), path);
+                self.mark_dirty();
+                host.request_redraw();
+                return Ok(());
+            }
+        }
+        self.open_file(path, host)
+    }
+
+    pub fn selection(&self) -> Option<(u64, u64)> {
+        if self.anchor == self.caret {
+            None
+        } else if self.anchor < self.caret {
+            Some((self.anchor, self.caret))
+        } else {
+            Some((self.caret, self.anchor))
+        }
+    }
+
+    pub fn selected_text(&mut self) -> Option<String> {
+        let (a, b) = self.selection()?;
+        let bytes = self.doc.read_range(a, (b - a) as usize);
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub fn mark_dirty(&mut self) {
+        self.dirty_frame = true;
+        self.framebuffer.dirty.mark_full();
+    }
+
+    pub fn is_dirty_frame(&self) -> bool {
+        self.dirty_frame
+    }
+
+    pub fn set_notice(&mut self, msg: impl Into<String>, is_error: bool) {
+        self.notice = Some((msg.into(), is_error, self.now_ms + 3_500));
+        self.mark_dirty();
+    }
+
+    pub fn sync_title(&self, host: &mut dyn PlatformHost) {
+        let name = self.doc.file_name();
+        let title = if self.doc.is_dirty() {
+            format!("{name} — Edited")
+        } else {
+            name.to_string()
+        };
+        host.set_title(&title);
+    }
+
+    pub fn recompute_layout(&mut self) {
+        let w = self.framebuffer.width as i32;
+        let h = self.framebuffer.height as i32;
+        let scale = self.framebuffer.scale;
+
+        let status_h = status_bar_height_px(scale);
+        let main_h = (h - status_h).max(0);
+        let sidebar_w = if self.sidebar.is_visible() {
+            (self.sidebar.width_pt() * scale)
+                .round()
+                .min((w as f32 - 220.0 * scale).max(0.0)) as i32
+        } else {
+            0
+        };
+        let sidebar = PixelRect::new(0, 0, sidebar_w, main_h);
+        let right_x = sidebar_w;
+        let right_w = (w - sidebar_w).max(0);
+
+        let find_h = self.find_bar.height_px(scale);
+        let find_bar = PixelRect::new(right_x, 0, right_w, find_h);
+
+        let goto_h = self.goto_line.height_px(scale);
+        let goto_bar = PixelRect::new(right_x, find_bar.bottom(), right_w, goto_h);
+
+        let vp_y = goto_bar.bottom();
+        let vp_h = (main_h - vp_y).max(0);
+        let viewport = PixelRect::new(right_x, vp_y, right_w, vp_h);
+
+        let status_bar = PixelRect::new(0, main_h, w, status_h);
+
+        self.layout = AppLayout {
+            sidebar,
+            find_bar,
+            goto_bar,
+            viewport,
+            status_bar,
+        };
+    }
+
+    /// Render the current frame into `self.framebuffer`. Returns `true` if pixels were updated.
+    pub fn render(&mut self, rasterizer: &mut dyn GlyphRasterizer) -> bool {
+        if !self.dirty_frame {
+            return false;
+        }
+        self.recompute_layout();
+        let theme = self.active_theme();
+        let layout = self.layout;
+        let (caret_line, caret_col) = self.doc.byte_to_line_col(self.caret);
+        let sel = self.selection();
+        let sel_bytes = sel.map(|(a, b)| (b - a) as usize).unwrap_or(0);
+        let notice = self.notice.as_ref().map(|(m, e, _)| (m.as_str(), *e));
+        let doc_focused = self.window_focused
+            && !self.sidebar.is_focused()
+            && !self.find_bar.is_focused()
+            && !self.goto_line.visible;
+
+        let mut painter = Painter::new(&mut self.framebuffer);
+
+        // 1. Sidebar
+        if !layout.sidebar.is_empty() {
+            self.sidebar
+                .draw(&mut painter, layout.sidebar, &theme, &mut self.atlas, rasterizer);
+        }
+
+        // 2. Find / Replace bar
+        if !layout.find_bar.is_empty() {
+            self.find_bar.draw(
+                &mut painter,
+                layout.find_bar,
+                &theme,
+                &mut self.atlas,
+                rasterizer,
+                self.caret_visible,
+            );
+        }
+
+        // 3. Go-To-Line bar
+        if !layout.goto_bar.is_empty() {
+            self.goto_line.draw(
+                &mut painter,
+                layout.goto_bar,
+                &theme,
+                &mut self.atlas,
+                rasterizer,
+                self.caret_visible,
+            );
+        }
+
+        // 4. Document viewport
+        self.viewport.draw(
+            &mut painter,
+            layout.viewport,
+            &mut self.doc,
+            self.caret,
+            sel,
+            &self.search_matches,
+            self.active_match,
+            &self.ime,
+            self.caret_visible,
+            doc_focused,
+            &theme,
+            &mut self.atlas,
+            rasterizer,
+        );
+
+        // 5. Status bar
+        let status_data = StatusBarData {
+            file_label: self.doc.file_name(),
+            dirty: self.doc.is_dirty(),
+            line_1based: caret_line + 1,
+            col_1based: caret_col + 1,
+            selection_bytes: sel_bytes,
+            language: self.doc.language(),
+            eol: self.doc.eol(),
+            word_wrap: self.viewport.word_wrap,
+            theme_pref: self.theme_pref,
+            notice,
+        };
+        draw_status_bar(
+            &mut painter,
+            layout.status_bar,
+            &status_data,
+            &theme,
+            &mut self.atlas,
+            rasterizer,
+        );
+
+        self.dirty_frame = false;
+        true
+    }
+
+    /// Snapshot of logical UI regions for future OS accessibility bridges.
+    pub fn a11y_snapshot(&self) -> Vec<A11yNode> {
+        let mut nodes = Vec::with_capacity(5);
+        nodes.push(A11yNode {
+            role: A11yRole::Window,
+            label: self.doc.file_name().to_string(),
+            bounds: self.framebuffer.bounds(),
+            focused: self.window_focused,
+        });
+        if self.sidebar.is_visible() {
+            nodes.push(A11yNode {
+                role: A11yRole::Sidebar,
+                label: "Files".to_string(),
+                bounds: self.layout.sidebar,
+                focused: self.sidebar.is_focused(),
+            });
+        }
+        nodes.push(A11yNode {
+            role: A11yRole::Document,
+            label: self.doc.file_name().to_string(),
+            bounds: self.layout.viewport,
+            focused: self.window_focused
+                && !self.sidebar.is_focused()
+                && !self.find_bar.is_focused()
+                && !self.goto_line.visible,
+        });
+        nodes.push(A11yNode {
+            role: A11yRole::StatusBar,
+            label: "Status".to_string(),
+            bounds: self.layout.status_bar,
+            focused: false,
+        });
+        nodes
+    }
+
+    /// Process a single platform-neutral `InputEvent`.
+    pub fn handle_event(
+        &mut self,
+        event: InputEvent,
+        rasterizer: &mut dyn GlyphRasterizer,
+        clipboard: &mut dyn Clipboard,
+        host: &mut dyn PlatformHost,
+    ) {
+        match event {
+            InputEvent::Resize {
+                width_px,
+                height_px,
+                scale,
+            } => {
+                self.framebuffer.resize(width_px.max(1), height_px.max(1), scale);
+                self.recompute_layout();
+                self.mark_dirty();
+            }
+            InputEvent::SystemThemeChanged(st) => {
+                if self.system_theme != st {
+                    self.system_theme = st;
+                    self.mark_dirty();
+                    host.request_redraw();
+                }
+            }
+            InputEvent::FocusChanged(focused) => {
+                self.window_focused = focused;
+                if focused {
+                    self.caret_visible = true;
+                    self.last_blink_ms = self.now_ms;
+                    self.sidebar.refresh(self.fs.as_ref());
+                }
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            InputEvent::OpenPath(path) => {
+                if self.confirm_discard_if_dirty(host) {
+                    if let Err(err) = self.open_path_or_dir(&path, host) {
+                        self.set_notice(err, true);
+                    }
+                }
+            }
+            InputEvent::Tick { now_ms } => {
+                self.now_ms = now_ms;
+                if let Some((_, _, exp)) = &self.notice {
+                    if now_ms >= *exp {
+                        self.notice = None;
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                }
+                if self.window_focused && now_ms.saturating_sub(self.last_blink_ms) >= 530 {
+                    self.caret_visible = !self.caret_visible;
+                    self.last_blink_ms = now_ms;
+                    self.mark_dirty();
+                    host.request_redraw();
+                }
+            }
+            InputEvent::Command(cmd) => {
+                self.handle_command(cmd, rasterizer, clipboard, host);
+            }
+            InputEvent::KeyDown { key, mods, text } => {
+                self.caret_visible = true;
+                self.last_blink_ms = self.now_ms;
+                self.handle_key_down(key, mods, text.as_deref(), rasterizer, clipboard, host);
+            }
+            InputEvent::MouseDown {
+                x_px,
+                y_px,
+                button,
+                click_count,
+                mods,
+            } => {
+                self.caret_visible = true;
+                self.last_blink_ms = self.now_ms;
+                if button == MouseButton::Left {
+                    self.handle_mouse_down(x_px, y_px, click_count, mods, rasterizer, host);
+                }
+            }
+            InputEvent::MouseMove { x_px, y_px, .. } => {
+                self.handle_mouse_move(x_px, y_px, rasterizer, host);
+            }
+            InputEvent::MouseUp { button, .. } => {
+                if button == MouseButton::Left {
+                    self.dragging_selection = false;
+                    self.dragging_sidebar_edge = false;
+                    self.viewport.end_scrollbar_drag();
+                }
+            }
+            InputEvent::Scroll {
+                dx_px,
+                dy_px,
+                x_px,
+                y_px,
+                ..
+            } => {
+                self.handle_scroll(dx_px, dy_px, x_px, y_px, rasterizer, host);
+            }
+        }
+    }
+
+    fn doc_metrics(&mut self, rasterizer: &mut dyn GlyphRasterizer) -> editor_platform::FontMetrics {
+        let font_px = self.viewport.font_px(self.framebuffer.scale);
+        self.atlas.metrics(rasterizer, FontStyle::Mono, font_px)
+    }
+
+    fn confirm_discard_if_dirty(&mut self, host: &mut dyn PlatformHost) -> bool {
+        if !self.doc.is_dirty() {
+            return true;
+        }
+        match host.confirm_discard(self.doc.file_name()) {
+            ConfirmChoice::Save => self.save_current(host),
+            ConfirmChoice::Discard => true,
+            ConfirmChoice::Cancel => false,
+        }
+    }
+
+    fn save_current(&mut self, host: &mut dyn PlatformHost) -> bool {
+        if self.doc.path().is_none() {
+            return self.save_as_dialog(host);
+        }
+        match self.doc.save(self.fs.as_ref(), None, false) {
+            Ok(report) => {
+                self.sync_title(host);
+                self.set_notice(format!("Saved ({})", report.method.as_str()), false);
+                host.request_redraw();
+                true
+            }
+            Err(e) => {
+                self.set_notice(format!("Save failed: {e}"), true);
+                host.request_redraw();
+                false
+            }
+        }
+    }
+
+    fn save_as_dialog(&mut self, host: &mut dyn PlatformHost) -> bool {
+        let Some(dst) = host.save_file_dialog(Some(self.doc.file_name())) else {
+            return false;
+        };
+        match self.doc.save_as(self.fs.as_ref(), &dst, None, false) {
+            Ok(_) => {
+                self.sync_title(host);
+                self.sidebar.refresh(self.fs.as_ref());
+                if let Some(p) = self.doc.path().map(Path::to_path_buf) {
+                    if self.sidebar.is_under_root(&p) {
+                        self.sidebar.reveal(self.fs.as_ref(), &p);
+                    }
+                }
+                self.set_notice("Saved", false);
+                host.request_redraw();
+                true
+            }
+            Err(e) => {
+                self.set_notice(format!("Save As failed: {e}"), true);
+                host.request_redraw();
+                false
+            }
+        }
+    }
+
+    fn handle_command(
+        &mut self,
+        cmd: AppCommand,
+        rasterizer: &mut dyn GlyphRasterizer,
+        clipboard: &mut dyn Clipboard,
+        host: &mut dyn PlatformHost,
+    ) {
+        match cmd {
+            AppCommand::NewFile => {
+                if self.confirm_discard_if_dirty(host) {
+                    self.doc = Document::new_untitled();
+                    self.caret = 0;
+                    self.anchor = 0;
+                    self.viewport.reset_for_document();
+                    self.search_matches.clear();
+                    self.active_match = None;
+                    self.sync_title(host);
+                    self.mark_dirty();
+                    host.request_redraw();
+                }
+            }
+            AppCommand::OpenFile => {
+                if self.confirm_discard_if_dirty(host) {
+                    if let Some(path) = host.open_file_dialog() {
+                        if let Err(e) = self.open_file(&path, host) {
+                            self.set_notice(e, true);
+                        }
+                    }
+                }
+            }
+            AppCommand::OpenFolder => {
+                if let Some(dir) = host.open_folder_dialog() {
+                    self.sidebar.set_visible(true);
+                    self.sidebar.set_root(self.fs.as_ref(), &dir);
+                    self.recompute_layout();
+                    self.mark_dirty();
+                    host.request_redraw();
+                }
+            }
+            AppCommand::Save => {
+                self.save_current(host);
+            }
+            AppCommand::SaveAs => {
+                self.save_as_dialog(host);
+            }
+            AppCommand::Reload => {
+                if self.confirm_discard_if_dirty(host) {
+                    if let Err(e) = self.doc.reload(self.fs.as_ref()) {
+                        self.set_notice(format!("Reload failed: {e}"), true);
+                    } else {
+                        self.caret = self.caret.min(self.doc.len_bytes());
+                        self.anchor = self.caret;
+                        self.refresh_search();
+                        self.sync_title(host);
+                        self.set_notice("Reloaded", false);
+                    }
+                    self.mark_dirty();
+                    host.request_redraw();
+                }
+            }
+            AppCommand::Undo => {
+                if let Some(pos) = self.doc.undo() {
+                    self.caret = pos.min(self.doc.len_bytes());
+                    self.anchor = self.caret;
+                    self.after_document_mutated(rasterizer, host);
+                }
+            }
+            AppCommand::Redo => {
+                if let Some(pos) = self.doc.redo() {
+                    self.caret = pos.min(self.doc.len_bytes());
+                    self.anchor = self.caret;
+                    self.after_document_mutated(rasterizer, host);
+                }
+            }
+            AppCommand::Copy => {
+                if let Some(text) = self.selected_text() {
+                    clipboard.set_text(&text);
+                }
+            }
+            AppCommand::Cut => {
+                if let Some(text) = self.selected_text() {
+                    clipboard.set_text(&text);
+                    let (a, b) = self.selection().unwrap();
+                    if let Ok(pos) = self.doc.edit(a, b - a, "", self.now_ms, false) {
+                        self.caret = pos;
+                        self.anchor = pos;
+                        self.after_document_mutated(rasterizer, host);
+                    }
+                }
+            }
+            AppCommand::Paste => {
+                if let Some(text) = clipboard.get_text() {
+                    let (start, removed) = self
+                        .selection()
+                        .map(|(a, b)| (a, b - a))
+                        .unwrap_or((self.caret, 0));
+                    if let Ok(pos) = self.doc.edit(start, removed, &text, self.now_ms, false) {
+                        self.caret = pos;
+                        self.anchor = pos;
+                        self.after_document_mutated(rasterizer, host);
+                    }
+                }
+            }
+            AppCommand::SelectAll => {
+                self.doc.tree_mut().ensure_fully_indexed();
+                self.anchor = 0;
+                self.caret = self.doc.len_bytes();
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::Find => {
+                self.goto_line.close();
+                self.sidebar.set_focused(false);
+                let seed = self.selected_text();
+                self.find_bar.open(false, seed.as_deref());
+                self.recompute_layout();
+                self.refresh_search();
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::Replace => {
+                self.goto_line.close();
+                self.sidebar.set_focused(false);
+                let seed = self.selected_text();
+                self.find_bar.open(true, seed.as_deref());
+                self.recompute_layout();
+                self.refresh_search();
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::GoToLine => {
+                self.find_bar.close();
+                self.sidebar.set_focused(false);
+                let (line, _) = self.doc.byte_to_line_col(self.caret);
+                self.goto_line.open(line + 1);
+                self.recompute_layout();
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::ToggleWrap => {
+                self.viewport.toggle_wrap();
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::ToggleSidebar => {
+                self.sidebar.toggle_visible();
+                self.recompute_layout();
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::ZoomIn => {
+                self.viewport.zoom_in();
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::ZoomOut => {
+                self.viewport.zoom_out();
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::ZoomReset => {
+                self.viewport.zoom_reset();
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::SetTheme(pref) => {
+                self.theme_pref = pref;
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::Quit => {
+                if self.confirm_discard_if_dirty(host) {
+                    host.request_quit();
+                }
+            }
+        }
+    }
+
+    fn handle_key_down(
+        &mut self,
+        key: Key,
+        mods: Modifiers,
+        text: Option<&str>,
+        rasterizer: &mut dyn GlyphRasterizer,
+        clipboard: &mut dyn Clipboard,
+        host: &mut dyn PlatformHost,
+    ) {
+        // Global shortcut dispatch first.
+        if mods.primary() {
+            match key {
+                Key::Char('s') | Key::Char('S') => {
+                    let cmd = if mods.shift {
+                        AppCommand::SaveAs
+                    } else {
+                        AppCommand::Save
+                    };
+                    self.handle_command(cmd, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('o') | Key::Char('O') => {
+                    let cmd = if mods.shift {
+                        AppCommand::OpenFolder
+                    } else {
+                        AppCommand::OpenFile
+                    };
+                    self.handle_command(cmd, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('n') | Key::Char('N') => {
+                    self.handle_command(AppCommand::NewFile, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('f') | Key::Char('F') => {
+                    let cmd = if mods.alt {
+                        AppCommand::Replace
+                    } else {
+                        AppCommand::Find
+                    };
+                    self.handle_command(cmd, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('g') | Key::Char('G') => {
+                    if self.find_bar.visible {
+                        if mods.shift {
+                            self.jump_search_match(false, rasterizer, host);
+                        } else {
+                            self.jump_search_match(true, rasterizer, host);
+                        }
+                    } else {
+                        self.handle_command(AppCommand::GoToLine, rasterizer, clipboard, host);
+                    }
+                    return;
+                }
+                Key::Char('b') | Key::Char('B') => {
+                    self.handle_command(AppCommand::ToggleSidebar, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('=') | Key::Char('+') => {
+                    self.handle_command(AppCommand::ZoomIn, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('-') => {
+                    self.handle_command(AppCommand::ZoomOut, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('0') => {
+                    self.handle_command(AppCommand::ZoomReset, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('q') | Key::Char('Q') => {
+                    self.handle_command(AppCommand::Quit, rasterizer, clipboard, host);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if mods.alt && !mods.primary() && matches!(key, Key::Char('z') | Key::Char('Z')) {
+            self.handle_command(AppCommand::ToggleWrap, rasterizer, clipboard, host);
+            return;
+        }
+
+        // Route to Go-To-Line bar if open.
+        if self.goto_line.visible {
+            if key == Key::Escape {
+                self.goto_line.close();
+                self.recompute_layout();
+                self.mark_dirty();
+                host.request_redraw();
+                return;
+            }
+            if key == Key::Enter {
+                if let Some(line1) = self.goto_line.parsed_line_1based() {
+                    let target = line1.saturating_sub(1);
+                    self.doc.tree_mut().ensure_indexed_for_line(target);
+                    let clamped = target.min(self.doc.editable_line_count().saturating_sub(1));
+                    if let Some((start, _, _)) = self.doc.line_byte_range(clamped) {
+                        self.caret = start;
+                        self.anchor = start;
+                        let m = self.doc_metrics(rasterizer);
+                        self.viewport
+                            .ensure_caret_visible(&mut self.doc, self.caret, m, self.framebuffer.scale);
+                    }
+                }
+                self.goto_line.close();
+                self.recompute_layout();
+                self.mark_dirty();
+                host.request_redraw();
+                return;
+            }
+            let clip = clipboard.get_text();
+            let (_, copied) = self
+                .goto_line
+                .input
+                .handle_key(key, mods, text, clip.as_deref());
+            if let Some(c) = copied {
+                clipboard.set_text(&c);
+            }
+            self.mark_dirty();
+            host.request_redraw();
+            return;
+        }
+
+        // Route to Find / Replace bar if focused.
+        if self.find_bar.is_focused() {
+            if key == Key::Escape {
+                self.find_bar.close();
+                self.search_matches.clear();
+                self.active_match = None;
+                self.recompute_layout();
+                self.mark_dirty();
+                host.request_redraw();
+                return;
+            }
+            if key == Key::Tab && self.find_bar.show_replace {
+                let f = self.find_bar.find_input.focused;
+                self.find_bar.find_input.focused = !f;
+                self.find_bar.replace_input.focused = f;
+                self.mark_dirty();
+                host.request_redraw();
+                return;
+            }
+            if key == Key::Enter {
+                if self.find_bar.find_input.focused {
+                    self.jump_search_match(!mods.shift, rasterizer, host);
+                } else if self.find_bar.replace_input.focused {
+                    self.replace_active_match(rasterizer, host);
+                }
+                return;
+            }
+            let clip = clipboard.get_text();
+            if self.find_bar.find_input.focused {
+                let (changed, copied) = self
+                    .find_bar
+                    .find_input
+                    .handle_key(key, mods, text, clip.as_deref());
+                if let Some(c) = copied {
+                    clipboard.set_text(&c);
+                }
+                if changed {
+                    self.refresh_search();
+                    if let Some(idx) = self.active_match {
+                        self.select_match(idx, rasterizer);
+                    }
+                }
+            } else {
+                let (_, copied) = self
+                    .find_bar
+                    .replace_input
+                    .handle_key(key, mods, text, clip.as_deref());
+                if let Some(c) = copied {
+                    clipboard.set_text(&c);
+                }
+            }
+            self.mark_dirty();
+            host.request_redraw();
+            return;
+        }
+
+        // Route to Sidebar if focused.
+        if self.sidebar.is_focused() {
+            if key == Key::Escape {
+                self.sidebar.set_focused(false);
+                self.mark_dirty();
+                host.request_redraw();
+                return;
+            }
+            match self
+                .sidebar
+                .handle_key(self.fs.as_ref(), key, self.layout.sidebar.h)
+            {
+                SidebarAction::OpenFile(p) => {
+                    if self.confirm_discard_if_dirty(host) {
+                        if let Err(e) = self.open_file(&p, host) {
+                            self.set_notice(e, true);
+                        } else {
+                            self.sidebar.set_focused(false);
+                        }
+                    }
+                }
+                SidebarAction::Changed => {
+                    self.mark_dirty();
+                    host.request_redraw();
+                }
+                SidebarAction::None => {}
+            }
+            return;
+        }
+
+        // Document primary editing shortcuts (Undo/Redo/Copy/Cut/Paste/SelectAll).
+        if mods.primary() {
+            match key {
+                Key::Char('z') | Key::Char('Z') => {
+                    let cmd = if mods.shift {
+                        AppCommand::Redo
+                    } else {
+                        AppCommand::Undo
+                    };
+                    self.handle_command(cmd, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('a') | Key::Char('A') => {
+                    self.handle_command(AppCommand::SelectAll, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('c') | Key::Char('C') => {
+                    self.handle_command(AppCommand::Copy, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('x') | Key::Char('X') => {
+                    self.handle_command(AppCommand::Cut, rasterizer, clipboard, host);
+                    return;
+                }
+                Key::Char('v') | Key::Char('V') => {
+                    self.handle_command(AppCommand::Paste, rasterizer, clipboard, host);
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // Document navigation & text editing!
+        self.handle_document_key(key, mods, text, rasterizer, host);
+    }
+
+    fn handle_document_key(
+        &mut self,
+        key: Key,
+        mods: Modifiers,
+        text: Option<&str>,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        let metrics = self.doc_metrics(rasterizer);
+        let scale = self.framebuffer.scale;
+
+        match key {
+            Key::Escape => {
+                if self.find_bar.visible {
+                    self.find_bar.close();
+                    self.search_matches.clear();
+                    self.active_match = None;
+                    self.recompute_layout();
+                } else {
+                    self.anchor = self.caret;
+                }
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            Key::Left => {
+                self.doc.break_undo_coalescing();
+                self.preferred_x_px = None;
+                if !mods.shift && self.selection().is_some() {
+                    let (a, _) = self.selection().unwrap();
+                    self.caret = a;
+                    self.anchor = a;
+                } else if mods.primary() {
+                    let (line, _) = self.doc.byte_to_line_col(self.caret);
+                    let (start, _, _) = self.doc.line_byte_range(line).unwrap_or((0, 0, 0));
+                    self.caret = start;
+                    if !mods.shift {
+                        self.anchor = self.caret;
+                    }
+                } else {
+                    self.caret = if mods.alt {
+                        self.move_word_left(self.caret)
+                    } else {
+                        self.move_grapheme_left(self.caret)
+                    };
+                    if !mods.shift {
+                        self.anchor = self.caret;
+                    }
+                }
+                self.viewport
+                    .ensure_caret_visible(&mut self.doc, self.caret, metrics, scale);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            Key::Right => {
+                self.doc.break_undo_coalescing();
+                self.preferred_x_px = None;
+                if !mods.shift && self.selection().is_some() {
+                    let (_, b) = self.selection().unwrap();
+                    self.caret = b;
+                    self.anchor = b;
+                } else if mods.primary() {
+                    let (line, _) = self.doc.byte_to_line_col(self.caret);
+                    let (_, end, _) = self.doc.line_byte_range(line).unwrap_or((0, 0, 0));
+                    self.caret = end;
+                    if !mods.shift {
+                        self.anchor = self.caret;
+                    }
+                } else {
+                    self.caret = if mods.alt {
+                        self.move_word_right(self.caret)
+                    } else {
+                        self.move_grapheme_right(self.caret)
+                    };
+                    if !mods.shift {
+                        self.anchor = self.caret;
+                    }
+                }
+                self.viewport
+                    .ensure_caret_visible(&mut self.doc, self.caret, metrics, scale);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            Key::Up => {
+                self.doc.break_undo_coalescing();
+                if mods.primary() {
+                    self.caret = 0;
+                    self.preferred_x_px = None;
+                } else {
+                    self.move_vertical(-1, metrics);
+                }
+                if !mods.shift {
+                    self.anchor = self.caret;
+                }
+                self.viewport
+                    .ensure_caret_visible(&mut self.doc, self.caret, metrics, scale);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            Key::Down => {
+                self.doc.break_undo_coalescing();
+                if mods.primary() {
+                    self.doc.tree_mut().ensure_fully_indexed();
+                    self.caret = self.doc.len_bytes();
+                    self.preferred_x_px = None;
+                } else {
+                    self.move_vertical(1, metrics);
+                }
+                if !mods.shift {
+                    self.anchor = self.caret;
+                }
+                self.viewport
+                    .ensure_caret_visible(&mut self.doc, self.caret, metrics, scale);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            Key::Home => {
+                self.doc.break_undo_coalescing();
+                self.preferred_x_px = None;
+                if mods.primary() {
+                    self.caret = 0;
+                } else {
+                    let (line, _) = self.doc.byte_to_line_col(self.caret);
+                    let (start, _, _) = self.doc.line_byte_range(line).unwrap_or((0, 0, 0));
+                    self.caret = start;
+                }
+                if !mods.shift {
+                    self.anchor = self.caret;
+                }
+                self.viewport
+                    .ensure_caret_visible(&mut self.doc, self.caret, metrics, scale);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            Key::End => {
+                self.doc.break_undo_coalescing();
+                self.preferred_x_px = None;
+                if mods.primary() {
+                    self.doc.tree_mut().ensure_fully_indexed();
+                    self.caret = self.doc.len_bytes();
+                } else {
+                    let (line, _) = self.doc.byte_to_line_col(self.caret);
+                    let (_, end, _) = self.doc.line_byte_range(line).unwrap_or((0, 0, 0));
+                    self.caret = end;
+                }
+                if !mods.shift {
+                    self.anchor = self.caret;
+                }
+                self.viewport
+                    .ensure_caret_visible(&mut self.doc, self.caret, metrics, scale);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            Key::PageUp => {
+                self.doc.break_undo_coalescing();
+                let page = (self.layout.viewport.h / metrics.line_height.max(1) as i32).max(1) as isize;
+                self.move_vertical(-page, metrics);
+                if !mods.shift {
+                    self.anchor = self.caret;
+                }
+                self.viewport
+                    .ensure_caret_visible(&mut self.doc, self.caret, metrics, scale);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            Key::PageDown => {
+                self.doc.break_undo_coalescing();
+                let page = (self.layout.viewport.h / metrics.line_height.max(1) as i32).max(1) as isize;
+                self.move_vertical(page, metrics);
+                if !mods.shift {
+                    self.anchor = self.caret;
+                }
+                self.viewport
+                    .ensure_caret_visible(&mut self.doc, self.caret, metrics, scale);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            Key::Backspace => {
+                self.preferred_x_px = None;
+                let (del_start, del_len, coalescable) = if let Some((a, b)) = self.selection() {
+                    (a, b - a, false)
+                } else if self.caret > 0 {
+                    let prev = if mods.primary() {
+                        let (line, _) = self.doc.byte_to_line_col(self.caret);
+                        self.doc.line_byte_range(line).map(|(s, _, _)| s).unwrap_or(0)
+                    } else if mods.alt {
+                        self.move_word_left(self.caret)
+                    } else {
+                        self.move_grapheme_left(self.caret)
+                    };
+                    (prev, self.caret - prev, !mods.alt && !mods.primary())
+                } else {
+                    return;
+                };
+                if let Ok(pos) = self.doc.edit(del_start, del_len, "", self.now_ms, coalescable) {
+                    self.caret = pos;
+                    self.anchor = pos;
+                    self.after_document_mutated(rasterizer, host);
+                }
+            }
+            Key::Delete => {
+                self.preferred_x_px = None;
+                let (del_start, del_len) = if let Some((a, b)) = self.selection() {
+                    (a, b - a)
+                } else if self.caret < self.doc.len_bytes() {
+                    let next = if mods.alt {
+                        self.move_word_right(self.caret)
+                    } else {
+                        self.move_grapheme_right(self.caret)
+                    };
+                    (self.caret, next - self.caret)
+                } else {
+                    return;
+                };
+                if let Ok(pos) = self.doc.edit(del_start, del_len, "", self.now_ms, false) {
+                    self.caret = pos;
+                    self.anchor = pos;
+                    self.after_document_mutated(rasterizer, host);
+                }
+            }
+            Key::Enter => {
+                self.preferred_x_px = None;
+                // Subtle auto-indent: preserve leading spaces/tabs of the current line.
+                let (line, col) = self.doc.byte_to_line_col(self.caret);
+                let indent: String = self
+                    .doc
+                    .line_content(line)
+                    .map(|l| {
+                        l[..col.min(l.len())]
+                            .chars()
+                            .take_while(|&c| c == ' ' || c == '\t')
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let insert_str = format!("\n{indent}");
+                let (start, removed) = self
+                    .selection()
+                    .map(|(a, b)| (a, b - a))
+                    .unwrap_or((self.caret, 0));
+                if let Ok(pos) = self.doc.edit(start, removed, &insert_str, self.now_ms, false) {
+                    self.caret = pos;
+                    self.anchor = pos;
+                    self.after_document_mutated(rasterizer, host);
+                }
+            }
+            Key::Tab => {
+                self.preferred_x_px = None;
+                let spaces = " ".repeat(self.viewport.tab_width);
+                let (start, removed) = self
+                    .selection()
+                    .map(|(a, b)| (a, b - a))
+                    .unwrap_or((self.caret, 0));
+                if let Ok(pos) = self.doc.edit(start, removed, &spaces, self.now_ms, false) {
+                    self.caret = pos;
+                    self.anchor = pos;
+                    self.after_document_mutated(rasterizer, host);
+                }
+            }
+            _ => {
+                if !mods.primary() && !mods.ctrl {
+                    if let Some(s) = text {
+                        if !s.is_empty() && !s.chars().all(|c| c.is_control()) {
+                            self.preferred_x_px = None;
+                            let (start, removed) = self
+                                .selection()
+                                .map(|(a, b)| (a, b - a))
+                                .unwrap_or((self.caret, 0));
+                            let coalescable = removed == 0 && s.len() <= 8;
+                            if let Ok(pos) =
+                                self.doc.edit(start, removed, s, self.now_ms, coalescable)
+                            {
+                                self.caret = pos;
+                                self.anchor = pos;
+                                self.after_document_mutated(rasterizer, host);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn after_document_mutated(
+        &mut self,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        let metrics = self.doc_metrics(rasterizer);
+        self.viewport
+            .ensure_caret_visible(&mut self.doc, self.caret, metrics, self.framebuffer.scale);
+        if self.find_bar.visible {
+            self.refresh_search();
+        }
+        self.sync_title(host);
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    fn move_grapheme_left(&mut self, offset: u64) -> u64 {
+        if offset == 0 {
+            return 0;
+        }
+        let (line, col) = self.doc.byte_to_line_col(offset);
+        if col > 0 {
+            let content = self.doc.line_content(line).unwrap_or_default();
+            let prev = prev_grapheme_boundary(&content, col);
+            let (start, _, _) = self.doc.line_byte_range(line).unwrap_or((0, 0, 0));
+            start + prev as u64
+        } else if line > 0 {
+            let (_, prev_content_end, _) = self.doc.line_byte_range(line - 1).unwrap_or((0, 0, 0));
+            prev_content_end
+        } else {
+            0
+        }
+    }
+
+    fn move_grapheme_right(&mut self, offset: u64) -> u64 {
+        let total = self.doc.len_bytes();
+        if offset >= total {
+            return total;
+        }
+        let (line, col) = self.doc.byte_to_line_col(offset);
+        let (start, content_end, full_end) = self.doc.line_byte_range(line).unwrap_or((0, 0, 0));
+        let content_len = (content_end - start) as usize;
+        if col < content_len {
+            let content = self.doc.line_content(line).unwrap_or_default();
+            let next = next_grapheme_boundary(&content, col);
+            start + next as u64
+        } else {
+            full_end
+        }
+    }
+
+    fn move_word_left(&mut self, offset: u64) -> u64 {
+        if offset == 0 {
+            return 0;
+        }
+        let (line, col) = self.doc.byte_to_line_col(offset);
+        if col > 0 {
+            let content = self.doc.line_content(line).unwrap_or_default();
+            let prev = prev_word_boundary(&content, col);
+            let (start, _, _) = self.doc.line_byte_range(line).unwrap_or((0, 0, 0));
+            start + prev as u64
+        } else if line > 0 {
+            let (_, prev_content_end, _) = self.doc.line_byte_range(line - 1).unwrap_or((0, 0, 0));
+            prev_content_end
+        } else {
+            0
+        }
+    }
+
+    fn move_word_right(&mut self, offset: u64) -> u64 {
+        let total = self.doc.len_bytes();
+        if offset >= total {
+            return total;
+        }
+        let (line, col) = self.doc.byte_to_line_col(offset);
+        let (start, content_end, full_end) = self.doc.line_byte_range(line).unwrap_or((0, 0, 0));
+        let content_len = (content_end - start) as usize;
+        if col < content_len {
+            let content = self.doc.line_content(line).unwrap_or_default();
+            let next = next_word_boundary(&content, col);
+            start + next as u64
+        } else {
+            full_end
+        }
+    }
+
+    fn move_vertical(&mut self, delta_lines: isize, metrics: editor_platform::FontMetrics) {
+        let (line, col) = self.doc.byte_to_line_col(self.caret);
+        let target_x = match self.preferred_x_px {
+            Some(x) => x,
+            None => {
+                let text = self.doc.line_content(line).unwrap_or_default();
+                let x = self.viewport.measure_prefix_px(&text, col, metrics.cell_width);
+                self.preferred_x_px = Some(x);
+                x
+            }
+        };
+
+        let target_line = if delta_lines < 0 {
+            line.saturating_sub((-delta_lines) as usize)
+        } else {
+            let cand = line.saturating_add(delta_lines as usize);
+            self.doc.tree_mut().ensure_indexed_for_line(cand);
+            cand.min(self.doc.editable_line_count().saturating_sub(1))
+        };
+
+        let content = self.doc.line_content(target_line).unwrap_or_default();
+        let (start, _, _) = self.doc.line_byte_range(target_line).unwrap_or((0, 0, 0));
+        // Find column closest to `target_x`.
+        let mut best_col = content.len();
+        let mut cur_cells = 0usize;
+        for (off, cluster) in editor_core::grapheme_clusters(&content) {
+            let cw = if cluster == "\t" {
+                self.viewport.tab_width - (cur_cells % self.viewport.tab_width)
+            } else {
+                editor_core::cluster_cell_width(cluster) as usize
+            };
+            let x0 = cur_cells as f32 * metrics.cell_width;
+            let mid = x0 + (cw as f32 * metrics.cell_width) * 0.5;
+            if target_x < mid {
+                best_col = off;
+                break;
+            }
+            cur_cells += cw;
+        }
+        self.caret = start + best_col as u64;
+    }
+
+    fn handle_mouse_down(
+        &mut self,
+        x_px: f32,
+        y_px: f32,
+        click_count: u8,
+        mods: Modifiers,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        let scale = self.framebuffer.scale;
+        let xi = x_px.round() as i32;
+        let yi = y_px.round() as i32;
+
+        // 1. Sidebar resize edge or click.
+        if self.sidebar.is_visible() {
+            let sb_hit = self.sidebar.hit_test(self.layout.sidebar, x_px, y_px, scale);
+            if sb_hit == SidebarHit::ResizeEdge {
+                self.dragging_sidebar_edge = true;
+                host.set_cursor(CursorShape::ResizeHorizontal);
+                return;
+            }
+            if sb_hit != SidebarHit::None {
+                self.sidebar.set_focused(true);
+                self.find_bar.find_input.focused = false;
+                self.find_bar.replace_input.focused = false;
+                match self
+                    .sidebar
+                    .handle_click(self.fs.as_ref(), self.layout.sidebar, x_px, y_px, scale)
+                {
+                    SidebarAction::OpenFile(p) => {
+                        if self.confirm_discard_if_dirty(host) {
+                            if let Err(e) = self.open_file(&p, host) {
+                                self.set_notice(e, true);
+                            } else {
+                                self.sidebar.set_focused(false);
+                            }
+                        }
+                    }
+                    SidebarAction::Changed => {
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    SidebarAction::None => {}
+                }
+                return;
+            }
+        }
+
+        // 2. Find / Replace bar click.
+        if self.find_bar.visible && self.layout.find_bar.contains(xi, yi) {
+            self.sidebar.set_focused(false);
+            match self.find_bar.hit_test(x_px, y_px) {
+                FindBarAction::FocusFind => {
+                    self.find_bar.find_input.focused = true;
+                    self.find_bar.replace_input.focused = false;
+                }
+                FindBarAction::FocusReplace => {
+                    self.find_bar.find_input.focused = false;
+                    self.find_bar.replace_input.focused = true;
+                }
+                FindBarAction::ToggleCase => {
+                    self.find_bar.case_sensitive = !self.find_bar.case_sensitive;
+                    self.refresh_search();
+                }
+                FindBarAction::FindNext => {
+                    self.jump_search_match(true, rasterizer, host);
+                    return;
+                }
+                FindBarAction::FindPrev => {
+                    self.jump_search_match(false, rasterizer, host);
+                    return;
+                }
+                FindBarAction::ReplaceOne => {
+                    self.replace_active_match(rasterizer, host);
+                    return;
+                }
+                FindBarAction::ReplaceAll => {
+                    self.replace_all_matches(rasterizer, host);
+                    return;
+                }
+                FindBarAction::Close => {
+                    self.find_bar.close();
+                    self.search_matches.clear();
+                    self.active_match = None;
+                    self.recompute_layout();
+                }
+                FindBarAction::None => {}
+            }
+            self.mark_dirty();
+            host.request_redraw();
+            return;
+        }
+
+        // 3. Document viewport (scrollbars first, then text hit-test).
+        if self.layout.viewport.contains(xi, yi) {
+            self.sidebar.set_focused(false);
+            self.find_bar.find_input.focused = false;
+            self.find_bar.replace_input.focused = false;
+            self.goto_line.close();
+            self.doc.break_undo_coalescing();
+
+            let metrics = self.doc_metrics(rasterizer);
+            let sb_hit = self.viewport.hit_test_scrollbar(x_px, y_px);
+            match sb_hit {
+                ScrollbarHit::VerticalThumb | ScrollbarHit::HorizontalThumb => {
+                    self.viewport.begin_scrollbar_drag(sb_hit, x_px, y_px, metrics);
+                    self.mark_dirty();
+                    host.request_redraw();
+                    return;
+                }
+                ScrollbarHit::VerticalTrack => {
+                    let page = self.viewport.layout.text.h as f32 * 0.85;
+                    let dir = if yi < self.viewport.layout.v_thumb.y {
+                        -page
+                    } else {
+                        page
+                    };
+                    self.viewport
+                        .scroll_by(0.0, dir, &mut self.doc, metrics, scale);
+                    self.mark_dirty();
+                    host.request_redraw();
+                    return;
+                }
+                ScrollbarHit::HorizontalTrack => {
+                    let page = self.viewport.layout.text.w as f32 * 0.85;
+                    let dir = if xi < self.viewport.layout.h_thumb.x {
+                        -page
+                    } else {
+                        page
+                    };
+                    self.viewport
+                        .scroll_by(dir, 0.0, &mut self.doc, metrics, scale);
+                    self.mark_dirty();
+                    host.request_redraw();
+                    return;
+                }
+                ScrollbarHit::None => {}
+            }
+
+            let hit = self
+                .viewport
+                .hit_test_text(x_px, y_px, &mut self.doc, metrics, scale);
+            self.preferred_x_px = None;
+            self.dragging_selection = true;
+            self.drag_click_count = click_count.clamp(1, 3);
+
+            match self.drag_click_count {
+                1 => {
+                    self.caret = hit.byte_offset;
+                    if !mods.shift {
+                        self.anchor = hit.byte_offset;
+                    }
+                }
+                2 => {
+                    let content = self.doc.line_content(hit.line).unwrap_or_default();
+                    let (ws, we) = word_range_at(&content, hit.col_bytes);
+                    let (ls, _, _) = self.doc.line_byte_range(hit.line).unwrap_or((0, 0, 0));
+                    self.anchor = ls + ws as u64;
+                    self.caret = ls + we as u64;
+                    self.drag_word_anchor = (self.anchor, self.caret);
+                }
+                _ => {
+                    let (ls, _, l_full) = self.doc.line_byte_range(hit.line).unwrap_or((0, 0, 0));
+                    self.anchor = ls;
+                    self.caret = l_full;
+                    self.drag_word_anchor = (ls, l_full);
+                }
+            }
+            self.mark_dirty();
+            host.request_redraw();
+        }
+    }
+
+    fn handle_mouse_move(
+        &mut self,
+        x_px: f32,
+        y_px: f32,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        let scale = self.framebuffer.scale;
+        if self.dragging_sidebar_edge {
+            self.sidebar.set_width_pt(x_px / scale);
+            self.recompute_layout();
+            self.mark_dirty();
+            host.request_redraw();
+            return;
+        }
+        if self.viewport.v_bar_dragging || self.viewport.h_bar_dragging {
+            let metrics = self.doc_metrics(rasterizer);
+            if self
+                .viewport
+                .drag_scrollbar(x_px, y_px, &mut self.doc, metrics, scale)
+            {
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            return;
+        }
+        if self.dragging_selection {
+            let metrics = self.doc_metrics(rasterizer);
+            let hit = self
+                .viewport
+                .hit_test_text(x_px, y_px, &mut self.doc, metrics, scale);
+            match self.drag_click_count {
+                1 => self.caret = hit.byte_offset,
+                2 => {
+                    let content = self.doc.line_content(hit.line).unwrap_or_default();
+                    let (ws, we) = word_range_at(&content, hit.col_bytes);
+                    let (ls, _, _) = self.doc.line_byte_range(hit.line).unwrap_or((0, 0, 0));
+                    let (a0, b0) = self.drag_word_anchor;
+                    let (cur_s, cur_e) = (ls + ws as u64, ls + we as u64);
+                    if cur_s < a0 {
+                        self.anchor = b0;
+                        self.caret = cur_s;
+                    } else {
+                        self.anchor = a0;
+                        self.caret = cur_e.max(b0);
+                    }
+                }
+                _ => {
+                    let (ls, _, l_full) = self.doc.line_byte_range(hit.line).unwrap_or((0, 0, 0));
+                    let (a0, b0) = self.drag_word_anchor;
+                    if ls < a0 {
+                        self.anchor = b0;
+                        self.caret = ls;
+                    } else {
+                        self.anchor = a0;
+                        self.caret = l_full.max(b0);
+                    }
+                }
+            }
+            self.mark_dirty();
+            host.request_redraw();
+            return;
+        }
+
+        // Hover cursor & scrollbar hover highlight.
+        let xi = x_px.round() as i32;
+        let yi = y_px.round() as i32;
+        if self.sidebar.is_visible() {
+            let hit = self
+                .sidebar
+                .set_hovered(self.layout.sidebar, x_px, y_px, scale);
+            if hit == SidebarHit::ResizeEdge {
+                host.set_cursor(CursorShape::ResizeHorizontal);
+                return;
+            }
+            if hit != SidebarHit::None {
+                host.set_cursor(CursorShape::Pointer);
+                self.mark_dirty();
+                host.request_redraw();
+                return;
+            }
+        }
+        let sb = self.viewport.hit_test_scrollbar(x_px, y_px);
+        let prev_vh = self.viewport.v_bar_hovered;
+        let prev_hh = self.viewport.h_bar_hovered;
+        self.viewport.v_bar_hovered =
+            matches!(sb, ScrollbarHit::VerticalThumb | ScrollbarHit::VerticalTrack);
+        self.viewport.h_bar_hovered = matches!(
+            sb,
+            ScrollbarHit::HorizontalThumb | ScrollbarHit::HorizontalTrack
+        );
+        if prev_vh != self.viewport.v_bar_hovered || prev_hh != self.viewport.h_bar_hovered {
+            self.mark_dirty();
+            host.request_redraw();
+        }
+        if sb != ScrollbarHit::None {
+            host.set_cursor(CursorShape::Arrow);
+        } else if self.viewport.layout.text.contains(xi, yi) {
+            host.set_cursor(CursorShape::IBeam);
+        } else {
+            host.set_cursor(CursorShape::Arrow);
+        }
+    }
+
+    fn handle_scroll(
+        &mut self,
+        dx_px: f32,
+        dy_px: f32,
+        x_px: f32,
+        y_px: f32,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        let xi = x_px.round() as i32;
+        let yi = y_px.round() as i32;
+        if self.sidebar.is_visible() && self.layout.sidebar.contains(xi, yi) {
+            self.sidebar.scroll_by(dy_px, self.layout.sidebar.h);
+            self.mark_dirty();
+            host.request_redraw();
+            return;
+        }
+        let metrics = self.doc_metrics(rasterizer);
+        self.viewport
+            .scroll_by(dx_px, dy_px, &mut self.doc, metrics, self.framebuffer.scale);
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    // ========================================================================
+    // Find / Replace Helpers
+    // ========================================================================
+
+    pub fn refresh_search(&mut self) {
+        let query = self.find_bar.find_input.text.clone();
+        if query.is_empty() {
+            self.search_matches.clear();
+            self.active_match = None;
+            self.find_bar.match_count = 0;
+            self.find_bar.active_match = None;
+            return;
+        }
+        let opts = SearchOptions {
+            case_sensitive: self.find_bar.case_sensitive,
+            max_matches: 10_000,
+        };
+        self.search_matches = self.doc.find_all(&query, opts);
+        self.find_bar.match_count = self.search_matches.len();
+        self.active_match = if self.search_matches.is_empty() {
+            None
+        } else {
+            self.search_matches
+                .iter()
+                .position(|m| m.start >= self.caret)
+                .or(Some(0))
+        };
+        self.find_bar.active_match = self.active_match;
+    }
+
+    fn select_match(&mut self, idx: usize, rasterizer: &mut dyn GlyphRasterizer) {
+        if let Some(m) = self.search_matches.get(idx).copied() {
+            self.active_match = Some(idx);
+            self.find_bar.active_match = Some(idx);
+            self.anchor = m.start;
+            self.caret = m.end;
+            let metrics = self.doc_metrics(rasterizer);
+            self.viewport
+                .ensure_caret_visible(&mut self.doc, self.caret, metrics, self.framebuffer.scale);
+        }
+    }
+
+    fn jump_search_match(
+        &mut self,
+        forward: bool,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        if self.search_matches.is_empty() {
+            self.refresh_search();
+        }
+        let len = self.search_matches.len();
+        if len == 0 {
+            return;
+        }
+        let next_idx = match self.active_match {
+            Some(i) if forward => (i + 1) % len,
+            Some(i) => (i + len - 1) % len,
+            None => 0,
+        };
+        self.select_match(next_idx, rasterizer);
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    fn replace_active_match(
+        &mut self,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        let Some(idx) = self.active_match else {
+            return;
+        };
+        let Some(m) = self.search_matches.get(idx).copied() else {
+            return;
+        };
+        let replacement = self.find_bar.replace_input.text.clone();
+        if let Ok(pos) = self
+            .doc
+            .edit(m.start, m.end - m.start, &replacement, self.now_ms, false)
+        {
+            self.caret = pos;
+            self.anchor = pos;
+            self.after_document_mutated(rasterizer, host);
+            if let Some(next_idx) = self.active_match {
+                self.select_match(next_idx, rasterizer);
+            }
+        }
+    }
+
+    fn replace_all_matches(
+        &mut self,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        let query = self.find_bar.find_input.text.clone();
+        if query.is_empty() {
+            return;
+        }
+        let replacement = self.find_bar.replace_input.text.clone();
+        let opts = SearchOptions {
+            case_sensitive: self.find_bar.case_sensitive,
+            max_matches: 100_000,
+        };
+        let count = self.doc.replace_all(&query, &replacement, opts, self.now_ms);
+        self.caret = self.caret.min(self.doc.len_bytes());
+        self.anchor = self.caret;
+        self.after_document_mutated(rasterizer, host);
+        self.set_notice(format!("Replaced {count} occurrence(s)"), false);
+    }
+}

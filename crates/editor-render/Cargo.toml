@@ -1,0 +1,9 @@
+[package]
+name = "editor-render"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+editor-platform = { path = "../editor-platform" }
+editor-core = { path = "../editor-core" }

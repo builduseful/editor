@@ -1,0 +1,15 @@
+[package]
+name = "editor-macos"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "editor-gui"
+path = "src/main.rs"
+
+[dependencies]
+editor-platform = { path = "../editor-platform" }
+editor-core = { path = "../editor-core" }
+editor-render = { path = "../editor-render" }
+editor-app = { path = "../editor-app" }

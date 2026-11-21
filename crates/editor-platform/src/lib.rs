@@ -1,0 +1,27 @@
+//! Minimal, portable platform adapter interfaces.
+//!
+//! This crate defines the ONLY boundaries between the portable Rust editor
+//! (`editor-core`, `editor-render`, `editor-app`) and any host operating system.
+//! It has zero third-party dependencies and includes pure-Rust headless/mock
+//! implementations so the entire application can be tested and benchmarked
+//! without an OS windowing server.
+
+pub mod fs;
+pub mod host;
+pub mod input;
+pub mod raster;
+pub mod surface;
+
+pub use fs::{
+    DirEntry, EntryKind, FileHandle, FileRev, FileStat, FileSystem, FsError, FsResult,
+    MemoryFileSystem, StdFileSystem,
+};
+pub use host::{Clipboard, HeadlessHost, MemoryClipboard, PlatformHost};
+pub use input::{
+    AppCommand, ConfirmChoice, CursorShape, InputEvent, Key, Modifiers, MouseButton, SystemTheme,
+    ThemePreference,
+};
+pub use raster::{
+    BuiltinBitmapRasterizer, FontMetrics, FontStyle, GlyphFormat, GlyphRasterizer, RasterizedGlyph,
+};
+pub use surface::{DirtyRegion, Framebuffer, PixelRect};

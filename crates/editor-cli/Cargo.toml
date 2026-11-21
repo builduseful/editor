@@ -1,0 +1,13 @@
+[package]
+name = "editor-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "editor"
+path = "src/main.rs"
+
+[dependencies]
+editor-platform = { path = "../editor-platform" }
+editor-core = { path = "../editor-core" }
