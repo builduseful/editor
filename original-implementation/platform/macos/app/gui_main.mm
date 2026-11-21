@@ -7,6 +7,7 @@
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
 
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -18,6 +19,8 @@
 #include "editor.hpp"
 #include "text_coretext.hpp"
 #include "dir_source_posix.hpp"
+#include "image_decode.hpp"
+#include "imageview.hpp"
 #include "viewcore.hpp"
 
 @class EditorView;
@@ -143,6 +146,7 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)applyTheme:(vc::Theme)t;
 @end
 
+
 // The file sidebar (§9). A recursive, lazily-read tree, custom-drawn (D2) from
 // the same tokens as the document view — no NSOutlineView, no native control.
 // The tree itself lives in viewcore (headless-tested); this is its AppKit shell.
@@ -162,6 +166,151 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)revealPath:(NSString*)path;
 // YES if `path` is the root or lies under it ("/foo" is not under "/foobar").
 - (BOOL)isUnderPath:(NSString*)path;
+@end
+
+// An image document (PNG, JPEG, …): the same window, a different kind of
+// document. It is custom-drawn through the same CoreGraphics canvas the text
+// view uses, so it needs no native control and matches the app's look.
+//
+// Deliberately small: Fit / Actual size, wheel and drag to pan. No zoom slider,
+// no rotation, no annotation — v1 shows the image.
+@interface ImageDocumentView : NSView
+// The image, or nil when the file could not be decoded.
+- (void)setImagePath:(NSString*)path;
+- (NSString*)imagePath;
+// YES if an image loaded; NO means the caller should show the failure text.
+- (BOOL)hasImage;
+// The decoded size in pixels, for the status bar.
+- (CGSize)pixelSize;
+- (void)applyTheme:(vc::Theme)t;
+// View > Actual Size / Fit.
+- (void)actualSize:(id)sender;
+- (void)fit:(id)sender;
+- (BOOL)validateMenuItem:(NSMenuItem*)item;
+// Test hook: pan by wheel notches (see the implementation).
+- (void)panByNotchesY:(int)dy x:(int)dx;
+@end
+
+@implementation ImageDocumentView {
+  std::unique_ptr<vc::ImageView> _view;
+  vc::Theme _theme;
+  std::string _path;
+  BOOL _dragging;
+  NSPoint _last;
+}
+
+- (instancetype)initWithFrame:(NSRect)frame {
+  self = [super initWithFrame:frame];
+  if (self != nil) {
+    _view = std::make_unique<vc::ImageView>();
+    _theme = vc::light_theme();
+    self.wantsLayer = YES;
+  }
+  return self;
+}
+
+- (BOOL)isFlipped {
+  return NO;  // CoreGraphics native orientation; the canvas converts y
+}
+
+- (BOOL)acceptsFirstResponder {
+  return YES;
+}
+
+- (void)applyTheme:(vc::Theme)t {
+  _theme = t;
+  self.layer.backgroundColor = ns_color(t.background).CGColor;
+  [self setNeedsDisplay:YES];
+}
+
+- (void)setImagePath:(NSString*)path {
+  _path = path != nil ? path.UTF8String : "";
+  vc::Image img =
+      path != nil ? ed::mac::decode_image(path.UTF8String) : vc::Image{};
+  _view->set_path(_path);
+  _view->set_image(img);
+  [self setNeedsDisplay:YES];
+}
+
+- (NSString*)imagePath {
+  return _path.empty() ? nil : [NSString stringWithUTF8String:_path.c_str()];
+}
+
+- (BOOL)hasImage {
+  return _view->has_image();
+}
+
+- (CGSize)pixelSize {
+  if (!_view->has_image()) return CGSizeZero;
+  return CGSizeMake(_view->image().width, _view->image().height);
+}
+
+- (void)actualSize:(id)sender {
+  (void)sender;
+  _view->set_actual();
+  [self setNeedsDisplay:YES];
+}
+
+- (void)fit:(id)sender {
+  (void)sender;
+  _view->set_fit();
+  [self setNeedsDisplay:YES];
+}
+
+- (BOOL)validateMenuItem:(NSMenuItem*)item {
+  if (item.action == @selector(actualSize:)) {
+    item.state = _view->fit() ? NSControlStateValueOff : NSControlStateValueOn;
+  } else if (item.action == @selector(fit:)) {
+    item.state = _view->fit() ? NSControlStateValueOn : NSControlStateValueOff;
+  }
+  return YES;
+}
+
+// Test hook: pan by whole wheel notches, through the same path scrollWheel:
+// uses, so a snapshot can pin a panned image without a display.
+- (void)panByNotchesY:(int)dy x:(int)dx {
+  static constexpr double kNotch = 48.9;  // the same quantum the text view uses
+  _view->scroll_by(-static_cast<double>(dx) * kNotch,
+                   -static_cast<double>(dy) * kNotch);
+  [self setNeedsDisplay:YES];
+}
+
+// Wheel pans the image (there is no text scroll model here).
+- (void)scrollWheel:(NSEvent*)event {
+  const double dy = event.scrollingDeltaY;
+  const double dx = event.scrollingDeltaX;
+  _view->scroll_by(-dx, -dy);
+  [self setNeedsDisplay:YES];
+}
+
+- (void)mouseDown:(NSEvent*)event {
+  _dragging = YES;
+  _last = [self convertPoint:event.locationInWindow fromView:nil];
+}
+
+- (void)mouseDragged:(NSEvent*)event {
+  if (!_dragging) return;
+  const NSPoint p = [self convertPoint:event.locationInWindow fromView:nil];
+  // AppKit y-up -> viewcore y-down: dragging down must move the image down.
+  _view->scroll_by(p.x - _last.x, _last.y - p.y);
+  _last = p;
+  [self setNeedsDisplay:YES];
+}
+
+- (void)mouseUp:(NSEvent*)event {
+  (void)event;
+  _dragging = NO;
+}
+
+- (void)drawRect:(NSRect)dirtyRect {
+  (void)dirtyRect;
+  const NSSize size = self.bounds.size;
+  _view->set_viewport(size.width, size.height);
+  CGContextRef ctx = [[NSGraphicsContext currentContext] CGContext];
+  auto canvas = ed::mac::create_cg_canvas(ctx, size.width, size.height);
+  _view->draw(*canvas, _theme);
+}
+
 @end
 
 @interface EditorView : NSView
@@ -212,6 +361,8 @@ static BOOL write_view_png(NSView* v, NSString* path) {
 - (void)toggleSidebar:(id)sender;
 // View > Tab Width: the sender's tag is the width in columns.
 - (void)setTabWidth:(id)sender;
+// View > Wrap Width: the tag is the column count, 0 meaning "the window".
+- (void)setWrapWidth:(id)sender;
 // Re-reads the sidebar's open directories from disk (the window became key).
 - (void)refreshSidebarFromDisk;
 @end
@@ -636,6 +787,10 @@ static constexpr double kSidebarGrip = 6.0;
   const int tw = static_cast<int>([d integerForKey:@"TabWidth"]);
   _view->set_tab_width(tw > 0 ? tw : 4);
   _view->set_wrap([d boolForKey:@"Wrap"]);
+  // A fixed wrap column (0 = the window). A stored column implies wrap on.
+  const int ww = static_cast<int>([d integerForKey:@"WrapWidth"]);
+  _view->set_wrap_width(ww > 0 ? ww : 0);
+  if (ww > 0) _view->set_wrap(YES);
 }
 
 - (void)applyFontSize:(double)size {
@@ -661,6 +816,20 @@ static constexpr double kSidebarGrip = 6.0;
   const bool on = !_view->wrap();
   _view->set_wrap(on);
   [[NSUserDefaults standardUserDefaults] setBool:on forKey:@"Wrap"];
+  [self setNeedsDisplay:YES];
+}
+
+// View > Wrap Width: the sender's tag is the column count; 0 means "the window".
+- (void)setWrapWidth:(id)sender {
+  const NSInteger width = [sender tag];
+  if (width < 0 || width > 200) return;
+  _view->set_wrap_width(static_cast<int>(width));
+  [[NSUserDefaults standardUserDefaults] setInteger:width forKey:@"WrapWidth"];
+  if (width > 0 && !_view->wrap()) {
+    // A fixed column is meaningless with wrap off.
+    _view->set_wrap(YES);
+    [[NSUserDefaults standardUserDefaults] setBool:YES forKey:@"Wrap"];
+  }
   [self setNeedsDisplay:YES];
 }
 
@@ -1102,6 +1271,10 @@ static constexpr double kSidebarGrip = 6.0;
     item.state = (static_cast<int>(item.tag) == _view->tab_width())
                      ? NSControlStateValueOn
                      : NSControlStateValueOff;
+  } else if (item.action == @selector(setWrapWidth:)) {
+    item.state = (static_cast<int>(item.tag) == _view->wrap_width())
+                     ? NSControlStateValueOn
+                     : NSControlStateValueOff;
   } else if (item.action == @selector(toggleSidebar:)) {
     item.state = (self.sidebar != nil && !self.sidebar.isHidden)
                      ? NSControlStateValueOn
@@ -1350,6 +1523,8 @@ static constexpr double kSidebarGrip = 6.0;
 @interface AppDelegate : NSObject <NSApplicationDelegate, NSWindowDelegate>
 @property(nonatomic, assign) Editor* editor;
 @property(nonatomic, assign) EditorView* view;
+// The image view, when the document is a picture instead of text.
+@property(nonatomic, assign) ImageDocumentView* imageView;
 @property(nonatomic, strong) NSWindow* aboutWindow;
 @property(nonatomic, copy) NSString* snapshotPath;
 // Capture before the index completes (`--snapshot-early`), not after.
@@ -1367,10 +1542,22 @@ static constexpr double kSidebarGrip = 6.0;
 @implementation AppDelegate
 - (void)applicationDidFinishLaunching:(NSNotification*)note {
   (void)note;
-  [self.view updateTitle];
-  [self.view performSelector:@selector(beginDiscovery)
-                  withObject:nil
-                  afterDelay:0.1];
+  if (self.view != nil) {
+    [self.view updateTitle];
+    [self.view performSelector:@selector(beginDiscovery)
+                    withObject:nil
+                    afterDelay:0.1];
+  }
+  // An image window has no EditorView to route the theme through, so apply it
+  // here, where the appearance is known.
+  if (self.imageView != nil) {
+    NSAppearanceName name = [self.imageView.effectiveAppearance
+        bestMatchFromAppearancesWithNames:@[ NSAppearanceNameAqua,
+                                             NSAppearanceNameDarkAqua ]];
+    [self.imageView applyTheme:[name isEqualToString:NSAppearanceNameDarkAqua]
+                                    ? vc::dark_theme()
+                                    : vc::light_theme()];
+  }
   if (self.snapshotPath != nil) {
     // Let the first frame draw, then snapshot and exit (the `--snapshot` test).
     [NSTimer scheduledTimerWithTimeInterval:0.5
@@ -1400,25 +1587,40 @@ static constexpr double kSidebarGrip = 6.0;
   // startup chrome (the gutter) does not move while the count grows; without it
   // every snapshot is post-discovery and would hide that.
   const BOOL early = self.snapshotEarly;
-  if (!early) [self.view finishIndex];  // a steady frame: exact scrollbars, caret on
-  if (self.snapshotScrollLine > 0) {
-    [self.view scrollToLine:self.snapshotScrollLine];
+  if (self.imageView != nil) {
+    // An image has no index to finish and no caret to freeze; it is already a
+    // steady frame once the decode has happened.
+    (void)early;
+  } else {
+    if (!early) [self.view finishIndex];  // exact scrollbars, caret on
   }
-  if (self.snapshotScrollX > 0) {
-    [self.view scrollToX:self.snapshotScrollX];
+  if (self.imageView == nil) {
+    if (self.snapshotScrollLine > 0) {
+      [self.view scrollToLine:self.snapshotScrollLine];
+    }
+    if (self.snapshotScrollX > 0) {
+      [self.view scrollToX:self.snapshotScrollX];
+    }
   }
   if (self.wheelNotches.length > 0) {
     NSArray<NSString*>* parts = [self.wheelNotches
         componentsSeparatedByString:@","];
     const int dy = parts.count > 0 ? parts[0].intValue : 0;
     const int dx = parts.count > 1 ? parts[1].intValue : 0;
-    [self postWheelNotchesY:dy x:dx];
+    if (self.imageView == nil) {
+      [self postWheelNotchesY:dy x:dx];
+    } else {
+      [self.imageView panByNotchesY:dy x:dx];
+    }
   }
   // The window's frame view, so the title bar (file name, dirty dot) is included.
-  NSView* content = self.view.window.contentView;
+  NSView* content = (self.imageView != nil ? self.imageView : self.view).window.contentView;
   NSView* frameView = content != nil ? content.superview : nil;
-  const BOOL ok = write_view_png(frameView != nil ? frameView : self.view,
-                                 self.snapshotPath);
+  const BOOL ok =
+      write_view_png(frameView != nil ? frameView
+                                      : (self.imageView != nil ? self.imageView
+                                                               : self.view),
+                     self.snapshotPath);
   std::fprintf(stderr, "[snapshot] %s -> %s\n",
                ok ? "wrote" : "FAILED", self.snapshotPath.UTF8String);
   [NSApp terminate:nil];
@@ -1646,20 +1848,63 @@ void build_menu_bar(NSApplication* app, id aboutTarget) {
   }
   [tabItem setSubmenu:submenu(@"Tab Width", widths)];
 
+  // Wrap Width: 0 means "the window" (wrap to the viewport, the default); a
+  // positive number wraps at that column, which is what prose wants (72 or 80).
+  NSMenuItem* wrapWidthItem = [[NSMenuItem alloc] initWithTitle:@"Wrap Width"
+                                                        action:nil
+                                                 keyEquivalent:@""];
+  NSMutableArray<NSMenuItem*>* wrapWidths = [NSMutableArray array];
+  NSMenuItem* wrapWindow = item(@"Window", @selector(setWrapWidth:), @"");
+  wrapWindow.tag = 0;
+  [wrapWidths addObject:wrapWindow];
+  for (NSInteger w = 40; w <= 100; w += 20) {
+    NSMenuItem* it = item([NSString stringWithFormat:@"%ld", (long)w],
+                          @selector(setWrapWidth:), @"");
+    it.tag = w;
+    [wrapWidths addObject:it];
+  }
+  [wrapWidthItem setSubmenu:submenu(@"Wrap Width", wrapWidths)];
+
+  // Wrap Lines: ⇧⌘W is the usual "wrap" binding, and it does not collide with
+  // anything here (⌘W is Close).
+  NSMenuItem* wrapItem = item(@"Wrap Lines", @selector(toggleWrap:), @"w");
+  wrapItem.keyEquivalentModifierMask =
+      NSEventModifierFlagCommand | NSEventModifierFlagShift;
+
   [viewItem setSubmenu:submenu(@"View", @[
     item(@"Show Sidebar", @selector(toggleSidebar:), @""),
-    item(@"Wrap Lines", @selector(toggleWrap:), @""),
+    wrapItem,
     [NSMenuItem separatorItem],
     item(@"Bigger", @selector(increaseFontSize:), @"+"),
     item(@"Smaller", @selector(decreaseFontSize:), @"-"),
     [NSMenuItem separatorItem],
     tabItem,
+    wrapWidthItem,
   ])];
 
   [app setMainMenu:menubar];
 }
 
 }  // namespace
+
+// True if `path`'s extension is one ImageIO decodes. This is a dispatch hint,
+// not the decision: an image that fails to decode still opens (with a message),
+// and a mislabelled file falls back to the text core.
+static bool looks_like_image(const std::string& path) {
+  const size_t dot = path.find_last_of('.');
+  if (dot == std::string::npos) return false;
+  std::string ext = path.substr(dot + 1);
+  for (char& c : ext) {
+    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  }
+  static const char* kImageExt[] = {"png", "jpg", "jpeg", "jpe", "gif",
+                                    "bmp", "tif", "tiff", "heic", "heif",
+                                    "ico", "webp"};
+  for (const char* e : kImageExt) {
+    if (ext == e) return true;
+  }
+  return false;
+}
 
 // The value of `--name VALUE`, or "" when it is absent. Used for the snapshot
 // flags, which are test surface and not a general argument parser.
@@ -1715,6 +1960,9 @@ int main(int argc, char** argv) {
     std::unique_ptr<Editor> ed;
     create_editor(*fs, &ed);
     bool opened = false;
+    // An image argument is a different kind of document: it does not go through
+    // the text core at all.
+    bool opened_as_image = false;
     if (!path.empty()) {
       // A folder on the command line (a dropped folder, `open -a editor DIR`)
       // is a sidebar root, not a document. Say so instead of reporting a
@@ -1723,6 +1971,9 @@ int main(int argc, char** argv) {
       if (::stat(path.c_str(), &st) == 0 && S_ISDIR(st.st_mode)) {
         std::fprintf(stderr, "editor: %s is a folder; rooting the sidebar\n",
                      path.c_str());
+      } else if (looks_like_image(path)) {
+        opened_as_image = true;
+        opened = true;  // the window has a document; just not a text one
       } else {
         const Status s = ed->open(path);
         if (s != Status::Ok) {
@@ -1739,7 +1990,7 @@ int main(int argc, char** argv) {
     // the file over it). The buffer is backed by a private temp file that is
     // removed once the document gets a path of its own, or on quit.
     std::string untitled;
-    if (!opened) {
+    if (!opened) {  // an image opened above is "opened" without a text buffer
       for (int attempt = 0; attempt < 3 && !opened; ++attempt) {
         untitled = untitled_path(attempt);
         if (ed->create(untitled) == Status::Ok) opened = true;
@@ -1767,17 +2018,33 @@ int main(int argc, char** argv) {
     // height beyond the system's own.
     [win setContentMinSize:NSMakeSize(480.0, 320.0)];
 
-    EditorView* view = [[EditorView alloc] initWithEditor:ed.get()];
-    if (opened && !path.empty()) {
-      view.documentPath = [NSString stringWithUTF8String:path.c_str()];
+    // An image window is the same shell with a different document view in the
+    // editor slot. The sidebar, the status bar and the theme all work the same;
+    // there is no find bar (there is nothing to find in a picture).
+    ImageDocumentView* imageView = nil;
+    EditorView* view = nil;
+    if (opened_as_image) {
+      imageView = [[ImageDocumentView alloc]
+          initWithFrame:NSMakeRect(0, 0, win_w, win_h)];
+      [imageView setImagePath:[NSString stringWithUTF8String:path.c_str()]];
+      if (![imageView hasImage]) {
+        std::fprintf(stderr, "editor: cannot decode image %s\n", path.c_str());
+      }
+    } else {
+      view = [[EditorView alloc] initWithEditor:ed.get()];
+      if (opened && !path.empty()) {
+        view.documentPath = [NSString stringWithUTF8String:path.c_str()];
+      }
+      if (!untitled.empty()) {
+        view.untitledTempPath = [NSString stringWithUTF8String:untitled.c_str()];
+      }
     }
-    if (!untitled.empty()) {
-      view.untitledTempPath = [NSString stringWithUTF8String:untitled.c_str()];
-    }
-    FindBar* bar = [[FindBar alloc] initWithEditorView:view];
+    FindBar* bar = view != nil ? [[FindBar alloc] initWithEditorView:view] : nil;
     StatusBar* status = [[StatusBar alloc] initWithFrame:NSMakeRect(0, 0, 900, 22)];
-    view.findBar = bar;
-    view.statusBar = status;
+    if (view != nil) {
+      view.findBar = bar;
+      view.statusBar = status;
+    }
     bar.hidden = YES;
     // The file sidebar: a directory tree to the left of the document. Rooted at
     // the open file's folder (v1: one folder, not a workspace).
@@ -1803,7 +2070,9 @@ int main(int argc, char** argv) {
             ? YES
             : [[NSUserDefaults standardUserDefaults] boolForKey:@"ShowSidebar"];
     sidebar.hidden = !wantSidebar;
-    view.sidebar = sidebar;  // so the theme reaches it
+    if (view != nil) {
+      view.sidebar = sidebar;  // so the theme reaches it
+    }
     // A folder given on the command line roots the column, the same as
     // File > Open Folder… (`--sidebar-root` is the explicit form of this).
     std::string sidebar_root = arg_value(argc, argv, "--sidebar-root");
@@ -1814,12 +2083,21 @@ int main(int argc, char** argv) {
       }
     }
     if (!sidebar_root.empty()) {
-      [view pinSidebarRoot:[NSString stringWithUTF8String:sidebar_root.c_str()]];
+      [sidebar setRootPath:[NSString stringWithUTF8String:sidebar_root.c_str()]];
     }
-    [view refreshTheme];  // give the chrome its page colour now the bars exist
+    if (view != nil) {
+      [view refreshTheme];  // give the chrome its page colour now the bars exist
+    }
 
-    // The editor's own column: find bar, document, status bar.
-    NSStackView* stack = [NSStackView stackViewWithViews:@[ bar, view, status ]];
+    // The editor's own column: find bar, document, status bar. The find bar is
+    // nil for an image (there is nothing to find in a picture), and the stack
+    // skips a nil view, so the image simply has no bar above it.
+    NSView* document = imageView != nil ? imageView : view;
+    NSMutableArray<NSView*>* column = [NSMutableArray array];
+    if (bar != nil) [column addObject:bar];
+    [column addObject:document];
+    [column addObject:status];
+    NSStackView* stack = [NSStackView stackViewWithViews:column];
     stack.orientation = NSUserInterfaceLayoutOrientationVertical;
     stack.distribution = NSStackViewDistributionFill;
     // Flush bands: the editor's bottom strip (the horizontal bar) sits right on
@@ -1877,6 +2155,7 @@ int main(int argc, char** argv) {
       delegate.snapshotPath = [NSString stringWithUTF8String:snapshot.c_str()];
       delegate.snapshotEarly = early_snapshot;
     }
+    delegate.imageView = imageView;  // nil for a text document
     [app setDelegate:delegate];
     win.delegate = delegate;  // for the unsaved-changes prompt on close
 

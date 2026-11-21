@@ -40,6 +40,17 @@ struct Glyph {
   double advance = 0;  // pen advance for this glyph
 };
 
+// An image to draw (PNG / JPEG / any format the platform decoder handles).
+// The pixels are decoded and owned by the platform layer; viewcore only ever
+// holds this opaque handle and the pixel dimensions, so it stays free of any
+// platform type. `handle` is a CGImageRef on macOS (retained), null when empty.
+struct Image {
+  void* handle = nullptr;
+  double width = 0;   // pixels
+  double height = 0;  // pixels
+  bool valid() const { return handle != nullptr && width > 0 && height > 0; }
+};
+
 // A shaped run: one piece of text measured by the backend. The skeleton backend
 // emits one glyph per codepoint; a real backend (CoreText) may merge or reorder.
 struct Run {

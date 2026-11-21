@@ -21,6 +21,11 @@ class Canvas {
   // Sets the colour used by subsequent draw_run calls (a run carries no colour).
   virtual void set_text_color(Color c) = 0;
   virtual void draw_run(const Run& run, double x, double y) = 0;
+  // Draws an image into the destination rect (view coordinates). `source` is an
+  // opaque platform handle — CGImageRef on macOS — wrapped in Image so viewcore
+  // never sees a platform type. The backends without image support (the headless
+  // recorder) record the command but draw nothing.
+  virtual void draw_image(const Image& img, const Rect& dst) { (void)img; (void)dst; }
 };
 
 }  // namespace vc

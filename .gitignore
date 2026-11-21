@@ -5,6 +5,7 @@
 .editor/
 
 # Build output
+target/
 build*/
 
 # OS

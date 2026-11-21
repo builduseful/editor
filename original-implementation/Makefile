@@ -44,7 +44,8 @@ TEST_OBJ := $(patsubst %.cpp,$(BUILD)/%.o,$(TEST_SRC))
 
 # CoreText/CoreGraphics backends (platform/macos/*.mm). The app shell lives in
 # platform/macos/app/ and is built only by `make app`.
-FRAMEWORKS := -framework Foundation -framework CoreText -framework CoreGraphics
+FRAMEWORKS := -framework Foundation -framework CoreText -framework CoreGraphics \
+              -framework ImageIO
 APP_FRAMEWORKS := $(FRAMEWORKS) -framework AppKit
 
 .PHONY: all test golden fuzz bench demo app bundle render gui-smoke gui-golden golden-update clean

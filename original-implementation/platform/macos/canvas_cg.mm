@@ -72,6 +72,14 @@ class CgCanvas final : public vc::Canvas {
     CFRelease(s);
   }
 
+  void draw_image(const vc::Image& img, const vc::Rect& d) override {
+    if (img.handle == nullptr) return;
+    CGImageRef image = static_cast<CGImageRef>(img.handle);
+    // viewcore y-down -> CoreGraphics y-up.
+    CGContextDrawImage(ctx_, CGRectMake(d.x, height_ - d.y - d.h, d.w, d.h),
+                       image);
+  }
+
  private:
   void set_fill(vc::Color c) {
     CGContextSetRGBFillColor(ctx_, c.r / 255.0, c.g / 255.0, c.b / 255.0,

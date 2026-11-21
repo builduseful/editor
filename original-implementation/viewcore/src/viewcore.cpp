@@ -244,7 +244,7 @@ const ViewCore::LineEntry& ViewCore::entry_for(int64_t line) const {
     e.bytes = text.size() + v.run.glyphs.size() * sizeof(Glyph) + 96;
     e.visual.push_back(std::move(v));
   } else {
-    const double maxw = text_width();
+    const double maxw = wrap_target_width();
     size_t pos = 0;
     while (pos < text.size()) {
       if (e.visual.size() >= kMaxVisualPerLine) {
@@ -383,6 +383,16 @@ ViewCore::ScrollPos ViewCore::max_top() const {
     out.px = 0;
   }
   return out;
+}
+
+double ViewCore::wrap_target_width() const {
+  if (wrap_width_ <= 0) return text_width();
+  // k character cells of the document font, not k pixels: a column count is a
+  // count of characters. The gutter does not eat into it — text starts to the
+  // right of the gutter and wraps within what is left.
+  const double cell = tb_->measure(font_, "0");
+  const double want = static_cast<double>(wrap_width_) * cell;
+  return want < 1.0 ? 1.0 : want;
 }
 
 double ViewCore::content_px() const {

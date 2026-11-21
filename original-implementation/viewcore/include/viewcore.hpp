@@ -132,6 +132,19 @@ class ViewCore {
   // file never blocks the window (the index must stay on the document thread).
   bool discover_step(int64_t max_lines) const;
   bool wrap() const { return wrap_; }
+  // Wraps at `wrap_width_` columns when > 0, otherwise at the viewport width.
+  // A fixed column is what prose wants (72 or 80); "the window" is the default.
+  int wrap_width() const { return wrap_width_; }
+  // The pixel width a line is wrapped to (a fixed column, or the viewport). Exposed
+  // so the tests can check the column directly; it is what the layout uses.
+  double wrap_target_width() const;
+  void set_wrap_width(int columns) {
+    if (columns < 0) columns = 0;
+    if (columns != wrap_width_) {
+      wrap_width_ = columns;
+      if (wrap_) invalidate_all();  // re-wrap at the new column
+    }
+  }
   const FontSpec& font() const { return font_; }
   double viewport_width() const { return width_; }
   double viewport_height() const { return height_; }
@@ -314,6 +327,10 @@ class ViewCore {
     const double w = width_ - gutter_width_;
     return w > 1.0 ? w : 1.0;
   }
+  // The pixel width a line is wrapped to: a fixed column count when one is set,
+  // otherwise the viewport. Column k means "k character cells", so the target is
+  // k advances of the current font — not k pixels.
+  double wrap_target_width() const;
   std::string line_text(int64_t line) const;  // logical line, terminator stripped
 
   // Input helpers.
@@ -347,6 +364,7 @@ class ViewCore {
   FontSpec font_;
   double width_ = 800, height_ = 600;
   bool wrap_ = false;
+  int wrap_width_ = 0;  // 0 = wrap to the viewport (see set_wrap_width)
 
   int64_t first_line_ = 0;
   double scroll_px_ = 0;

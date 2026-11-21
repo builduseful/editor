@@ -78,6 +78,67 @@ std::vector<std::string> naive_wrap(const std::string& text, size_t per) {
   return out;
 }
 
+// --- A fixed wrap column ----------------------------------------------------
+
+TEST(viewcore_wrap_width_wraps_at_a_column_not_the_viewport) {
+  // A wide viewport, a narrow column: the line must wrap at the column, not at
+  // the edge of the window.
+  std::string content;
+  for (int i = 0; i < 40; ++i) content += "word ";
+  content += "\n";
+  Doc d(content);
+  d.view->resize(400, 600);  // wide: 50 columns at 8 px
+  d.view->set_wrap(true);
+  d.view->discover_all();
+  vc::RecordingCanvas wide;
+  d.view->draw(wide);
+  int wide_rows = 0;
+  for (const vc::DrawCmd& c : wide.cmds) {
+    if (c.kind == vc::DrawCmd::Kind::DrawRun) ++wide_rows;
+  }
+
+  d.view->set_wrap_width(20);
+  vc::RecordingCanvas narrow;
+  d.view->draw(narrow);
+  int narrow_rows = 0;
+  for (const vc::DrawCmd& c : narrow.cmds) {
+    if (c.kind == vc::DrawCmd::Kind::DrawRun) ++narrow_rows;
+  }
+  // A 20-column wrap needs more rows than a 50-column one.
+  CHECK(narrow_rows > wide_rows);
+}
+
+TEST(viewcore_wrap_width_zero_means_the_viewport) {
+  Doc d("word word word\n");
+  d.view->resize(400, 600);
+  d.view->set_wrap_width(0);
+  const double at_zero = d.view->wrap_target_width();
+  CHECK(at_zero > 0);
+  CHECK_EQ(at_zero, d.view->text_width());
+}
+
+TEST(viewcore_wrap_width_is_a_character_count_not_a_pixel_count) {
+  // Column 10 is 10 advances of the document font, independent of the window.
+  Doc d("x\n");
+  d.view->resize(1200, 600);
+  d.view->set_wrap_width(10);
+  const double ten = d.view->wrap_target_width();
+  d.view->resize(400, 600);
+  CHECK_EQ(d.view->wrap_target_width(), ten);  // the window changed; the column did not
+}
+
+TEST(viewcore_wrap_width_survives_toggling_wrap_off_and_on) {
+  Doc d("word word word word word word\n");
+  d.view->resize(200, 600);
+  d.view->set_wrap(true);
+  d.view->set_wrap_width(16);
+  const double before = d.view->wrap_target_width();
+  d.view->set_wrap(false);
+  d.view->set_wrap(true);
+  CHECK_EQ(d.view->wrap_width(), 16);
+  CHECK_EQ(d.view->wrap_target_width(), before);
+}
+
 }  // namespace
 
 TEST(viewcore_no_wrap_one_run_per_line) {
@@ -311,6 +372,67 @@ std::string n_lines(int n, const std::string& body = "line\n") {
   for (int i = 0; i < n; ++i) s += body;
   return s;
 }
+// --- A fixed wrap column ----------------------------------------------------
+
+TEST(viewcore_wrap_width_wraps_at_a_column_not_the_viewport) {
+  // A wide viewport, a narrow column: the line must wrap at the column, not at
+  // the edge of the window.
+  std::string content;
+  for (int i = 0; i < 40; ++i) content += "word ";
+  content += "\n";
+  Doc d(content);
+  d.view->resize(400, 600);  // wide: 50 columns at 8 px
+  d.view->set_wrap(true);
+  d.view->discover_all();
+  vc::RecordingCanvas wide;
+  d.view->draw(wide);
+  int wide_rows = 0;
+  for (const vc::DrawCmd& c : wide.cmds) {
+    if (c.kind == vc::DrawCmd::Kind::DrawRun) ++wide_rows;
+  }
+
+  d.view->set_wrap_width(20);
+  vc::RecordingCanvas narrow;
+  d.view->draw(narrow);
+  int narrow_rows = 0;
+  for (const vc::DrawCmd& c : narrow.cmds) {
+    if (c.kind == vc::DrawCmd::Kind::DrawRun) ++narrow_rows;
+  }
+  // A 20-column wrap needs more rows than a 50-column one.
+  CHECK(narrow_rows > wide_rows);
+}
+
+TEST(viewcore_wrap_width_zero_means_the_viewport) {
+  Doc d("word word word\n");
+  d.view->resize(400, 600);
+  d.view->set_wrap_width(0);
+  const double at_zero = d.view->wrap_target_width();
+  CHECK(at_zero > 0);
+  CHECK_EQ(at_zero, d.view->text_width());
+}
+
+TEST(viewcore_wrap_width_is_a_character_count_not_a_pixel_count) {
+  // Column 10 is 10 advances of the document font, independent of the window.
+  Doc d("x\n");
+  d.view->resize(1200, 600);
+  d.view->set_wrap_width(10);
+  const double ten = d.view->wrap_target_width();
+  d.view->resize(400, 600);
+  CHECK_EQ(d.view->wrap_target_width(), ten);  // the window changed; the column did not
+}
+
+TEST(viewcore_wrap_width_survives_toggling_wrap_off_and_on) {
+  Doc d("word word word word word word\n");
+  d.view->resize(200, 600);
+  d.view->set_wrap(true);
+  d.view->set_wrap_width(16);
+  const double before = d.view->wrap_target_width();
+  d.view->set_wrap(false);
+  d.view->set_wrap(true);
+  CHECK_EQ(d.view->wrap_width(), 16);
+  CHECK_EQ(d.view->wrap_target_width(), before);
+}
+
 }  // namespace
 
 TEST(viewcore_scrollbar_appears_once_the_count_is_known) {
