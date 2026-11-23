@@ -4,6 +4,7 @@
 //! 100% testable headlessly by feeding `InputEvent`s and inspecting document state
 //! and rendered pixels in `Framebuffer`.
 
+pub mod autopairs;
 pub mod buffers;
 pub mod keymap;
 pub mod panes;
@@ -218,6 +219,8 @@ pub struct EditorApp {
     pub default_word_wrap: bool,
     /// Per-file-extension word wrap overrides (lowercase extension without dot, e.g. `"md" => true`).
     pub wrap_by_ext: BTreeMap<String, bool>,
+    /// Auto-close brackets/quotes, wrap selections, paired backspace, and smart Enter indent.
+    pub auto_pairs: bool,
 
     pub atlas: GlyphAtlas,
     pub framebuffer: Framebuffer,
@@ -309,6 +312,7 @@ impl EditorApp {
             syntax_ext_map: BTreeMap::new(),
             default_word_wrap: false,
             wrap_by_ext: default_wrap_by_ext(),
+            auto_pairs: true,
             atlas: GlyphAtlas::new(),
             framebuffer,
             layout: AppLayout::default(),
@@ -405,6 +409,9 @@ impl EditorApp {
         if let Some(vim) = host.load_pref("VimMode") {
             self.vim.set_enabled(vim == "1" || vim == "true");
         }
+        if let Some(ap) = host.load_pref("AutoPairs") {
+            self.auto_pairs = ap == "1" || ap == "true";
+        }
         self.sync_wrap_for_panes();
         self.sync_languages_for_panes();
         self.recompute_layout();
@@ -441,6 +448,7 @@ impl EditorApp {
         );
         host.save_pref("SyntaxExtMap", &format_str_map(&self.syntax_ext_map));
         host.save_pref("VimMode", if self.vim.enabled { "1" } else { "0" });
+        host.save_pref("AutoPairs", if self.auto_pairs { "1" } else { "0" });
     }
 
     /// Resolve effective word wrap for `path` (per-extension override -> global default).
@@ -3412,6 +3420,7 @@ impl EditorApp {
             ("sidebar-right", "Move sidebar to right", "Panes & View"),
             ("sidebar-width:reset", "Reset sidebar width to default", "Panes & View"),
             ("pane-ratio:reset", "Reset split pane sizes to 50/50", "Panes & View"),
+            ("toggle-auto-pairs", "Toggle auto-pairs & smart indent", "Editing"),
             ("reload", "Reload file from disk", "File & Navigation"),
         ];
         for &(id, title, category) in extras {
@@ -4497,6 +4506,21 @@ impl EditorApp {
                 let (del_start, del_len, coalescable) = if let Some((a, b)) = self.selection() {
                     (a, b - a, false)
                 } else if self.caret > 0 {
+                    // Paired Backspace: deleting inside empty `()`, `[]`, `{}`, `""`, `''`, `` `` `` removes both.
+                    if self.auto_pairs && !mods.primary() && !mods.alt {
+                        if let (Some(prev_b), Some(next_b)) =
+                            (self.byte_at(self.caret - 1), self.byte_at(self.caret))
+                        {
+                            if autopairs::is_matching_pair(prev_b, next_b) {
+                                if let Ok(pos) = self.doc.edit(self.caret - 1, 2, "", self.now_ms, false) {
+                                    self.caret = pos;
+                                    self.anchor = pos;
+                                    self.after_document_mutated(rasterizer, host);
+                                }
+                                return;
+                            }
+                        }
+                    }
                     let prev = if mods.primary() {
                         let (line, _) = self.doc.byte_to_line_col(self.caret);
                         self.doc.line_byte_range(line).map(|(s, _, _)| s).unwrap_or(0)
@@ -4537,25 +4561,46 @@ impl EditorApp {
             }
             Key::Enter => {
                 self.preferred_x_px = None;
-                let (line, col) = self.doc.byte_to_line_col(self.caret);
-                let indent: String = self
-                    .doc
-                    .line_content(line)
-                    .map(|l| {
-                        l[..col.min(l.len())]
-                            .chars()
-                            .take_while(|&c| c == ' ' || c == '\t')
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let insert_str = format!("\n{indent}");
                 let (start, removed) = self
                     .selection()
                     .map(|(a, b)| (a, b - a))
                     .unwrap_or((self.caret, 0));
-                if let Ok(pos) = self.doc.edit(start, removed, &insert_str, self.now_ms, false) {
-                    self.caret = pos;
-                    self.anchor = pos;
+                let (line, col) = self.doc.byte_to_line_col(start);
+                let (end_line, end_col) = if removed > 0 {
+                    self.doc.byte_to_line_col(start + removed)
+                } else {
+                    (line, col)
+                };
+                let (insert_str, caret_rel) = if self.auto_pairs {
+                    let line_str = self.doc.line_content(line).unwrap_or_default();
+                    let before = &line_str[..col.min(line_str.len())];
+                    let after_owned;
+                    let after: &str = if end_line == line {
+                        &line_str[end_col.min(line_str.len())..]
+                    } else {
+                        after_owned = self.doc.line_content(end_line).unwrap_or_default();
+                        &after_owned[end_col.min(after_owned.len())..]
+                    };
+                    autopairs::smart_enter_insert(before, after, self.viewport.tab_width)
+                } else {
+                    let indent: String = self
+                        .doc
+                        .line_content(line)
+                        .map(|l| {
+                            l[..col.min(l.len())]
+                                .chars()
+                                .take_while(|&c| c == ' ' || c == '\t')
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let s = format!("\n{indent}");
+                    let r = s.len();
+                    (s, r)
+                };
+                if self.doc.edit(start, removed, &insert_str, self.now_ms, false).is_ok() {
+                    let new_pos = start + caret_rel as u64;
+                    self.caret = new_pos;
+                    self.anchor = new_pos;
                     self.after_document_mutated(rasterizer, host);
                 }
             }
@@ -4582,6 +4627,82 @@ impl EditorApp {
                     if let Some(s) = text {
                         if !s.is_empty() && !s.chars().all(|c| c.is_control()) {
                             self.preferred_x_px = None;
+                            if self.auto_pairs && s.len() == 1 {
+                                let b = s.as_bytes()[0];
+                                if let Some((a, sel_end)) = self.selection() {
+                                    // Wrap active selection in matching delimiters when <= 256 KB.
+                                    if let Some(close) = autopairs::closing_delimiter(b) {
+                                        let sel_len = sel_end - a;
+                                        if sel_len <= 256 * 1024 {
+                                            let mut wrapped =
+                                                Vec::with_capacity(sel_len as usize + 2);
+                                            wrapped.push(b);
+                                            self.doc.tree_mut().read_range(
+                                                a,
+                                                sel_len as usize,
+                                                &mut wrapped,
+                                            );
+                                            wrapped.push(close);
+                                            if wrapped.len() == sel_len as usize + 2 {
+                                                if let Ok(wstr) = std::str::from_utf8(&wrapped) {
+                                                    if self
+                                                        .doc
+                                                        .edit(a, sel_len, wstr, self.now_ms, false)
+                                                        .is_ok()
+                                                    {
+                                                        self.anchor = a + 1;
+                                                        self.caret = a + 1 + sel_len;
+                                                        self.after_document_mutated(
+                                                            rasterizer, host,
+                                                        );
+                                                        return;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    // Skip-over when typing a closing delimiter that is already right under the caret.
+                                    let next_b = self.byte_at(self.caret);
+                                    if autopairs::is_closing_delimiter(b) && next_b == Some(b) {
+                                        self.caret += 1;
+                                        self.anchor = self.caret;
+                                        self.viewport.ensure_caret_visible(
+                                            &mut self.doc,
+                                            self.caret,
+                                            metrics,
+                                            scale,
+                                        );
+                                        self.mark_dirty();
+                                        host.request_redraw();
+                                        return;
+                                    }
+                                    // Auto-close opening delimiter when context allows.
+                                    let prev_b = if self.caret > 0 {
+                                        self.byte_at(self.caret - 1)
+                                    } else {
+                                        None
+                                    };
+                                    if let Some(close) = autopairs::closing_delimiter(b) {
+                                        if autopairs::should_auto_close(b, prev_b, next_b) {
+                                            let pair = [b, close];
+                                            let pair_str =
+                                                std::str::from_utf8(&pair).unwrap_or(s);
+                                            let start = self.caret;
+                                            if self
+                                                .doc
+                                                .edit(start, 0, pair_str, self.now_ms, false)
+                                                .is_ok()
+                                            {
+                                                self.caret = start + 1;
+                                                self.anchor = start + 1;
+                                                self.after_document_mutated(rasterizer, host);
+                                                return;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             let (start, removed) = self
                                 .selection()
                                 .map(|(a, b)| (a, b - a))
@@ -4599,6 +4720,16 @@ impl EditorApp {
                 }
             }
         }
+    }
+
+    #[inline]
+    fn byte_at(&mut self, offset: u64) -> Option<u8> {
+        if offset >= self.doc.len_bytes() {
+            return None;
+        }
+        let mut b = Vec::with_capacity(1);
+        self.doc.tree_mut().read_range(offset, 1, &mut b);
+        b.first().copied()
     }
 
     fn after_document_mutated(
@@ -5890,6 +6021,20 @@ impl EditorApp {
                     }
                     "toggle-wrap" => {
                         self.handle_command(AppCommand::ToggleWrap, rasterizer, clipboard, host)
+                    }
+                    "toggle-auto-pairs" => {
+                        self.auto_pairs = !self.auto_pairs;
+                        self.save_preferences(host);
+                        self.set_notice(
+                            if self.auto_pairs {
+                                "Auto-pairs enabled"
+                            } else {
+                                "Auto-pairs disabled"
+                            },
+                            false,
+                        );
+                        self.mark_dirty();
+                        host.request_redraw();
                     }
                     "toggle-sidebar" => {
                         self.handle_command(AppCommand::ToggleSidebar, rasterizer, clipboard, host)

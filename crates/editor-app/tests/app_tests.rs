@@ -2964,3 +2964,98 @@ fn command_palette_fuzzy_searches_and_runs_keymap_and_extra_commands() {
     );
     assert_eq!(app.sidebar.side(), SidebarSide::Right);
 }
+
+#[test]
+fn auto_pairs_skip_over_wrap_paired_backspace_and_smart_enter() {
+    use editor_platform::{InputEvent, Key, Modifiers};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    let mut app = EditorApp::new(fs, 1200, 800, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    let type_char = |app: &mut EditorApp,
+                     ch: char,
+                     raster: &mut BuiltinBitmapRasterizer,
+                     clip: &mut MemoryClipboard,
+                     host: &mut HeadlessHost| {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            raster,
+            clip,
+            host,
+        );
+    };
+
+    let doc_text = |app: &mut EditorApp| -> String {
+        let len = app.doc.len_bytes() as usize;
+        let mut buf = Vec::with_capacity(len);
+        app.doc.tree_mut().read_range(0, len, &mut buf);
+        String::from_utf8(buf).unwrap()
+    };
+
+    // 1. Auto-close `{` and smart Enter between `{|}` -> indented body line + closing brace!
+    for ch in "fn f() {".chars() {
+        type_char(&mut app, ch, &mut raster, &mut clip, &mut host);
+    }
+    assert_eq!(doc_text(&mut app), "fn f() {}");
+    assert_eq!(app.caret, 8);
+
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(doc_text(&mut app), "fn f() {\n    \n}");
+    assert_eq!(app.doc.byte_to_line_col(app.caret), (1, 4));
+
+    // 2. Skip-over closing delimiter + paired Backspace.
+    type_char(&mut app, '(', &mut raster, &mut clip, &mut host);
+    assert_eq!(doc_text(&mut app), "fn f() {\n    ()\n}");
+    // Backspace deletes both `(` and `)`!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Backspace,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(doc_text(&mut app), "fn f() {\n    \n}");
+
+    // Type `("ok")` -> typing closing `"` and `)` skips over without doubling!
+    for ch in "(\"ok\")".chars() {
+        type_char(&mut app, ch, &mut raster, &mut clip, &mut host);
+    }
+    assert_eq!(doc_text(&mut app), "fn f() {\n    (\"ok\")\n}");
+
+    // 3. Wrapping an active selection with `[` keeps inner text selected!
+    let pos = doc_text(&mut app).find("ok").unwrap() as u64;
+    app.anchor = pos;
+    app.caret = pos + 2;
+    type_char(&mut app, '[', &mut raster, &mut clip, &mut host);
+    assert_eq!(doc_text(&mut app), "fn f() {\n    (\"[ok]\")\n}");
+    assert_eq!(app.anchor, pos + 1);
+    assert_eq!(app.caret, pos + 3);
+
+    // 4. Contractions (`don't`) do not insert stray closing apostrophes.
+    app.doc = editor_core::Document::new_untitled();
+    app.caret = 0;
+    app.anchor = 0;
+    for ch in "don't".chars() {
+        type_char(&mut app, ch, &mut raster, &mut clip, &mut host);
+    }
+    assert_eq!(doc_text(&mut app), "don't");
+}
