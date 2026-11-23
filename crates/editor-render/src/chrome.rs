@@ -545,6 +545,8 @@ pub fn draw_status_bar(
 pub struct ConfirmModal {
     pub visible: bool,
     pub file_name: String,
+    pub is_delete: bool,
+    pub delete_is_dir: bool,
     pub btn_save: PixelRect,
     pub btn_discard: PixelRect,
     pub btn_cancel: PixelRect,
@@ -553,11 +555,21 @@ pub struct ConfirmModal {
 impl ConfirmModal {
     pub fn open(&mut self, file_name: &str) {
         self.visible = true;
+        self.is_delete = false;
+        self.delete_is_dir = false;
         self.file_name = file_name.to_string();
+    }
+
+    pub fn open_delete(&mut self, name: &str, is_dir: bool) {
+        self.visible = true;
+        self.is_delete = true;
+        self.delete_is_dir = is_dir;
+        self.file_name = name.to_string();
     }
 
     pub fn close(&mut self) {
         self.visible = false;
+        self.is_delete = false;
     }
 
     pub fn hit_test(&self, x_px: f32, y_px: f32) -> Option<ConfirmChoice> {
@@ -566,7 +578,7 @@ impl ConfirmModal {
         }
         let xi = x_px.round() as i32;
         let yi = y_px.round() as i32;
-        if self.btn_save.contains(xi, yi) {
+        if !self.btn_save.is_empty() && self.btn_save.contains(xi, yi) {
             Some(ConfirmChoice::Save)
         } else if self.btn_discard.contains(xi, yi) {
             Some(ConfirmChoice::Discard)
@@ -615,7 +627,21 @@ impl ConfirmModal {
         let tm = atlas.metrics(rasterizer, FontStyle::UiBold, title_px);
         let bm = atlas.metrics(rasterizer, FontStyle::Ui, body_px);
 
-        let heading = format!("Save Changes to {}?", self.file_name);
+        let (heading, body) = if self.is_delete {
+            (
+                format!("Delete {}?", self.file_name),
+                if self.delete_is_dir {
+                    "This folder and all its contents will be permanently removed."
+                } else {
+                    "This file will be permanently removed."
+                },
+            )
+        } else {
+            (
+                format!("Save Changes to {}?", self.file_name),
+                "Your unsaved changes will be lost if you do not save them.",
+            )
+        };
         painter.draw_text_ui(
             (card.x + pad) as f32,
             (card.y + pad) as f32 + tm.ascent,
@@ -629,7 +655,7 @@ impl ConfirmModal {
         painter.draw_text_ui(
             (card.x + pad) as f32,
             (card.y + pad + px(28.0, scale)) as f32 + bm.ascent,
-            "Your unsaved changes will be lost if you do not save them.",
+            body,
             FontStyle::Ui,
             body_px,
             theme.text_muted,
@@ -640,16 +666,48 @@ impl ConfirmModal {
         let btn_h = px(28.0, scale);
         let btn_y = card.bottom() - pad - btn_h;
         let gap = px(8.0, scale);
-        let save_w = px(72.0, scale);
-        let discard_w = px(92.0, scale);
         let cancel_w = px(72.0, scale);
 
-        self.btn_save = PixelRect::new(card.right() - pad - save_w, btn_y, save_w, btn_h);
-        self.btn_discard = PixelRect::new(self.btn_save.x - gap - discard_w, btn_y, discard_w, btn_h);
-        self.btn_cancel = PixelRect::new(card.x + pad, btn_y, cancel_w, btn_h);
+        if self.is_delete {
+            let del_w = px(82.0, scale);
+            self.btn_save = PixelRect::ZERO;
+            self.btn_discard = PixelRect::new(card.right() - pad - del_w, btn_y, del_w, btn_h);
+            self.btn_cancel = PixelRect::new(card.x + pad, btn_y, cancel_w, btn_h);
+            draw_button(painter, self.btn_cancel, "Cancel", false, theme, atlas, rasterizer);
+            // Danger action button using Build Useful `state_danger` token.
+            let r = 4.0 * scale;
+            painter.fill_rounded_rect(self.btn_discard, r, theme.surface);
+            painter.stroke_rounded_rect(
+                self.btn_discard,
+                r,
+                (1.0 * scale).max(1.0),
+                theme.state_danger,
+            );
+            let font_px = 11.5 * scale;
+            let m = atlas.metrics(rasterizer, FontStyle::UiBold, font_px);
+            let tw = Painter::measure_text_ui("Delete", FontStyle::UiBold, font_px, atlas, rasterizer);
+            let tx = self.btn_discard.x as f32 + (self.btn_discard.w as f32 - tw) * 0.5;
+            let baseline = self.btn_discard.y as f32 + (self.btn_discard.h as f32 + m.ascent - m.descent) * 0.5;
+            painter.draw_text_ui(
+                tx,
+                baseline,
+                "Delete",
+                FontStyle::UiBold,
+                font_px,
+                theme.state_danger,
+                atlas,
+                rasterizer,
+            );
+        } else {
+            let save_w = px(72.0, scale);
+            let discard_w = px(92.0, scale);
+            self.btn_save = PixelRect::new(card.right() - pad - save_w, btn_y, save_w, btn_h);
+            self.btn_discard = PixelRect::new(self.btn_save.x - gap - discard_w, btn_y, discard_w, btn_h);
+            self.btn_cancel = PixelRect::new(card.x + pad, btn_y, cancel_w, btn_h);
 
-        draw_button(painter, self.btn_cancel, "Cancel", false, theme, atlas, rasterizer);
-        draw_button(painter, self.btn_discard, "Don't Save", false, theme, atlas, rasterizer);
-        draw_button(painter, self.btn_save, "Save", true, theme, atlas, rasterizer);
+            draw_button(painter, self.btn_cancel, "Cancel", false, theme, atlas, rasterizer);
+            draw_button(painter, self.btn_discard, "Don't Save", false, theme, atlas, rasterizer);
+            draw_button(painter, self.btn_save, "Save", true, theme, atlas, rasterizer);
+        }
     }
 }

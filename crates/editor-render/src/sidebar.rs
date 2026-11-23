@@ -12,10 +12,13 @@
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use editor_platform::{DirEntry, EntryKind, FileSystem, FontStyle, GlyphRasterizer, Key, PixelRect};
+use editor_platform::{
+    DirEntry, EntryKind, FileSystem, FontStyle, GlyphRasterizer, Key, Modifiers, PixelRect,
+};
 
 use crate::atlas::GlyphAtlas;
 use crate::painter::Painter;
+use crate::text_input::TextInput;
 use crate::theme::{px, Theme};
 
 pub const SIDEBAR_MIN_WIDTH_PT: f32 = 160.0;
@@ -79,6 +82,43 @@ pub enum SidebarAction {
     OpenFile(PathBuf),
     Changed,
     Minimize,
+    StartNewFile,
+    StartNewFolder,
+    StartRename,
+    RequestDelete { path: PathBuf, is_dir: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarPromptKind {
+    NewFile { parent: PathBuf },
+    NewFolder { parent: PathBuf },
+    Rename { target: PathBuf, is_dir: bool },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SidebarPromptAction {
+    None,
+    Changed,
+    Cancel,
+    Submit { kind: SidebarPromptKind, name: String },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SidebarContextAction {
+    NewFile,
+    NewFolder,
+    Rename,
+    Delete,
+}
+
+#[derive(Debug, Clone)]
+struct SidebarContextMenu {
+    anchor_x: i32,
+    anchor_y: i32,
+    has_target: bool,
+    hovered: Option<usize>,
+    card_rect: PixelRect,
+    item_rects: Vec<(SidebarContextAction, PixelRect)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -120,7 +160,12 @@ pub struct Sidebar {
     crumb_rects: Vec<(PixelRect, PathBuf)>,
     /// Cached header minimize button rect from last paint for exact hit-testing.
     minimize_rect: PixelRect,
+    /// Active inline creation/rename prompt bar inside the sidebar (zero native dialogs!).
+    prompt: Option<(SidebarPromptKind, TextInput)>,
+    /// Active custom-drawn right-click context menu.
+    context_menu: Option<SidebarContextMenu>,
     header_height_px: i32,
+    prompt_height_px: i32,
     row_height_px: i32,
 }
 
@@ -149,7 +194,10 @@ impl Sidebar {
             scroll_y_px: 0.0,
             crumb_rects: Vec::new(),
             minimize_rect: PixelRect::ZERO,
+            prompt: None,
+            context_menu: None,
             header_height_px: 30,
+            prompt_height_px: 0,
             row_height_px: 24,
         }
     }
@@ -179,6 +227,9 @@ impl Sidebar {
             self.minimize_hovered = false;
             self.edge_hovered = false;
             self.edge_active = false;
+            self.prompt = None;
+            self.prompt_height_px = 0;
+            self.context_menu = None;
         }
     }
 
@@ -196,6 +247,10 @@ impl Sidebar {
 
     pub fn set_focused(&mut self, focused: bool) {
         self.focused = focused && self.visible;
+        if !self.focused {
+            self.prompt = None;
+            self.prompt_height_px = 0;
+        }
     }
 
     pub fn width_pt(&self) -> f32 {
@@ -284,6 +339,292 @@ impl Sidebar {
             }
         }
         self.rebuild_rows();
+    }
+
+    /// Lazy single-directory refresh: reloads `dir` ONLY if it is already loaded in `dir_cache`
+    /// or equals `root`. Returns `true` if the visible tree was updated.
+    pub fn refresh_dir(&mut self, fs: &dyn FileSystem, dir: &Path) -> bool {
+        let canonical = fs.canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        let is_root = self.root.as_deref() == Some(canonical.as_path());
+        if !is_root && !self.dir_cache.contains_key(&canonical) {
+            return false;
+        }
+        if let Ok(entries) = fs.read_dir(&canonical) {
+            self.dir_cache.insert(canonical, entries);
+        } else {
+            self.dir_cache.remove(&canonical);
+        }
+        self.rebuild_rows();
+        true
+    }
+
+    /// Remove cached entries for a deleted or moved directory subtree and refresh its parent.
+    pub fn invalidate_subtree(&mut self, fs: &dyn FileSystem, path: &Path) {
+        self.dir_cache.retain(|k, _| !k.starts_with(path));
+        self.expanded.retain(|k| !k.starts_with(path));
+        if self.selected.as_deref().map(|s| s.starts_with(path)).unwrap_or(false) {
+            self.selected = None;
+        }
+        if let Some(parent) = path.parent() {
+            let _ = self.refresh_dir(fs, parent);
+        } else {
+            self.rebuild_rows();
+        }
+    }
+
+    pub fn set_selected(&mut self, path: Option<PathBuf>) {
+        self.selected = path;
+    }
+
+    pub fn selected_row(&self) -> Option<&FlatRow> {
+        let sel = self.selected.as_ref()?;
+        self.rows.iter().find(|r| &r.path == sel)
+    }
+
+    /// Resolve the target parent directory for creating a new file or folder.
+    fn target_parent_dir(&self) -> Option<PathBuf> {
+        if let Some(row) = self.selected_row() {
+            if row.kind == EntryKind::Directory {
+                return Some(row.path.clone());
+            }
+            if let Some(p) = row.path.parent() {
+                return Some(p.to_path_buf());
+            }
+        }
+        self.root.clone()
+    }
+
+    pub fn is_prompt_open(&self) -> bool {
+        self.prompt.is_some()
+    }
+
+    pub fn cancel_prompt(&mut self) {
+        self.prompt = None;
+        self.prompt_height_px = 0;
+    }
+
+    pub fn start_new_file(&mut self, fs: &dyn FileSystem) -> bool {
+        let Some(parent) = self.target_parent_dir() else {
+            return false;
+        };
+        if self.root.as_deref() != Some(parent.as_path()) {
+            self.expanded.insert(parent.clone());
+            self.ensure_dir_loaded(fs, &parent);
+            self.rebuild_rows();
+        }
+        let mut input = TextInput::new("file.rs");
+        input.focused = true;
+        self.prompt = Some((SidebarPromptKind::NewFile { parent }, input));
+        self.context_menu = None;
+        self.focused = true;
+        true
+    }
+
+    pub fn start_new_folder(&mut self, fs: &dyn FileSystem) -> bool {
+        let Some(parent) = self.target_parent_dir() else {
+            return false;
+        };
+        if self.root.as_deref() != Some(parent.as_path()) {
+            self.expanded.insert(parent.clone());
+            self.ensure_dir_loaded(fs, &parent);
+            self.rebuild_rows();
+        }
+        let mut input = TextInput::new("folder-name");
+        input.focused = true;
+        self.prompt = Some((SidebarPromptKind::NewFolder { parent }, input));
+        self.context_menu = None;
+        self.focused = true;
+        true
+    }
+
+    pub fn start_rename(&mut self) -> bool {
+        let Some(row) = self.selected_row().cloned() else {
+            return false;
+        };
+        let mut input = TextInput::new("New name");
+        input.set_text(&row.name);
+        input.focused = true;
+        self.prompt = Some((
+            SidebarPromptKind::Rename {
+                target: row.path,
+                is_dir: row.kind == EntryKind::Directory,
+            },
+            input,
+        ));
+        self.context_menu = None;
+        self.focused = true;
+        true
+    }
+
+    pub fn handle_prompt_key(
+        &mut self,
+        key: Key,
+        mods: Modifiers,
+        text: Option<&str>,
+        clipboard: Option<&str>,
+    ) -> (SidebarPromptAction, Option<String>) {
+        if self.prompt.is_none() {
+            return (SidebarPromptAction::None, None);
+        }
+        match key {
+            Key::Escape => {
+                self.cancel_prompt();
+                return (SidebarPromptAction::Cancel, None);
+            }
+            Key::Enter => {
+                let (kind, input) = self.prompt.take().unwrap();
+                self.prompt_height_px = 0;
+                return (
+                    SidebarPromptAction::Submit {
+                        kind,
+                        name: input.text.trim().to_string(),
+                    },
+                    None,
+                );
+            }
+            _ => {}
+        }
+        if let Some((_, ref mut input)) = self.prompt {
+            let (changed, copied) = input.handle_key(key, mods, text, clipboard);
+            if changed || copied.is_some() {
+                return (SidebarPromptAction::Changed, copied);
+            }
+        }
+        (SidebarPromptAction::Changed, None)
+    }
+
+    pub fn is_context_menu_open(&self) -> bool {
+        self.context_menu.is_some()
+    }
+
+    pub fn close_context_menu(&mut self) {
+        self.context_menu = None;
+    }
+
+    pub fn open_context_menu(&mut self, rect: PixelRect, x_px: f32, y_px: f32, scale: f32) -> bool {
+        if !self.visible || !rect.contains(x_px.round() as i32, y_px.round() as i32) {
+            return false;
+        }
+        self.cancel_prompt();
+        let hit = self.hit_test(rect, x_px, y_px, scale);
+        let has_target = match hit {
+            SidebarHit::RowBody(i) | SidebarHit::RowDisclosure(i) | SidebarHit::RowEnter(i) => {
+                if let Some(row) = self.rows.get(i) {
+                    self.selected = Some(row.path.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => self.selected_row().is_some(),
+        };
+        self.focused = true;
+        self.context_menu = Some(SidebarContextMenu {
+            anchor_x: x_px.round() as i32,
+            anchor_y: y_px.round() as i32,
+            has_target,
+            hovered: None,
+            card_rect: PixelRect::ZERO,
+            item_rects: Vec::new(),
+        });
+        true
+    }
+
+    pub fn hover_context_menu(&mut self, x_px: f32, y_px: f32) -> bool {
+        let Some(ref mut menu) = self.context_menu else {
+            return false;
+        };
+        let xi = x_px.round() as i32;
+        let yi = y_px.round() as i32;
+        let next = menu
+            .item_rects
+            .iter()
+            .position(|(_, r)| r.contains(xi, yi));
+        let changed = menu.hovered != next;
+        menu.hovered = next;
+        changed
+    }
+
+    pub fn click_context_menu(&mut self, x_px: f32, y_px: f32) -> Option<SidebarContextAction> {
+        let menu = self.context_menu.take()?;
+        let xi = x_px.round() as i32;
+        let yi = y_px.round() as i32;
+        for (act, r) in menu.item_rects {
+            if r.contains(xi, yi) {
+                return Some(act);
+            }
+        }
+        None
+    }
+
+    pub fn draw_context_menu(
+        &mut self,
+        painter: &mut Painter,
+        bounds: PixelRect,
+        theme: &Theme,
+        atlas: &mut GlyphAtlas,
+        rasterizer: &mut dyn GlyphRasterizer,
+    ) {
+        let Some(ref mut menu) = self.context_menu else {
+            return;
+        };
+        let scale = painter.scale();
+        let items: Vec<(SidebarContextAction, &str, bool)> = if menu.has_target {
+            vec![
+                (SidebarContextAction::NewFile, "New File…", false),
+                (SidebarContextAction::NewFolder, "New Folder…", false),
+                (SidebarContextAction::Rename, "Rename…", false),
+                (SidebarContextAction::Delete, "Delete…", true),
+            ]
+        } else {
+            vec![
+                (SidebarContextAction::NewFile, "New File…", false),
+                (SidebarContextAction::NewFolder, "New Folder…", false),
+            ]
+        };
+        let pad = px(4.0, scale);
+        let row_h = px(24.0, scale);
+        let card_w = px(142.0, scale);
+        let card_h = pad * 2 + (items.len() as i32) * row_h;
+        let x = menu.anchor_x.min(bounds.right() - card_w - px(6.0, scale)).max(bounds.x + px(4.0, scale));
+        let y = menu.anchor_y.min(bounds.bottom() - card_h - px(6.0, scale)).max(bounds.y + px(4.0, scale));
+        let card = PixelRect::new(x, y, card_w, card_h);
+        menu.card_rect = card;
+        menu.item_rects.clear();
+
+        painter.fill_rounded_rect(card, 6.0 * scale, theme.surface);
+        painter.stroke_rounded_rect(card, 6.0 * scale, (1.0 * scale).max(1.0), theme.border_control);
+
+        let font_px = 12.0 * scale;
+        let m = atlas.metrics(rasterizer, FontStyle::Ui, font_px);
+        for (idx, (act, label, is_danger)) in items.into_iter().enumerate() {
+            let r = PixelRect::new(
+                card.x + pad,
+                card.y + pad + (idx as i32) * row_h,
+                card.w - pad * 2,
+                row_h,
+            );
+            menu.item_rects.push((act, r));
+            if menu.hovered == Some(idx) {
+                painter.fill_rounded_rect(r, 4.0 * scale, theme.selection);
+            }
+            let baseline = r.y as f32 + (r.h as f32 + m.ascent - m.descent) * 0.5;
+            let col = if is_danger {
+                theme.state_danger
+            } else {
+                theme.text
+            };
+            painter.draw_text_ui(
+                (r.x + px(8.0, scale)) as f32,
+                baseline,
+                label,
+                FontStyle::Ui,
+                font_px,
+                col,
+                atlas,
+                rasterizer,
+            );
+        }
     }
 
     fn ensure_dir_loaded(&mut self, fs: &dyn FileSystem, dir: &Path) {
@@ -409,7 +750,11 @@ impl Sidebar {
             }
             return SidebarHit::None;
         }
-        let rel_y = (yi - (rect.y + self.header_height_px)) as f32 + self.scroll_y_px;
+        if yi < rect.y + self.header_height_px + self.prompt_height_px {
+            return SidebarHit::None;
+        }
+        let rel_y = (yi - (rect.y + self.header_height_px + self.prompt_height_px)) as f32
+            + self.scroll_y_px;
         if rel_y < 0.0 || self.row_height_px <= 0 {
             return SidebarHit::None;
         }
@@ -490,11 +835,16 @@ impl Sidebar {
         viewport_h_px: i32,
     ) -> SidebarAction {
         if self.rows.is_empty() {
-            if key == Key::Left {
-                if let Some(parent) = self.root.as_ref().and_then(|r| r.parent()).map(PathBuf::from) {
-                    self.navigate_to(fs, &parent);
-                    return SidebarAction::Changed;
+            match key {
+                Key::Left => {
+                    if let Some(parent) = self.root.as_ref().and_then(|r| r.parent()).map(PathBuf::from) {
+                        self.navigate_to(fs, &parent);
+                        return SidebarAction::Changed;
+                    }
                 }
+                Key::Char('n') => return SidebarAction::StartNewFile,
+                Key::Char('N') => return SidebarAction::StartNewFolder,
+                _ => {}
             }
             return SidebarAction::None;
         }
@@ -561,6 +911,16 @@ impl Sidebar {
                     }
                     EntryKind::File | EntryKind::Symlink => SidebarAction::OpenFile(row.path),
                     EntryKind::Other => SidebarAction::None,
+                }
+            }
+            Key::Char('n') => SidebarAction::StartNewFile,
+            Key::Char('N') => SidebarAction::StartNewFolder,
+            Key::Char('r') | Key::F(2) => SidebarAction::StartRename,
+            Key::Backspace | Key::Delete => {
+                let row = self.rows[cur_idx].clone();
+                SidebarAction::RequestDelete {
+                    path: row.path,
+                    is_dir: row.kind == EntryKind::Directory,
                 }
             }
             _ => SidebarAction::None,
@@ -691,12 +1051,52 @@ impl Sidebar {
             theme.border_subtle,
         );
 
+        // 1b. Optional inline prompt strip for New File / New Folder / Rename (zero native dialogs!).
+        let mut list_top = header_rect.bottom();
+        if let Some((ref kind, ref mut input)) = self.prompt {
+            let ph = px(48.0, scale);
+            self.prompt_height_px = ph;
+            let prect = PixelRect::new(content_rect.x, list_top, content_rect.w, ph);
+            painter.fill_rect(prect, theme.surface);
+            let label = match kind {
+                SidebarPromptKind::NewFile { .. } => "New File",
+                SidebarPromptKind::NewFolder { .. } => "New Folder",
+                SidebarPromptKind::Rename { .. } => "Rename",
+            };
+            let lp = 10.5 * scale;
+            let lm = atlas.metrics(rasterizer, FontStyle::UiBold, lp);
+            painter.draw_text_ui(
+                (prect.x + px(8.0, scale)) as f32,
+                (prect.y + px(4.0, scale)) as f32 + lm.ascent,
+                label,
+                FontStyle::UiBold,
+                lp,
+                theme.text_muted,
+                atlas,
+                rasterizer,
+            );
+            let in_rect = PixelRect::new(
+                prect.x + px(6.0, scale),
+                prect.y + px(19.0, scale),
+                (prect.w - px(12.0, scale)).max(0),
+                px(23.0, scale),
+            );
+            input.draw(painter, in_rect, theme, atlas, rasterizer, true);
+            painter.fill_rect(
+                PixelRect::new(prect.x, prect.bottom() - hairline, prect.w, hairline),
+                theme.border_subtle,
+            );
+            list_top = prect.bottom();
+        } else {
+            self.prompt_height_px = 0;
+        }
+
         // 2. Scrollable rows list.
         let list_rect = PixelRect::new(
             content_rect.x,
-            header_rect.bottom(),
+            list_top,
             content_rect.w,
-            (content_rect.h - self.header_height_px).max(0),
+            (content_rect.bottom() - list_top).max(0),
         );
         painter.push_clip(list_rect);
 

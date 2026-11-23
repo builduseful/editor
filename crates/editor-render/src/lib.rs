@@ -28,7 +28,8 @@ pub use palette::{
 };
 pub use shortcuts::{ShortcutDisplayItem, ShortcutsAction, ShortcutsOverlay};
 pub use sidebar::{
-    Sidebar, SidebarAction, SidebarBadge, SidebarHit, SidebarSide, SIDEBAR_AUTO_MINIMIZE_WIDTH_PT,
+    Sidebar, SidebarAction, SidebarBadge, SidebarContextAction, SidebarHit, SidebarPromptAction,
+    SidebarPromptKind, SidebarSide, SIDEBAR_AUTO_MINIMIZE_WIDTH_PT,
 };
 pub use tab_strip::{
     tab_strip_height_px, StripDropTarget, TabDisplayItem, TabStrip, TabStripHit,

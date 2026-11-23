@@ -153,6 +153,57 @@ impl WorkingSet {
             .map(|m| m.id)
     }
 
+    pub fn ids_under_path(&self, path: &Path) -> Vec<BufferId> {
+        self.meta
+            .values()
+            .filter(|m| m.path.as_deref().map(|p| p.starts_with(path)).unwrap_or(false))
+            .map(|m| m.id)
+            .collect()
+    }
+
+    pub fn remap_paths(
+        &mut self,
+        from: &Path,
+        to: &Path,
+        is_dir: bool,
+        syntax_ext_map: &BTreeMap<String, String>,
+    ) {
+        let remap = |p: &Path| -> Option<PathBuf> {
+            if !is_dir {
+                (p == from).then(|| to.to_path_buf())
+            } else if p.starts_with(from) {
+                let rel = p.strip_prefix(from).ok()?;
+                Some(if rel.as_os_str().is_empty() {
+                    to.to_path_buf()
+                } else {
+                    to.join(rel)
+                })
+            } else {
+                None
+            }
+        };
+        for parked in self.parked.values_mut() {
+            if let Some(new_p) = parked.doc.path().and_then(remap) {
+                parked.doc.set_path(new_p);
+                let lang = editor_core::Language::from_path_with_overrides(
+                    parked.doc.path(),
+                    syntax_ext_map,
+                );
+                parked.doc.set_language(lang);
+            }
+        }
+        for meta in self.meta.values_mut() {
+            if let Some(new_p) = meta.path.as_deref().and_then(remap) {
+                meta.file_name = new_p
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("Untitled")
+                    .to_string();
+                meta.path = Some(new_p);
+            }
+        }
+    }
+
     pub fn pin_slot(&self, id: BufferId) -> Option<u8> {
         self.pinned
             .iter()

@@ -151,11 +151,17 @@ impl FileSystem for MacFileSystem {
             Err(FsError::Unsupported("APFS clonefile failed".into()))
         }
     }
+    fn create_dir(&self, path: &Path) -> FsResult<()> {
+        self.inner.create_dir(path)
+    }
     fn rename(&self, from: &Path, to: &Path) -> FsResult<()> {
         self.inner.rename(from, to)
     }
     fn remove_file(&self, path: &Path) -> FsResult<()> {
         self.inner.remove_file(path)
+    }
+    fn remove_dir_all(&self, path: &Path) -> FsResult<()> {
+        self.inner.remove_dir_all(path)
     }
     fn temp_dir(&self) -> PathBuf {
         self.inner.temp_dir()

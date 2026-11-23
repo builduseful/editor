@@ -3059,3 +3059,191 @@ fn auto_pairs_skip_over_wrap_paired_backspace_and_smart_enter() {
     }
     assert_eq!(doc_text(&mut app), "don't");
 }
+
+#[test]
+fn sidebar_file_operations_create_rename_delete_and_context_menu() {
+    use editor_platform::{FileSystem, InputEvent, Key, Modifiers, MouseButton};
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/proj/main.rs", b"fn main() {}\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1400, 900, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_folder(Path::new("/proj"), &mut host);
+    app.open_file(Path::new("/proj/main.rs"), &mut host).unwrap();
+    app.render(&mut raster);
+
+    // 1. Create a new file via inline prompt (`sidebar-new-file`) -> creates on disk, refreshes lazily & opens!
+    let _ = app.execute_ipc(
+        &editor_platform::ipc::IpcCommand::Action("sidebar-new-file".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.sidebar.is_prompt_open());
+    app.render(&mut raster);
+    for ch in "notes.md".chars() {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+    }
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.sidebar.is_prompt_open());
+    assert!(fs.stat(Path::new("/proj/notes.md")).is_ok());
+    assert_eq!(app.doc.path(), Some(Path::new("/proj/notes.md")));
+
+    // 2. Rename selected file (`notes.md` -> `readme.md`) -> updates disk AND active open buffer path!
+    let _ = app.execute_ipc(
+        &editor_platform::ipc::IpcCommand::Action("sidebar-rename".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.sidebar.is_prompt_open());
+    // Select all & replace name
+    let mut primary = Modifiers::NONE;
+    #[cfg(target_os = "macos")]
+    {
+        primary.meta = true;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        primary.ctrl = true;
+    }
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('a'),
+            mods: primary,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    for ch in "readme.md".chars() {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+    }
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(fs.stat(Path::new("/proj/notes.md")).is_err());
+    assert!(fs.stat(Path::new("/proj/readme.md")).is_ok());
+    assert_eq!(app.doc.path(), Some(Path::new("/proj/readme.md")));
+
+    // 3. Create a new folder via inline prompt (`sidebar-new-folder`).
+    let _ = app.execute_ipc(
+        &editor_platform::ipc::IpcCommand::Action("sidebar-new-folder".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    for ch in "docs".chars() {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+    }
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(fs.stat(Path::new("/proj/docs")).map(|s| s.is_dir).unwrap_or(false));
+
+    // 4. Right-click inside sidebar opens custom context menu; Escape dismisses it cleanly.
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: 80.0,
+            y_px: 100.0,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.sidebar.is_context_menu_open());
+    app.render(&mut raster);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.sidebar.is_context_menu_open());
+
+    // 5. Delete selected folder (`docs`) goes through ConfirmModal -> Enter confirms deletion!
+    let _ = app.execute_ipc(
+        &editor_platform::ipc::IpcCommand::Action("sidebar-delete".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.confirm_modal.visible);
+    assert!(app.confirm_modal.is_delete);
+    app.render(&mut raster);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.confirm_modal.visible);
+    assert!(fs.stat(Path::new("/proj/docs")).is_err());
+}

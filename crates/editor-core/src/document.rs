@@ -222,6 +222,12 @@ impl Document {
         self.path.as_deref()
     }
 
+    pub fn set_path(&mut self, path: PathBuf) {
+        let lang = Language::from_path(Some(path.as_path()));
+        self.path = Some(path);
+        self.set_language(lang);
+    }
+
     #[inline]
     pub fn file_name(&self) -> &str {
         self.path

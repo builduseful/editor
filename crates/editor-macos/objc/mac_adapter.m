@@ -751,6 +751,13 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
                      (uint8_t)MIN(event.clickCount, 3), encode_mods(event.modifierFlags));
 }
 
+- (void)rightMouseDown:(NSEvent*)event {
+    [self.window makeFirstResponder:self];
+    NSPoint p = [self pixelPointFromEvent:event];
+    self.cb.on_mouse(self.cb.userdata, 0, (float)p.x, (float)p.y, 1,
+                     (uint8_t)MIN(event.clickCount, 3), encode_mods(event.modifierFlags));
+}
+
 - (void)mouseDragged:(NSEvent*)event {
     NSPoint p = [self pixelPointFromEvent:event];
     self.cb.on_mouse(self.cb.userdata, 1, (float)p.x, (float)p.y, 0, 1,

@@ -31,7 +31,8 @@ use editor_render::{
     parse_mono_style, tab_strip_height_px, A11yNode, A11yRole, Color, CommandPalette, ConfirmModal,
     FindBarAction, FindBarState, GlyphAtlas, GotoLineState, HarpoonAction, HarpoonOverlay,
     ImeComposition, Painter, PaletteAction, ScrollbarHit, ShortcutsAction, ShortcutsOverlay,
-    Sidebar, SidebarAction, SidebarBadge, SidebarHit, SidebarSide, StatusBarData, StripDropTarget,
+    Sidebar, SidebarAction, SidebarBadge, SidebarContextAction, SidebarHit, SidebarPromptAction,
+    SidebarPromptKind, SidebarSide, StatusBarData, StripDropTarget,
     SyntaxPalette, SyntaxStylePreference, SyntaxThemeConfig, SyntaxThemePreset, TabStrip,
     TabStripHit, Theme, TokenOverride, Viewport, SIDEBAR_AUTO_MINIMIZE_WIDTH_PT,
 };
@@ -151,6 +152,7 @@ enum PendingDiscardAction {
     CloseBuffer(BufferId),
     CloseWindow,
     Quit,
+    DeletePath { path: PathBuf, is_dir: bool },
 }
 
 pub struct EditorApp {
@@ -2162,6 +2164,7 @@ impl EditorApp {
             || self.palette.is_open()
             || self.shortcuts.visible
             || self.harpoon.visible
+            || self.sidebar.is_context_menu_open()
         {
             full_bounds
         } else {
@@ -2406,6 +2409,17 @@ impl EditorApp {
             );
         }
 
+        // 5c. Optional custom-drawn sidebar context menu.
+        if self.sidebar.is_context_menu_open() {
+            self.sidebar.draw_context_menu(
+                &mut painter,
+                full_bounds,
+                &theme,
+                &mut self.atlas,
+                rasterizer,
+            );
+        }
+
         // 6. Optional Quick Open / Project Search palette overlay.
         if self.palette.is_open() {
             self.palette.draw(
@@ -2496,11 +2510,23 @@ impl EditorApp {
         if self.confirm_modal.visible {
             match event {
                 InputEvent::KeyDown { key, .. } => {
-                    let choice = match key {
-                        Key::Enter | Key::Char('s') | Key::Char('S') => Some(ConfirmChoice::Save),
-                        Key::Char('d') | Key::Char('D') => Some(ConfirmChoice::Discard),
-                        Key::Escape => Some(ConfirmChoice::Cancel),
-                        _ => None,
+                    let choice = if self.confirm_modal.is_delete {
+                        match key {
+                            Key::Enter | Key::Char('d') | Key::Char('D') => {
+                                Some(ConfirmChoice::Discard)
+                            }
+                            Key::Escape => Some(ConfirmChoice::Cancel),
+                            _ => None,
+                        }
+                    } else {
+                        match key {
+                            Key::Enter | Key::Char('s') | Key::Char('S') => {
+                                Some(ConfirmChoice::Save)
+                            }
+                            Key::Char('d') | Key::Char('D') => Some(ConfirmChoice::Discard),
+                            Key::Escape => Some(ConfirmChoice::Cancel),
+                            _ => None,
+                        }
                     };
                     if let Some(c) = choice {
                         self.resolve_confirm_modal(c, host);
@@ -2734,6 +2760,65 @@ impl EditorApp {
             }
         }
 
+        // Intercept pointer & Escape when the sidebar right-click context menu is open.
+        if self.sidebar.is_context_menu_open() {
+            match event {
+                InputEvent::MouseMove { x_px, y_px, .. } => {
+                    if self.sidebar.hover_context_menu(x_px, y_px) {
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    return;
+                }
+                InputEvent::MouseDown {
+                    x_px,
+                    y_px,
+                    button: MouseButton::Left,
+                    ..
+                } => {
+                    let act = self.sidebar.click_context_menu(x_px, y_px);
+                    self.mark_dirty();
+                    host.request_redraw();
+                    if let Some(a) = act {
+                        self.execute_sidebar_context_action(a, host);
+                    }
+                    return;
+                }
+                InputEvent::MouseDown {
+                    x_px,
+                    y_px,
+                    button: MouseButton::Right,
+                    ..
+                } => {
+                    if self.sidebar.open_context_menu(
+                        self.layout.sidebar,
+                        x_px,
+                        y_px,
+                        self.framebuffer.scale,
+                    ) {
+                        self.mark_dirty();
+                        host.request_redraw();
+                    } else {
+                        self.sidebar.close_context_menu();
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    return;
+                }
+                InputEvent::KeyDown {
+                    key: Key::Escape, ..
+                } => {
+                    self.sidebar.close_context_menu();
+                    self.mark_dirty();
+                    host.request_redraw();
+                    return;
+                }
+                _ => {
+                    self.sidebar.close_context_menu();
+                }
+            }
+        }
+
         match event {
             InputEvent::Resize {
                 width_px,
@@ -2835,6 +2920,17 @@ impl EditorApp {
                 self.last_blink_ms = self.now_ms;
                 if button == MouseButton::Left {
                     self.handle_mouse_down(x_px, y_px, click_count, mods, rasterizer, host);
+                } else if button == MouseButton::Right
+                    && self.sidebar.is_visible()
+                    && self.sidebar.open_context_menu(
+                        self.layout.sidebar,
+                        x_px,
+                        y_px,
+                        self.framebuffer.scale,
+                    )
+                {
+                    self.mark_dirty();
+                    host.request_redraw();
                 }
             }
             InputEvent::MouseMove { x_px, y_px, .. } => {
@@ -3305,6 +3401,208 @@ impl EditorApp {
                     host.request_quit();
                 }
             }
+            PendingDiscardAction::DeletePath { path, is_dir } => {
+                self.execute_delete_path(&path, is_dir, host);
+            }
+        }
+    }
+
+    fn execute_sidebar_context_action(
+        &mut self,
+        act: SidebarContextAction,
+        host: &mut dyn PlatformHost,
+    ) {
+        if !self.sidebar.is_visible() {
+            self.set_sidebar_visible_user(true, host);
+        }
+        match act {
+            SidebarContextAction::NewFile => {
+                if !self.sidebar.start_new_file(self.fs.as_ref()) {
+                    self.set_notice("Open a folder first", true);
+                }
+            }
+            SidebarContextAction::NewFolder => {
+                if !self.sidebar.start_new_folder(self.fs.as_ref()) {
+                    self.set_notice("Open a folder first", true);
+                }
+            }
+            SidebarContextAction::Rename => {
+                if !self.sidebar.start_rename() {
+                    self.set_notice("Select a file or folder first", true);
+                }
+            }
+            SidebarContextAction::Delete => {
+                if let Some(row) = self.sidebar.selected_row().cloned() {
+                    self.request_delete_path(
+                        row.path,
+                        row.kind == editor_platform::EntryKind::Directory,
+                        host,
+                    );
+                    return;
+                } else {
+                    self.set_notice("Select a file or folder first", true);
+                }
+            }
+        }
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    fn request_delete_path(&mut self, path: PathBuf, is_dir: bool, host: &mut dyn PlatformHost) {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("item")
+            .to_string();
+        self.pending_discard = Some(PendingDiscardAction::DeletePath { path, is_dir });
+        self.confirm_modal.open_delete(&name, is_dir);
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    fn execute_delete_path(&mut self, path: &Path, is_dir: bool, host: &mut dyn PlatformHost) {
+        let res = if is_dir {
+            self.fs.remove_dir_all(path)
+        } else {
+            self.fs.remove_file(path)
+        };
+        match res {
+            Ok(()) => {
+                self.close_buffers_under_path(path, host);
+                self.sidebar.invalidate_subtree(self.fs.as_ref(), path);
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
+                self.set_notice(format!("Deleted {name}"), false);
+            }
+            Err(e) => {
+                self.set_notice(format!("Delete failed: {e}"), true);
+            }
+        }
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    fn commit_sidebar_prompt(
+        &mut self,
+        kind: SidebarPromptKind,
+        raw_name: &str,
+        host: &mut dyn PlatformHost,
+    ) {
+        let name = raw_name.trim();
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+            || name.contains('\0')
+        {
+            self.set_notice("Invalid file or folder name", true);
+            self.mark_dirty();
+            host.request_redraw();
+            return;
+        }
+        match kind {
+            SidebarPromptKind::NewFile { parent } => {
+                let dst = parent.join(name);
+                if self.fs.stat(&dst).is_ok() {
+                    self.set_notice(format!("{name} already exists"), true);
+                } else {
+                    match self.fs.write_atomic(&dst, &mut |_w| Ok(())) {
+                        Ok(_) => {
+                            let _ = self.sidebar.refresh_dir(self.fs.as_ref(), &parent);
+                            self.sidebar.set_selected(Some(dst.clone()));
+                            let _ = self.open_file_with_mode(&dst, OpenMode::Keep, host);
+                            self.sidebar.set_focused(false);
+                            self.set_notice(format!("Created {name}"), false);
+                        }
+                        Err(e) => self.set_notice(format!("Create failed: {e}"), true),
+                    }
+                }
+            }
+            SidebarPromptKind::NewFolder { parent } => {
+                let dst = parent.join(name);
+                match self.fs.create_dir(&dst) {
+                    Ok(()) => {
+                        let _ = self.sidebar.refresh_dir(self.fs.as_ref(), &parent);
+                        self.sidebar.set_selected(Some(dst));
+                        self.set_notice(format!("Created folder {name}"), false);
+                    }
+                    Err(e) => self.set_notice(format!("Create folder failed: {e}"), true),
+                }
+            }
+            SidebarPromptKind::Rename { target, is_dir } => {
+                let Some(parent) = target.parent().map(Path::to_path_buf) else {
+                    return;
+                };
+                let dst = parent.join(name);
+                if dst == target {
+                    self.mark_dirty();
+                    host.request_redraw();
+                    return;
+                }
+                if self.fs.stat(&dst).is_ok() {
+                    self.set_notice(format!("{name} already exists"), true);
+                } else {
+                    match self.fs.rename(&target, &dst) {
+                        Ok(()) => {
+                            self.update_buffers_after_rename(&target, &dst, is_dir, host);
+                            if is_dir {
+                                self.sidebar.invalidate_subtree(self.fs.as_ref(), &target);
+                            }
+                            let _ = self.sidebar.refresh_dir(self.fs.as_ref(), &parent);
+                            self.sidebar.set_selected(Some(dst));
+                            self.set_notice(format!("Renamed to {name}"), false);
+                        }
+                        Err(e) => self.set_notice(format!("Rename failed: {e}"), true),
+                    }
+                }
+            }
+        }
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    fn update_buffers_after_rename(
+        &mut self,
+        from: &Path,
+        to: &Path,
+        is_dir: bool,
+        host: &mut dyn PlatformHost,
+    ) {
+        let remap = |p: &Path| -> Option<PathBuf> {
+            if !is_dir {
+                (p == from).then(|| to.to_path_buf())
+            } else if p.starts_with(from) {
+                let rel = p.strip_prefix(from).ok()?;
+                Some(if rel.as_os_str().is_empty() {
+                    to.to_path_buf()
+                } else {
+                    to.join(rel)
+                })
+            } else {
+                None
+            }
+        };
+        if let Some(new_p) = self.doc.path().and_then(remap) {
+            self.doc.set_path(new_p);
+            let lang = Language::from_path_with_overrides(self.doc.path(), &self.syntax_ext_map);
+            self.doc.set_language(lang);
+            self.sync_active_buffer_meta();
+            self.sync_title(host);
+        }
+        for pane in &mut self.other_panes {
+            if let Some(new_p) = pane.doc.path().and_then(remap) {
+                pane.doc.set_path(new_p);
+                let lang = Language::from_path_with_overrides(pane.doc.path(), &self.syntax_ext_map);
+                pane.doc.set_language(lang);
+            }
+        }
+        self.working_set
+            .remap_paths(from, to, is_dir, &self.syntax_ext_map);
+    }
+
+    fn close_buffers_under_path(&mut self, path: &Path, host: &mut dyn PlatformHost) {
+        for id in self.working_set.ids_under_path(path) {
+            self.force_close_buffer(id, host);
         }
     }
 
@@ -3421,6 +3719,10 @@ impl EditorApp {
             ("sidebar-width:reset", "Reset sidebar width to default", "Panes & View"),
             ("pane-ratio:reset", "Reset split pane sizes to 50/50", "Panes & View"),
             ("toggle-auto-pairs", "Toggle auto-pairs & smart indent", "Editing"),
+            ("sidebar-new-file", "Sidebar: New file", "File & Navigation"),
+            ("sidebar-new-folder", "Sidebar: New folder", "File & Navigation"),
+            ("sidebar-rename", "Sidebar: Rename selected", "File & Navigation"),
+            ("sidebar-delete", "Sidebar: Delete selected", "File & Navigation"),
             ("reload", "Reload file from disk", "File & Navigation"),
         ];
         for &(id, title, category) in extras {
@@ -4069,6 +4371,28 @@ impl EditorApp {
             return;
         }
 
+        // Route to Sidebar inline prompt (New File / New Folder / Rename) when active.
+        if self.sidebar.is_prompt_open() {
+            let clip = clipboard.get_text();
+            let (act, copied) =
+                self.sidebar
+                    .handle_prompt_key(key, mods, text, clip.as_deref());
+            if let Some(c) = copied {
+                clipboard.set_text(&c);
+            }
+            match act {
+                SidebarPromptAction::None => {}
+                SidebarPromptAction::Changed | SidebarPromptAction::Cancel => {
+                    self.mark_dirty_rect(self.layout.sidebar);
+                    host.request_redraw();
+                }
+                SidebarPromptAction::Submit { kind, name } => {
+                    self.commit_sidebar_prompt(kind, &name, host);
+                }
+            }
+            return;
+        }
+
         // Route to Sidebar if focused.
         if self.sidebar.is_focused() {
             if key == Key::Escape {
@@ -4091,6 +4415,18 @@ impl EditorApp {
                 }
                 SidebarAction::Minimize => {
                     self.set_sidebar_visible_user(false, host);
+                }
+                SidebarAction::StartNewFile => {
+                    self.execute_sidebar_context_action(SidebarContextAction::NewFile, host);
+                }
+                SidebarAction::StartNewFolder => {
+                    self.execute_sidebar_context_action(SidebarContextAction::NewFolder, host);
+                }
+                SidebarAction::StartRename => {
+                    self.execute_sidebar_context_action(SidebarContextAction::Rename, host);
+                }
+                SidebarAction::RequestDelete { path, is_dir } => {
+                    self.request_delete_path(path, is_dir, host);
                 }
                 SidebarAction::Changed => {
                     if self.sidebar.root() != root_before.as_deref() {
@@ -4918,7 +5254,11 @@ impl EditorApp {
                         self.mark_dirty();
                         host.request_redraw();
                     }
-                    SidebarAction::None => {}
+                    SidebarAction::StartNewFile
+                    | SidebarAction::StartNewFolder
+                    | SidebarAction::StartRename
+                    | SidebarAction::RequestDelete { .. }
+                    | SidebarAction::None => {}
                 }
                 return;
             }
@@ -6049,6 +6389,18 @@ impl EditorApp {
                     "sidebar-right" => self.set_sidebar_side(SidebarSide::Right, host),
                     "sidebar-show" => self.set_sidebar_visible_user(true, host),
                     "sidebar-hide" => self.set_sidebar_visible_user(false, host),
+                    "sidebar-new-file" => {
+                        self.execute_sidebar_context_action(SidebarContextAction::NewFile, host);
+                    }
+                    "sidebar-new-folder" => {
+                        self.execute_sidebar_context_action(SidebarContextAction::NewFolder, host);
+                    }
+                    "sidebar-rename" => {
+                        self.execute_sidebar_context_action(SidebarContextAction::Rename, host);
+                    }
+                    "sidebar-delete" => {
+                        self.execute_sidebar_context_action(SidebarContextAction::Delete, host);
+                    }
                     "zoom-in" => {
                         self.handle_command(AppCommand::ZoomIn, rasterizer, clipboard, host)
                     }

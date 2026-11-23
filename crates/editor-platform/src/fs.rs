@@ -161,8 +161,10 @@ pub trait FileSystem: Send + Sync {
         Err(FsError::Unsupported("clone_file not supported".into()))
     }
 
+    fn create_dir(&self, path: &Path) -> FsResult<()>;
     fn rename(&self, from: &Path, to: &Path) -> FsResult<()>;
     fn remove_file(&self, path: &Path) -> FsResult<()>;
+    fn remove_dir_all(&self, path: &Path) -> FsResult<()>;
     fn temp_dir(&self) -> PathBuf;
 
     /// Acquire an exclusive advisory lockfile (`<path>.editor.lock`, `O_CREAT|O_EXCL`).
@@ -463,12 +465,20 @@ impl FileSystem for StdFileSystem {
         Ok(metadata_to_stat(&meta))
     }
 
+    fn create_dir(&self, path: &Path) -> FsResult<()> {
+        std::fs::create_dir(path).map_err(|e| map_io_err(path, e))
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> FsResult<()> {
         std::fs::rename(from, to).map_err(|e| map_io_err(to, e))
     }
 
     fn remove_file(&self, path: &Path) -> FsResult<()> {
         std::fs::remove_file(path).map_err(|e| map_io_err(path, e))
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> FsResult<()> {
+        std::fs::remove_dir_all(path).map_err(|e| map_io_err(path, e))
     }
 
     fn temp_dir(&self) -> PathBuf {
@@ -803,19 +813,90 @@ impl FileSystem for MemoryFileSystem {
         })
     }
 
+    fn create_dir(&self, path: &Path) -> FsResult<()> {
+        let p = normalize_mem_path(path);
+        let mut s = self.state.lock().unwrap();
+        if s.files.contains_key(&p) || s.dirs.contains_key(&p) {
+            return Err(FsError::AlreadyExists(p));
+        }
+        let mut cur = p.as_path();
+        loop {
+            s.dirs.insert(cur.to_path_buf(), ());
+            match cur.parent() {
+                Some(parent) if parent != cur => cur = parent,
+                _ => break,
+            }
+        }
+        Ok(())
+    }
+
     fn rename(&self, from: &Path, to: &Path) -> FsResult<()> {
         let f = normalize_mem_path(from);
         let t = normalize_mem_path(to);
         let mut s = self.state.lock().unwrap();
-        let entry = s.files.remove(&f).ok_or_else(|| FsError::NotFound(f))?;
-        s.files.insert(t, entry);
-        Ok(())
+        if let Some(entry) = s.files.remove(&f) {
+            if let Some(parent) = t.parent() {
+                let mut cur = parent;
+                loop {
+                    s.dirs.insert(cur.to_path_buf(), ());
+                    match cur.parent() {
+                        Some(p) if p != cur => cur = p,
+                        _ => break,
+                    }
+                }
+            }
+            s.files.insert(t, entry);
+            return Ok(());
+        }
+        if s.dirs.contains_key(&f) {
+            let moved_dirs: Vec<PathBuf> = s
+                .dirs
+                .keys()
+                .filter(|d| d.starts_with(&f))
+                .cloned()
+                .collect();
+            for old_d in moved_dirs {
+                s.dirs.remove(&old_d);
+                let rel = old_d.strip_prefix(&f).unwrap_or(Path::new(""));
+                let new_d = if rel.as_os_str().is_empty() {
+                    t.clone()
+                } else {
+                    t.join(rel)
+                };
+                s.dirs.insert(new_d, ());
+            }
+            let moved_files: Vec<PathBuf> = s
+                .files
+                .keys()
+                .filter(|fp| fp.starts_with(&f))
+                .cloned()
+                .collect();
+            for old_f in moved_files {
+                if let Some(mf) = s.files.remove(&old_f) {
+                    let rel = old_f.strip_prefix(&f).unwrap_or(Path::new(""));
+                    s.files.insert(t.join(rel), mf);
+                }
+            }
+            return Ok(());
+        }
+        Err(FsError::NotFound(f))
     }
 
     fn remove_file(&self, path: &Path) -> FsResult<()> {
         let p = normalize_mem_path(path);
         let mut s = self.state.lock().unwrap();
         s.files.remove(&p).ok_or_else(|| FsError::NotFound(p))?;
+        Ok(())
+    }
+
+    fn remove_dir_all(&self, path: &Path) -> FsResult<()> {
+        let p = normalize_mem_path(path);
+        let mut s = self.state.lock().unwrap();
+        if !s.dirs.contains_key(&p) {
+            return Err(FsError::NotFound(p));
+        }
+        s.dirs.retain(|d, _| !d.starts_with(&p));
+        s.files.retain(|f, _| !f.starts_with(&p));
         Ok(())
     }
 
