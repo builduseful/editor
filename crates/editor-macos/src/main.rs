@@ -48,6 +48,7 @@ struct MacCallbacks {
     on_focus: extern "C" fn(*mut c_void, u32),
     on_theme: extern "C" fn(*mut c_void, u32),
     on_open_path: extern "C" fn(*mut c_void, *const c_char),
+    on_fs_changed: extern "C" fn(*mut c_void, *const *const c_char, usize),
     on_drag: extern "C" fn(*mut c_void, u32, f32, f32, *const c_char),
     on_command: extern "C" fn(*mut c_void, u32),
     on_tick: extern "C" fn(*mut c_void, u64),
@@ -95,6 +96,7 @@ extern "C" {
     fn mac_request_redraw();
     fn mac_close_window();
     fn mac_request_quit();
+    fn mac_watch_directory(dir_path: *const c_char);
     fn mac_activate_app();
     fn mac_wake_main_loop();
     fn mac_run_app(cb: MacCallbacks);
@@ -363,6 +365,13 @@ impl PlatformHost for MacHost {
     fn save_pref(&mut self, key: &str, value: &str) {
         if let (Ok(k), Ok(v)) = (CString::new(key), CString::new(value)) {
             unsafe { mac_pref_set(k.as_ptr(), v.as_ptr()) };
+        }
+    }
+
+    fn watch_directory(&mut self, dir: Option<&Path>) {
+        match dir.and_then(|p| p.to_str()).and_then(|s| CString::new(s).ok()) {
+            Some(cs) => unsafe { mac_watch_directory(cs.as_ptr()) },
+            None => unsafe { mac_watch_directory(std::ptr::null()) },
         }
     }
 }
@@ -652,6 +661,28 @@ extern "C" fn cb_drag(
             y_px: y,
             path,
         },
+        &mut b.rasterizer,
+        &mut b.clipboard,
+        &mut b.host,
+    );
+}
+
+extern "C" fn cb_fs_changed(ud: *mut c_void, paths_ptr: *const *const c_char, count: usize) {
+    let b = unsafe { &mut *(ud as *mut Bridge) };
+    let mut paths = Vec::with_capacity(count.min(256));
+    if !paths_ptr.is_null() && count > 0 {
+        let slice = unsafe { std::slice::from_raw_parts(paths_ptr, count) };
+        for &cp in slice {
+            if !cp.is_null() {
+                let s = unsafe { CStr::from_ptr(cp) }.to_string_lossy().into_owned();
+                if !s.is_empty() {
+                    paths.push(PathBuf::from(s));
+                }
+            }
+        }
+    }
+    b.app.handle_event(
+        InputEvent::FsChanged(paths),
         &mut b.rasterizer,
         &mut b.clipboard,
         &mut b.host,
@@ -1113,6 +1144,7 @@ fn main() {
     if let Some(p) = positional {
         let _ = bridge.app.open_path_or_dir(&p, &mut bridge.host);
     }
+    bridge.app.sync_fs_watch(&mut bridge.host);
 
     let ud = (&mut *bridge as *mut Bridge) as *mut c_void;
     let cbs = MacCallbacks {
@@ -1124,6 +1156,7 @@ fn main() {
         on_focus: cb_focus,
         on_theme: cb_theme,
         on_open_path: cb_open_path,
+        on_fs_changed: cb_fs_changed,
         on_drag: cb_drag,
         on_command: cb_command,
         on_tick: cb_tick,

@@ -161,6 +161,37 @@ impl WorkingSet {
             .collect()
     }
 
+    /// Check clean parked buffers matching `changed` (or all clean parked buffers if `changed` is empty)
+    /// and silently reload any whose on-disk identity changed. Never overwrites dirty buffers.
+    pub fn reload_clean_parked(
+        &mut self,
+        fs: &dyn editor_platform::FileSystem,
+        changed: &[PathBuf],
+    ) -> bool {
+        let mut any = false;
+        for parked in self.parked.values_mut() {
+            if parked.doc.is_dirty() {
+                continue;
+            }
+            let Some(p) = parked.doc.path() else {
+                continue;
+            };
+            let matches = changed.is_empty()
+                || changed
+                    .iter()
+                    .any(|c| c == p || p.parent() == Some(c.as_path()));
+            if matches
+                && parked.doc.check_identity(fs) == editor_core::IdentityCheck::ReloadedClean
+            {
+                let len = parked.doc.len_bytes();
+                parked.caret = parked.caret.min(len);
+                parked.anchor = parked.anchor.min(len);
+                any = true;
+            }
+        }
+        any
+    }
+
     pub fn remap_paths(
         &mut self,
         from: &Path,

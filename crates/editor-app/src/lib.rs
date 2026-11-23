@@ -6,6 +6,7 @@
 
 pub mod autopairs;
 pub mod buffers;
+pub mod fs_undo;
 pub mod keymap;
 pub mod panes;
 pub mod session;
@@ -28,13 +29,18 @@ use editor_platform::{
 };
 use editor_render::{
     chrome::{draw_status_bar, status_bar_height_px},
-    parse_mono_style, tab_strip_height_px, A11yNode, A11yRole, Color, CommandPalette, ConfirmModal,
-    FindBarAction, FindBarState, GlyphAtlas, GotoLineState, HarpoonAction, HarpoonOverlay,
-    ImeComposition, Painter, PaletteAction, ScrollbarHit, ShortcutsAction, ShortcutsOverlay,
-    Sidebar, SidebarAction, SidebarBadge, SidebarContextAction, SidebarHit, SidebarPromptAction,
-    SidebarPromptKind, SidebarSide, StatusBarData, StripDropTarget,
+    parse_mono_style, tab_strip_height_px, A11yNode, A11yRole, ActionToast, Color, CommandPalette,
+    ConfirmModal, FindBarAction, FindBarState, GlyphAtlas, GotoLineState, HarpoonAction,
+    HarpoonOverlay, ImeComposition, Painter, PaletteAction, ScrollbarHit, ShortcutsAction,
+    ShortcutsOverlay, Sidebar, SidebarAction, SidebarBadge, SidebarContextAction, SidebarHit,
+    SidebarPromptAction, SidebarPromptKind, SidebarSide, StatusBarData, StripDropTarget,
     SyntaxPalette, SyntaxStylePreference, SyntaxThemeConfig, SyntaxThemePreset, TabStrip,
-    TabStripHit, Theme, TokenOverride, Viewport, SIDEBAR_AUTO_MINIMIZE_WIDTH_PT,
+    TabStripHit, Theme, ToastHit, TokenOverride, Viewport, SIDEBAR_AUTO_MINIMIZE_WIDTH_PT,
+};
+
+use fs_undo::{
+    probe_dir_size_bounded, FsOp, FsUndoStack, LARGE_FOLDER_BYTE_THRESHOLD,
+    LARGE_FOLDER_ENTRY_THRESHOLD, MAX_DELETE_SNAPSHOT_BYTES,
 };
 
 pub use buffers::{
@@ -72,11 +78,13 @@ impl AppLayout {
     }
 }
 
-/// What is being dragged towards the tab strip or pane grid.
+/// What is being dragged towards the sidebar, tab strip, or pane grid.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DragPayload {
     /// A file from the sidebar or from Finder.
     File(PathBuf),
+    /// A folder dragged inside the sidebar to move into another folder.
+    Dir(PathBuf),
     /// A tab pill from the top Working-Set Strip.
     Tab(BufferId),
     /// An existing pane, dragged by its header.
@@ -99,6 +107,8 @@ struct PaneDrag {
     plan: Option<DropPlan>,
     /// Drop insertion target when hovering over the top Working-Set Strip.
     strip_drop: Option<(StripDropTarget, i32)>,
+    /// Destination directory when dragging a file/folder inside the sidebar.
+    sidebar_drop: Option<PathBuf>,
     /// Floating label chip rect last drawn (for exact damage tracking).
     chip: PixelRect,
 }
@@ -156,6 +166,7 @@ enum PendingDiscardAction {
     CloseWindow,
     Quit,
     DeletePath { path: PathBuf, is_dir: bool },
+    MoveLargeFolder { src: PathBuf, dst_dir: PathBuf },
 }
 
 pub struct EditorApp {
@@ -204,6 +215,10 @@ pub struct EditorApp {
     pub palette: CommandPalette,
     pub shortcuts: ShortcutsOverlay,
     pub confirm_modal: ConfirmModal,
+    /// Gmail-style floating action toast with optional inline `Undo` button.
+    pub toast: ActionToast,
+    /// Bounded in-memory undo/redo history for sidebar filesystem ops (independent of document undo).
+    pub fs_undo: FsUndoStack,
     pub keymap: Keymap,
     pub vim: VimState,
     pub ime: ImeComposition,
@@ -245,6 +260,7 @@ pub struct EditorApp {
     dragging_gutter_anchor_line: Option<usize>,
     dragging_find_input: bool,
     dragging_replace_input: bool,
+    dragging_sidebar_input: bool,
     drag_click_count: u8,
     drag_word_anchor: (u64, u64),
     dragging_sidebar_edge: bool,
@@ -305,6 +321,8 @@ impl EditorApp {
             palette: CommandPalette::new(),
             shortcuts: ShortcutsOverlay::new(),
             confirm_modal: ConfirmModal::default(),
+            toast: ActionToast::default(),
+            fs_undo: FsUndoStack::new(),
             keymap: Keymap::new(),
             vim: VimState::new(),
             ime: ImeComposition::default(),
@@ -334,6 +352,7 @@ impl EditorApp {
             dragging_gutter_anchor_line: None,
             dragging_find_input: false,
             dragging_replace_input: false,
+            dragging_sidebar_input: false,
             drag_click_count: 1,
             drag_word_anchor: (0, 0),
             dragging_sidebar_edge: false,
@@ -808,9 +827,14 @@ impl EditorApp {
         out
     }
 
+    pub fn sync_fs_watch(&self, host: &mut dyn PlatformHost) {
+        host.watch_directory(self.sidebar.root());
+    }
+
     fn persist_last_folder(&self, host: &mut dyn PlatformHost) {
         if let Some(root) = self.sidebar.root() {
             host.save_pref("LastFolder", &root.to_string_lossy());
+            host.watch_directory(Some(root));
         }
     }
 
@@ -2174,6 +2198,7 @@ impl EditorApp {
             || self.shortcuts.visible
             || self.harpoon.visible
             || self.sidebar.is_context_menu_open()
+            || self.toast.visible
         {
             full_bounds
         } else {
@@ -2229,6 +2254,7 @@ impl EditorApp {
 
         // 1. Sidebar (with quiet Harpoon `1..9` badges and `•` dirty dots!)
         if !layout.sidebar.intersect(effective_clip).is_empty() {
+            self.sidebar.set_prompt_caret_visible(self.caret_visible);
             let ws = &self.working_set;
             self.sidebar.draw_with_badges(
                 &mut painter,
@@ -2421,7 +2447,23 @@ impl EditorApp {
                 plan.map(|p| p.preview),
                 chip,
                 &name,
-                action,
+                &action,
+                &theme,
+                &mut self.atlas,
+                rasterizer,
+            );
+        }
+
+        // 5b2. Quiet Gmail-style floating action toast (bottom-left of editor viewport).
+        if self.toast.visible {
+            let toast_bounds = if !layout.viewport.is_empty() {
+                layout.viewport
+            } else {
+                full_bounds
+            };
+            self.toast.draw(
+                &mut painter,
+                toast_bounds,
                 &theme,
                 &mut self.atlas,
                 rasterizer,
@@ -2529,7 +2571,7 @@ impl EditorApp {
         if self.confirm_modal.visible {
             match event {
                 InputEvent::KeyDown { key, .. } => {
-                    let choice = if self.confirm_modal.is_delete {
+                    let choice = if self.confirm_modal.is_delete || self.confirm_modal.is_move_confirm {
                         match key {
                             Key::Enter | Key::Char('d') | Key::Char('D') => {
                                 Some(ConfirmChoice::Discard)
@@ -2783,10 +2825,36 @@ impl EditorApp {
         if self.sidebar.is_context_menu_open() {
             match event {
                 InputEvent::MouseMove { x_px, y_px, .. } => {
-                    if self.sidebar.hover_context_menu(x_px, y_px) {
+                    let (changed, over_item) = self.sidebar.hover_context_menu(x_px, y_px);
+                    host.set_cursor(if over_item {
+                        CursorShape::Pointer
+                    } else {
+                        CursorShape::Arrow
+                    });
+                    if changed {
                         self.mark_dirty();
                         host.request_redraw();
                     }
+                    return;
+                }
+                InputEvent::MouseUp { .. } => {
+                    // Releasing the right-click that opened the menu must NOT dismiss it!
+                    return;
+                }
+                InputEvent::Tick { now_ms } => {
+                    // Keep the menu open across periodic blink ticks!
+                    self.now_ms = now_ms;
+                    return;
+                }
+                InputEvent::Resize {
+                    width_px,
+                    height_px,
+                    scale,
+                } => {
+                    self.framebuffer
+                        .resize(width_px.max(1), height_px.max(1), scale);
+                    self.recompute_layout();
+                    self.mark_dirty();
                     return;
                 }
                 InputEvent::MouseDown {
@@ -2832,8 +2900,22 @@ impl EditorApp {
                     host.request_redraw();
                     return;
                 }
+                InputEvent::FsChanged(paths) => {
+                    self.handle_fs_changed(&paths, host);
+                    return;
+                }
+                InputEvent::SystemThemeChanged(st) => {
+                    if self.system_theme != st {
+                        self.system_theme = st;
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    return;
+                }
                 _ => {
                     self.sidebar.close_context_menu();
+                    self.mark_dirty();
+                    host.request_redraw();
                 }
             }
         }
@@ -2860,6 +2942,7 @@ impl EditorApp {
                 if !focused {
                     let _ = self.sidebar.clear_hover();
                     let _ = self.tab_strip.clear_hover();
+                    let _ = self.toast.clear_hover();
                     self.hovered_divider = None;
                     self.viewport.v_bar_hovered = false;
                     self.viewport.h_bar_hovered = false;
@@ -2889,8 +2972,15 @@ impl EditorApp {
                     self.sidebar.set_focused(false);
                 }
             }
+            InputEvent::FsChanged(paths) => {
+                self.handle_fs_changed(&paths, host);
+            }
             InputEvent::Tick { now_ms } => {
                 self.now_ms = now_ms;
+                if self.toast.expire_if_needed(now_ms) {
+                    self.mark_dirty();
+                    host.request_redraw();
+                }
                 if let Some((_, _, exp)) = &self.notice {
                     if now_ms >= *exp {
                         self.notice = None;
@@ -2905,6 +2995,8 @@ impl EditorApp {
                         self.mark_dirty_rect(self.layout.find_bar);
                     } else if self.goto_line.visible {
                         self.mark_dirty_rect(self.layout.goto_bar);
+                    } else if self.sidebar.is_prompt_open() {
+                        self.mark_dirty_rect(self.layout.sidebar);
                     } else if !self.sidebar.is_focused() && !self.viewport.last_caret_rect.is_empty()
                     {
                         // Sub-0.05 ms partial dirty-rect redraw for caret blink!
@@ -2972,6 +3064,7 @@ impl EditorApp {
                     self.dragging_gutter_anchor_line = None;
                     self.dragging_find_input = false;
                     self.dragging_replace_input = false;
+                    self.dragging_sidebar_input = false;
                     self.dragging_sidebar_edge = false;
                     self.dragging_divider = None;
                     self.viewport.end_scrollbar_drag();
@@ -3047,6 +3140,7 @@ impl EditorApp {
             click_count,
             plan: None,
             strip_drop: None,
+            sidebar_drop: None,
             chip: PixelRect::ZERO,
         });
     }
@@ -3072,16 +3166,24 @@ impl EditorApp {
             .unwrap_or("")
     }
 
-    fn drag_labels(&self) -> (String, &'static str) {
+    fn drag_labels(&self) -> (String, String) {
         let Some(d) = self.drag.as_ref() else {
-            return (String::new(), "");
+            return (String::new(), String::new());
         };
-        let (name, is_pane) = match &d.payload {
+        let (name, is_pane, is_dir) = match &d.payload {
             DragPayload::File(p) => (
                 p.file_name()
                     .map(|n| n.to_string_lossy().into_owned())
                     .unwrap_or_else(|| p.to_string_lossy().into_owned()),
                 false,
+                false,
+            ),
+            DragPayload::Dir(p) => (
+                p.file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| p.to_string_lossy().into_owned()),
+                false,
+                true,
             ),
             DragPayload::Tab(buf_id) => (
                 self.working_set
@@ -3089,15 +3191,27 @@ impl EditorApp {
                     .map(|m| m.file_name.clone())
                     .unwrap_or_else(|| "Untitled".to_string()),
                 false,
+                false,
             ),
-            DragPayload::Pane(id) => (self.pane_file_name(*id).to_string(), true),
+            DragPayload::Pane(id) => (self.pane_file_name(*id).to_string(), true, false),
         };
+        if let Some(ref dst_dir) = d.sidebar_drop {
+            let dest_name = dst_dir
+                .file_name()
+                .and_then(|n| n.to_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("/");
+            return (name, format!("Move to {dest_name}"));
+        }
+        if is_dir {
+            return (name, "Drop on a folder".to_string());
+        }
         if let Some((target, _)) = d.strip_drop {
             let action = match target {
                 StripDropTarget::PinnedAt(_) => "Pin to strip",
                 StripDropTarget::OpenAt(_) => "Move in strip",
             };
-            return (name, action);
+            return (name, action.to_string());
         }
         let action = match (d.plan.map(|p| p.zone), is_pane) {
             (None, _) => "Drop on a pane",
@@ -3112,7 +3226,7 @@ impl EditorApp {
             (Some(DropZone::Top), true) => "Move above",
             (Some(DropZone::Bottom), true) => "Move below",
         };
-        (name, action)
+        (name, action.to_string())
     }
 
     /// Floating label chip geometry (identical maths to `draw_drag_overlay`).
@@ -3121,7 +3235,7 @@ impl EditorApp {
         let (name, action) = self.drag_labels();
         let fs = DRAG_CHIP_FONT_PT * scale;
         let wn = Painter::measure_text_ui(&name, FontStyle::UiBold, fs, &mut self.atlas, rasterizer);
-        let wa = Painter::measure_text_ui(action, FontStyle::Ui, fs, &mut self.atlas, rasterizer);
+        let wa = Painter::measure_text_ui(&action, FontStyle::Ui, fs, &mut self.atlas, rasterizer);
         let w = (wn + wa + (DRAG_CHIP_GAP_PT + 2.0 * DRAG_CHIP_PAD_PT) * scale).ceil() as i32;
         let h = (DRAG_CHIP_H_PT * scale).round() as i32;
         let b = self.framebuffer.bounds();
@@ -3150,21 +3264,37 @@ impl EditorApp {
             }
             d.started = true;
         }
+        let sidebar_src: Option<(PathBuf, bool)> = match &d.payload {
+            DragPayload::File(p) if !d.external => Some((p.clone(), false)),
+            DragPayload::Dir(p) => Some((p.clone(), true)),
+            _ => None,
+        };
+        let is_dir_only = matches!(d.payload, DragPayload::Dir(_));
         let can_drop_strip = matches!(d.payload, DragPayload::Tab(_) | DragPayload::File(_));
         let moving = match d.payload {
             DragPayload::Pane(id) => Some(id),
-            DragPayload::File(_) | DragPayload::Tab(_) => None,
+            DragPayload::File(_) | DragPayload::Dir(_) | DragPayload::Tab(_) => None,
         };
         let old_plan = d.plan;
         let old_strip = d.strip_drop;
+        let old_sidebar_drop = d.sidebar_drop.clone();
         let old_chip = d.chip;
 
-        let strip_drop = if can_drop_strip {
+        let sidebar_drop = sidebar_src.as_ref().and_then(|(src, is_dir)| {
+            self.sidebar
+                .drop_target_at(self.layout.sidebar, x, y, scale, src, *is_dir)
+        });
+        let in_sidebar = self
+            .layout
+            .sidebar
+            .contains(x.round() as i32, y.round() as i32);
+
+        let strip_drop = if can_drop_strip && !in_sidebar {
             self.tab_strip.drop_target_at(x, y)
         } else {
             None
         };
-        let plan = if strip_drop.is_some() {
+        let plan = if is_dir_only || in_sidebar || strip_drop.is_some() {
             None
         } else {
             panes::plan_drop_at(
@@ -3179,6 +3309,10 @@ impl EditorApp {
         if let Some(d) = self.drag.as_mut() {
             d.plan = plan;
             d.strip_drop = strip_drop;
+            d.sidebar_drop = sidebar_drop.clone();
+        }
+        if self.sidebar.set_drop_target(sidebar_drop.clone()) || old_sidebar_drop != sidebar_drop {
+            self.mark_dirty_rect(self.layout.sidebar);
         }
         let chip = self.drag_chip_rect(x, y, rasterizer);
         if let Some(d) = self.drag.as_mut() {
@@ -3203,6 +3337,9 @@ impl EditorApp {
 
     fn cancel_drag(&mut self, host: &mut dyn PlatformHost) {
         if let Some(d) = self.drag.take() {
+            if self.sidebar.set_drop_target(None) {
+                self.mark_dirty_rect(self.layout.sidebar);
+            }
             self.mark_dirty_rect(d.chip);
             if let Some(p) = d.plan {
                 self.mark_dirty_rect(p.preview);
@@ -3221,6 +3358,9 @@ impl EditorApp {
             self.update_drag(x, y, rasterizer, host);
         }
         let Some(d) = self.drag.take() else { return };
+        if self.sidebar.set_drop_target(None) {
+            self.mark_dirty_rect(self.layout.sidebar);
+        }
         self.mark_dirty_rect(d.chip);
         if let Some(p) = d.plan {
             self.mark_dirty_rect(p.preview);
@@ -3240,9 +3380,15 @@ impl EditorApp {
                     };
                     if let Err(e) = self.open_file_with_mode(&p, mode, host) {
                         self.set_notice(e, true);
-                    } else {
+                    } else if mode == OpenMode::Keep {
+                        // Double-clicking a file hands focus to the editor; single-click keeps
+                        // focus in the sidebar so ↑/↓/←/→/Enter/r/Delete/⌘Z work immediately!
                         self.sidebar.set_focused(false);
                     }
+                }
+                DragPayload::Dir(dir) => {
+                    self.sidebar.toggle_expand(self.fs.as_ref(), &dir);
+                    self.mark_dirty_rect(self.layout.sidebar);
                 }
                 DragPayload::Tab(buf_id) => {
                     if d.click_count >= 2 {
@@ -3255,11 +3401,19 @@ impl EditorApp {
             host.request_redraw();
             return;
         }
+        if let Some(dst_dir) = d.sidebar_drop {
+            match d.payload {
+                DragPayload::File(src) => self.request_move_entry(&src, &dst_dir, false, host),
+                DragPayload::Dir(src) => self.request_move_entry(&src, &dst_dir, true, host),
+                _ => {}
+            }
+            return;
+        }
         if let Some((strip_target, _)) = d.strip_drop {
             let buf_opt = match d.payload {
                 DragPayload::Tab(id) => Some(id),
                 DragPayload::File(p) => self.open_file_with_mode(&p, OpenMode::Keep, host).ok(),
-                DragPayload::Pane(_) => None,
+                DragPayload::Dir(_) | DragPayload::Pane(_) => None,
             };
             if let Some(buf_id) = buf_opt {
                 match strip_target {
@@ -3312,6 +3466,7 @@ impl EditorApp {
             }
             (DragPayload::Tab(buf_id), zone) => self.split_buffer_at(plan.target, zone, buf_id, host),
             (DragPayload::Pane(src), zone) => self.move_pane(src, plan.target, zone, host),
+            (DragPayload::Dir(_), _) => false,
         }
     }
 
@@ -3423,6 +3578,114 @@ impl EditorApp {
             PendingDiscardAction::DeletePath { path, is_dir } => {
                 self.execute_delete_path(&path, is_dir, host);
             }
+            PendingDiscardAction::MoveLargeFolder { src, dst_dir } => {
+                if let Some(name) = src.file_name() {
+                    let dst = dst_dir.join(name);
+                    self.execute_move_entry(&src, &dst, true, true, host);
+                }
+            }
+        }
+    }
+
+    /// Process coalesced OS filesystem change notifications lazily and with zero unnecessary work:
+    /// - Only refreshes directories ALREADY loaded in `sidebar.dir_cache` (never scans collapsed dirs).
+    /// - Silently reloads clean open/split/parked buffers whose on-disk identity changed.
+    /// - Never overwrites dirty buffers (shows a quiet notice instead).
+    fn handle_fs_changed(&mut self, raw_paths: &[PathBuf], host: &mut dyn PlatformHost) {
+        let mut any_changed = false;
+
+        // 1. Lazy sidebar refresh (strictly limited to already-loaded directories!).
+        if raw_paths.is_empty() {
+            self.sidebar.refresh(self.fs.as_ref());
+            any_changed = true;
+        } else {
+            let mut dirs_to_check: Vec<PathBuf> = Vec::new();
+            for p in raw_paths {
+                let s = p.to_string_lossy();
+                if s.contains("/.git/")
+                    || s.contains("/target/")
+                    || s.contains("/node_modules/")
+                    || s.ends_with("/.DS_Store")
+                    || s.ends_with(".editor.lock")
+                    || s.contains(".editor.tmp")
+                {
+                    continue;
+                }
+                if !dirs_to_check.contains(p) {
+                    dirs_to_check.push(p.clone());
+                }
+                if let Some(parent) = p.parent() {
+                    let pb = parent.to_path_buf();
+                    if !dirs_to_check.contains(&pb) {
+                        dirs_to_check.push(pb);
+                    }
+                }
+            }
+            for dir in &dirs_to_check {
+                if self.sidebar.refresh_dir(self.fs.as_ref(), dir) {
+                    any_changed = true;
+                }
+            }
+        }
+
+        let path_matches = |doc_path: &Path| -> bool {
+            if raw_paths.is_empty() {
+                return true;
+            }
+            raw_paths
+                .iter()
+                .any(|c| c == doc_path || doc_path.parent() == Some(c.as_path()))
+        };
+
+        // 2. Active document identity check (reloads clean external edits; guards dirty edits).
+        if let Some(active_p) = self.doc.path().map(Path::to_path_buf) {
+            if path_matches(&active_p) {
+                match self.doc.check_identity(self.fs.as_ref()) {
+                    IdentityCheck::ReloadedClean => {
+                        let len = self.doc.len_bytes();
+                        self.caret = self.caret.min(len);
+                        self.anchor = self.anchor.min(len);
+                        self.extra_cursors.clear();
+                        self.sync_active_buffer_meta();
+                        if self.find_bar.visible {
+                            self.refresh_search();
+                        }
+                        self.set_notice("Reloaded external changes", false);
+                        any_changed = true;
+                    }
+                    IdentityCheck::StaleDirty => {
+                        self.set_notice("File changed on disk", true);
+                        any_changed = true;
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // 3. Secondary visible split panes.
+        for pane in &mut self.other_panes {
+            if let Some(p) = pane.doc.path().map(Path::to_path_buf) {
+                if path_matches(&p) && pane.doc.check_identity(self.fs.as_ref()) == IdentityCheck::ReloadedClean {
+                    let len = pane.doc.len_bytes();
+                    pane.caret = pane.caret.min(len);
+                    pane.anchor = pane.anchor.min(len);
+                    pane.extra_cursors.clear();
+                    any_changed = true;
+                }
+            }
+        }
+
+        // 4. Clean parked buffers in the working set.
+        if self
+            .working_set
+            .reload_clean_parked(self.fs.as_ref(), raw_paths)
+        {
+            any_changed = true;
+        }
+
+        if any_changed {
+            self.mark_dirty();
+            host.request_redraw();
         }
     }
 
@@ -3479,7 +3742,318 @@ impl EditorApp {
         host.request_redraw();
     }
 
+    fn show_toast(&mut self, msg: impl Into<String>, can_undo: bool, is_error: bool) {
+        self.toast.show(msg, can_undo, is_error, self.now_ms);
+        self.mark_dirty();
+    }
+
+    fn request_move_entry(
+        &mut self,
+        src: &Path,
+        dst_dir: &Path,
+        is_dir: bool,
+        host: &mut dyn PlatformHost,
+    ) {
+        let Some(name) = src.file_name() else {
+            return;
+        };
+        if src.parent() == Some(dst_dir) {
+            return;
+        }
+        if is_dir && dst_dir.starts_with(src) {
+            self.show_toast("Cannot move a folder into itself", false, true);
+            host.request_redraw();
+            return;
+        }
+        let dst = dst_dir.join(name);
+        if self.fs.stat(&dst).is_ok() {
+            let n = name.to_string_lossy();
+            let d = dst_dir
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("folder");
+            self.show_toast(format!("{n} already exists in {d}"), false, true);
+            host.request_redraw();
+            return;
+        }
+        if is_dir {
+            let probe = probe_dir_size_bounded(
+                self.fs.as_ref(),
+                src,
+                LARGE_FOLDER_ENTRY_THRESHOLD,
+                LARGE_FOLDER_BYTE_THRESHOLD,
+            );
+            if probe.exceeded {
+                let n = name.to_string_lossy().into_owned();
+                let dest_name = dst_dir
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("/")
+                    .to_string();
+                let summary = if probe.entries >= LARGE_FOLDER_ENTRY_THRESHOLD {
+                    format!("{}+ items", probe.entries)
+                } else {
+                    format!("{:.1}+ MB", probe.bytes as f64 / (1024.0 * 1024.0))
+                };
+                self.pending_discard = Some(PendingDiscardAction::MoveLargeFolder {
+                    src: src.to_path_buf(),
+                    dst_dir: dst_dir.to_path_buf(),
+                });
+                self.confirm_modal.open_confirm_move(&n, &dest_name, &summary);
+                self.mark_dirty();
+                host.request_redraw();
+                return;
+            }
+        }
+        self.execute_move_entry(src, &dst, is_dir, true, host);
+    }
+
+    fn execute_move_entry(
+        &mut self,
+        from: &Path,
+        to: &Path,
+        is_dir: bool,
+        record_undo: bool,
+        host: &mut dyn PlatformHost,
+    ) -> bool {
+        if self.fs.stat(to).is_ok() {
+            let n = to.file_name().and_then(|s| s.to_str()).unwrap_or("item");
+            self.show_toast(format!("{n} already exists"), false, true);
+            host.request_redraw();
+            return false;
+        }
+        match self.fs.rename(from, to) {
+            Ok(()) => {
+                self.update_buffers_after_rename(from, to, is_dir, host);
+                if is_dir {
+                    self.sidebar.invalidate_subtree(self.fs.as_ref(), from);
+                }
+                if let Some(p) = from.parent() {
+                    let _ = self.sidebar.refresh_dir(self.fs.as_ref(), p);
+                }
+                if let Some(p) = to.parent() {
+                    let _ = self.sidebar.refresh_dir(self.fs.as_ref(), p);
+                }
+                self.sidebar.set_selected(Some(to.to_path_buf()));
+                let op = FsOp::Move {
+                    from: from.to_path_buf(),
+                    to: to.to_path_buf(),
+                    is_dir,
+                };
+                let label = op.done_label();
+                if record_undo {
+                    self.fs_undo.push(op);
+                    self.show_toast(label, true, false);
+                } else {
+                    self.show_toast(label, false, false);
+                }
+                self.mark_dirty();
+                host.request_redraw();
+                true
+            }
+            Err(e) => {
+                self.show_toast(format!("Move failed: {e}"), false, true);
+                host.request_redraw();
+                false
+            }
+        }
+    }
+
+    pub fn undo_sidebar_fs_op(&mut self, host: &mut dyn PlatformHost) -> bool {
+        let Some(op) = self.fs_undo.pop_undo() else {
+            self.show_toast("Nothing to undo in sidebar", false, false);
+            host.request_redraw();
+            return false;
+        };
+        let undone_msg = op.undone_label();
+        let ok = match &op {
+            FsOp::Move { from, to, is_dir } => {
+                if self.fs.stat(from).is_ok() {
+                    self.show_toast("Cannot undo: original path already exists", false, true);
+                    false
+                } else if let Err(e) = self.fs.rename(to, from) {
+                    self.show_toast(format!("Undo failed: {e}"), false, true);
+                    false
+                } else {
+                    self.update_buffers_after_rename(to, from, *is_dir, host);
+                    if *is_dir {
+                        self.sidebar.invalidate_subtree(self.fs.as_ref(), to);
+                    }
+                    if let Some(p) = to.parent() {
+                        let _ = self.sidebar.refresh_dir(self.fs.as_ref(), p);
+                    }
+                    if let Some(p) = from.parent() {
+                        let _ = self.sidebar.refresh_dir(self.fs.as_ref(), p);
+                    }
+                    self.sidebar.set_selected(Some(from.clone()));
+                    true
+                }
+            }
+            FsOp::CreateFile { path } => {
+                let is_empty = self
+                    .fs
+                    .stat(path)
+                    .map(|st| st.is_file && st.rev.size == 0)
+                    .unwrap_or(false);
+                if !is_empty {
+                    self.show_toast("Cannot undo create: file is no longer empty", false, true);
+                    false
+                } else if let Err(e) = self.fs.remove_file(path) {
+                    self.show_toast(format!("Undo failed: {e}"), false, true);
+                    false
+                } else {
+                    self.close_buffers_under_path(path, host);
+                    self.sidebar.invalidate_subtree(self.fs.as_ref(), path);
+                    true
+                }
+            }
+            FsOp::CreateFolder { path } => {
+                let is_empty = self
+                    .fs
+                    .read_dir(path)
+                    .map(|entries| entries.is_empty())
+                    .unwrap_or(false);
+                if !is_empty {
+                    self.show_toast("Cannot undo create: folder is not empty", false, true);
+                    false
+                } else if let Err(e) = self.fs.remove_dir_all(path) {
+                    self.show_toast(format!("Undo failed: {e}"), false, true);
+                    false
+                } else {
+                    self.sidebar.invalidate_subtree(self.fs.as_ref(), path);
+                    true
+                }
+            }
+            FsOp::DeleteFile { path, content } => {
+                if self.fs.stat(path).is_ok() {
+                    self.show_toast("Cannot restore: file already exists", false, true);
+                    false
+                } else if let Err(e) = self
+                    .fs
+                    .write_atomic(path, &mut |w| w.write_all(content))
+                {
+                    self.show_toast(format!("Restore failed: {e}"), false, true);
+                    false
+                } else {
+                    if let Some(p) = path.parent() {
+                        let _ = self.sidebar.refresh_dir(self.fs.as_ref(), p);
+                    }
+                    self.sidebar.set_selected(Some(path.clone()));
+                    true
+                }
+            }
+        };
+        if ok {
+            self.fs_undo.push_redo(op);
+            self.show_toast(undone_msg, false, false);
+        } else {
+            self.fs_undo.push_undo_without_clearing_redo(op);
+        }
+        self.mark_dirty();
+        host.request_redraw();
+        ok
+    }
+
+    pub fn redo_sidebar_fs_op(&mut self, host: &mut dyn PlatformHost) -> bool {
+        let Some(op) = self.fs_undo.pop_redo() else {
+            self.show_toast("Nothing to redo in sidebar", false, false);
+            host.request_redraw();
+            return false;
+        };
+        let done_msg = op.done_label();
+        let ok = match &op {
+            FsOp::Move { from, to, is_dir } => {
+                if self.fs.stat(to).is_ok() {
+                    self.show_toast("Cannot redo: destination already exists", false, true);
+                    false
+                } else if let Err(e) = self.fs.rename(from, to) {
+                    self.show_toast(format!("Redo failed: {e}"), false, true);
+                    false
+                } else {
+                    self.update_buffers_after_rename(from, to, *is_dir, host);
+                    if *is_dir {
+                        self.sidebar.invalidate_subtree(self.fs.as_ref(), from);
+                    }
+                    if let Some(p) = from.parent() {
+                        let _ = self.sidebar.refresh_dir(self.fs.as_ref(), p);
+                    }
+                    if let Some(p) = to.parent() {
+                        let _ = self.sidebar.refresh_dir(self.fs.as_ref(), p);
+                    }
+                    self.sidebar.set_selected(Some(to.clone()));
+                    true
+                }
+            }
+            FsOp::CreateFile { path } => {
+                if let Err(e) = self.fs.write_atomic(path, &mut |_| Ok(())) {
+                    self.show_toast(format!("Redo failed: {e}"), false, true);
+                    false
+                } else {
+                    if let Some(p) = path.parent() {
+                        let _ = self.sidebar.refresh_dir(self.fs.as_ref(), p);
+                    }
+                    self.sidebar.set_selected(Some(path.clone()));
+                    true
+                }
+            }
+            FsOp::CreateFolder { path } => {
+                if let Err(e) = self.fs.create_dir(path) {
+                    self.show_toast(format!("Redo failed: {e}"), false, true);
+                    false
+                } else {
+                    if let Some(p) = path.parent() {
+                        let _ = self.sidebar.refresh_dir(self.fs.as_ref(), p);
+                    }
+                    self.sidebar.set_selected(Some(path.clone()));
+                    true
+                }
+            }
+            FsOp::DeleteFile { path, .. } => {
+                if let Err(e) = self.fs.remove_file(path) {
+                    self.show_toast(format!("Redo failed: {e}"), false, true);
+                    false
+                } else {
+                    self.close_buffers_under_path(path, host);
+                    self.sidebar.invalidate_subtree(self.fs.as_ref(), path);
+                    true
+                }
+            }
+        };
+        if ok {
+            self.fs_undo.push_undo_without_clearing_redo(op);
+            self.show_toast(done_msg, true, false);
+        } else {
+            self.fs_undo.push_redo(op);
+        }
+        self.mark_dirty();
+        host.request_redraw();
+        ok
+    }
+
     fn execute_delete_path(&mut self, path: &Path, is_dir: bool, host: &mut dyn PlatformHost) {
+        // Snapshot small single-file deletes (<= 256 KB) in memory so Gmail-style Undo works cleanly!
+        let snapshot: Option<Vec<u8>> = if !is_dir {
+            self.fs
+                .open_read(path)
+                .ok()
+                .filter(|h| (h.len() as usize) <= MAX_DELETE_SNAPSHOT_BYTES)
+                .and_then(|h| {
+                    let mut buf = vec![0u8; h.len() as usize];
+                    let mut got = 0usize;
+                    while got < buf.len() {
+                        match h.read_at(got as u64, &mut buf[got..]) {
+                            Ok(0) => break,
+                            Ok(n) => got += n,
+                            Err(_) => return None,
+                        }
+                    }
+                    buf.truncate(got);
+                    Some(buf)
+                })
+        } else {
+            None
+        };
         let res = if is_dir {
             self.fs.remove_dir_all(path)
         } else {
@@ -3490,10 +4064,20 @@ impl EditorApp {
                 self.close_buffers_under_path(path, host);
                 self.sidebar.invalidate_subtree(self.fs.as_ref(), path);
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
-                self.set_notice(format!("Deleted {name}"), false);
+                if let Some(content) = snapshot {
+                    let op = FsOp::DeleteFile {
+                        path: path.to_path_buf(),
+                        content,
+                    };
+                    let msg = op.done_label();
+                    self.fs_undo.push(op);
+                    self.show_toast(msg, true, false);
+                } else {
+                    self.show_toast(format!("Deleted {name}"), false, false);
+                }
             }
             Err(e) => {
-                self.set_notice(format!("Delete failed: {e}"), true);
+                self.show_toast(format!("Delete failed: {e}"), false, true);
             }
         }
         self.mark_dirty();
@@ -3514,7 +4098,7 @@ impl EditorApp {
             || name.contains('\\')
             || name.contains('\0')
         {
-            self.set_notice("Invalid file or folder name", true);
+            self.show_toast("Invalid file or folder name", false, true);
             self.mark_dirty();
             host.request_redraw();
             return;
@@ -3523,7 +4107,7 @@ impl EditorApp {
             SidebarPromptKind::NewFile { parent } => {
                 let dst = parent.join(name);
                 if self.fs.stat(&dst).is_ok() {
-                    self.set_notice(format!("{name} already exists"), true);
+                    self.show_toast(format!("{name} already exists"), false, true);
                 } else {
                     match self.fs.write_atomic(&dst, &mut |_w| Ok(())) {
                         Ok(_) => {
@@ -3531,9 +4115,12 @@ impl EditorApp {
                             self.sidebar.set_selected(Some(dst.clone()));
                             let _ = self.open_file_with_mode(&dst, OpenMode::Keep, host);
                             self.sidebar.set_focused(false);
-                            self.set_notice(format!("Created {name}"), false);
+                            let op = FsOp::CreateFile { path: dst };
+                            let msg = op.done_label();
+                            self.fs_undo.push(op);
+                            self.show_toast(msg, true, false);
                         }
-                        Err(e) => self.set_notice(format!("Create failed: {e}"), true),
+                        Err(e) => self.show_toast(format!("Create failed: {e}"), false, true),
                     }
                 }
             }
@@ -3542,10 +4129,13 @@ impl EditorApp {
                 match self.fs.create_dir(&dst) {
                     Ok(()) => {
                         let _ = self.sidebar.refresh_dir(self.fs.as_ref(), &parent);
-                        self.sidebar.set_selected(Some(dst));
-                        self.set_notice(format!("Created folder {name}"), false);
+                        self.sidebar.set_selected(Some(dst.clone()));
+                        let op = FsOp::CreateFolder { path: dst };
+                        let msg = op.done_label();
+                        self.fs_undo.push(op);
+                        self.show_toast(msg, true, false);
                     }
-                    Err(e) => self.set_notice(format!("Create folder failed: {e}"), true),
+                    Err(e) => self.show_toast(format!("Create folder failed: {e}"), false, true),
                 }
             }
             SidebarPromptKind::Rename { target, is_dir } => {
@@ -3558,22 +4148,8 @@ impl EditorApp {
                     host.request_redraw();
                     return;
                 }
-                if self.fs.stat(&dst).is_ok() {
-                    self.set_notice(format!("{name} already exists"), true);
-                } else {
-                    match self.fs.rename(&target, &dst) {
-                        Ok(()) => {
-                            self.update_buffers_after_rename(&target, &dst, is_dir, host);
-                            if is_dir {
-                                self.sidebar.invalidate_subtree(self.fs.as_ref(), &target);
-                            }
-                            let _ = self.sidebar.refresh_dir(self.fs.as_ref(), &parent);
-                            self.sidebar.set_selected(Some(dst));
-                            self.set_notice(format!("Renamed to {name}"), false);
-                        }
-                        Err(e) => self.set_notice(format!("Rename failed: {e}"), true),
-                    }
-                }
+                self.execute_move_entry(&target, &dst, is_dir, true, host);
+                return;
             }
         }
         self.mark_dirty();
@@ -3742,6 +4318,8 @@ impl EditorApp {
             ("sidebar-new-folder", "Sidebar: New folder", "File & Navigation"),
             ("sidebar-rename", "Sidebar: Rename selected", "File & Navigation"),
             ("sidebar-delete", "Sidebar: Delete selected", "File & Navigation"),
+            ("sidebar-undo", "Sidebar: Undo file action", "File & Navigation"),
+            ("sidebar-redo", "Sidebar: Redo file action", "File & Navigation"),
             ("reload", "Reload file from disk", "File & Navigation"),
         ];
         for &(id, title, category) in extras {
@@ -3876,6 +4454,8 @@ impl EditorApp {
             Some(&mut self.shortcuts.input)
         } else if self.palette.is_open() {
             Some(&mut self.palette.input)
+        } else if self.sidebar.is_prompt_open() {
+            self.sidebar.active_prompt_input_mut()
         } else if self.goto_line.visible {
             Some(&mut self.goto_line.input)
         } else if self.find_bar.visible && self.find_bar.find_input.focused {
@@ -3939,6 +4519,10 @@ impl EditorApp {
                 self.request_discard_or_run(PendingDiscardAction::Reload, host);
             }
             AppCommand::Undo => {
+                if self.sidebar.is_focused() && !self.sidebar.is_prompt_open() {
+                    self.undo_sidebar_fs_op(host);
+                    return;
+                }
                 self.extra_cursors.clear();
                 if let Some(pos) = self.doc.undo() {
                     self.caret = pos.min(self.doc.len_bytes());
@@ -3947,6 +4531,10 @@ impl EditorApp {
                 }
             }
             AppCommand::Redo => {
+                if self.sidebar.is_focused() && !self.sidebar.is_prompt_open() {
+                    self.redo_sidebar_fs_op(host);
+                    return;
+                }
                 self.extra_cursors.clear();
                 if let Some(pos) = self.doc.redo() {
                     self.caret = pos.min(self.doc.len_bytes());
@@ -4437,6 +5025,13 @@ impl EditorApp {
 
         // Route to Sidebar if focused.
         if self.sidebar.is_focused() {
+            // Scoped sidebar Undo / Redo (`⌘Z` / `⇧⌘Z`): reverts sidebar FS ops without touching open files!
+            if let Some(cmd) = self.keymap.resolve(KeyScope::Document, key, mods) {
+                if matches!(cmd, AppCommand::Undo | AppCommand::Redo) {
+                    self.handle_command(cmd, rasterizer, clipboard, host);
+                    return;
+                }
+            }
             if key == Key::Escape {
                 self.sidebar.set_focused(false);
                 self.mark_dirty();
@@ -4454,6 +5049,11 @@ impl EditorApp {
                     } else {
                         self.sidebar.set_focused(false);
                     }
+                }
+                SidebarAction::DirectoryClicked(dir) => {
+                    self.sidebar.toggle_expand(self.fs.as_ref(), &dir);
+                    self.mark_dirty();
+                    host.request_redraw();
                 }
                 SidebarAction::Minimize => {
                     self.set_sidebar_visible_user(false, host);
@@ -5662,9 +6262,47 @@ impl EditorApp {
         let xi = x_px.round() as i32;
         let yi = y_px.round() as i32;
 
-        // 1. Sidebar resize edge or click.
+        // 0. Floating action toast (`Undo` / `×` dismiss, Gmail-style).
+        if self.toast.visible {
+            match self.toast.hit_test(x_px, y_px) {
+                ToastHit::Undo => {
+                    self.undo_sidebar_fs_op(host);
+                    return;
+                }
+                ToastHit::Close => {
+                    if self.toast.dismiss() {
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    return;
+                }
+                ToastHit::Body => return,
+                ToastHit::None => {}
+            }
+        }
+
+        // 1. Sidebar resize edge or click (including in-place Rename / New File / New Folder input!).
         if self.sidebar.is_visible() {
             let sb_hit = self.sidebar.hit_test(self.layout.sidebar, x_px, y_px, scale);
+            if self.sidebar.is_prompt_open() {
+                if sb_hit == SidebarHit::InlineInput {
+                    self.sidebar.prompt_mouse_down(
+                        x_px,
+                        scale,
+                        mods.shift,
+                        &mut self.atlas,
+                        rasterizer,
+                    );
+                    self.dragging_sidebar_input = true;
+                    self.mark_dirty_rect(self.layout.sidebar);
+                    host.request_redraw();
+                    return;
+                }
+                // Clicking outside the active inline input cancels cleanly.
+                self.sidebar.cancel_prompt();
+                self.mark_dirty_rect(self.layout.sidebar);
+                host.request_redraw();
+            }
             if sb_hit == SidebarHit::ResizeEdge {
                 if click_count >= 2 {
                     self.dragging_sidebar_edge = false;
@@ -5692,8 +6330,14 @@ impl EditorApp {
                 {
                     SidebarAction::OpenFile(p) => {
                         // Start a drag candidate: if released within 4pt it opens in Preview
-                        // (single-click) or Kept (double-click); dragging beyond 4pt shows the drop preview!
+                        // (single-click) or Kept (double-click); dragging beyond 4pt moves into a folder or opens in a pane!
                         self.begin_drag(DragPayload::File(p), x_px, y_px, false, click_count);
+                        self.mark_dirty_rect(self.layout.sidebar);
+                        host.request_redraw();
+                    }
+                    SidebarAction::DirectoryClicked(dir) => {
+                        // Start a drag candidate: plain click toggles expand; dragging > 4pt moves folder!
+                        self.begin_drag(DragPayload::Dir(dir), x_px, y_px, false, click_count);
                         self.mark_dirty_rect(self.layout.sidebar);
                         host.request_redraw();
                     }
@@ -5713,6 +6357,14 @@ impl EditorApp {
                     | SidebarAction::RequestDelete { .. }
                     | SidebarAction::None => {}
                 }
+                return;
+            }
+            if self.layout.sidebar.contains(xi, yi) {
+                self.sidebar.set_focused(true);
+                self.find_bar.find_input.focused = false;
+                self.find_bar.replace_input.focused = false;
+                self.mark_dirty();
+                host.request_redraw();
                 return;
             }
         }
@@ -6003,6 +6655,16 @@ impl EditorApp {
             host.request_redraw();
             return;
         }
+        if self.dragging_sidebar_input {
+            if self
+                .sidebar
+                .prompt_mouse_drag(x_px, scale, &mut self.atlas, rasterizer)
+            {
+                self.mark_dirty_rect(self.layout.sidebar);
+                host.request_redraw();
+            }
+            return;
+        }
         if self.dragging_find_input {
             let rect = self.find_bar.layout.find_input;
             self.find_bar
@@ -6180,11 +6842,33 @@ impl EditorApp {
             needs_redraw = true;
         }
 
+        // 3c. Floating action toast hover (reconciled unconditionally!).
+        let toast_hit = if !overlay_open && self.toast.visible {
+            let (changed, hit) = self.toast.set_hovered(x_px, y_px);
+            if changed {
+                self.mark_dirty();
+                needs_redraw = true;
+            }
+            hit
+        } else {
+            if self.toast.clear_hover() {
+                self.mark_dirty();
+                needs_redraw = true;
+            }
+            ToastHit::None
+        };
+
         // 4. Resolve cursor shape cleanly from active hit region.
         let cursor = if overlay_open {
             CursorShape::Arrow
+        } else if matches!(toast_hit, ToastHit::Undo | ToastHit::Close) {
+            CursorShape::Pointer
+        } else if toast_hit == ToastHit::Body {
+            CursorShape::Arrow
         } else if sb_hit == SidebarHit::ResizeEdge {
             CursorShape::ResizeHorizontal
+        } else if sb_hit == SidebarHit::InlineInput {
+            CursorShape::IBeam
         } else if sb_hit != SidebarHit::None {
             CursorShape::Pointer
         } else if in_tab_strip {
@@ -6870,6 +7554,21 @@ impl EditorApp {
                     }
                     "sidebar-delete" => {
                         self.execute_sidebar_context_action(SidebarContextAction::Delete, host);
+                    }
+                    "sidebar-undo" => {
+                        self.undo_sidebar_fs_op(host);
+                    }
+                    "sidebar-redo" => {
+                        self.redo_sidebar_fs_op(host);
+                    }
+                    act if act.starts_with("sidebar-move:") => {
+                        let spec = &act["sidebar-move:".len()..];
+                        if let Some((src_s, dst_s)) = spec.split_once('|') {
+                            let src = PathBuf::from(src_s.trim());
+                            let dst_dir = PathBuf::from(dst_s.trim());
+                            let is_dir = self.fs.stat(&src).map(|s| s.is_dir).unwrap_or(false);
+                            self.request_move_entry(&src, &dst_dir, is_dir, host);
+                        }
                     }
                     "zoom-in" => {
                         self.handle_command(AppCommand::ZoomIn, rasterizer, clipboard, host)

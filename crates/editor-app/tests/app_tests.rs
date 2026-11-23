@@ -3112,7 +3112,9 @@ fn sidebar_file_operations_create_rename_delete_and_context_menu() {
     assert!(fs.stat(Path::new("/proj/notes.md")).is_ok());
     assert_eq!(app.doc.path(), Some(Path::new("/proj/notes.md")));
 
-    // 2. Rename selected file (`notes.md` -> `readme.md`) -> updates disk AND active open buffer path!
+    // 2. Rename selected file (`notes.md` -> `readme.md`):
+    //    - In-place at the row's exact Y (NOT in a disconnected top strip!)
+    //    - Smart stem pre-selection selects only `"notes"`, leaving `.md` intact!
     let _ = app.execute_ipc(
         &editor_platform::ipc::IpcCommand::Action("sidebar-rename".into()),
         &mut raster,
@@ -3120,27 +3122,17 @@ fn sidebar_file_operations_create_rename_delete_and_context_menu() {
         &mut host,
     );
     assert!(app.sidebar.is_prompt_open());
-    // Select all & replace name
-    let mut primary = Modifiers::NONE;
-    #[cfg(target_os = "macos")]
-    {
-        primary.meta = true;
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        primary.ctrl = true;
-    }
-    app.handle_event(
-        InputEvent::KeyDown {
-            key: Key::Char('a'),
-            mods: primary,
-            text: None,
-        },
-        &mut raster,
-        &mut clip,
-        &mut host,
+    app.render(&mut raster);
+    let in_rect = app.sidebar.prompt_input_rect();
+    assert!(!in_rect.is_empty(), "in-place rename input rect must be populated");
+    // Row 1 (`notes.md`, after `main.rs`) sits below the 30pt header + row 0 (24pt) -> y >= 100px @ 2x!
+    assert!(
+        in_rect.y >= 100,
+        "in-place rename must render at the target row's position, not the top of the sidebar (got y={})",
+        in_rect.y
     );
-    for ch in "readme.md".chars() {
+    // Because `"notes"` is pre-selected (leaving `.md` untouched), typing `"readme"` produces `"readme.md"`!
+    for ch in "readme".chars() {
         app.handle_event(
             InputEvent::KeyDown {
                 key: Key::Char(ch),
@@ -3197,7 +3189,8 @@ fn sidebar_file_operations_create_rename_delete_and_context_menu() {
     );
     assert!(fs.stat(Path::new("/proj/docs")).map(|s| s.is_dir).unwrap_or(false));
 
-    // 4. Right-click inside sidebar opens custom context menu; Escape dismisses it cleanly.
+    // 4. Right-click inside sidebar opens custom context menu; MouseUp, Tick, and MouseMove hover
+    //    must keep it open cleanly, and Escape dismisses it.
     app.handle_event(
         InputEvent::MouseDown {
             x_px: 80.0,
@@ -3212,6 +3205,37 @@ fn sidebar_file_operations_create_rename_delete_and_context_menu() {
     );
     assert!(app.sidebar.is_context_menu_open());
     app.render(&mut raster);
+    app.handle_event(
+        InputEvent::MouseUp {
+            x_px: 80.0,
+            y_px: 100.0,
+            button: MouseButton::Right,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::Tick { now_ms: 10_000 },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: 120.0,
+            y_px: 120.0,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(
+        app.sidebar.is_context_menu_open(),
+        "context menu must survive MouseUp, Tick, and MouseMove hover"
+    );
     app.handle_event(
         InputEvent::KeyDown {
             key: Key::Escape,
@@ -3348,4 +3372,370 @@ fn multi_cursor_cmd_d_alt_click_atomic_edit_paste_and_undo() {
         &mut host,
     );
     assert!(app.extra_cursors.is_empty());
+}
+
+#[test]
+fn live_fs_watcher_reloads_clean_buffers_preserves_dirty_and_stays_lazy() {
+    use editor_platform::{InputEvent, Key, Modifiers};
+    use std::path::{Path, PathBuf};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/ws/clean.rs", b"fn v1() {}\n".to_vec());
+    fs.add_file("/ws/dirty.rs", b"fn orig() {}\n".to_vec());
+    fs.add_file("/ws/sub/deep.rs", b"fn deep() {}\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1400, 900, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    // 1. Opening a folder registers it with the OS watcher via `PlatformHost::watch_directory`.
+    app.open_folder(Path::new("/ws"), &mut host);
+    assert_eq!(host.watched_dir.as_deref(), Some(Path::new("/ws")));
+
+    // Open clean.rs, then modify it externally (simulating an agent CLI edit or git checkout)
+    // and deliver a coalesced `InputEvent::FsChanged`.
+    app.open_file(Path::new("/ws/clean.rs"), &mut host).unwrap();
+    fs.add_file("/ws/clean.rs", b"fn v2_from_agent() {}\n".to_vec());
+    fs.add_file("/ws/created_by_agent.rs", b"// new\n".to_vec());
+
+    app.handle_event(
+        InputEvent::FsChanged(vec![
+            PathBuf::from("/ws/clean.rs"),
+            PathBuf::from("/ws/created_by_agent.rs"),
+        ]),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(0).unwrap(), "fn v2_from_agent() {}");
+    assert!(
+        app.sidebar
+            .rows()
+            .iter()
+            .any(|r| r.name == "created_by_agent.rs"),
+        "sidebar root should refresh lazily and show newly created sibling file"
+    );
+    // Unexpanded subdirectory `/ws/sub` MUST remain collapsed & lazy!
+    assert!(
+        !app.sidebar.rows().iter().any(|r| r.name == "deep.rs"),
+        "collapsed subdirectories must never be eagerly scanned by FS events"
+    );
+
+    // 2. Dirty buffer is NEVER overwritten by external FS changes!
+    app.open_file(Path::new("/ws/dirty.rs"), &mut host).unwrap();
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('x'),
+            mods: Modifiers::NONE,
+            text: Some("// local unsaved\n".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.doc.is_dirty());
+    fs.add_file("/ws/dirty.rs", b"fn overwritten_on_disk() {}\n".to_vec());
+    app.handle_event(
+        InputEvent::FsChanged(vec![PathBuf::from("/ws/dirty.rs")]),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(0).unwrap(), "// local unsaved");
+    assert!(app.doc.is_dirty());
+}
+
+#[test]
+fn sidebar_drag_drop_move_large_folder_guard_scoped_undo_and_toast() {
+    use editor_platform::{AppCommand, FileSystem, InputEvent, Key, Modifiers, MouseButton};
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/proj/alpha.rs", b"fn alpha() {}\n".to_vec());
+    fs.add_file("/proj/sub/keep.rs", b"fn keep() {}\n".to_vec());
+    // Large folder (> 50 files) to verify pre-move confirmation guard!
+    for i in 0..55 {
+        fs.add_file(format!("/proj/big_dir/f{i}.txt"), b"x".to_vec());
+    }
+    fs.add_file("/proj/dest/placeholder.txt", b"ok".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1400, 900, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_folder(Path::new("/proj"), &mut host);
+    app.open_file(Path::new("/proj/alpha.rs"), &mut host).unwrap();
+    app.render(&mut raster);
+
+    // 1. Type an edit inside `alpha.rs` (document undo stack has 1 text edit).
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('a'),
+            mods: Modifiers::NONE,
+            text: Some("// edited\n".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(0).unwrap(), "// edited");
+
+    // 2. Drag `alpha.rs` onto `sub/` inside the sidebar!
+    let alpha_idx = app
+        .sidebar
+        .rows()
+        .iter()
+        .position(|r| r.name == "alpha.rs")
+        .unwrap();
+    let sub_idx = app
+        .sidebar
+        .rows()
+        .iter()
+        .position(|r| r.name == "sub")
+        .unwrap();
+    let row_y = |idx: usize| -> f32 {
+        // 30pt header + idx * 24pt + 12pt center, at 2x scale
+        (30.0 + idx as f32 * 24.0 + 12.0) * 2.0
+    };
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: 120.0,
+            y_px: row_y(alpha_idx),
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: 120.0,
+            y_px: row_y(sub_idx),
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.is_dragging());
+    app.handle_event(
+        InputEvent::MouseUp {
+            x_px: 120.0,
+            y_px: row_y(sub_idx),
+            button: MouseButton::Left,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(fs.stat(Path::new("/proj/alpha.rs")).is_err());
+    assert!(fs.stat(Path::new("/proj/sub/alpha.rs")).is_ok());
+    assert_eq!(
+        app.doc.path(),
+        Some(Path::new("/proj/sub/alpha.rs")),
+        "moving an open file updates its buffer path seamlessly"
+    );
+    assert!(app.toast.visible && app.toast.can_undo);
+    assert!(app.toast.message.contains("Moved alpha.rs to sub"));
+    app.render(&mut raster);
+
+    // 3. Scoped Undo isolation:
+    //    - While editor is focused, `AppCommand::Undo` undoes ONLY the text edit (file stays in `sub/`!).
+    app.sidebar.set_focused(false);
+    app.handle_event(
+        InputEvent::Command(AppCommand::Undo),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.line_content(0).unwrap(), "fn alpha() {}");
+    assert!(
+        fs.stat(Path::new("/proj/sub/alpha.rs")).is_ok(),
+        "document undo must NEVER revert sidebar moves"
+    );
+
+    //    - While sidebar is focused, `AppCommand::Undo` undoes ONLY the sidebar move (doc stays untouched)!
+    app.sidebar.set_focused(true);
+    app.handle_event(
+        InputEvent::Command(AppCommand::Undo),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(fs.stat(Path::new("/proj/alpha.rs")).is_ok());
+    assert!(fs.stat(Path::new("/proj/sub/alpha.rs")).is_err());
+    assert_eq!(app.doc.path(), Some(Path::new("/proj/alpha.rs")));
+
+    //    - Sidebar Redo moves it right back into `sub/`, then clicking Undo on the toast reverts it!
+    app.handle_event(
+        InputEvent::Command(AppCommand::Redo),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(fs.stat(Path::new("/proj/sub/alpha.rs")).is_ok());
+    assert!(app.toast.visible && app.toast.can_undo);
+    app.render(&mut raster);
+    // Click the toast's Undo button (even when document is focused!)
+    app.sidebar.set_focused(false);
+    let card = app.toast.card_rect;
+    // Undo button sits just left of the 20pt close `×` button at right side of toast card.
+    let undo_x = (card.right() - 78) as f32;
+    let undo_y = (card.y + card.h / 2) as f32;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: undo_x,
+            y_px: undo_y,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(fs.stat(Path::new("/proj/alpha.rs")).is_ok());
+    assert!(fs.stat(Path::new("/proj/sub/alpha.rs")).is_err());
+
+    // 4. Large folder move guard (> 50 files in `big_dir`): warns via ConfirmModal before moving!
+    let _ = app.execute_ipc(
+        &editor_platform::ipc::IpcCommand::Action("sidebar-move:/proj/big_dir|/proj/dest".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.confirm_modal.visible && app.confirm_modal.is_move_confirm);
+    assert!(fs.stat(Path::new("/proj/big_dir")).is_ok(), "must not move before confirmation");
+    app.render(&mut raster);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.confirm_modal.visible);
+    assert!(fs.stat(Path::new("/proj/dest/big_dir")).is_ok());
+    assert!(app.toast.visible && app.toast.can_undo);
+}
+
+#[test]
+fn sidebar_single_click_keeps_focus_for_arrow_navigation_while_enter_or_double_click_focuses_editor()
+{
+    use editor_platform::{InputEvent, Key, Modifiers, MouseButton};
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/proj/a.rs", b"line1\nline2\nline3\n".to_vec());
+    fs.add_file("/proj/b.rs", b"second1\nsecond2\n".to_vec());
+
+    let mut app = EditorApp::new(fs, 1400, 900, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_folder(Path::new("/proj"), &mut host);
+    app.render(&mut raster);
+
+    // 1. Single-click `a.rs` (row 0 in sidebar) -> opens preview AND keeps sidebar focused!
+    let row0_y = (30.0 + 12.0) * 2.0;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: 100.0,
+            y_px: row0_y,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseUp {
+            x_px: 100.0,
+            y_px: row0_y,
+            button: MouseButton::Left,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.path(), Some(Path::new("/proj/a.rs")));
+    assert!(app.sidebar.is_focused(), "single-click in sidebar must keep sidebar focus");
+
+    // 2. Pressing Down arrow moves selection to `b.rs` in sidebar (NOT line 2 in `a.rs`)!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Down,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.sidebar.selected(), Some(Path::new("/proj/b.rs")));
+    assert_eq!(app.doc.byte_to_line_col(app.caret).0, 0, "editor caret must not move");
+
+    // 3. Pressing Enter opens `b.rs` and hands focus to the editor -> Down arrow now moves in editor!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.path(), Some(Path::new("/proj/b.rs")));
+    assert!(!app.sidebar.is_focused(), "Enter on file must hand focus to editor");
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Down,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.byte_to_line_col(app.caret).0, 1);
+
+    // 4. Double-clicking `a.rs` in sidebar opens it as Kept AND focuses the editor!
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: 100.0,
+            y_px: row0_y,
+            button: MouseButton::Left,
+            click_count: 2,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseUp {
+            x_px: 100.0,
+            y_px: row0_y,
+            button: MouseButton::Left,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.path(), Some(Path::new("/proj/a.rs")));
+    assert!(!app.sidebar.is_focused(), "double-click must focus editor");
 }

@@ -198,6 +198,9 @@ pub enum InputEvent {
     FocusChanged(bool),
     SystemThemeChanged(SystemTheme),
     OpenPath(PathBuf),
+    /// Coalesced filesystem change notifications delivered by the OS event watcher.
+    /// Empty list requests a lightweight reconciliation of currently loaded directories and open buffers.
+    FsChanged(Vec<PathBuf>),
     Command(AppCommand),
     /// Periodic caret blink / debounce timer tick (`now_ms` monotonic milliseconds).
     Tick {

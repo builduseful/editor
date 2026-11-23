@@ -5,6 +5,7 @@
 
 #import <AppKit/AppKit.h>
 #import <CoreGraphics/CoreGraphics.h>
+#import <CoreServices/CoreServices.h>
 #import <CoreText/CoreText.h>
 #import <IOSurface/IOSurface.h>
 #import <QuartzCore/QuartzCore.h>
@@ -331,6 +332,7 @@ typedef struct {
     void (*on_focus)(void* ud, uint32_t focused);
     void (*on_theme)(void* ud, uint32_t is_dark);
     void (*on_open_path)(void* ud, const char* path);
+    void (*on_fs_changed)(void* ud, const char* const* paths, size_t count);
     void (*on_drag)(void* ud, uint32_t phase, float x, float y, const char* path);
     void (*on_command)(void* ud, uint32_t cmd_id);
     void (*on_tick)(void* ud, uint64_t now_ms);
@@ -796,6 +798,27 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
 
 static NSWindow* g_window = nil;
 static EditorSurfaceView* g_view = nil;
+static FSEventStreamRef g_fs_stream = NULL;
+static NSString* g_watched_dir = nil;
+
+static BOOL is_noisy_fs_path(const char* p) {
+    if (!p || p[0] == '\0') return YES;
+    if (strstr(p, "/.git/") != NULL || strstr(p, "/target/") != NULL ||
+        strstr(p, "/node_modules/") != NULL || strstr(p, "/.DS_Store") != NULL ||
+        strstr(p, ".editor.lock") != NULL || strstr(p, ".editor.tmp") != NULL) {
+        return YES;
+    }
+    return NO;
+}
+
+static void stop_fs_watcher_stream(void) {
+    if (g_fs_stream) {
+        FSEventStreamStop(g_fs_stream);
+        FSEventStreamInvalidate(g_fs_stream);
+        FSEventStreamRelease(g_fs_stream);
+        g_fs_stream = NULL;
+    }
+}
 
 void mac_set_title(const char* title) {
     if (!g_window || !title) return;
@@ -832,9 +855,90 @@ void mac_request_redraw(void) {
 
 static EditorAppDelegate* g_delegate = nil;
 
+static void fsevents_callback(
+    ConstFSEventStreamRef streamRef,
+    void* clientCallBackInfo,
+    size_t numEvents,
+    void* eventPaths,
+    const FSEventStreamEventFlags eventFlags[],
+    const FSEventStreamEventId eventIds[]
+) {
+    (void)streamRef;
+    (void)clientCallBackInfo;
+    (void)eventFlags;
+    (void)eventIds;
+    if (!g_delegate || !g_delegate.cb.on_fs_changed || numEvents == 0) return;
+
+    NSArray* nsPaths = (__bridge NSArray*)eventPaths;
+    if (!nsPaths) return;
+
+    // Filter noisy VCS/build/lock paths BEFORE crossing FFI or waking Rust.
+    size_t cap = numEvents < 256 ? numEvents : 256;
+    const char** filtered = (const char**)calloc(cap, sizeof(const char*));
+    if (!filtered) return;
+    size_t out_n = 0;
+    for (size_t i = 0; i < numEvents && out_n < cap; i++) {
+        id item = nsPaths[i];
+        if (![item isKindOfClass:[NSString class]]) continue;
+        const char* utf8 = [(NSString*)item UTF8String];
+        if (!is_noisy_fs_path(utf8)) {
+            filtered[out_n++] = utf8;
+        }
+    }
+    if (out_n > 0) {
+        g_delegate.cb.on_fs_changed(g_delegate.cb.userdata, filtered, out_n);
+    }
+    free(filtered);
+}
+
+static void start_fs_watcher_stream_if_needed(void) {
+    stop_fs_watcher_stream();
+    if (!g_watched_dir || g_watched_dir.length == 0 || !g_delegate) return;
+    if (g_window && !g_window.visible) return;
+
+    NSArray* paths = @[ g_watched_dir ];
+    FSEventStreamContext ctx = {0, NULL, NULL, NULL, NULL};
+    // Kernel-coalesced (0.25s) event stream on main dispatch queue:
+    // zero polling threads, zero wakeups while idle, ignores our own process's writes.
+    FSEventStreamCreateFlags flags =
+        kFSEventStreamCreateFlagUseCFTypes |
+        kFSEventStreamCreateFlagFileEvents |
+        kFSEventStreamCreateFlagIgnoreSelf;
+    g_fs_stream = FSEventStreamCreate(
+        NULL,
+        fsevents_callback,
+        &ctx,
+        (__bridge CFArrayRef)paths,
+        kFSEventStreamEventIdSinceNow,
+        0.25,
+        flags
+    );
+    if (g_fs_stream) {
+        FSEventStreamSetDispatchQueue(g_fs_stream, dispatch_get_main_queue());
+        FSEventStreamStart(g_fs_stream);
+    }
+}
+
+void mac_watch_directory(const char* dir_path) {
+    @autoreleasepool {
+        if (!dir_path || dir_path[0] == '\0') {
+            g_watched_dir = nil;
+            stop_fs_watcher_stream();
+            return;
+        }
+        NSString* next = [NSString stringWithUTF8String:dir_path];
+        if (g_watched_dir && [g_watched_dir isEqualToString:next] && g_fs_stream != NULL) {
+            return;
+        }
+        g_watched_dir = next;
+        start_fs_watcher_stream_if_needed();
+    }
+}
+
 void mac_close_window(void) {
     // macOS document-app convention: close/hide window while staying alive in Dock (white dot)
-    // with 0.00% idle CPU and zero retained IOSurface GPU buffers.
+    // with 0.00% idle CPU, zero kernel FS wakeups, and zero retained IOSurface GPU buffers.
+    stop_fs_watcher_stream();
     if (g_delegate) {
         [g_delegate stopBlinkTimer];
     }
@@ -897,6 +1001,7 @@ void mac_activate_app(void) {
     [NSApp activateIgnoringOtherApps:YES];
 
     [self startBlinkTimer];
+    start_fs_watcher_stream_if_needed();
 }
 
 - (void)startBlinkTimer {
@@ -947,6 +1052,10 @@ void mac_activate_app(void) {
             [g_view scheduleRedraw];
         }
         [self startBlinkTimer];
+        start_fs_watcher_stream_if_needed();
+        if (self.cb.on_fs_changed) {
+            self.cb.on_fs_changed(self.cb.userdata, NULL, 0);
+        }
     } else {
         [g_window makeKeyAndOrderFront:nil];
     }

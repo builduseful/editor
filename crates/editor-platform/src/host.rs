@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::input::{ConfirmChoice, CursorShape};
 
@@ -51,6 +51,10 @@ pub trait PlatformHost {
         None
     }
     fn save_pref(&mut self, _key: &str, _value: &str) {}
+    /// Watch a workspace directory using the OS's kernel event-driven watcher (e.g. `FSEvents`,
+    /// `inotify`, `ReadDirectoryChangesW`). Passing `None` stops watching.
+    /// Default is a no-op for headless/test hosts.
+    fn watch_directory(&mut self, _dir: Option<&Path>) {}
 }
 
 #[derive(Debug, Default)]
@@ -62,6 +66,7 @@ pub struct HeadlessHost {
     pub close_window_requested: bool,
     /// Test knob: when `true`, mimics macOS stay-in-Dock semantics (`request_close_window` does not quit).
     pub stay_alive_on_close: bool,
+    pub watched_dir: Option<PathBuf>,
     pub next_open_file: Option<PathBuf>,
     pub next_open_folder: Option<PathBuf>,
     pub next_save_file: Option<PathBuf>,
@@ -121,5 +126,9 @@ impl PlatformHost for HeadlessHost {
 
     fn save_pref(&mut self, key: &str, value: &str) {
         self.prefs.insert(key.to_string(), value.to_string());
+    }
+
+    fn watch_directory(&mut self, dir: Option<&Path>) {
+        self.watched_dir = dir.map(Path::to_path_buf);
     }
 }

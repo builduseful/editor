@@ -18,8 +18,8 @@ pub mod viewport;
 
 pub use atlas::{AtlasGlyph, GlyphAtlas};
 pub use chrome::{
-    A11yNode, A11yRole, ConfirmModal, FindBarAction, FindBarLayout, FindBarState, GotoLineState,
-    ImeComposition, StatusBarData,
+    A11yNode, A11yRole, ActionToast, ConfirmModal, FindBarAction, FindBarLayout, FindBarState,
+    GotoLineState, ImeComposition, StatusBarData, ToastHit,
 };
 pub use harpoon::{HarpoonAction, HarpoonEntry, HarpoonOverlay};
 pub use painter::Painter;

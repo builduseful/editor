@@ -553,6 +553,8 @@ pub struct ConfirmModal {
     pub file_name: String,
     pub is_delete: bool,
     pub delete_is_dir: bool,
+    pub is_move_confirm: bool,
+    pub move_body: String,
     pub btn_save: PixelRect,
     pub btn_discard: PixelRect,
     pub btn_cancel: PixelRect,
@@ -563,6 +565,8 @@ impl ConfirmModal {
         self.visible = true;
         self.is_delete = false;
         self.delete_is_dir = false;
+        self.is_move_confirm = false;
+        self.move_body.clear();
         self.file_name = file_name.to_string();
     }
 
@@ -570,12 +574,24 @@ impl ConfirmModal {
         self.visible = true;
         self.is_delete = true;
         self.delete_is_dir = is_dir;
+        self.is_move_confirm = false;
+        self.move_body.clear();
         self.file_name = name.to_string();
+    }
+
+    pub fn open_confirm_move(&mut self, name: &str, dest_name: &str, summary: &str) {
+        self.visible = true;
+        self.is_delete = false;
+        self.delete_is_dir = false;
+        self.is_move_confirm = true;
+        self.file_name = name.to_string();
+        self.move_body = format!("Move \"{name}\" ({summary}) into \"{dest_name}\"?");
     }
 
     pub fn close(&mut self) {
         self.visible = false;
         self.is_delete = false;
+        self.is_move_confirm = false;
     }
 
     pub fn hit_test(&self, x_px: f32, y_px: f32) -> Option<ConfirmChoice> {
@@ -615,7 +631,7 @@ impl ConfirmModal {
         };
         painter.fill_rect(bounds, scrim);
 
-        let card_w = px(380.0, scale).min(bounds.w - px(32.0, scale));
+        let card_w = px(400.0, scale).min(bounds.w - px(32.0, scale));
         let card_h = px(136.0, scale);
         let card = PixelRect::new(
             bounds.x + (bounds.w - card_w) / 2,
@@ -633,7 +649,7 @@ impl ConfirmModal {
         let tm = atlas.metrics(rasterizer, FontStyle::UiBold, title_px);
         let bm = atlas.metrics(rasterizer, FontStyle::Ui, body_px);
 
-        let (heading, body) = if self.is_delete {
+        let (heading, body): (String, &str) = if self.is_delete {
             (
                 format!("Delete {}?", self.file_name),
                 if self.delete_is_dir {
@@ -642,12 +658,15 @@ impl ConfirmModal {
                     "This file will be permanently removed."
                 },
             )
+        } else if self.is_move_confirm {
+            ("Move Large Folder?".to_string(), self.move_body.as_str())
         } else {
             (
                 format!("Save Changes to {}?", self.file_name),
                 "Your unsaved changes will be lost if you do not save them.",
             )
         };
+        painter.push_clip(PixelRect::new(card.x + pad, card.y, (card.w - pad * 2).max(0), card.h));
         painter.draw_text_ui(
             (card.x + pad) as f32,
             (card.y + pad) as f32 + tm.ascent,
@@ -668,6 +687,7 @@ impl ConfirmModal {
             atlas,
             rasterizer,
         );
+        painter.pop_clip();
 
         let btn_h = px(28.0, scale);
         let btn_y = card.bottom() - pad - btn_h;
@@ -704,6 +724,13 @@ impl ConfirmModal {
                 atlas,
                 rasterizer,
             );
+        } else if self.is_move_confirm {
+            let move_w = px(82.0, scale);
+            self.btn_save = PixelRect::ZERO;
+            self.btn_discard = PixelRect::new(card.right() - pad - move_w, btn_y, move_w, btn_h);
+            self.btn_cancel = PixelRect::new(card.x + pad, btn_y, cancel_w, btn_h);
+            draw_button(painter, self.btn_cancel, "Cancel", false, theme, atlas, rasterizer);
+            draw_button(painter, self.btn_discard, "Move", true, theme, atlas, rasterizer);
         } else {
             let save_w = px(72.0, scale);
             let discard_w = px(92.0, scale);
@@ -715,5 +742,234 @@ impl ConfirmModal {
             draw_button(painter, self.btn_discard, "Don't Save", false, theme, atlas, rasterizer);
             draw_button(painter, self.btn_save, "Save", true, theme, atlas, rasterizer);
         }
+    }
+}
+
+// ============================================================================
+// Quiet Gmail-Style Floating Action Toast with Inline `Undo` Button
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToastHit {
+    None,
+    Body,
+    Undo,
+    Close,
+}
+
+#[derive(Debug, Default)]
+pub struct ActionToast {
+    pub visible: bool,
+    pub message: String,
+    pub can_undo: bool,
+    pub is_error: bool,
+    pub expires_at_ms: u64,
+    hovered_undo: bool,
+    hovered_close: bool,
+    pub card_rect: PixelRect,
+    undo_rect: PixelRect,
+    close_rect: PixelRect,
+}
+
+impl ActionToast {
+    pub fn show(&mut self, message: impl Into<String>, can_undo: bool, is_error: bool, now_ms: u64) {
+        self.visible = true;
+        self.message = message.into();
+        self.can_undo = can_undo;
+        self.is_error = is_error;
+        self.expires_at_ms = now_ms.saturating_add(6_000);
+        self.hovered_undo = false;
+        self.hovered_close = false;
+    }
+
+    pub fn dismiss(&mut self) -> bool {
+        let was = self.visible;
+        self.visible = false;
+        self.hovered_undo = false;
+        self.hovered_close = false;
+        self.card_rect = PixelRect::ZERO;
+        self.undo_rect = PixelRect::ZERO;
+        self.close_rect = PixelRect::ZERO;
+        was
+    }
+
+    pub fn expire_if_needed(&mut self, now_ms: u64) -> bool {
+        if self.visible && now_ms >= self.expires_at_ms {
+            self.dismiss();
+            return true;
+        }
+        false
+    }
+
+    pub fn hit_test(&self, x_px: f32, y_px: f32) -> ToastHit {
+        if !self.visible || self.card_rect.is_empty() {
+            return ToastHit::None;
+        }
+        let xi = x_px.round() as i32;
+        let yi = y_px.round() as i32;
+        if !self.card_rect.contains(xi, yi) {
+            return ToastHit::None;
+        }
+        if self.can_undo && self.undo_rect.contains(xi, yi) {
+            ToastHit::Undo
+        } else if self.close_rect.contains(xi, yi) {
+            ToastHit::Close
+        } else {
+            ToastHit::Body
+        }
+    }
+
+    pub fn set_hovered(&mut self, x_px: f32, y_px: f32) -> (bool, ToastHit) {
+        let hit = self.hit_test(x_px, y_px);
+        let u = hit == ToastHit::Undo;
+        let c = hit == ToastHit::Close;
+        let changed = self.hovered_undo != u || self.hovered_close != c;
+        self.hovered_undo = u;
+        self.hovered_close = c;
+        (changed, hit)
+    }
+
+    pub fn clear_hover(&mut self) -> bool {
+        let changed = self.hovered_undo || self.hovered_close;
+        self.hovered_undo = false;
+        self.hovered_close = false;
+        changed
+    }
+
+    pub fn draw(
+        &mut self,
+        painter: &mut Painter,
+        viewport_bounds: PixelRect,
+        theme: &Theme,
+        atlas: &mut GlyphAtlas,
+        rasterizer: &mut dyn GlyphRasterizer,
+    ) {
+        if !self.visible || viewport_bounds.is_empty() {
+            self.card_rect = PixelRect::ZERO;
+            self.undo_rect = PixelRect::ZERO;
+            self.close_rect = PixelRect::ZERO;
+            return;
+        }
+        let scale = painter.scale();
+        let font_px = 12.0 * scale;
+        let m = atlas.metrics(rasterizer, FontStyle::Ui, font_px);
+        let msg_w = Painter::measure_text_ui(&self.message, FontStyle::Ui, font_px, atlas, rasterizer);
+        let pad_x = px(12.0, scale);
+        let gap = px(10.0, scale);
+        let undo_w = if self.can_undo { px(46.0, scale) } else { 0 };
+        let close_w = px(20.0, scale);
+        let card_h = px(32.0, scale);
+        let max_w = (viewport_bounds.w - px(28.0, scale)).max(px(160.0, scale));
+        let desired_w = pad_x
+            + msg_w.ceil() as i32
+            + if self.can_undo { gap + undo_w } else { 0 }
+            + px(6.0, scale)
+            + close_w
+            + px(8.0, scale);
+        let card_w = desired_w.min(max_w);
+        let card_x = viewport_bounds.x + px(14.0, scale);
+        let card_y = viewport_bounds.bottom() - card_h - px(12.0, scale);
+        let card = PixelRect::new(card_x, card_y, card_w, card_h);
+        self.card_rect = card;
+
+        let radius = 6.0 * scale;
+        let border = if self.is_error {
+            theme.state_danger
+        } else {
+            theme.border_control
+        };
+        painter.fill_rounded_rect(card, radius, theme.surface);
+        painter.stroke_rounded_rect(card, radius, (1.0 * scale).max(1.0), border);
+
+        let close_h = px(20.0, scale);
+        self.close_rect = PixelRect::new(
+            card.right() - px(6.0, scale) - close_w,
+            card.y + (card.h - close_h) / 2,
+            close_w,
+            close_h,
+        );
+        let mut right_edge = self.close_rect.x - px(4.0, scale);
+
+        if self.can_undo {
+            let uh = px(22.0, scale);
+            self.undo_rect = PixelRect::new(
+                right_edge - undo_w,
+                card.y + (card.h - uh) / 2,
+                undo_w,
+                uh,
+            );
+            let bg = if self.hovered_undo {
+                theme.selection
+            } else {
+                theme.current_line
+            };
+            painter.fill_rounded_rect(self.undo_rect, 4.0 * scale, bg);
+            painter.stroke_rounded_rect(
+                self.undo_rect,
+                4.0 * scale,
+                (1.0 * scale).max(1.0),
+                theme.border_subtle,
+            );
+            let uw = Painter::measure_text_ui("Undo", FontStyle::UiBold, font_px, atlas, rasterizer);
+            let ubase = self.undo_rect.y as f32 + (self.undo_rect.h as f32 + m.ascent - m.descent) * 0.5;
+            painter.draw_text_ui(
+                self.undo_rect.x as f32 + (self.undo_rect.w as f32 - uw) * 0.5,
+                ubase,
+                "Undo",
+                FontStyle::UiBold,
+                font_px,
+                theme.text,
+                atlas,
+                rasterizer,
+            );
+            right_edge = self.undo_rect.x - gap;
+        } else {
+            self.undo_rect = PixelRect::ZERO;
+        }
+
+        if self.hovered_close {
+            painter.fill_rounded_rect(self.close_rect, 4.0 * scale, theme.current_line);
+        }
+        let xw = Painter::measure_text_ui("×", FontStyle::Ui, font_px, atlas, rasterizer);
+        let xbase = self.close_rect.y as f32 + (self.close_rect.h as f32 + m.ascent - m.descent) * 0.5;
+        painter.draw_text_ui(
+            self.close_rect.x as f32 + (self.close_rect.w as f32 - xw) * 0.5,
+            xbase,
+            "×",
+            FontStyle::Ui,
+            font_px,
+            if self.hovered_close {
+                theme.text
+            } else {
+                theme.text_muted
+            },
+            atlas,
+            rasterizer,
+        );
+
+        let text_clip = PixelRect::new(
+            card.x + pad_x,
+            card.y,
+            (right_edge - (card.x + pad_x)).max(0),
+            card.h,
+        );
+        painter.push_clip(text_clip);
+        let baseline = card.y as f32 + (card.h as f32 + m.ascent - m.descent) * 0.5;
+        let msg_col = if self.is_error {
+            theme.state_danger
+        } else {
+            theme.text
+        };
+        painter.draw_text_ui(
+            text_clip.x as f32,
+            baseline,
+            &self.message,
+            FontStyle::Ui,
+            font_px,
+            msg_col,
+            atlas,
+            rasterizer,
+        );
+        painter.pop_clip();
     }
 }
