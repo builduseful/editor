@@ -25,14 +25,26 @@ const MAX_VISIBLE_ITEMS: usize = 10;
 pub enum PaletteMode {
     Closed,
     QuickOpen,
+    Commands,
     ProjectSearch,
+}
+
+/// Entry supplied by `EditorApp` when opening the `⇧⌘P` Command Palette.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaletteCommandEntry {
+    pub id: String,
+    pub title: String,
+    pub category: String,
+    pub shortcut: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PaletteItem {
     pub path: PathBuf,
+    pub command_id: Option<String>,
     pub primary: String,
     pub secondary: String,
+    pub shortcut: String,
     pub line_0based: Option<usize>,
     pub col_bytes: Option<usize>,
 }
@@ -46,6 +58,7 @@ pub enum PaletteAction {
         line_0based: Option<usize>,
         col_bytes: Option<usize>,
     },
+    RunCommand(String),
     Changed,
 }
 
@@ -55,11 +68,12 @@ pub struct CommandPalette {
     pub case_sensitive: bool,
     root: Option<PathBuf>,
     all_files: Vec<(PathBuf, String)>, // (absolute path, relative display path)
+    all_commands: Vec<PaletteCommandEntry>,
     pub items: Vec<PaletteItem>,
     pub selected: usize,
     pub status_summary: String,
     card_rect: PixelRect,
-    item_rects: Vec<PixelRect>,
+    item_rects: Vec<(usize, PixelRect)>,
 }
 
 impl Default for CommandPalette {
@@ -76,6 +90,7 @@ impl CommandPalette {
             case_sensitive: false,
             root: None,
             all_files: Vec::new(),
+            all_commands: Vec::new(),
             items: Vec::new(),
             selected: 0,
             status_summary: String::new(),
@@ -91,8 +106,18 @@ impl CommandPalette {
     pub fn close(&mut self) {
         self.mode = PaletteMode::Closed;
         self.input.focused = false;
+        self.all_commands.clear();
         self.items.clear();
         self.item_rects.clear();
+    }
+
+    pub fn open_commands(&mut self, commands: Vec<PaletteCommandEntry>) {
+        self.mode = PaletteMode::Commands;
+        self.input = TextInput::new("Run a command");
+        self.input.focused = true;
+        self.selected = 0;
+        self.all_commands = commands;
+        self.refresh_command_results();
     }
 
     pub fn open_quick_open(&mut self, fs: &dyn FileSystem, root: Option<&Path>) {
@@ -101,6 +126,7 @@ impl CommandPalette {
         self.input.focused = true;
         self.selected = 0;
         self.root = root.map(Path::to_path_buf);
+        self.all_commands.clear();
         self.all_files.clear();
         if let Some(r) = root {
             collect_project_files(fs, r, r, 0, &mut self.all_files);
@@ -124,6 +150,7 @@ impl CommandPalette {
         self.input.focused = true;
         self.selected = 0;
         self.root = root.map(Path::to_path_buf);
+        self.all_commands.clear();
         self.all_files.clear();
         if let Some(r) = root {
             collect_project_files(fs, r, r, 0, &mut self.all_files);
@@ -131,13 +158,65 @@ impl CommandPalette {
         self.refresh_results(fs);
     }
 
+    fn refresh_command_results(&mut self) {
+        self.items.clear();
+        self.selected = 0;
+        let query = self.input.text.trim();
+        if query.is_empty() {
+            for cmd in &self.all_commands {
+                self.items.push(PaletteItem {
+                    path: PathBuf::new(),
+                    command_id: Some(cmd.id.clone()),
+                    primary: cmd.title.clone(),
+                    secondary: cmd.category.clone(),
+                    shortcut: cmd.shortcut.clone(),
+                    line_0based: None,
+                    col_bytes: None,
+                });
+            }
+            self.status_summary = format!("{} commands", self.all_commands.len());
+            return;
+        }
+        let mut scored: Vec<(i32, usize)> = Vec::new();
+        for (idx, cmd) in self.all_commands.iter().enumerate() {
+            let best = fuzzy_score(query, &cmd.title)
+                .map(|s| s + 24)
+                .into_iter()
+                .chain(fuzzy_score(query, &format!("{}: {}", cmd.category, cmd.title)))
+                .chain(fuzzy_score(query, &cmd.id))
+                .max();
+            if let Some(score) = best {
+                scored.push((score, idx));
+            }
+        }
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+        let total = scored.len();
+        for (_, idx) in scored.into_iter().take(60) {
+            let cmd = &self.all_commands[idx];
+            self.items.push(PaletteItem {
+                path: PathBuf::new(),
+                command_id: Some(cmd.id.clone()),
+                primary: cmd.title.clone(),
+                secondary: cmd.category.clone(),
+                shortcut: cmd.shortcut.clone(),
+                line_0based: None,
+                col_bytes: None,
+            });
+        }
+        self.status_summary = format!("{total} matches");
+    }
+
     pub fn refresh_results(&mut self, fs: &dyn FileSystem) {
+        if self.mode == PaletteMode::Commands {
+            self.refresh_command_results();
+            return;
+        }
         self.items.clear();
         self.selected = 0;
         let query = self.input.text.trim();
 
         match self.mode {
-            PaletteMode::Closed => {}
+            PaletteMode::Closed | PaletteMode::Commands => {}
             PaletteMode::QuickOpen => {
                 if query.is_empty() {
                     for (abs, rel) in self.all_files.iter().take(60) {
@@ -148,8 +227,10 @@ impl CommandPalette {
                             .to_string();
                         self.items.push(PaletteItem {
                             path: abs.clone(),
+                            command_id: None,
                             primary: name,
                             secondary: rel.clone(),
+                            shortcut: String::new(),
                             line_0based: None,
                             col_bytes: None,
                         });
@@ -173,8 +254,10 @@ impl CommandPalette {
                             .to_string();
                         self.items.push(PaletteItem {
                             path: abs.clone(),
+                            command_id: None,
                             primary: name,
                             secondary: rel.clone(),
+                            shortcut: String::new(),
                             line_0based: None,
                             col_bytes: None,
                         });
@@ -265,8 +348,10 @@ impl CommandPalette {
 
                         self.items.push(PaletteItem {
                             path: abs.clone(),
+                            command_id: None,
                             primary: format!("{}:{}", rel, cur_line + 1),
                             secondary: preview,
+                            shortcut: String::new(),
                             line_0based: Some(cur_line),
                             col_bytes: Some(abs_hit - last_line_start),
                         });
@@ -315,6 +400,9 @@ impl CommandPalette {
             Key::Enter => {
                 if let Some(item) = self.items.get(self.selected).cloned() {
                     self.close();
+                    if let Some(cmd_id) = item.command_id {
+                        return (PaletteAction::RunCommand(cmd_id), None);
+                    }
                     return (
                         PaletteAction::Open {
                             path: item.path,
@@ -346,10 +434,13 @@ impl CommandPalette {
             self.close();
             return PaletteAction::Close;
         }
-        for (idx, rect) in self.item_rects.iter().enumerate() {
+        for &(idx, rect) in &self.item_rects {
             if rect.contains(xi, yi) {
                 if let Some(item) = self.items.get(idx).cloned() {
                     self.close();
+                    if let Some(cmd_id) = item.command_id {
+                        return PaletteAction::RunCommand(cmd_id);
+                    }
                     return PaletteAction::Open {
                         path: item.path,
                         line_0based: item.line_0based,
@@ -410,6 +501,7 @@ impl CommandPalette {
         // Title + count summary row.
         let heading = match self.mode {
             PaletteMode::QuickOpen => "Quick Open",
+            PaletteMode::Commands => "Command Palette",
             PaletteMode::ProjectSearch => "Search in Folder",
             PaletteMode::Closed => "",
         };
@@ -471,7 +563,7 @@ impl CommandPalette {
         let sm = atlas.metrics(rasterizer, FontStyle::Ui, sub_px);
 
         if self.items.is_empty() {
-            let empty_msg = if self.root.is_none() {
+            let empty_msg = if self.mode != PaletteMode::Commands && self.root.is_none() {
                 "Open a folder to search files"
             } else {
                 "No matches"
@@ -498,7 +590,7 @@ impl CommandPalette {
                 let item = &self.items[idx];
                 let ry = list_clip.y + (slot as i32) * row_h;
                 let r = PixelRect::new(list_clip.x, ry, list_clip.w, row_h);
-                self.item_rects.push(r);
+                self.item_rects.push((idx, r));
 
                 if idx == self.selected {
                     painter.fill_rounded_rect(r, 4.0 * scale, theme.selection);
@@ -530,6 +622,54 @@ impl CommandPalette {
                     );
                 } else {
                     let baseline = r.y as f32 + (r.h as f32 + fm.ascent - fm.descent) * 0.5;
+                    let mut right_limit = r.right() - px(8.0, scale);
+                    if !item.shortcut.is_empty() {
+                        let kw = Painter::measure_text_ui(
+                            &item.shortcut,
+                            FontStyle::Mono,
+                            sub_px,
+                            atlas,
+                            rasterizer,
+                        );
+                        let pill_pad = px(6.0, scale);
+                        let pill_w = kw.ceil() as i32 + pill_pad * 2;
+                        let pill_h = (r.h - px(8.0, scale)).max(14);
+                        let pill_x = right_limit - pill_w;
+                        let pill_y = r.y + (r.h - pill_h) / 2;
+                        let pill = PixelRect::new(pill_x, pill_y, pill_w, pill_h);
+                        let pill_bg = if idx == self.selected {
+                            theme.surface
+                        } else {
+                            theme.current_line
+                        };
+                        painter.fill_rounded_rect(pill, 3.0 * scale, pill_bg);
+                        painter.stroke_rounded_rect(
+                            pill,
+                            3.0 * scale,
+                            (1.0 * scale).max(1.0),
+                            theme.border_subtle,
+                        );
+                        let sm_m = atlas.metrics(rasterizer, FontStyle::Mono, sub_px);
+                        let kbase =
+                            pill.y as f32 + (pill.h as f32 + sm_m.ascent - sm_m.descent) * 0.5;
+                        painter.draw_text_ui(
+                            (pill.x + pill_pad) as f32,
+                            kbase,
+                            &item.shortcut,
+                            FontStyle::Mono,
+                            sub_px,
+                            theme.text_muted,
+                            atlas,
+                            rasterizer,
+                        );
+                        right_limit = pill_x - px(8.0, scale);
+                    }
+                    painter.push_clip(PixelRect::new(
+                        r.x,
+                        r.y,
+                        (right_limit - r.x).max(0),
+                        r.h,
+                    ));
                     let after_name = painter.draw_text_ui(
                         tx,
                         baseline,
@@ -540,7 +680,7 @@ impl CommandPalette {
                         atlas,
                         rasterizer,
                     );
-                    if item.secondary != item.primary {
+                    if !item.secondary.is_empty() && item.secondary != item.primary {
                         painter.draw_text_ui(
                             after_name + px(10.0, scale) as f32,
                             baseline,
@@ -552,6 +692,7 @@ impl CommandPalette {
                             rasterizer,
                         );
                     }
+                    painter.pop_clip();
                 }
             }
         }

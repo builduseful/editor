@@ -118,6 +118,7 @@ pub enum AppCommand {
     FindPrev,
     GoToLine,
     QuickOpen,
+    CommandPalette,
     ProjectSearch,
     DuplicateLine,
     DeleteLine,

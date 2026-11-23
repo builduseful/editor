@@ -2648,6 +2648,19 @@ impl EditorApp {
         if self.palette.is_open() {
             match event {
                 InputEvent::KeyDown { key, mods, text } => {
+                    // Allow switching directly between Quick Open (`⌘P`), Command Palette (`⇧⌘P`),
+                    // and Project Search (`⇧⌘F`) while the palette is open!
+                    if let Some(cmd) = self.keymap.resolve(KeyScope::Global, key, mods) {
+                        if matches!(
+                            cmd,
+                            AppCommand::QuickOpen
+                                | AppCommand::CommandPalette
+                                | AppCommand::ProjectSearch
+                        ) {
+                            self.handle_command(cmd, rasterizer, clipboard, host);
+                            return;
+                        }
+                    }
                     self.caret_visible = true;
                     self.last_blink_ms = self.now_ms;
                     let clip = clipboard.get_text();
@@ -2661,7 +2674,7 @@ impl EditorApp {
                     if let Some(c) = copied {
                         clipboard.set_text(&c);
                     }
-                    self.handle_palette_action(act, rasterizer, host);
+                    self.handle_palette_action(act, rasterizer, clipboard, host);
                     return;
                 }
                 InputEvent::MouseDown {
@@ -2671,7 +2684,7 @@ impl EditorApp {
                     ..
                 } => {
                     let act = self.palette.handle_click(x_px, y_px);
-                    self.handle_palette_action(act, rasterizer, host);
+                    self.handle_palette_action(act, rasterizer, clipboard, host);
                     return;
                 }
                 InputEvent::Command(cmd)
@@ -2682,6 +2695,7 @@ impl EditorApp {
                             | AppCommand::Paste
                             | AppCommand::SelectAll
                             | AppCommand::QuickOpen
+                            | AppCommand::CommandPalette
                             | AppCommand::ProjectSearch
                     ) =>
                 {
@@ -3372,10 +3386,50 @@ impl EditorApp {
         }
     }
 
+    fn palette_command_entries(&self) -> Vec<editor_render::PaletteCommandEntry> {
+        let mut entries = Vec::with_capacity(72);
+        for item in self.keymap.to_display_items() {
+            if !item.runnable || item.id == "command-palette" {
+                continue;
+            }
+            entries.push(editor_render::PaletteCommandEntry {
+                id: item.id.to_string(),
+                title: item.label.to_string(),
+                category: item.category.to_string(),
+                shortcut: item.keys,
+            });
+        }
+        let extras: &[(&str, &str, &str)] = &[
+            ("theme-system", "Use system theme", "Appearance"),
+            ("theme-light", "Use light theme", "Appearance"),
+            ("theme-dark", "Use dark theme", "Appearance"),
+            ("syntax-style:editorial", "Syntax theme: Editorial", "Appearance"),
+            ("syntax-style:monochrome", "Syntax theme: Monochrome", "Appearance"),
+            ("syntax-style:studio", "Syntax theme: Studio", "Appearance"),
+            ("syntax-style:warm", "Syntax theme: Warm", "Appearance"),
+            ("toggle-syntax-style", "Cycle syntax colour style", "Appearance"),
+            ("sidebar-left", "Move sidebar to left", "Panes & View"),
+            ("sidebar-right", "Move sidebar to right", "Panes & View"),
+            ("sidebar-width:reset", "Reset sidebar width to default", "Panes & View"),
+            ("pane-ratio:reset", "Reset split pane sizes to 50/50", "Panes & View"),
+            ("reload", "Reload file from disk", "File & Navigation"),
+        ];
+        for &(id, title, category) in extras {
+            entries.push(editor_render::PaletteCommandEntry {
+                id: id.to_string(),
+                title: title.to_string(),
+                category: category.to_string(),
+                shortcut: String::new(),
+            });
+        }
+        entries
+    }
+
     fn handle_palette_action(
         &mut self,
         act: PaletteAction,
         rasterizer: &mut dyn GlyphRasterizer,
+        clipboard: &mut dyn Clipboard,
         host: &mut dyn PlatformHost,
     ) {
         match act {
@@ -3390,6 +3444,18 @@ impl EditorApp {
                 col_bytes,
             } => {
                 self.open_at_location(&path, line_0based, col_bytes, rasterizer, host);
+            }
+            PaletteAction::RunCommand(id) => {
+                if let Some(cmd) = self.keymap.command_for_id(&id) {
+                    self.handle_command(cmd, rasterizer, clipboard, host);
+                } else {
+                    let _ = self.execute_ipc(
+                        &editor_platform::ipc::IpcCommand::Action(id),
+                        rasterizer,
+                        clipboard,
+                        host,
+                    );
+                }
             }
         }
     }
@@ -3681,6 +3747,16 @@ impl EditorApp {
                     .map(Path::to_path_buf)
                     .or_else(|| self.doc.path().and_then(|p| p.parent()).map(Path::to_path_buf));
                 self.palette.open_quick_open(self.fs.as_ref(), root.as_deref());
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            AppCommand::CommandPalette => {
+                self.goto_line.close();
+                self.shortcuts.close();
+                self.harpoon.close();
+                self.sidebar.set_focused(false);
+                let entries = self.palette_command_entries();
+                self.palette.open_commands(entries);
                 self.mark_dirty();
                 host.request_redraw();
             }
@@ -5411,6 +5487,7 @@ impl EditorApp {
         let palette_mode = match self.palette.mode {
             editor_render::PaletteMode::Closed => "closed",
             editor_render::PaletteMode::QuickOpen => "quick_open",
+            editor_render::PaletteMode::Commands => "commands",
             editor_render::PaletteMode::ProjectSearch => "project_search",
         };
         let theme_pref = match self.theme_pref {
@@ -5802,6 +5879,10 @@ impl EditorApp {
                     "quick-open" => {
                         activate = true;
                         self.handle_command(AppCommand::QuickOpen, rasterizer, clipboard, host);
+                    }
+                    "command-palette" => {
+                        activate = true;
+                        self.handle_command(AppCommand::CommandPalette, rasterizer, clipboard, host);
                     }
                     "project-search" => {
                         activate = true;

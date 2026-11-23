@@ -2867,3 +2867,100 @@ fn pane_dividers_and_sidebar_resize_handles_double_click_reset_and_ipc() {
     assert!((app.arrangement.col_ratio - 0.5).abs() < 0.001);
     assert!((app.arrangement.row_ratio[1] - 0.5).abs() < 0.001);
 }
+
+#[test]
+fn command_palette_fuzzy_searches_and_runs_keymap_and_extra_commands() {
+    use editor_platform::{InputEvent, Key, Modifiers};
+    use editor_render::{PaletteMode, SidebarSide};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    let mut app = EditorApp::new(fs, 1400, 900, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    // Open Command Palette via `⇧⌘P` (or `Ctrl+Shift+P` on non-macOS).
+    let mut open_mods = Modifiers::NONE;
+    #[cfg(target_os = "macos")]
+    {
+        open_mods.meta = true;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        open_mods.ctrl = true;
+    }
+    open_mods.shift = true;
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('p'),
+            mods: open_mods,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.palette.mode, PaletteMode::Commands);
+    assert!(app.palette.items.len() >= 30);
+    app.render(&mut raster);
+
+    // Filter for "monochrome" and hit Enter -> switches syntax preset to Monochrome!
+    for ch in "monochrome".chars() {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+    }
+    assert!(!app.palette.items.is_empty());
+    assert!(app.palette.items[0].primary.to_ascii_lowercase().contains("monochrome"));
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.palette.mode, PaletteMode::Closed);
+    assert_eq!(app.syntax_theme.preset.as_str(), "monochrome");
+
+    // Reopen Command Palette via IPC, run "Move sidebar to right", and verify!
+    let _ = app.execute_ipc(
+        &editor_platform::ipc::IpcCommand::Action("command-palette".into()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.palette.mode, PaletteMode::Commands);
+    for ch in "sidebar to right".chars() {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+    }
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.sidebar.side(), SidebarSide::Right);
+}

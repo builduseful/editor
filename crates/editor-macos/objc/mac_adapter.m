@@ -1071,6 +1071,9 @@ void mac_activate_app(void) {
     // View Menu
     NSMenuItem* viewItem = [[NSMenuItem alloc] init];
     NSMenu* viewMenu = [[NSMenu alloc] initWithTitle:@"View"];
+    [viewMenu addItem:[self menuItem:@"Command Palette…" key:@"p" tag:48
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
+    [viewMenu addItem:[NSMenuItem separatorItem]];
     [viewMenu addItem:[self menuItem:@"Toggle Sidebar" key:@"b" tag:16 mods:NSEventModifierFlagCommand]];
     [viewMenu addItem:[self menuItem:@"Move Sidebar Left / Right" key:@"b" tag:47
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];

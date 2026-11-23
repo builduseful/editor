@@ -293,6 +293,13 @@ impl Keymap {
         out
     }
 
+    pub fn command_for_id(&self, id: &str) -> Option<AppCommand> {
+        self.entries
+            .iter()
+            .find(|e| e.id == id && e.runnable)
+            .and_then(|e| e.command)
+    }
+
     pub fn to_display_items(&self) -> Vec<ShortcutDisplayItem> {
         self.entries
             .iter()
@@ -355,6 +362,7 @@ fn default_shortcuts() -> Vec<ShortcutEntry> {
     vec![
         // ── Main Shortcuts (featured = true, shown immediately in ⌘K / ⇧⌘/) ──
         bind("quick-open", "Quick open file", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('p'))], None, true, AppCommand::QuickOpen),
+        bind("command-palette", "Command palette", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('p'))], None, true, AppCommand::CommandPalette),
         bind("harpoon", "Pinned & open files (Harpoon)", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('e'))], None, true, AppCommand::ShowHarpoon),
         bind("pin-file", "Pin or unpin current file (1–9)", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('m'))], None, true, AppCommand::TogglePin),
         bind("project-search", "Search across project", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('f'))], None, true, AppCommand::ProjectSearch),

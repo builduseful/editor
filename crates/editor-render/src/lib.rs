@@ -23,7 +23,9 @@ pub use chrome::{
 };
 pub use harpoon::{HarpoonAction, HarpoonEntry, HarpoonOverlay};
 pub use painter::Painter;
-pub use palette::{fuzzy_score, CommandPalette, PaletteAction, PaletteItem, PaletteMode};
+pub use palette::{
+    fuzzy_score, CommandPalette, PaletteAction, PaletteCommandEntry, PaletteItem, PaletteMode,
+};
 pub use shortcuts::{ShortcutDisplayItem, ShortcutsAction, ShortcutsOverlay};
 pub use sidebar::{
     Sidebar, SidebarAction, SidebarBadge, SidebarHit, SidebarSide, SIDEBAR_AUTO_MINIMIZE_WIDTH_PT,
