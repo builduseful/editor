@@ -125,6 +125,7 @@ pub enum AppCommand {
     MoveLineUp,
     MoveLineDown,
     ToggleComment,
+    SelectNextOccurrence,
     ToggleWrap,
     ToggleSidebar,
     ToggleSidebarSide,

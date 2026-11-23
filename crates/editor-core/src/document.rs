@@ -535,6 +535,87 @@ impl Document {
         Ok(after)
     }
 
+    /// Apply multiple non-overlapping edits `(offset, removed_len, text)` in a single atomic
+    /// undo/redo step (used by multi-cursor editing).
+    ///
+    /// `edits` must be sorted in ascending `offset` order with non-overlapping ranges.
+    /// Returns the post-edit end byte offset for each edit in the same ascending order.
+    pub fn edit_multi(
+        &mut self,
+        edits: &[(u64, u64, String)],
+        timestamp_ms: u64,
+    ) -> Result<Vec<u64>, DocumentError> {
+        if edits.is_empty() {
+            return Ok(Vec::new());
+        }
+        let doc_len = self.len_bytes();
+        let mut prev_end = 0u64;
+        let mut normalized: Vec<(u64, u64, Vec<u8>)> = Vec::with_capacity(edits.len());
+        for (offset, removed_len, text) in edits {
+            if *offset < prev_end || offset.saturating_add(*removed_len) > doc_len {
+                return Err(DocumentError::Range(
+                    "multi-edit range out of bounds or overlapping".into(),
+                ));
+            }
+            for &boundary in &[*offset, offset + removed_len] {
+                if boundary > 0 && boundary < doc_len {
+                    let mut b = Vec::with_capacity(1);
+                    self.tree.read_range(boundary, 1, &mut b);
+                    if let Some(&byte) = b.first() {
+                        if (byte & 0xC0) == 0x80 {
+                            return Err(DocumentError::Range(
+                                "multi-edit offset is not a UTF-8 boundary".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+            prev_end = offset + removed_len;
+            normalized.push((*offset, *removed_len, self.normalize_insert_eol(text)));
+        }
+
+        // Compute final post-edit end offsets in ascending order before mutating.
+        let mut result_ends = Vec::with_capacity(normalized.len());
+        let mut delta: i64 = 0;
+        for (offset, removed_len, inserted) in &normalized {
+            let new_start = (*offset as i64 + delta).max(0) as u64;
+            let new_end = new_start + inserted.len() as u64;
+            result_ends.push(new_end);
+            delta += inserted.len() as i64 - *removed_len as i64;
+        }
+
+        // Apply back-to-front so earlier offsets stay exact.
+        let mut ops = Vec::with_capacity(normalized.len());
+        let mut earliest_line = usize::MAX;
+        for (offset, removed_len, inserted) in normalized.into_iter().rev() {
+            let (line, _) = self.tree.byte_to_line_col(offset);
+            earliest_line = earliest_line.min(line);
+            let deleted = if removed_len > 0 {
+                self.tree.delete(offset, removed_len)
+            } else {
+                Vec::new()
+            };
+            if !inserted.is_empty() {
+                self.tree.insert(offset, &inserted);
+            }
+            let after = offset + inserted.len() as u64;
+            ops.push(EditOp {
+                offset,
+                deleted,
+                inserted,
+                cursor_before: offset + removed_len,
+                cursor_after: after,
+            });
+        }
+
+        self.undo.record_batch(ops, timestamp_ms);
+        if earliest_line != usize::MAX {
+            self.syntax.invalidate_from(earliest_line);
+        }
+        self.generation += 1;
+        Ok(result_ends)
+    }
+
     /// Replace all occurrences of `query` with `replacement` in one atomic undo step.
     /// Returns the number of replacements made.
     pub fn replace_all(

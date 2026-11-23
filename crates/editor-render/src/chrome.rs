@@ -397,6 +397,7 @@ pub struct StatusBarData<'a> {
     pub line_1based: usize,
     pub col_1based: usize,
     pub selection_bytes: usize,
+    pub extra_cursor_count: usize,
     pub language: Language,
     pub eol: Eol,
     pub word_wrap: bool,
@@ -501,13 +502,18 @@ pub fn draw_status_bar(
     }
 
     // Right: technical status values.
-    let pos_text = if data.selection_bytes > 0 {
+    let base_pos = if data.selection_bytes > 0 {
         format!(
             "Ln {}, Col {} ({} B)",
             data.line_1based, data.col_1based, data.selection_bytes
         )
     } else {
         format!("Ln {}, Col {}", data.line_1based, data.col_1based)
+    };
+    let pos_text = if data.extra_cursor_count > 0 {
+        format!("{} cursors   {base_pos}", data.extra_cursor_count + 1)
+    } else {
+        base_pos
     };
     let wrap_text = if data.word_wrap { "Wrap" } else { "No Wrap" };
     let theme_text = match data.theme_pref {

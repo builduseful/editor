@@ -3247,3 +3247,105 @@ fn sidebar_file_operations_create_rename_delete_and_context_menu() {
     assert!(!app.confirm_modal.visible);
     assert!(fs.stat(Path::new("/proj/docs")).is_err());
 }
+
+#[test]
+fn multi_cursor_cmd_d_alt_click_atomic_edit_paste_and_undo() {
+    use editor_platform::{AppCommand, InputEvent, Key, Modifiers, MouseButton};
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file(
+        "/proj/mc.rs",
+        b"let foo = 1;\nlet bar = foo + foo;\n".to_vec(),
+    );
+
+    let mut app = EditorApp::new(fs, 1400, 900, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_file(Path::new("/proj/mc.rs"), &mut host).unwrap();
+    app.caret = 4; // inside first `foo`
+    app.anchor = 4;
+
+    // 1. First `⌘D` selects `foo`, second & third `⌘D` add the next two occurrences!
+    for _ in 0..3 {
+        app.handle_event(
+            InputEvent::Command(AppCommand::SelectNextOccurrence),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+    }
+    assert_eq!(app.extra_cursors.len(), 2, "should have 3 total cursors on `foo`");
+    app.render(&mut raster);
+
+    // 2. Typing `baz` replaces ALL 3 occurrences simultaneously in ONE atomic undo step!
+    for ch in "baz".chars() {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+    }
+    let read_all = |app: &mut EditorApp| -> String {
+        let len = app.doc.len_bytes() as usize;
+        let mut buf = Vec::with_capacity(len);
+        app.doc.tree_mut().read_range(0, len, &mut buf);
+        String::from_utf8(buf).unwrap()
+    };
+    assert_eq!(read_all(&mut app), "let baz = 1;\nlet bar = baz + baz;\n");
+
+    // 3. Multi-cursor line-distributed paste: 3 clipboard lines -> 1 per cursor!
+    clip.set_text("a\nb\nc");
+    app.handle_event(
+        InputEvent::Command(AppCommand::Paste),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(read_all(&mut app), "let baza = 1;\nlet bar = bazb + bazc;\n");
+
+    // Single Undo reverts all 3 pasted edits atomically!
+    app.handle_event(
+        InputEvent::Command(AppCommand::Undo),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(read_all(&mut app), "let baz = 1;\nlet bar = baz + baz;\n");
+
+    // 4. Alt-click adds an extra cursor, Escape collapses back to single cursor!
+    app.render(&mut raster);
+    let mut alt = Modifiers::NONE;
+    alt.alt = true;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: (app.layout.viewport.x + 120) as f32,
+            y_px: (app.layout.viewport.y + 8) as f32,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: alt,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.extra_cursors.len(), 1);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.extra_cursors.is_empty());
+}

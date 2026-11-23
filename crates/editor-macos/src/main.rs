@@ -464,6 +464,7 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         46 => Some(AppCommand::CloseWindow),
         47 => Some(AppCommand::ToggleSidebarSide),
         48 => Some(AppCommand::CommandPalette),
+        49 => Some(AppCommand::SelectNextOccurrence),
         100 => Some(AppCommand::SetTheme(ThemePreference::System)),
         101 => Some(AppCommand::SetTheme(ThemePreference::Light)),
         102 => Some(AppCommand::SetTheme(ThemePreference::Dark)),

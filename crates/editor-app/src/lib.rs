@@ -111,6 +111,8 @@ pub struct PaneState {
     pub doc: Document,
     pub caret: u64,
     pub anchor: u64,
+    /// Secondary `(anchor, caret)` pairs for multi-cursor editing (empty in single-cursor mode).
+    pub extra_cursors: Vec<(u64, u64)>,
     preferred_x_px: Option<f32>,
     pub viewport: Viewport,
     pub search_matches: Vec<SearchMatch>,
@@ -128,6 +130,7 @@ impl PaneState {
             doc: Document::new_untitled(),
             caret: 0,
             anchor: 0,
+            extra_cursors: Vec::new(),
             preferred_x_px: None,
             viewport: vp,
             search_matches: Vec::new(),
@@ -160,6 +163,8 @@ pub struct EditorApp {
     pub doc: Document,
     pub caret: u64,
     pub anchor: u64,
+    /// Secondary `(anchor, caret)` pairs for multi-cursor editing (empty in single-cursor mode).
+    pub extra_cursors: Vec<(u64, u64)>,
     preferred_x_px: Option<f32>,
 
     /// Stable buffer id currently displayed in the active pane (`self.doc`).
@@ -276,6 +281,7 @@ impl EditorApp {
             doc: Document::new_untitled(),
             caret: 0,
             anchor: 0,
+            extra_cursors: Vec::new(),
             preferred_x_px: None,
             active_buf_id: 1,
             working_set: WorkingSet::new(1),
@@ -1231,6 +1237,7 @@ impl EditorApp {
             return false;
         }
         self.working_set.touch_mru(target_id);
+        self.extra_cursors.clear();
         if self.find_bar.visible {
             self.refresh_search();
         }
@@ -1337,6 +1344,7 @@ impl EditorApp {
         if mode == OpenMode::Keep {
             self.enforce_open_tab_limit();
         }
+        self.extra_cursors.clear();
         if self.find_bar.visible {
             self.refresh_search();
         }
@@ -1943,6 +1951,7 @@ impl EditorApp {
         std::mem::swap(&mut self.doc, &mut other.doc);
         std::mem::swap(&mut self.caret, &mut other.caret);
         std::mem::swap(&mut self.anchor, &mut other.anchor);
+        std::mem::swap(&mut self.extra_cursors, &mut other.extra_cursors);
         std::mem::swap(&mut self.preferred_x_px, &mut other.preferred_x_px);
         std::mem::swap(&mut self.viewport, &mut other.viewport);
         std::mem::swap(&mut self.search_matches, &mut other.search_matches);
@@ -2197,8 +2206,17 @@ impl EditorApp {
             && !self.find_bar.is_focused()
             && !self.goto_line.visible;
         self.viewport.block_caret = self.vim.uses_block_caret();
+        if self.extra_cursors.is_empty() {
+            self.viewport.extra_cursors.clear();
+        } else {
+            self.viewport.extra_cursors.clear();
+            self.viewport
+                .extra_cursors
+                .extend_from_slice(&self.extra_cursors);
+        }
         for sec in &mut self.other_panes {
             sec.viewport.block_caret = false;
+            sec.viewport.extra_cursors.clear();
         }
         let matching_brackets = if sel.is_none() && doc_focused {
             self.doc.find_matching_bracket(self.caret)
@@ -2376,6 +2394,7 @@ impl EditorApp {
                 line_1based: caret_line + 1,
                 col_1based: caret_col + 1,
                 selection_bytes: sel_bytes,
+                extra_cursor_count: self.extra_cursors.len(),
                 language: self.doc.language(),
                 eol: self.doc.eol(),
                 word_wrap: self.viewport.word_wrap,
@@ -3920,6 +3939,7 @@ impl EditorApp {
                 self.request_discard_or_run(PendingDiscardAction::Reload, host);
             }
             AppCommand::Undo => {
+                self.extra_cursors.clear();
                 if let Some(pos) = self.doc.undo() {
                     self.caret = pos.min(self.doc.len_bytes());
                     self.anchor = self.caret;
@@ -3927,6 +3947,7 @@ impl EditorApp {
                 }
             }
             AppCommand::Redo => {
+                self.extra_cursors.clear();
                 if let Some(pos) = self.doc.redo() {
                     self.caret = pos.min(self.doc.len_bytes());
                     self.anchor = self.caret;
@@ -3939,6 +3960,12 @@ impl EditorApp {
                     if inp.has_selection() {
                         let s = inp.selected_text().to_string();
                         clipboard.set_text(&s);
+                    }
+                    return;
+                }
+                if !self.extra_cursors.is_empty() {
+                    if let Some(joined) = self.multi_cursor_selected_text() {
+                        clipboard.set_text(&joined);
                     }
                     return;
                 }
@@ -3961,6 +3988,13 @@ impl EditorApp {
                         }
                         self.mark_dirty();
                         host.request_redraw();
+                    }
+                    return;
+                }
+                if !self.extra_cursors.is_empty() {
+                    if let Some(joined) = self.multi_cursor_selected_text() {
+                        clipboard.set_text(&joined);
+                        self.multi_cursor_apply_text("", rasterizer, host);
                     }
                     return;
                 }
@@ -3989,6 +4023,10 @@ impl EditorApp {
                         host.request_redraw();
                         return;
                     }
+                    if !self.extra_cursors.is_empty() {
+                        self.multi_cursor_paste(&clip, rasterizer, host);
+                        return;
+                    }
                     let (start, removed) = self
                         .selection()
                         .map(|(a, b)| (a, b - a))
@@ -4007,6 +4045,7 @@ impl EditorApp {
                     host.request_redraw();
                     return;
                 }
+                self.extra_cursors.clear();
                 self.doc.tree_mut().ensure_fully_indexed();
                 self.anchor = 0;
                 self.caret = self.doc.len_bytes();
@@ -4099,6 +4138,9 @@ impl EditorApp {
             }
             AppCommand::ToggleComment => {
                 self.toggle_line_comment(rasterizer, host);
+            }
+            AppCommand::SelectNextOccurrence => {
+                self.select_next_occurrence(rasterizer, host);
             }
             AppCommand::ToggleWrap => {
                 self.viewport.toggle_wrap();
@@ -4672,6 +4714,12 @@ impl EditorApp {
         let metrics = self.doc_metrics(rasterizer);
         let scale = self.framebuffer.scale;
 
+        if !self.extra_cursors.is_empty() {
+            if self.handle_multi_cursor_key(key, mods, text, metrics, scale, rasterizer, host) {
+                return;
+            }
+        }
+
         match key {
             Key::Escape => {
                 if self.find_bar.visible {
@@ -5066,6 +5114,411 @@ impl EditorApp {
         let mut b = Vec::with_capacity(1);
         self.doc.tree_mut().read_range(offset, 1, &mut b);
         b.first().copied()
+    }
+
+    // ------------------------------------------------------------------------
+    // Multi-cursor & multi-selection helpers (`⌘D`, `⌥`-click)
+    // ------------------------------------------------------------------------
+
+    fn all_cursors_sorted(&self) -> Vec<(u64, u64, bool)> {
+        let mut all = Vec::with_capacity(1 + self.extra_cursors.len());
+        all.push((self.anchor, self.caret, true));
+        for &(a, c) in &self.extra_cursors {
+            all.push((a, c, false));
+        }
+        all.sort_by_key(|&(a, c, _)| (a.min(c), a.max(c)));
+        all
+    }
+
+    fn set_cursors_from_list(&mut self, list: Vec<(u64, u64, bool)>) {
+        if list.is_empty() {
+            self.extra_cursors.clear();
+            return;
+        }
+        let mut sorted = list;
+        sorted.sort_by_key(|&(a, c, _)| (a.min(c), a.max(c)));
+        // Merge overlapping or duplicate selections cleanly.
+        let mut merged: Vec<(u64, u64, bool)> = Vec::with_capacity(sorted.len());
+        for (a, c, is_prim) in sorted {
+            let (s, e) = (a.min(c), a.max(c));
+            if let Some(last) = merged.last_mut() {
+                let (ls, le) = (last.0.min(last.1), last.0.max(last.1));
+                let overlaps = if ls == le && s == e {
+                    ls == s
+                } else {
+                    s < le
+                };
+                if overlaps {
+                    let ns = ls.min(s);
+                    let ne = le.max(e);
+                    let forward = c >= a;
+                    last.0 = if forward { ns } else { ne };
+                    last.1 = if forward { ne } else { ns };
+                    last.2 |= is_prim;
+                    continue;
+                }
+            }
+            merged.push((a, c, is_prim));
+        }
+        let prim_idx = merged.iter().position(|&(_, _, p)| p).unwrap_or(0);
+        let (pa, pc, _) = merged.remove(prim_idx);
+        self.anchor = pa;
+        self.caret = pc;
+        self.extra_cursors = merged.into_iter().map(|(a, c, _)| (a, c)).collect();
+    }
+
+    fn toggle_extra_cursor_at(&mut self, offset: u64) {
+        if let Some(idx) = self
+            .extra_cursors
+            .iter()
+            .position(|&(a, c)| offset >= a.min(c) && offset <= a.max(c))
+        {
+            self.extra_cursors.remove(idx);
+            return;
+        }
+        let (ps, pe) = (self.anchor.min(self.caret), self.anchor.max(self.caret));
+        if offset >= ps && offset <= pe {
+            if !self.extra_cursors.is_empty() {
+                let (na, nc) = self.extra_cursors.remove(0);
+                self.anchor = na;
+                self.caret = nc;
+            }
+            return;
+        }
+        self.extra_cursors.push((offset, offset));
+        let all = self.all_cursors_sorted();
+        self.set_cursors_from_list(all);
+    }
+
+    fn select_next_occurrence(
+        &mut self,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        self.preferred_x_px = None;
+        // First `⌘D` with no selection selects the word under the primary caret.
+        if self.selection().is_none() && self.extra_cursors.is_empty() {
+            let (line, col) = self.doc.byte_to_line_col(self.caret);
+            let content = self.doc.line_content(line).unwrap_or_default();
+            let (ws, we) = word_range_at(&content, col.min(content.len()));
+            if we > ws {
+                let (ls, _, _) = self.doc.line_byte_range(line).unwrap_or((0, 0, 0));
+                self.anchor = ls + ws as u64;
+                self.caret = ls + we as u64;
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            return;
+        }
+
+        let Some(needle) = self.selected_text() else {
+            return;
+        };
+        if needle.is_empty() {
+            return;
+        }
+        let matches = self.doc.find_all(
+            &needle,
+            SearchOptions {
+                case_sensitive: true,
+                max_matches: 10_000,
+            },
+        );
+        if matches.is_empty() {
+            return;
+        }
+
+        // Find the furthest end offset among current cursors, then pick the next uncovered match.
+        let mut search_after = self.anchor.max(self.caret);
+        for &(a, c) in &self.extra_cursors {
+            search_after = search_after.max(a.max(c));
+        }
+
+        let is_covered = |s: u64, e: u64, app: &Self| -> bool {
+            let (ps, pe) = (app.anchor.min(app.caret), app.anchor.max(app.caret));
+            if s < pe && e > ps {
+                return true;
+            }
+            app.extra_cursors
+                .iter()
+                .any(|&(a, c)| s < a.max(c) && e > a.min(c))
+        };
+
+        let next_match = matches
+            .iter()
+            .find(|m| m.start >= search_after && !is_covered(m.start, m.end, self))
+            .or_else(|| {
+                matches
+                    .iter()
+                    .find(|m| !is_covered(m.start, m.end, self))
+            })
+            .copied();
+
+        if let Some(m) = next_match {
+            self.extra_cursors.push((m.start, m.end));
+            let all = self.all_cursors_sorted();
+            self.set_cursors_from_list(all);
+            let metrics = self.doc_metrics(rasterizer);
+            self.viewport
+                .ensure_caret_visible(&mut self.doc, m.end, metrics, self.framebuffer.scale);
+            self.mark_dirty();
+            host.request_redraw();
+        }
+    }
+
+    fn multi_cursor_selected_text(&mut self) -> Option<String> {
+        let all = self.all_cursors_sorted();
+        let mut parts = Vec::with_capacity(all.len());
+        for (a, c, _) in all {
+            let (s, e) = (a.min(c), a.max(c));
+            if e > s {
+                let bytes = self.doc.read_range(s, (e - s) as usize);
+                parts.push(String::from_utf8_lossy(&bytes).into_owned());
+            }
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join("\n"))
+        }
+    }
+
+    fn multi_cursor_apply_text(
+        &mut self,
+        replacement: &str,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        let all = self.all_cursors_sorted();
+        let edits: Vec<(u64, u64, String)> = all
+            .iter()
+            .map(|&(a, c, _)| {
+                let s = a.min(c);
+                let e = a.max(c);
+                (s, e - s, replacement.to_string())
+            })
+            .collect();
+        if let Ok(ends) = self.doc.edit_multi(&edits, self.now_ms) {
+            let next: Vec<(u64, u64, bool)> = ends
+                .into_iter()
+                .zip(all.iter())
+                .map(|(end, &(_, _, is_p))| (end, end, is_p))
+                .collect();
+            self.set_cursors_from_list(next);
+            self.after_document_mutated(rasterizer, host);
+        }
+    }
+
+    fn multi_cursor_paste(
+        &mut self,
+        clip: &str,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        let all = self.all_cursors_sorted();
+        let lines: Vec<&str> = clip.lines().collect();
+        let distribute = lines.len() == all.len() && !clip.ends_with('\n');
+        let edits: Vec<(u64, u64, String)> = all
+            .iter()
+            .enumerate()
+            .map(|(i, &(a, c, _))| {
+                let s = a.min(c);
+                let e = a.max(c);
+                let txt = if distribute { lines[i] } else { clip };
+                (s, e - s, txt.to_string())
+            })
+            .collect();
+        if let Ok(ends) = self.doc.edit_multi(&edits, self.now_ms) {
+            let next: Vec<(u64, u64, bool)> = ends
+                .into_iter()
+                .zip(all.iter())
+                .map(|(end, &(_, _, is_p))| (end, end, is_p))
+                .collect();
+            self.set_cursors_from_list(next);
+            self.after_document_mutated(rasterizer, host);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn handle_multi_cursor_key(
+        &mut self,
+        key: Key,
+        mods: Modifiers,
+        text: Option<&str>,
+        metrics: editor_platform::FontMetrics,
+        scale: f32,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) -> bool {
+        match key {
+            Key::Escape => {
+                self.extra_cursors.clear();
+                self.mark_dirty();
+                host.request_redraw();
+                true
+            }
+            Key::Left | Key::Right | Key::Home | Key::End => {
+                self.doc.break_undo_coalescing();
+                self.preferred_x_px = None;
+                let all = self.all_cursors_sorted();
+                let mut next = Vec::with_capacity(all.len());
+                for (a, c, is_p) in all {
+                    let nc = match key {
+                        Key::Left => {
+                            if !mods.shift && a != c {
+                                a.min(c)
+                            } else if mods.primary() {
+                                let (line, _) = self.doc.byte_to_line_col(c);
+                                self.doc.line_byte_range(line).map(|(s, _, _)| s).unwrap_or(0)
+                            } else if mods.alt {
+                                self.move_word_left(c)
+                            } else {
+                                self.move_grapheme_left(c)
+                            }
+                        }
+                        Key::Right => {
+                            if !mods.shift && a != c {
+                                a.max(c)
+                            } else if mods.primary() {
+                                let (line, _) = self.doc.byte_to_line_col(c);
+                                self.doc.line_byte_range(line).map(|(_, e, _)| e).unwrap_or(0)
+                            } else if mods.alt {
+                                self.move_word_right(c)
+                            } else {
+                                self.move_grapheme_right(c)
+                            }
+                        }
+                        Key::Home => {
+                            let (line, _) = self.doc.byte_to_line_col(c);
+                            self.doc.line_byte_range(line).map(|(s, _, _)| s).unwrap_or(0)
+                        }
+                        Key::End => {
+                            let (line, _) = self.doc.byte_to_line_col(c);
+                            self.doc.line_byte_range(line).map(|(_, e, _)| e).unwrap_or(0)
+                        }
+                        _ => c,
+                    };
+                    let na = if mods.shift { a } else { nc };
+                    next.push((na, nc, is_p));
+                }
+                self.set_cursors_from_list(next);
+                self.viewport
+                    .ensure_caret_visible(&mut self.doc, self.caret, metrics, scale);
+                self.mark_dirty();
+                host.request_redraw();
+                true
+            }
+            Key::Backspace => {
+                self.preferred_x_px = None;
+                let all = self.all_cursors_sorted();
+                let mut edits: Vec<(u64, u64, String)> = Vec::with_capacity(all.len());
+                let mut flags: Vec<bool> = Vec::with_capacity(all.len());
+                for (a, c, is_p) in all {
+                    let (s, e) = (a.min(c), a.max(c));
+                    let (ds, dl) = if e > s {
+                        (s, e - s)
+                    } else if s > 0 {
+                        let prev = if mods.alt {
+                            self.move_word_left(s)
+                        } else {
+                            self.move_grapheme_left(s)
+                        };
+                        (prev, s - prev)
+                    } else {
+                        (0, 0)
+                    };
+                    if let Some(last) = edits.last_mut() {
+                        if ds < last.0 + last.1 {
+                            let merged_end = (last.0 + last.1).max(ds + dl);
+                            last.1 = merged_end - last.0;
+                            if let Some(lf) = flags.last_mut() {
+                                *lf |= is_p;
+                            }
+                            continue;
+                        }
+                    }
+                    edits.push((ds, dl, String::new()));
+                    flags.push(is_p);
+                }
+                if let Ok(ends) = self.doc.edit_multi(&edits, self.now_ms) {
+                    let next: Vec<(u64, u64, bool)> = ends
+                        .into_iter()
+                        .zip(flags)
+                        .map(|(end, is_p)| (end, end, is_p))
+                        .collect();
+                    self.set_cursors_from_list(next);
+                    self.after_document_mutated(rasterizer, host);
+                }
+                true
+            }
+            Key::Delete => {
+                self.preferred_x_px = None;
+                let doc_len = self.doc.len_bytes();
+                let all = self.all_cursors_sorted();
+                let mut edits: Vec<(u64, u64, String)> = Vec::with_capacity(all.len());
+                let mut flags: Vec<bool> = Vec::with_capacity(all.len());
+                for (a, c, is_p) in all {
+                    let (s, e) = (a.min(c), a.max(c));
+                    let (ds, dl) = if e > s {
+                        (s, e - s)
+                    } else if s < doc_len {
+                        let next_pos = if mods.alt {
+                            self.move_word_right(s)
+                        } else {
+                            self.move_grapheme_right(s)
+                        };
+                        (s, next_pos - s)
+                    } else {
+                        (s, 0)
+                    };
+                    if let Some(last) = edits.last_mut() {
+                        if ds < last.0 + last.1 {
+                            let merged_end = (last.0 + last.1).max(ds + dl);
+                            last.1 = merged_end - last.0;
+                            if let Some(lf) = flags.last_mut() {
+                                *lf |= is_p;
+                            }
+                            continue;
+                        }
+                    }
+                    edits.push((ds, dl, String::new()));
+                    flags.push(is_p);
+                }
+                if let Ok(ends) = self.doc.edit_multi(&edits, self.now_ms) {
+                    let next: Vec<(u64, u64, bool)> = ends
+                        .into_iter()
+                        .zip(flags)
+                        .map(|(end, is_p)| (end, end, is_p))
+                        .collect();
+                    self.set_cursors_from_list(next);
+                    self.after_document_mutated(rasterizer, host);
+                }
+                true
+            }
+            Key::Enter => {
+                self.preferred_x_px = None;
+                self.multi_cursor_apply_text("\n", rasterizer, host);
+                true
+            }
+            Key::Tab => {
+                self.preferred_x_px = None;
+                let spaces = " ".repeat(self.viewport.tab_width);
+                self.multi_cursor_apply_text(&spaces, rasterizer, host);
+                true
+            }
+            _ => {
+                if !mods.primary() && !mods.ctrl {
+                    if let Some(s) = text {
+                        if !s.is_empty() && !s.chars().all(|c| c.is_control()) {
+                            self.preferred_x_px = None;
+                            self.multi_cursor_apply_text(s, rasterizer, host);
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+        }
     }
 
     fn after_document_mutated(
@@ -5465,6 +5918,7 @@ impl EditorApp {
 
             // Gutter click selects the whole logical line!
             if self.viewport.layout.gutter.contains(xi, yi) {
+                self.extra_cursors.clear();
                 let line = self.viewport.hit_test_gutter(y_px, &mut self.doc, metrics, scale);
                 let (ls, _, l_full) = self.doc.line_byte_range(line).unwrap_or((0, 0, 0));
                 self.anchor = ls;
@@ -5479,6 +5933,16 @@ impl EditorApp {
                 .viewport
                 .hit_test_text(x_px, y_px, &mut self.doc, metrics, scale);
             self.preferred_x_px = None;
+
+            // Alt/Option-click toggles an extra cursor at the clicked position!
+            if mods.alt && !mods.primary() && !mods.shift && click_count == 1 {
+                self.toggle_extra_cursor_at(hit.byte_offset);
+                self.mark_dirty();
+                host.request_redraw();
+                return;
+            }
+
+            self.extra_cursors.clear();
             self.dragging_selection = true;
             self.drag_click_count = click_count.clamp(1, 3);
 
@@ -6335,6 +6799,12 @@ impl EditorApp {
                     "select-all" => {
                         self.handle_command(AppCommand::SelectAll, rasterizer, clipboard, host)
                     }
+                    "select-next-occurrence" => self.handle_command(
+                        AppCommand::SelectNextOccurrence,
+                        rasterizer,
+                        clipboard,
+                        host,
+                    ),
                     "find" => {
                         activate = true;
                         self.handle_command(AppCommand::Find, rasterizer, clipboard, host);

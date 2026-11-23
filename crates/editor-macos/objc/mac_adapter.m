@@ -1059,6 +1059,7 @@ void mac_activate_app(void) {
     [editMenu addItem:[self menuItem:@"Copy" key:@"c" tag:9 mods:NSEventModifierFlagCommand]];
     [editMenu addItem:[self menuItem:@"Paste" key:@"v" tag:10 mods:NSEventModifierFlagCommand]];
     [editMenu addItem:[self menuItem:@"Select All" key:@"a" tag:11 mods:NSEventModifierFlagCommand]];
+    [editMenu addItem:[self menuItem:@"Select Next Occurrence" key:@"d" tag:49 mods:NSEventModifierFlagCommand]];
     [editMenu addItem:[NSMenuItem separatorItem]];
     [editMenu addItem:[self menuItem:@"Toggle Line Comment" key:@"/" tag:31 mods:NSEventModifierFlagCommand]];
     [editMenu addItem:[self menuItem:@"Duplicate Line" key:@"d" tag:32

@@ -83,6 +83,8 @@ pub struct Viewport {
     pub last_caret_rect: PixelRect,
     /// Render a cell-wide block cursor (used in Vim Normal / Visual modes) instead of a thin bar.
     pub block_caret: bool,
+    /// Optional secondary `(anchor, caret)` byte-offset pairs for multi-cursor rendering.
+    pub extra_cursors: Vec<(u64, u64)>,
 }
 
 impl Default for Viewport {
@@ -114,6 +116,7 @@ impl Viewport {
             layout: ViewportLayout::default(),
             last_caret_rect: PixelRect::ZERO,
             block_caret: false,
+            extra_cursors: Vec::new(),
         }
     }
 
@@ -881,8 +884,18 @@ impl Viewport {
                 let seg_abs_end = line_start + (win_rel_start + seg.byte_end) as u64;
                 let seg_origin_x = text_origin_x + win_x_shift;
 
-                // Selection highlight on this visual segment.
-                if let Some((sel_a, sel_b)) = selection {
+                // Selection highlights on this visual segment (primary + any extra cursors).
+                let primary_sel_iter = selection.into_iter();
+                let extra_sel_iter = self.extra_cursors.iter().filter_map(|&(ea, ec)| {
+                    if ea == ec {
+                        None
+                    } else if ea < ec {
+                        Some((ea, ec))
+                    } else {
+                        Some((ec, ea))
+                    }
+                });
+                for (sel_a, sel_b) in primary_sel_iter.chain(extra_sel_iter) {
                     if sel_b > seg_abs_start && sel_a < line_full_end {
                         let ov_start = sel_a.max(seg_abs_start);
                         let ov_end = sel_b.min(seg_abs_end);
@@ -1039,7 +1052,11 @@ impl Viewport {
                             caret_w,
                             (line_h.round() as i32 - 2).max(1),
                         );
-                        self.last_caret_rect = crect;
+                        self.last_caret_rect = if self.last_caret_rect.is_empty() {
+                            crect
+                        } else {
+                            self.last_caret_rect.union(crect)
+                        };
                         if caret_visible {
                             if self.block_caret {
                                 painter.fill_rect(crect, theme.text.with_alpha(95));
@@ -1075,6 +1092,34 @@ impl Viewport {
                                 ),
                                 theme.border_control,
                             );
+                        }
+                    }
+                }
+                // Draw any secondary multi-cursor carets falling inside this visual segment.
+                if focused && !self.extra_cursors.is_empty() {
+                    let caret_w = (2.0 * scale).round().max(1.0) as i32;
+                    for &(_, ec) in &self.extra_cursors {
+                        let in_seg = ec >= seg_abs_start
+                            && (ec < seg_abs_end
+                                || (seg_idx + 1 == segs.len() && ec <= line_content_end));
+                        if in_seg {
+                            let local_col = ((ec - seg_abs_start) as usize).min(seg_str.len());
+                            let cx =
+                                seg_origin_x + self.measure_prefix_px(seg_str, local_col, cell_w);
+                            let crect = PixelRect::new(
+                                cx.round() as i32,
+                                seg_y.round() as i32 + 1,
+                                caret_w,
+                                (line_h.round() as i32 - 2).max(1),
+                            );
+                            self.last_caret_rect = if self.last_caret_rect.is_empty() {
+                                crect
+                            } else {
+                                self.last_caret_rect.union(crect)
+                            };
+                            if caret_visible {
+                                painter.fill_rect(crect, theme.text);
+                            }
                         }
                     }
                 }

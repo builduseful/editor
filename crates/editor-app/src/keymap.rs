@@ -375,6 +375,7 @@ fn default_shortcuts() -> Vec<ShortcutEntry> {
         bind("toggle-sidebar-side", "Move sidebar left / right", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Char('b'))], None, false, AppCommand::ToggleSidebarSide),
         bind("save", "Save file", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('s'))], None, true, AppCommand::Save),
         bind("toggle-comment", "Toggle line comment", "Editing", KeyScope::Document, vec![KeyChord::primary(Key::Char('/'))], Some("⌘/"), true, AppCommand::ToggleComment),
+        bind("select-next-occurrence", "Select next occurrence", "Editing", KeyScope::Document, vec![KeyChord::primary(Key::Char('d'))], None, true, AppCommand::SelectNextOccurrence),
         bind("toggle-vim", "Toggle Vim mode", "Panes & View", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('v'))], None, true, AppCommand::ToggleVimMode),
         bind("shortcuts", "Show keyboard shortcuts", "Panes & View", KeyScope::Global, vec![KeyChord::primary(Key::Char('k')), KeyChord::primary_shift(Key::Char('/')), KeyChord::primary_shift(Key::Char('?')), KeyChord::primary(Key::Char('?'))], Some("⌘K"), true, AppCommand::ShowShortcuts),
 
