@@ -184,7 +184,7 @@ fn cli_ipc_open_close_and_quit_commands() {
                         ));
                     }
                     IpcCommand::Open(p) => {
-                        assert!(p.ends_with("hello.rs"));
+                        assert!(p.ends_with("hello.rs") || p.is_dir());
                         pending.respond(IpcReply::Opened);
                     }
                     IpcCommand::Goto {
@@ -259,13 +259,13 @@ fn cli_ipc_open_close_and_quit_commands() {
                     other => panic!("unexpected ipc command: {other:?}"),
                 }
                 handled += 1;
-                if handled == 22 {
+                if handled == 24 {
                     break;
                 }
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert_eq!(handled, 22);
+        assert_eq!(handled, 24);
     });
 
     // `editor status`
@@ -289,6 +289,35 @@ fn cli_ipc_open_close_and_quit_commands() {
     let s = String::from_utf8(out.stdout).unwrap();
     assert!(s.contains("\"launched\":false"));
     assert!(s.contains("\"status\":\"opened\""));
+
+    // VS Code-style shorthand: `editor .` (opens current working directory) and `editor hello.rs`
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .current_dir(&root)
+        .arg(".")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "editor . failed: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"status\":\"opened\""));
+
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .current_dir(&root)
+        .arg("hello.rs")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "editor hello.rs failed: {}", String::from_utf8_lossy(&out.stdout));
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"status\":\"opened\""));
+
+    // Unknown non-path command still fails cleanly with E_USAGE
+    let out = Command::new(bin)
+        .env("EDITOR_IPC_SOCK", &sock)
+        .current_dir(&root)
+        .arg("definitely-not-a-command")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8(out.stdout).unwrap().contains("\"E_USAGE\""));
 
     // `editor goto 5:2`
     let out = Command::new(bin)

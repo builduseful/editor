@@ -29,6 +29,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 struct GlobalOpts {
     root: PathBuf,
+    explicit_root: bool,
 }
 
 fn main() -> ExitCode {
@@ -68,12 +69,14 @@ fn main() -> ExitCode {
     }
 
     let fs = StdFileSystem;
+    let explicit_root = root.is_some();
     let default_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let resolved_root = fs
         .canonicalize(root.as_deref().unwrap_or(&default_root))
         .unwrap_or_else(|_| root.unwrap_or(default_root));
     let globals = GlobalOpts {
         root: resolved_root,
+        explicit_root,
     };
 
     let cmd = args[0].as_str();
@@ -114,17 +117,40 @@ fn main() -> ExitCode {
         "action" => cmd_action(&fs, &globals, rest, start),
         "close" | "quit" => cmd_quit(cmd, rest, start),
         other => {
-            emit_err(
-                other,
-                start,
-                "E_USAGE",
-                &format!("unknown command: {other}"),
-                None,
-            );
-            3
+            // VS Code-style shorthand: `editor .`, `editor src/`, `editor file.rs`
+            if looks_like_open_target(&globals, other) {
+                cmd_open("open", &fs, &globals, &args, start)
+            } else {
+                emit_err(
+                    other,
+                    start,
+                    "E_USAGE",
+                    &format!("unknown command: {other}"),
+                    None,
+                );
+                3
+            }
         }
     };
     ExitCode::from(code)
+}
+
+fn looks_like_open_target(globals: &GlobalOpts, arg: &str) -> bool {
+    if arg.is_empty() || arg.starts_with('-') {
+        return false;
+    }
+    if arg == "."
+        || arg == ".."
+        || arg.starts_with("./")
+        || arg.starts_with("../")
+        || arg.starts_with('/')
+        || arg.contains('/')
+        || arg.contains('\\')
+    {
+        return true;
+    }
+    let candidate = globals.root.join(arg);
+    candidate.exists()
 }
 
 fn print_usage() {
@@ -133,6 +159,7 @@ fn print_usage() {
          \n\
          Global flags: --root DIR\n\
          Commands:\n\
+           editor <PATH>                                         (open folder or file in GUI, e.g. `editor .`)\n\
            editor read <path> [--from N --to N | --from-offset B --length L] [--max-bytes N]\n\
            editor info <path>\n\
            editor validate <path>\n\
@@ -1419,25 +1446,58 @@ fn cmd_batch(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: 
 // GUI IPC Control Commands: `open`, `gui`, `close` / `quit`
 // ============================================================================
 
+fn resolve_open_path(
+    fs: &dyn FileSystem,
+    globals: &GlobalOpts,
+    raw: &str,
+) -> Result<PathBuf, (&'static str, String)> {
+    if globals.explicit_root {
+        return resolve_confined(fs, globals, raw);
+    }
+    let p = PathBuf::from(raw);
+    let joined = if p.is_absolute() {
+        p
+    } else {
+        globals.root.join(p)
+    };
+    fs.canonicalize(&joined)
+        .map_err(|e| ("E_NOT_FOUND", e.to_string()))
+}
+
 fn launch_gui_process(sidebar_root: Option<&Path>, target: Option<&Path>) -> Result<(), String> {
-    // Prefer sibling `Editor.app` bundle if present next to `editor`, else sibling `editor-gui`.
+    // Prefer sibling `Editor.app` bundle if present next to `editor`, else `/Applications/Editor.app`,
+    // else sibling `editor-gui`.
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(Path::to_path_buf));
 
     let mut gui_args: Vec<String> = Vec::new();
-    if let Some(root) = sidebar_root {
+    let effective_root = match (sidebar_root, target) {
+        (Some(r), _) => Some(r),
+        (None, Some(t)) if t.is_dir() => Some(t),
+        _ => None,
+    };
+    if let Some(root) = effective_root {
         gui_args.push("--sidebar-root".to_string());
         gui_args.push(root.to_string_lossy().into_owned());
     }
     if let Some(t) = target {
-        gui_args.push(t.to_string_lossy().into_owned());
+        if !t.is_dir() {
+            gui_args.push(t.to_string_lossy().into_owned());
+        }
     }
 
     #[cfg(target_os = "macos")]
-    if let Some(ref dir) = exe_dir {
-        let app_bundle = dir.join("Editor.app");
-        if app_bundle.exists() {
+    {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(ref dir) = exe_dir {
+            candidates.push(dir.join("Editor.app"));
+        }
+        candidates.push(PathBuf::from("/Applications/Editor.app"));
+        if let Ok(home) = std::env::var("HOME") {
+            candidates.push(PathBuf::from(home).join("Applications/Editor.app"));
+        }
+        if let Some(app_bundle) = candidates.into_iter().find(|p| p.exists()) {
             let mut cmd = std::process::Command::new("/usr/bin/open");
             cmd.arg("-n").arg(&app_bundle);
             if !gui_args.is_empty() {
@@ -1482,7 +1542,7 @@ fn cmd_open(
     while i < args.len() {
         match args[i].as_str() {
             "--sidebar-root" if i + 1 < args.len() => {
-                match resolve_confined(fs, globals, &args[i + 1]) {
+                match resolve_open_path(fs, globals, &args[i + 1]) {
                     Ok(p) => sidebar_root = Some(p),
                     Err((c, m)) => {
                         emit_err(command_name, start, c, &m, Some(Path::new(&args[i + 1])));
@@ -1492,7 +1552,7 @@ fn cmd_open(
                 i += 2;
             }
             other if !other.starts_with('-') && target.is_none() => {
-                match resolve_confined(fs, globals, other) {
+                match resolve_open_path(fs, globals, other) {
                     Ok(p) => target = Some(p),
                     Err((c, m)) => {
                         emit_err(command_name, start, c, &m, Some(Path::new(other)));

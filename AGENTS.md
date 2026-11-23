@@ -60,6 +60,20 @@ reference, not a component library.
 
 - **Rust 2021, zero external crates (`std` only).** No third-party crates in
   `Cargo.toml`.
+- **Performance, memory, CPU, and battery first.** Every feature must stay
+  extremely lightweight and resource-efficient across all platforms:
+  - **Zero idle CPU and battery-friendly by design.** Never add busy loops,
+    background polling timers, or speculative filesystem scans. Prefer OS
+    event-driven primitives, coalesce bursty events, and stay completely idle
+    when unfocused or hidden.
+  - **Minimal memory footprint.** Prefer lazy loading/paging, compact flat
+    tables, bounded caches, and zero unnecessary allocations on hot paths
+    (typing, scrolling, lexing, layout, painting).
+  - **Sub-millisecond hot paths and incremental rendering.** Redraw only
+    damaged regions, keep edit/search/render latency flat even on very large or
+    pathological files, and verify with benchmarks.
+  - **Minimal disk and install footprint.** Keep binaries small and avoid
+    scattering caches, metadata, or state files across the user's machine.
 - **Minimal platform adapter (`crates/editor-platform`).** Only irreducible OS
   boundaries sit behind traits (`FileSystem`, 2-method `GlyphRasterizer`,
   `Clipboard`, `PlatformHost`, and BGRA8 framebuffer + dirty-rect presentation).
@@ -84,5 +98,7 @@ reference, not a component library.
 
 ## Repo hygiene
 
-- No personal paths, local machine details, or secrets in tracked files.
+- **Never add or commit personal information.** No personal paths (`/Users/...`,
+  home directories, usernames), local machine details, emails, tokens, or
+  secrets in any tracked file, test, comment, or commit message.
 - Keep tracked files minimal and commit in clean, logical chunks.
