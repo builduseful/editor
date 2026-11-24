@@ -60,6 +60,16 @@ reference, not a component library.
 
 - **Rust 2021, zero external crates (`std` only).** No third-party crates in
   `Cargo.toml`.
+- **Clean, simple, refined over feature-bloated.** Always prefer a small,
+  cohesive, deeply thought-through design over a clunky "has all the features"
+  approach. Learn from great tools' core ideas and refine them to fit this
+  editor rather than copying complexity or adding overlapping modes, shortcuts,
+  or caches that don't clearly earn their keep.
+- **Architectural craftsmanship over surface hacks.** Treat every feature,
+  refinement, and bug fix as an opportunity to strengthen the underlying
+  architecture — module boundaries, data flow, clarity, maintainability,
+  extensibility, and performance — rather than bolting on workarounds or
+  duplicating logic across layers.
 - **Performance, memory, CPU, and battery first.** Every feature must stay
   extremely lightweight and resource-efficient across all platforms:
   - **Zero idle CPU and battery-friendly by design.** Never add busy loops,

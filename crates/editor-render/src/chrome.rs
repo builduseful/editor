@@ -50,6 +50,8 @@ pub enum FindBarAction {
     FindNext,
     FindPrev,
     ToggleCase,
+    ToggleWholeWord,
+    ToggleRegex,
     ReplaceOne,
     ReplaceAll,
     Close,
@@ -63,6 +65,8 @@ pub struct FindBarLayout {
     pub find_input: PixelRect,
     pub replace_input: PixelRect,
     pub btn_case: PixelRect,
+    pub btn_word: PixelRect,
+    pub btn_regex: PixelRect,
     pub btn_prev: PixelRect,
     pub btn_next: PixelRect,
     pub btn_replace: PixelRect,
@@ -76,6 +80,9 @@ pub struct FindBarState {
     pub find_input: TextInput,
     pub replace_input: TextInput,
     pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub regex: bool,
+    pub regex_error: Option<String>,
     pub match_count: usize,
     pub active_match: Option<usize>,
     pub layout: FindBarLayout,
@@ -95,6 +102,9 @@ impl FindBarState {
             find_input: TextInput::new("Find"),
             replace_input: TextInput::new("Replace"),
             case_sensitive: false,
+            whole_word: false,
+            regex: false,
+            regex_error: None,
             match_count: 0,
             active_match: None,
             layout: FindBarLayout::default(),
@@ -148,6 +158,10 @@ impl FindBarState {
             FindBarAction::FocusReplace
         } else if l.btn_case.contains(xi, yi) {
             FindBarAction::ToggleCase
+        } else if l.btn_word.contains(xi, yi) {
+            FindBarAction::ToggleWholeWord
+        } else if l.btn_regex.contains(xi, yi) {
+            FindBarAction::ToggleRegex
         } else if l.btn_prev.contains(xi, yi) {
             FindBarAction::FindPrev
         } else if l.btn_next.contains(xi, yi) {
@@ -189,7 +203,7 @@ impl FindBarState {
         );
 
         let y1 = rect.y + px(7.0, scale);
-        let input_w = (rect.w - px(260.0, scale)).clamp(px(140.0, scale), px(340.0, scale));
+        let input_w = (rect.w - px(340.0, scale)).clamp(px(120.0, scale), px(320.0, scale));
         let find_rect = PixelRect::new(rect.x + pad, y1, input_w, row_h);
         self.find_input
             .draw(painter, find_rect, theme, atlas, rasterizer, caret_visible);
@@ -197,7 +211,15 @@ impl FindBarState {
         let mut cx = find_rect.right() + gap;
         let btn_case = PixelRect::new(cx, y1, px(28.0, scale), row_h);
         draw_button(painter, btn_case, "Aa", self.case_sensitive, theme, atlas, rasterizer);
-        cx = btn_case.right() + gap;
+        cx = btn_case.right() + px(4.0, scale);
+
+        let btn_word = PixelRect::new(cx, y1, px(26.0, scale), row_h);
+        draw_button(painter, btn_word, "W", self.whole_word, theme, atlas, rasterizer);
+        cx = btn_word.right() + px(4.0, scale);
+
+        let btn_regex = PixelRect::new(cx, y1, px(28.0, scale), row_h);
+        draw_button(painter, btn_regex, ".*", self.regex, theme, atlas, rasterizer);
+        cx = btn_regex.right() + gap;
 
         let btn_prev = PixelRect::new(cx, y1, px(28.0, scale), row_h);
         draw_button(painter, btn_prev, "↑", false, theme, atlas, rasterizer);
@@ -207,35 +229,42 @@ impl FindBarState {
         draw_button(painter, btn_next, "↓", false, theme, atlas, rasterizer);
         cx = btn_next.right() + px(10.0, scale);
 
-        // Match counter label.
-        let count_label = if self.find_input.text.is_empty() {
-            String::new()
+        // Match counter or quiet inline regex error label.
+        let (count_label, is_err) = if let Some(ref err) = self.regex_error {
+            (err.clone(), true)
+        } else if self.find_input.text.is_empty() {
+            (String::new(), false)
         } else if self.match_count == 0 {
-            "No matches".to_string()
+            ("No matches".to_string(), true)
         } else if let Some(idx) = self.active_match {
-            format!("{} of {}", idx + 1, self.match_count)
+            (format!("{} of {}", idx + 1, self.match_count), false)
         } else {
-            format!("{} matches", self.match_count)
+            (format!("{} matches", self.match_count), false)
         };
         if !count_label.is_empty() {
             let font_px = 11.5 * scale;
             let m = atlas.metrics(rasterizer, FontStyle::Ui, font_px);
             let baseline = y1 as f32 + (row_h as f32 + m.ascent - m.descent) * 0.5;
-            let color = if self.match_count == 0 {
+            let color = if is_err {
                 theme.state_danger
             } else {
                 theme.text_muted
             };
-            painter.draw_text_ui(
-                cx as f32,
-                baseline,
-                &count_label,
-                FontStyle::Ui,
-                font_px,
-                color,
-                atlas,
-                rasterizer,
-            );
+            let max_label_x = rect.right() - pad - px(30.0, scale);
+            if cx < max_label_x {
+                painter.push_clip(PixelRect::new(cx, y1, max_label_x - cx, row_h));
+                painter.draw_text_ui(
+                    cx as f32,
+                    baseline,
+                    &count_label,
+                    FontStyle::Ui,
+                    font_px,
+                    color,
+                    atlas,
+                    rasterizer,
+                );
+                painter.pop_clip();
+            }
         }
 
         let btn_close = PixelRect::new(rect.right() - pad - px(24.0, scale), y1, px(24.0, scale), row_h);
@@ -270,6 +299,8 @@ impl FindBarState {
             find_input: find_rect,
             replace_input: replace_rect,
             btn_case,
+            btn_word,
+            btn_regex,
             btn_prev,
             btn_next,
             btn_replace,

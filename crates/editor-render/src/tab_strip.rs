@@ -1,8 +1,8 @@
-//! Custom-drawn Unified Working-Set Strip (Harpoon `1..9` pins + Open/Preview tabs).
+//! Custom-drawn Unified Working-Set Strip (numbered `1..9` pins + Open/Preview tabs).
 //!
 //! Built strictly with Build Useful design tokens:
 //! - Single 26pt bar across the editor column (`theme.page` ground, `1px` `theme.border_subtle` hairline).
-//! - Left side: fixed numbered Harpoon pin slots (`1`..`9`) that never shift on unpinned churn.
+//! - Left side: fixed numbered pin slots (`1`..`9`) that never shift on unpinned churn.
 //! - Subtle hairline divider `│` separating pinned slots from unpinned tabs.
 //! - Right side: Kept open tabs + at most 1 transient single-click preview tab at the far right.
 //! - Far right utilities: `+` new tab, fullscreen zoom toggle (when split), and quiet list trigger.
@@ -27,7 +27,7 @@ pub fn tab_strip_height_px(scale: f32) -> i32 {
 pub struct TabDisplayItem {
     pub id: u32,
     pub label: String,
-    /// `Some(1..=9)` for Harpoon pinned slots; `None` for unpinned tabs.
+    /// `Some(1..=9)` for pinned slots; `None` for unpinned tabs.
     pub pin_slot: Option<u8>,
     pub dirty: bool,
     pub is_preview: bool,
@@ -317,7 +317,7 @@ impl TabStrip {
         }
 
         // Right-side utility buttons (right-to-left): [Zoom (if split)] [Menu ⌘E] [+]
-        // 1. Harpoon / open list button (quiet 3-bar icon).
+        // 1. Pinned & open files list button (quiet 3-bar icon).
         let menu_w = px(24.0, scale);
         right_edge -= menu_w;
         self.menu_btn_rect = PixelRect::new(right_edge, rect.y, menu_w, btn_h);
@@ -536,7 +536,7 @@ impl TabStrip {
             let mut tx = (pill.x + pad_l) as f32;
             let content_cy = rect.y as f32 + (rect.h - hairline) as f32 * 0.5;
 
-            // 1. Optional Harpoon slot keycap badge (`1`..`9`).
+            // 1. Optional pinned slot keycap badge (`1`..`9`).
             if let Some(slot) = it.pin_slot {
                 let by = (content_cy - badge_h as f32 * 0.5).round() as i32;
                 let brect = PixelRect::new(tx.round() as i32, by, badge_w, badge_h);

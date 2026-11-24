@@ -80,6 +80,7 @@ pub struct SidebarBadge {
 pub enum SidebarAction {
     None,
     OpenFile(PathBuf),
+    PreviewFile(PathBuf),
     DirectoryClicked(PathBuf),
     Changed,
     Minimize,
@@ -1030,19 +1031,18 @@ impl Sidebar {
         &mut self,
         fs: &dyn FileSystem,
         key: Key,
+        mods: Modifiers,
         viewport_h_px: i32,
     ) -> SidebarAction {
+        let no_cmd = !mods.meta && !mods.ctrl && !mods.alt;
         if self.rows.is_empty() {
-            match key {
-                Key::Left => {
-                    if let Some(parent) = self.root.as_ref().and_then(|r| r.parent()).map(PathBuf::from) {
-                        self.navigate_to(fs, &parent);
-                        return SidebarAction::Changed;
-                    }
+            if no_cmd {
+                match key {
+                    Key::Char('n') if !mods.shift => return SidebarAction::StartNewFile,
+                    Key::Char('N') => return SidebarAction::StartNewFolder,
+                    Key::Char('n') if mods.shift => return SidebarAction::StartNewFolder,
+                    _ => {}
                 }
-                Key::Char('n') => return SidebarAction::StartNewFile,
-                Key::Char('N') => return SidebarAction::StartNewFolder,
-                _ => {}
             }
             return SidebarAction::None;
         }
@@ -1052,21 +1052,47 @@ impl Sidebar {
             .as_ref()
             .and_then(|sel| self.rows.iter().position(|r| &r.path == sel))
             .unwrap_or(0);
+        let page_rows = ((viewport_h_px - self.header_height_px).max(self.row_height_px)
+            / self.row_height_px.max(1))
+        .max(1) as usize;
 
         match key {
-            Key::Up => {
+            Key::Up if no_cmd => {
                 let next = cur_idx.saturating_sub(1);
                 self.selected = Some(self.rows[next].path.clone());
                 self.ensure_row_visible(next, viewport_h_px);
                 SidebarAction::Changed
             }
-            Key::Down => {
+            Key::Down if no_cmd => {
                 let next = (cur_idx + 1).min(self.rows.len() - 1);
                 self.selected = Some(self.rows[next].path.clone());
                 self.ensure_row_visible(next, viewport_h_px);
                 SidebarAction::Changed
             }
-            Key::Right => {
+            Key::Home if no_cmd => {
+                self.selected = Some(self.rows[0].path.clone());
+                self.ensure_row_visible(0, viewport_h_px);
+                SidebarAction::Changed
+            }
+            Key::End if no_cmd => {
+                let last = self.rows.len() - 1;
+                self.selected = Some(self.rows[last].path.clone());
+                self.ensure_row_visible(last, viewport_h_px);
+                SidebarAction::Changed
+            }
+            Key::PageUp if no_cmd => {
+                let next = cur_idx.saturating_sub(page_rows);
+                self.selected = Some(self.rows[next].path.clone());
+                self.ensure_row_visible(next, viewport_h_px);
+                SidebarAction::Changed
+            }
+            Key::PageDown if no_cmd => {
+                let next = (cur_idx + page_rows).min(self.rows.len() - 1);
+                self.selected = Some(self.rows[next].path.clone());
+                self.ensure_row_visible(next, viewport_h_px);
+                SidebarAction::Changed
+            }
+            Key::Right if no_cmd => {
                 let row = self.rows[cur_idx].clone();
                 if row.kind == EntryKind::Directory {
                     if !row.expanded {
@@ -1081,7 +1107,7 @@ impl Sidebar {
                 }
                 SidebarAction::None
             }
-            Key::Left => {
+            Key::Left if no_cmd => {
                 let row = self.rows[cur_idx].clone();
                 if row.kind == EntryKind::Directory && row.expanded {
                     self.toggle_expand(fs, &row.path);
@@ -1094,13 +1120,21 @@ impl Sidebar {
                         return SidebarAction::Changed;
                     }
                 }
-                if let Some(parent) = self.root.as_ref().and_then(|r| r.parent()).map(PathBuf::from) {
-                    self.navigate_to(fs, &parent);
-                    return SidebarAction::Changed;
-                }
+                // Stay within the currently opened root folder (breadcrumbs navigate above root).
                 SidebarAction::None
             }
-            Key::Enter => {
+            Key::Char(' ') if no_cmd && !mods.shift => {
+                let row = self.rows[cur_idx].clone();
+                match row.kind {
+                    EntryKind::Directory => {
+                        self.toggle_expand(fs, &row.path);
+                        SidebarAction::Changed
+                    }
+                    EntryKind::File | EntryKind::Symlink => SidebarAction::PreviewFile(row.path),
+                    EntryKind::Other => SidebarAction::None,
+                }
+            }
+            Key::Enter if no_cmd => {
                 let row = self.rows[cur_idx].clone();
                 match row.kind {
                     EntryKind::Directory => {
@@ -1111,10 +1145,19 @@ impl Sidebar {
                     EntryKind::Other => SidebarAction::None,
                 }
             }
-            Key::Char('n') => SidebarAction::StartNewFile,
-            Key::Char('N') => SidebarAction::StartNewFolder,
-            Key::Char('r') | Key::F(2) => SidebarAction::StartRename,
-            Key::Backspace | Key::Delete => {
+            Key::Char('n') if no_cmd && !mods.shift => SidebarAction::StartNewFile,
+            Key::Char('N') if no_cmd => SidebarAction::StartNewFolder,
+            Key::Char('n') if no_cmd && mods.shift => SidebarAction::StartNewFolder,
+            Key::Char('r') if no_cmd && !mods.shift => SidebarAction::StartRename,
+            Key::F(2) if no_cmd && !mods.shift => SidebarAction::StartRename,
+            Key::Delete if !mods.alt && !mods.ctrl => {
+                let row = self.rows[cur_idx].clone();
+                SidebarAction::RequestDelete {
+                    path: row.path,
+                    is_dir: row.kind == EntryKind::Directory,
+                }
+            }
+            Key::Backspace if mods.primary() && !mods.alt && !mods.shift => {
                 let row = self.rows[cur_idx].clone();
                 SidebarAction::RequestDelete {
                     path: row.path,
@@ -1366,7 +1409,17 @@ impl Sidebar {
                     (row_rect.w - px(8.0, scale)).max(0),
                     (row_rect.h - px(2.0, scale)).max(0),
                 );
-                painter.fill_rounded_rect(pill, 4.0 * scale, theme.selection);
+                if self.focused {
+                    painter.fill_rounded_rect(pill, 4.0 * scale, theme.selection);
+                    painter.stroke_rounded_rect(
+                        pill,
+                        4.0 * scale,
+                        (1.0 * scale).max(1.0),
+                        theme.border_control,
+                    );
+                } else {
+                    painter.fill_rounded_rect(pill, 4.0 * scale, theme.border_subtle);
+                }
             } else if is_hovered {
                 let pill = PixelRect::new(
                     row_rect.x + px(4.0, scale),
@@ -1429,7 +1482,7 @@ impl Sidebar {
             );
             painter.pop_clip();
 
-            // Quiet right-aligned dirty dot & Harpoon slot badge (`1`..`9`) on file rows.
+            // Quiet right-aligned dirty dot & pinned slot badge (`1`..`9`) on file rows.
             if row.kind != EntryKind::Directory {
                 let mut rx = row_rect.right() - px(8.0, scale);
                 if let Some(slot) = badge.pin_slot {

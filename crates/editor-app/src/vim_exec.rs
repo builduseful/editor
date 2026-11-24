@@ -369,8 +369,8 @@ impl EditorApp {
             VimAction::TogglePin => {
                 self.handle_command(AppCommand::TogglePin, rasterizer, clipboard, host)
             }
-            VimAction::ShowHarpoon => {
-                self.handle_command(AppCommand::ShowHarpoon, rasterizer, clipboard, host)
+            VimAction::ShowPins => {
+                self.handle_command(AppCommand::ShowPins, rasterizer, clipboard, host)
             }
             VimAction::JumpPin(slot) => {
                 self.handle_command(AppCommand::JumpPin(slot), rasterizer, clipboard, host)
@@ -383,6 +383,15 @@ impl EditorApp {
             }
             VimAction::ToggleLastBuffer => {
                 self.handle_command(AppCommand::ToggleLastBuffer, rasterizer, clipboard, host)
+            }
+            VimAction::QuickOpen => {
+                self.handle_command(AppCommand::QuickOpen, rasterizer, clipboard, host)
+            }
+            VimAction::ProjectSearch => {
+                self.handle_command(AppCommand::ProjectSearch, rasterizer, clipboard, host)
+            }
+            VimAction::FocusSidebar => {
+                self.handle_command(AppCommand::FocusSidebar, rasterizer, clipboard, host)
             }
         }
     }

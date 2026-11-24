@@ -412,6 +412,19 @@ fn decode_key(keycode: u16, text: &str) -> Option<Key> {
         119 => Some(Key::End),
         116 => Some(Key::PageUp),
         121 => Some(Key::PageDown),
+        // Standard macOS hardware virtual keycodes for F1–F12.
+        122 => Some(Key::F(1)),
+        120 => Some(Key::F(2)),
+        99 => Some(Key::F(3)),
+        118 => Some(Key::F(4)),
+        96 => Some(Key::F(5)),
+        97 => Some(Key::F(6)),
+        98 => Some(Key::F(7)),
+        100 => Some(Key::F(8)),
+        101 => Some(Key::F(9)),
+        109 => Some(Key::F(10)),
+        103 => Some(Key::F(11)),
+        111 => Some(Key::F(12)),
         // Normalize physical macOS punctuation keys so shifted chords (⇧⌘/, ⇧⌘\, ⇧⌘=, ⇧⌘[, ⇧⌘]) always match!
         44 => Some(Key::Char('/')),
         42 => Some(Key::Char('\\')),
@@ -463,7 +476,7 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         36 => Some(AppCommand::FocusDownPane),
         37 => Some(AppCommand::NewTab),
         38 => Some(AppCommand::CloseTab),
-        39 => Some(AppCommand::ShowHarpoon),
+        39 => Some(AppCommand::ShowPins),
         40 => Some(AppCommand::TogglePin),
         41 => Some(AppCommand::ToggleZoomPane),
         42 => Some(AppCommand::PrevTab),
@@ -474,6 +487,7 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         47 => Some(AppCommand::ToggleSidebarSide),
         48 => Some(AppCommand::CommandPalette),
         49 => Some(AppCommand::SelectNextOccurrence),
+        50 => Some(AppCommand::FocusSidebar),
         100 => Some(AppCommand::SetTheme(ThemePreference::System)),
         101 => Some(AppCommand::SetTheme(ThemePreference::Light)),
         102 => Some(AppCommand::SetTheme(ThemePreference::Dark)),
@@ -831,7 +845,7 @@ fn main() {
     let mut enable_vim = false;
     let mut pin_files: Vec<PathBuf> = Vec::new();
     let mut preview_file: Option<PathBuf> = None;
-    let mut open_harpoon = false;
+    let mut open_pins = false;
     let mut zoom_pane = false;
     let mut hide_sidebar = false;
     let mut sidebar_side_override: Option<editor_render::SidebarSide> = None;
@@ -925,8 +939,8 @@ fn main() {
                 preview_file = Some(PathBuf::from(&args[i + 1]));
                 i += 2;
             }
-            "--harpoon" => {
-                open_harpoon = true;
+            "--pins" => {
+                open_pins = true;
                 i += 1;
             }
             "--zoom" => {
@@ -1093,9 +1107,9 @@ fn main() {
                 app.shortcuts.toggle_expanded();
             }
         }
-        if open_harpoon {
+        if open_pins {
             app.handle_event(
-                InputEvent::Command(AppCommand::ShowHarpoon),
+                InputEvent::Command(AppCommand::ShowPins),
                 &mut rasterizer,
                 &mut MacClipboard,
                 &mut host,

@@ -1,10 +1,10 @@
-//! In-memory Buffer Pool & Unified Working-Set model (Harpoon `1..9` + Open/Preview tabs).
+//! In-memory Buffer Pool & Unified Working-Set model (numbered `1..9` pins + Open/Preview tabs).
 //!
 //! Invariants:
 //! - Every open/edited/pinned file has a stable [`BufferId`].
 //! - Switching files never prompts to discard unsaved changes: outgoing documents are
 //!   parked safely in memory with their exact caret, anchor, scroll position, and undo history.
-//! - Left side (`pinned`, up to [`MAX_PINS`] = 9): fixed numbered Harpoon slots `1..=9`
+//! - Left side (`pinned`, up to [`MAX_PINS`] = 9): fixed numbered pin slots `1..=9`
 //!   that never auto-evict and never shift when unpinned tabs open or close.
 //! - Right side (`open` + optional single `preview`):
 //!   - Single-clicking in the sidebar reuses the single `preview` slot (zero tab sprawl).
@@ -16,11 +16,11 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use editor_core::Document;
-use editor_render::{HarpoonEntry, TabDisplayItem};
+use editor_render::{PinEntry, TabDisplayItem};
 
 pub type BufferId = u32;
 
-/// Maximum number of numbered Harpoon pin slots (`1..=9`).
+/// Maximum number of numbered pin slots (`1..=9`).
 pub const MAX_PINS: usize = 9;
 /// Default LRU cap for clean, unpinned Kept open tabs (`0` = unlimited).
 /// Pinned (`1..9`), dirty (unsaved), and split-visible tabs are never evicted.
@@ -67,7 +67,7 @@ pub struct WorkingSet {
     next_id: BufferId,
     meta: BTreeMap<BufferId, BufferMeta>,
     parked: BTreeMap<BufferId, ParkedBuffer>,
-    /// Numbered Harpoon slots `1..=9`.
+    /// Numbered pin slots `1..=9`.
     pub pinned: Vec<BufferId>,
     /// Kept unpinned open tabs.
     pub open: Vec<BufferId>,
@@ -190,6 +190,28 @@ impl WorkingSet {
             }
         }
         any
+    }
+
+    /// Snapshot in-memory bytes of dirty parked buffers (bounded by `max_bytes`) so
+    /// Live Grep and Live Preview reflect unsaved edits.
+    pub fn dirty_parked_snapshots(&mut self, max_bytes: u64) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut out = Vec::new();
+        for parked in self.parked.values_mut() {
+            if !parked.doc.is_dirty() {
+                continue;
+            }
+            let Some(path) = parked.doc.path().map(Path::to_path_buf) else {
+                continue;
+            };
+            let len = parked.doc.len_bytes();
+            if len == 0 || len > max_bytes {
+                continue;
+            }
+            let mut buf = Vec::with_capacity(len as usize);
+            parked.doc.tree_mut().read_range(0, len as usize, &mut buf);
+            out.push((path, buf));
+        }
+        out
     }
 
     pub fn remap_paths(
@@ -445,7 +467,7 @@ impl WorkingSet {
         true
     }
 
-    /// Swap a pinned slot up (`delta = -1`) or down (`delta = 1`) for `⌘E` Harpoon reordering.
+    /// Swap a pinned slot up (`delta = -1`) or down (`delta = 1`) for `⌘E` pin reordering.
     pub fn nudge_pin(&mut self, slot_0based: usize, delta: isize) -> bool {
         if slot_0based >= self.pinned.len() {
             return false;
@@ -596,13 +618,13 @@ impl WorkingSet {
         out
     }
 
-    /// Build entries for the `⌘E` [`editor_render::HarpoonOverlay`].
-    pub fn to_harpoon_entries(
+    /// Build entries for the `⌘E` [`editor_render::PinsOverlay`].
+    pub fn to_pin_entries(
         &self,
         active_id: BufferId,
         other_visible_ids: &[BufferId],
         root: Option<&Path>,
-    ) -> Vec<HarpoonEntry> {
+    ) -> Vec<PinEntry> {
         let mut out = Vec::with_capacity(self.len());
         for id in self.ordered_ids() {
             let Some(m) = self.meta.get(&id) else {
@@ -617,7 +639,7 @@ impl WorkingSet {
                 (Some(p), None) => p.to_string_lossy().into_owned(),
                 (None, _) => String::new(),
             };
-            out.push(HarpoonEntry {
+            out.push(PinEntry {
                 id,
                 name: m.file_name.clone(),
                 rel_path,
@@ -656,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn harpoon_pins_enforce_max_9_and_keep_stable_numbers() {
+    fn pinned_slots_enforce_max_9_and_keep_stable_numbers() {
         let mut ws = WorkingSet::new(1);
         for i in 0..9 {
             let id = ws.alloc_buffer(Some(PathBuf::from(format!("/r/f{i}.rs"))), format!("f{i}.rs"), false);

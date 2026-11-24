@@ -97,9 +97,18 @@ fn sidebar_is_lazy_and_navigation_preserves_expansions_and_selection() {
     sb.set_width_pt(900.0);
     assert_eq!(sb.width_pt(), 480.0);
 
-    // Keyboard Enter on selected file returns OpenFile.
-    let act = sb.handle_key(&fs, Key::Enter, 400);
+    // Keyboard Enter on selected file returns OpenFile; Space returns PreviewFile; Left does not escape root.
+    let act = sb.handle_key(&fs, Key::Enter, Modifiers::NONE, 400);
     assert_eq!(act, SidebarAction::OpenFile(PathBuf::from("/proj/src/nested/deep.rs")));
+    let prev = sb.handle_key(&fs, Key::Char(' '), Modifiers::NONE, 400);
+    assert_eq!(prev, SidebarAction::PreviewFile(PathBuf::from("/proj/src/nested/deep.rs")));
+    assert_eq!(sb.handle_key(&fs, Key::F(2), Modifiers::NONE, 400), SidebarAction::StartRename);
+    assert_eq!(sb.handle_key(&fs, Key::Home, Modifiers::NONE, 400), SidebarAction::Changed);
+    assert_eq!(sb.selected(), Some(PathBuf::from("/proj/other").as_path()));
+    assert_eq!(sb.handle_key(&fs, Key::Left, Modifiers::NONE, 400), SidebarAction::None);
+    assert_eq!(sb.root(), Some(PathBuf::from("/proj").as_path()));
+    assert_eq!(sb.handle_key(&fs, Key::End, Modifiers::NONE, 400), SidebarAction::Changed);
+    assert_eq!(sb.selected(), Some(PathBuf::from("/proj/README.md").as_path()));
 }
 
 #[test]
@@ -292,11 +301,11 @@ fn tab_strip_hit_testing_drop_targets_and_overflow_scroll() {
 }
 
 #[test]
-fn harpoon_overlay_navigation_reorder_split_and_remove() {
-    use editor_render::{HarpoonAction, HarpoonEntry, HarpoonOverlay};
+fn pins_overlay_navigation_reorder_split_and_remove() {
+    use editor_render::{PaletteOpenTarget, PinEntry, PinsAction, PinsOverlay};
 
     let entries = vec![
-        HarpoonEntry {
+        PinEntry {
             id: 10,
             name: "a.rs".into(),
             rel_path: "src/a.rs".into(),
@@ -306,7 +315,7 @@ fn harpoon_overlay_navigation_reorder_split_and_remove() {
             is_active: true,
             in_other_pane: false,
         },
-        HarpoonEntry {
+        PinEntry {
             id: 20,
             name: "b.rs".into(),
             rel_path: "src/b.rs".into(),
@@ -316,7 +325,7 @@ fn harpoon_overlay_navigation_reorder_split_and_remove() {
             is_active: false,
             in_other_pane: false,
         },
-        HarpoonEntry {
+        PinEntry {
             id: 30,
             name: "c.rs".into(),
             rel_path: "src/c.rs".into(),
@@ -328,12 +337,12 @@ fn harpoon_overlay_navigation_reorder_split_and_remove() {
         },
     ];
 
-    let mut overlay = HarpoonOverlay::new();
-    overlay.open(entries);
+    let mut overlay = PinsOverlay::new();
+    overlay.open(entries.clone());
     assert!(overlay.visible);
 
     // Move down with `j`, then `J` reorders slot 2 up/down (`MovePin { slot_0based: 1, delta: 1 }`).
-    assert_eq!(overlay.handle_key(Key::Char('j'), Modifiers::NONE), HarpoonAction::Changed);
+    assert_eq!(overlay.handle_key(Key::Char('j'), Modifiers::NONE), PinsAction::Changed);
     assert_eq!(
         overlay.handle_key(
             Key::Char('J'),
@@ -342,7 +351,7 @@ fn harpoon_overlay_navigation_reorder_split_and_remove() {
                 ..Modifiers::NONE
             }
         ),
-        HarpoonAction::MovePin {
+        PinsAction::MovePin {
             slot_0based: 1,
             delta: 1,
         }
@@ -350,14 +359,32 @@ fn harpoon_overlay_navigation_reorder_split_and_remove() {
     // `p` toggles pin on selected row (id 20); `d` removes/unpins it.
     assert_eq!(
         overlay.handle_key(Key::Char('p'), Modifiers::NONE),
-        HarpoonAction::TogglePin(20)
+        PinsAction::TogglePin(20)
     );
     assert_eq!(
         overlay.handle_key(Key::Char('d'), Modifiers::NONE),
-        HarpoonAction::RemoveOrClose(20)
+        PinsAction::RemoveOrClose(20)
     );
 
-    // `⌘Enter` splits right and closes overlay!
+    // `⌃N` / `⌃P` navigate consistently with Quick Open, and `⌃X` splits down!
+    let ctrl_only = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    assert_eq!(overlay.handle_key(Key::Char('n'), ctrl_only), PinsAction::Changed);
+    assert_eq!(overlay.handle_key(Key::Char('p'), ctrl_only), PinsAction::Changed);
+    assert_eq!(
+        overlay.handle_key(Key::Char('x'), ctrl_only),
+        PinsAction::JumpToBuffer {
+            id: 20,
+            target: PaletteOpenTarget::SplitDown,
+        }
+    );
+    assert!(!overlay.visible);
+
+    // Reopen and verify `⌘Enter` / `⌃V` split right and close overlay!
+    overlay.open(entries);
+    overlay.handle_key(Key::Char('j'), Modifiers::NONE);
     let primary = Modifiers {
         #[cfg(target_os = "macos")]
         meta: true,
@@ -367,9 +394,9 @@ fn harpoon_overlay_navigation_reorder_split_and_remove() {
     };
     assert_eq!(
         overlay.handle_key(Key::Enter, primary),
-        HarpoonAction::JumpToBuffer {
+        PinsAction::JumpToBuffer {
             id: 20,
-            split_right: true,
+            target: PaletteOpenTarget::SplitRight,
         }
     );
     assert!(!overlay.visible);

@@ -51,8 +51,10 @@ pub enum VimPending {
     ZPrefix,
     /// Waiting for second key after `Ctrl+W` (pane commands).
     WindowPrefix,
-    /// Waiting for second key after `<Space>` leader (Harpoon / buffer flicking).
+    /// Waiting for second key after `<Space>` leader (pins, file search, buffer flicking).
     LeaderPrefix,
+    /// Waiting for third key after `<Space>f` (`ff` Quick Open, `fg` Search in Files, `fb` Pinned & Open, `fe` Focus Sidebar).
+    LeaderFPrefix,
     /// Waiting for target character after `f`/`F`/`t`/`T`.
     FindChar(FindCharKind),
     /// Waiting for replacement character after `r`.
@@ -146,11 +148,14 @@ pub enum VimAction {
     FocusPaneDown,
     FocusOtherPane,
     TogglePin,
-    ShowHarpoon,
+    ShowPins,
     JumpPin(u8),
     NextTab,
     PrevTab,
     ToggleLastBuffer,
+    QuickOpen,
+    ProjectSearch,
+    FocusSidebar,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +246,7 @@ impl VimState {
             VimPending::ZPrefix => suffix.push('z'),
             VimPending::WindowPrefix => suffix.push_str("^W"),
             VimPending::LeaderPrefix => suffix.push_str("SPC"),
+            VimPending::LeaderFPrefix => suffix.push_str("SPC f"),
             VimPending::FindChar(k) => suffix.push(match k {
                 FindCharKind::Forward => 'f',
                 FindCharKind::Backward => 'F',
@@ -429,12 +435,28 @@ impl VimState {
             }
             VimPending::LeaderPrefix => {
                 self.pending = VimPending::None;
+                if ch_opt == Some('f') {
+                    self.pending = VimPending::LeaderFPrefix;
+                    return VimAction::Consumed;
+                }
                 self.reset_pending();
                 return match ch_opt {
                     Some('a') | Some('m') => VimAction::TogglePin,
-                    Some('e') => VimAction::ShowHarpoon,
+                    Some('e') => VimAction::ShowPins,
+                    Some('/') => VimAction::ProjectSearch,
                     Some(' ') => VimAction::ToggleLastBuffer,
                     Some(c @ '1'..='9') => VimAction::JumpPin((c as u8) - b'0'),
+                    _ => VimAction::Consumed,
+                };
+            }
+            VimPending::LeaderFPrefix => {
+                self.pending = VimPending::None;
+                self.reset_pending();
+                return match ch_opt {
+                    Some('f') => VimAction::QuickOpen,
+                    Some('g') => VimAction::ProjectSearch,
+                    Some('b') => VimAction::ShowPins,
+                    Some('e') => VimAction::FocusSidebar,
                     _ => VimAction::Consumed,
                 };
             }

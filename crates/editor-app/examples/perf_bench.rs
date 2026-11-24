@@ -114,10 +114,31 @@ fn main() {
     }
     let lookup_us = t3.elapsed().as_micros();
 
-    // 6. Measure streaming literal search across the full 50+ MB file.
+    // 6. Measure streaming literal, case-insensitive, whole-word, and regex search across 60 MB!
     let t4 = Instant::now();
     let hits = doc.find_all("line_0999999", SearchOptions::default());
     let search_ms = t4.elapsed().as_secs_f64() * 1000.0;
+
+    let t4_ci = Instant::now();
+    let hits_ci = doc.find_all(
+        "LINE_0999999",
+        SearchOptions {
+            case_sensitive: false,
+            ..SearchOptions::default()
+        },
+    );
+    let search_ci_ms = t4_ci.elapsed().as_secs_f64() * 1000.0;
+
+    let t4_re = Instant::now();
+    let hits_re = doc.find_all(
+        r"pub fn line_099999\d",
+        SearchOptions {
+            case_sensitive: true,
+            regex: true,
+            ..SearchOptions::default()
+        },
+    );
+    let search_re_ms = t4_re.elapsed().as_secs_f64() * 1000.0;
 
     // 7. Measure Retina 2240x1480 full frame + caret-blink partial frame + 10 MB single-line frame!
     let mut app = EditorApp::new(fs.clone(), 2240, 1480, 2.0);
@@ -218,6 +239,111 @@ fn main() {
     }
     let custom_frame_ms = (t_custom.elapsed().as_secs_f64() * 1000.0) / frames as f64;
 
+    // 10. Large Nested Project Search & Quick Open Stress Benchmark (5,000 files, 200 nested dirs, ~20 MB + 4 MB log)!
+    let proj_root = std::env::temp_dir().join(format!("editor_perf_proj_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&proj_root);
+    let sample_body = "use std::collections::HashMap;\n\npub fn compute_metric(input: &[u64]) -> u64 {\n    let mut total = 0u64;\n    for &v in input { total = total.wrapping_add(v * 31); }\n    total\n}\n".repeat(22);
+    for pkg in 0..20usize {
+        for sub in 0..10usize {
+            let dir = proj_root
+                .join(format!("pkg_{pkg:02}"))
+                .join("src")
+                .join("nested")
+                .join(format!("mod_{sub:02}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in 0..25usize {
+                let id = pkg * 250 + sub * 25 + f;
+                let file_path = dir.join(format!("file_{id:04}.rs"));
+                if id == 4999 {
+                    std::fs::write(
+                        &file_path,
+                        format!("{sample_body}\npub fn unique_needle_4999(x: i32) -> i32 {{ x + 42 }}\n"),
+                    )
+                    .unwrap();
+                } else {
+                    std::fs::write(&file_path, &sample_body).unwrap();
+                }
+            }
+        }
+    }
+    // Add binary assets (skipped with zero syscalls) + a 4 MB text file (streamed in 64 KB chunks).
+    std::fs::write(proj_root.join("logo.png"), vec![0u8; 64 * 1024]).unwrap();
+    {
+        let mut big = "regular log line without match\n".repeat(130_000);
+        big.push_str("unique_needle_big_4mb_tail\n");
+        std::fs::write(proj_root.join("big_4mb.log"), big).unwrap();
+    }
+
+    let mut palette = editor_render::CommandPalette::new();
+    let t_walk = Instant::now();
+    palette.open_quick_open(fs.as_ref(), Some(&proj_root));
+    let walk_ms = t_walk.elapsed().as_secs_f64() * 1000.0;
+    let indexed_n = palette.indexed_file_count();
+
+    let t_fuzzy = Instant::now();
+    palette.input.set_text("pkg_19/mod_09/4999");
+    palette.refresh_results(fs.as_ref());
+    let fuzzy_us = t_fuzzy.elapsed().as_micros();
+    let fuzzy_hits = palette.items.len();
+
+    // Cold common query ("pub fn" -> stops immediately at 200 matches in < 2 ms without reading 5k files!).
+    let t_grep_common = Instant::now();
+    palette.open_project_search(fs.as_ref(), Some(&proj_root), Some("pub fn"));
+    let grep_common_ms = t_grep_common.elapsed().as_secs_f64() * 1000.0;
+    let grep_common_hits = palette.items.len();
+    palette.close(); // Reset slab so `grep_cold` still measures a true full cold scan!
+
+    let t_grep_cold = Instant::now();
+    palette.open_project_search(fs.as_ref(), Some(&proj_root), Some("UNIQUE_NEEDLE_4999"));
+    let grep_cold_ms = t_grep_cold.elapsed().as_secs_f64() * 1000.0;
+    let grep_cold_hits = palette.items.len();
+
+    let t_grep_warm = Instant::now();
+    palette.input.set_text("unique_needle_4999");
+    palette.refresh_results(fs.as_ref());
+    let grep_warm_ms = t_grep_warm.elapsed().as_secs_f64() * 1000.0;
+    let grep_warm_hits = palette.items.len();
+
+    // Common-prefix literal (`"pub fn unique_needle"` — exercises rarest-byte SWAR pair!).
+    let t_grep_prefix = Instant::now();
+    palette.input.set_text("pub fn unique_needle");
+    palette.refresh_results(fs.as_ref());
+    let grep_prefix_ms = t_grep_prefix.elapsed().as_secs_f64() * 1000.0;
+    let grep_prefix_hits = palette.items.len();
+
+    let t_grep_re = Instant::now();
+    palette.regex = true;
+    palette.input.set_text(r"pub\s+fn\s+unique_needle_\d+");
+    palette.refresh_results(fs.as_ref());
+    let grep_re_ms = t_grep_re.elapsed().as_secs_f64() * 1000.0;
+    let grep_re_hits = palette.items.len();
+
+    // Alternation regex (`alt_literals` SWAR prefilter!).
+    let t_grep_alt = Instant::now();
+    palette.input.set_text("unique_needle_4999|unique_needle_big_4mb");
+    palette.refresh_results(fs.as_ref());
+    let grep_alt_ms = t_grep_alt.elapsed().as_secs_f64() * 1000.0;
+    let grep_alt_hits = palette.items.len();
+
+    // Unprefixed class regex (no mandatory literal — exercises 16-byte capture-free PikeVM + `start_filter`!).
+    let t_grep_class = Instant::now();
+    palette.case_sensitive = true;
+    palette.input.set_text(r"\b[0-9]{4}\b");
+    palette.refresh_results(fs.as_ref());
+    let grep_class_ms = t_grep_class.elapsed().as_secs_f64() * 1000.0;
+    let grep_class_hits = palette.items.len();
+    palette.case_sensitive = false;
+
+    let t_grep_big = Instant::now();
+    palette.regex = false;
+    palette.input.set_text("unique_needle_big_4mb_tail");
+    palette.refresh_results(fs.as_ref());
+    let grep_big_ms = t_grep_big.elapsed().as_secs_f64() * 1000.0;
+    let grep_big_hits = palette.items.len();
+
+    palette.close(); // Verify modal close releases the slab cleanly before phys_footprint!
+    let _ = std::fs::remove_dir_all(&proj_root);
+
     println!("=== editor Rust v2 Performance Benchmark ===");
     println!("File size:                {:.2} MB ({} lines)", file_size as f64 / 1_048_576.0, total_lines);
     println!("Lazy open + 1st line:     {} us ({:.3} ms)", open_us, open_us as f64 / 1000.0);
@@ -225,6 +351,18 @@ fn main() {
     println!("10,000 typing edits:      {} us ({:.2} ns/edit)", edit_us, (edit_us as f64 * 1000.0) / 10_000.0);
     println!("10,000 random lookups:    {} us ({:.2} us/lookup, acc={})", lookup_us, lookup_us as f64 / 10_000.0, acc);
     println!("Literal search 60 MB:     {:.2} ms (hits={})", search_ms, hits.len());
+    println!("Case-insens search 60 MB: {:.2} ms (hits={})", search_ci_ms, hits_ci.len());
+    println!("Regex search 60 MB:       {:.2} ms (hits={})", search_re_ms, hits_re.len());
+    println!("Project walk ({indexed_n} files): {:.2} ms", walk_ms);
+    println!("Quick Open fuzzy ({indexed_n}):  {} us ({:.3} ms, hits={})", fuzzy_us, fuzzy_us as f64 / 1000.0, fuzzy_hits);
+    println!("Search cold common (200): {:.2} ms (hits={})", grep_common_ms, grep_common_hits);
+    println!("Search cold rare ({indexed_n}):  {:.2} ms (hits={})", grep_cold_ms, grep_cold_hits);
+    println!("Search warm CI ({indexed_n}):    {:.2} ms (hits={})", grep_warm_ms, grep_warm_hits);
+    println!("Search warm prefix ({indexed_n}):{:.2} ms (hits={})", grep_prefix_ms, grep_prefix_hits);
+    println!("Search warm RE ({indexed_n}):    {:.2} ms (hits={})", grep_re_ms, grep_re_hits);
+    println!("Search warm Alt ({indexed_n}):   {:.2} ms (hits={})", grep_alt_ms, grep_alt_hits);
+    println!("Search warm Class ({indexed_n}): {:.2} ms (hits={})", grep_class_ms, grep_class_hits);
+    println!("Search 4 MB stream tail:  {:.2} ms (hits={})", grep_big_ms, grep_big_hits);
     println!("Retina 2240x1480 frame:   {:.3} ms/frame ({:.0} FPS eq)", frame_ms, 1000.0 / frame_ms);
     println!("Retina custom-theme frame:{:.3} ms/frame ({:.0} FPS eq)", custom_frame_ms, 1000.0 / custom_frame_ms);
     println!("Caret-blink partial rect: {:.1} us/frame ({:.0} FPS eq)", blink_us, 1_000_000.0 / blink_us.max(0.1));
@@ -232,7 +370,7 @@ fn main() {
     println!("Syntax lex (17 langs):    {:.1} MB/s ({:.0} ns/line, {} spans)", syn_mb_s, syn_ns_line, total_lex_spans);
     println!("Syntax 1M-line jump:      {} us ({:.3} ms)", jump_us, jump_us as f64 / 1000.0);
     println!("Syntax incremental edit:  {} us ({:.3} ms)", inc_us, inc_us as f64 / 1000.0);
-    println!("macOS phys_footprint:     {:.2} MB (after 60 MB + 10 MB + Retina FB + 17 plugins)", phys_footprint_mb());
+    println!("macOS phys_footprint:     {:.2} MB (after 60 MB + 10 MB + 5k files + Retina FB)", phys_footprint_mb());
 
     let _ = std::fs::remove_file(&tmp);
     let _ = PathBuf::from("done");

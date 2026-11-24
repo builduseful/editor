@@ -30,8 +30,8 @@ use editor_platform::{
 use editor_render::{
     chrome::{draw_status_bar, status_bar_height_px},
     parse_mono_style, tab_strip_height_px, A11yNode, A11yRole, ActionToast, Color, CommandPalette,
-    ConfirmModal, FindBarAction, FindBarState, GlyphAtlas, GotoLineState, HarpoonAction,
-    HarpoonOverlay, ImeComposition, Painter, PaletteAction, ScrollbarHit, ShortcutsAction,
+    ConfirmModal, FindBarAction, FindBarState, GlyphAtlas, GotoLineState, ImeComposition, Painter,
+    PaletteAction, PaletteOpenTarget, PinsAction, PinsOverlay, ScrollbarHit, ShortcutsAction,
     ShortcutsOverlay, Sidebar, SidebarAction, SidebarBadge, SidebarContextAction, SidebarHit,
     SidebarPromptAction, SidebarPromptKind, SidebarSide, StatusBarData, StripDropTarget,
     SyntaxPalette, SyntaxStylePreference, SyntaxThemeConfig, SyntaxThemePreset, TabStrip,
@@ -57,7 +57,7 @@ pub use vim::{VimMode, VimState};
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AppLayout {
     pub sidebar: PixelRect,
-    /// Unified top Working-Set Strip (Harpoon `1..9` pins + Open/Preview tabs).
+    /// Unified top Working-Set Strip (numbered `1..9` pins + Open/Preview tabs).
     pub tab_strip: PixelRect,
     pub find_bar: PixelRect,
     pub goto_bar: PixelRect,
@@ -180,7 +180,7 @@ pub struct EditorApp {
 
     /// Stable buffer id currently displayed in the active pane (`self.doc`).
     pub active_buf_id: BufferId,
-    /// Shared in-memory buffer pool + Harpoon `1..9` pins + Kept/Preview working set.
+    /// Shared in-memory buffer pool + numbered `1..9` pins + Kept/Preview working set.
     pub working_set: WorkingSet,
     /// LRU cap on clean unpinned Kept open tabs (`0` = unlimited; default = 8).
     pub max_open_tabs: usize,
@@ -190,8 +190,8 @@ pub struct EditorApp {
     view_memory: Vec<(PathBuf, SavedViewState)>,
     /// Custom-drawn top Working-Set Strip.
     pub tab_strip: TabStrip,
-    /// Custom-drawn Harpoon & Open Files quick overlay (`⌘E` / `<Space>e`).
-    pub harpoon: HarpoonOverlay,
+    /// Custom-drawn Pinned & Open Files quick overlay (`⌘E` / `<Space>e`).
+    pub pins_overlay: PinsOverlay,
 
     pub sidebar: Sidebar,
     /// User's explicit sidebar visibility preference (persisted; preserved across narrow auto-minimize).
@@ -305,7 +305,7 @@ impl EditorApp {
             session_store: SessionStore::default(),
             view_memory: Vec::new(),
             tab_strip: TabStrip::new(),
-            harpoon: HarpoonOverlay::new(),
+            pins_overlay: PinsOverlay::new(),
             sidebar: Sidebar::new(),
             sidebar_user_visible: true,
             sidebar_auto_minimized: false,
@@ -889,7 +889,7 @@ impl EditorApp {
         host.request_redraw();
     }
 
-    /// Capture the active workspace folder's Harpoon pins, Kept open files, and active cursor.
+    /// Capture the active workspace folder's numbered pins, Kept open files, and active cursor.
     pub fn capture_current_folder_session(&mut self) -> Option<FolderSession> {
         let folder = self.sidebar.root()?.to_path_buf();
         self.sync_active_buffer_meta();
@@ -1093,7 +1093,7 @@ impl EditorApp {
     }
 
     // ========================================================================
-    // Buffer Pool, Working-Set Strip (Harpoon 1..9 + Open/Preview) & Zoom
+    // Buffer Pool, Working-Set Strip (Numbered Pins 1..9 + Open/Preview) & Zoom
     // ========================================================================
 
     fn is_initial_empty_untitled(&self) -> bool {
@@ -1419,7 +1419,7 @@ impl EditorApp {
         id
     }
 
-    /// Toggle Harpoon pin (`1..9`) on `id`.
+    /// Toggle numbered pin (`1..9`) on `id`.
     pub fn toggle_pin_buffer(&mut self, id: BufferId, host: &mut dyn PlatformHost) {
         if !self.working_set.contains(id) {
             return;
@@ -1441,7 +1441,7 @@ impl EditorApp {
         host.request_redraw();
     }
 
-    /// Jump directly to Harpoon pin slot `1..=9` (`⌘1`..`⌘9` / `<Space>1`..`9`).
+    /// Jump directly to pinned slot `1..=9` (`⌘1`..`⌘9` / `<Space>1`..`9`).
     pub fn jump_to_pin(&mut self, slot_1based: u8, host: &mut dyn PlatformHost) -> bool {
         let idx = slot_1based.saturating_sub(1) as usize;
         if let Some(&id) = self.working_set.pinned.get(idx) {
@@ -1614,16 +1614,16 @@ impl EditorApp {
         host.request_redraw();
     }
 
-    fn refresh_harpoon_overlay(&mut self, keep_selected_id: Option<u32>) {
+    fn refresh_pins_overlay(&mut self, keep_selected_id: Option<u32>) {
         self.sync_active_buffer_meta();
         let others = self.other_pane_buf_ids();
         let entries =
             self.working_set
-                .to_harpoon_entries(self.active_buf_id, &others, self.sidebar.root());
-        if self.harpoon.visible {
-            self.harpoon.refresh(entries, keep_selected_id);
+                .to_pin_entries(self.active_buf_id, &others, self.sidebar.root());
+        if self.pins_overlay.visible {
+            self.pins_overlay.refresh(entries, keep_selected_id);
         } else {
-            self.harpoon.open(entries);
+            self.pins_overlay.open(entries);
         }
     }
 
@@ -1810,7 +1810,7 @@ impl EditorApp {
     }
 
     /// Create a new split pane displaying an existing buffer `buf_id` (used by tab drag-to-split
-    /// and `⌘Enter` in the Harpoon overlay).
+    /// and `⌘Enter` / `⌃V` in the Pinned & Open Files overlay).
     pub fn split_buffer_at(
         &mut self,
         target: PaneId,
@@ -2042,6 +2042,33 @@ impl EditorApp {
         self.set_sidebar_visible_user(next, host);
     }
 
+    pub fn focus_sidebar(&mut self, host: &mut dyn PlatformHost) {
+        if self.sidebar.is_visible() && self.sidebar.is_focused() {
+            self.sidebar.set_focused(false);
+            self.mark_dirty();
+            host.request_redraw();
+            return;
+        }
+        if !self.sidebar.is_visible() {
+            self.set_sidebar_visible_user(true, host);
+        }
+        self.sidebar.set_focused(true);
+        self.find_bar.find_input.focused = false;
+        self.find_bar.replace_input.focused = false;
+        if self.sidebar.selected().is_none() {
+            if let Some(p) = self.doc.path().map(Path::to_path_buf) {
+                self.sidebar.reveal(self.fs.as_ref(), &p);
+            }
+            if self.sidebar.selected().is_none() {
+                if let Some(first) = self.sidebar.rows().first().map(|r| r.path.clone()) {
+                    self.sidebar.set_selected(Some(first));
+                }
+            }
+        }
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
     pub fn set_sidebar_side(&mut self, side: SidebarSide, host: &mut dyn PlatformHost) {
         self.sidebar.set_side(side);
         self.save_preferences(host);
@@ -2196,7 +2223,7 @@ impl EditorApp {
             || self.confirm_modal.visible
             || self.palette.is_open()
             || self.shortcuts.visible
-            || self.harpoon.visible
+            || self.pins_overlay.visible
             || self.sidebar.is_context_menu_open()
             || self.toast.visible
         {
@@ -2226,7 +2253,7 @@ impl EditorApp {
             && !self.confirm_modal.visible
             && !self.palette.is_open()
             && !self.shortcuts.visible
-            && !self.harpoon.visible
+            && !self.pins_overlay.visible
             && !self.sidebar.is_focused()
             && !self.find_bar.is_focused()
             && !self.goto_line.visible;
@@ -2252,7 +2279,7 @@ impl EditorApp {
         let mut painter = Painter::from_surface(surf);
         painter.push_clip(effective_clip);
 
-        // 1. Sidebar (with quiet Harpoon `1..9` badges and `•` dirty dots!)
+        // 1. Sidebar (with quiet pinned `1..9` badges and `•` dirty dots!)
         if !layout.sidebar.intersect(effective_clip).is_empty() {
             self.sidebar.set_prompt_caret_visible(self.caret_visible);
             let ws = &self.working_set;
@@ -2269,7 +2296,7 @@ impl EditorApp {
             );
         }
 
-        // 1b. Unified Top Working-Set Strip (Harpoon `1..9` pins + Open/Preview tabs)
+        // 1b. Unified Top Working-Set Strip (numbered `1..9` pins + Open/Preview tabs)
         if !layout.tab_strip.intersect(effective_clip).is_empty() {
             let other_ids = self.other_pane_buf_ids();
             let tab_items = self.working_set.to_tab_items(self.active_buf_id, &other_ids);
@@ -2505,9 +2532,9 @@ impl EditorApp {
             );
         }
 
-        // 7b. Optional Harpoon & Open Files Quick Overlay (`Cmd+E`).
-        if self.harpoon.visible {
-            self.harpoon
+        // 7b. Optional Pinned & Open Files Quick Overlay (`Cmd+E`).
+        if self.pins_overlay.visible {
+            self.pins_overlay
                 .draw(&mut painter, full_bounds, &theme, &mut self.atlas, rasterizer);
         }
 
@@ -2619,18 +2646,18 @@ impl EditorApp {
             }
         }
 
-        // Intercept keyboard & mouse when Harpoon & Open Files overlay (`Cmd+E`) is open.
-        if self.harpoon.visible {
+        // Intercept keyboard & mouse when Pinned & Open Files overlay (`Cmd+E`) is open.
+        if self.pins_overlay.visible {
             match event {
                 InputEvent::KeyDown { key, mods, .. } => {
-                    if self.keymap.lookup_command(key, mods) == Some(AppCommand::ShowHarpoon) {
-                        self.harpoon.close();
+                    if self.keymap.lookup_command(key, mods) == Some(AppCommand::ShowPins) {
+                        self.pins_overlay.close();
                         self.mark_dirty();
                         host.request_redraw();
                         return;
                     }
-                    let act = self.harpoon.handle_key(key, mods);
-                    self.handle_harpoon_action(act, host);
+                    let act = self.pins_overlay.handle_key(key, mods);
+                    self.handle_pins_action(act, host);
                     return;
                 }
                 InputEvent::MouseDown {
@@ -2640,12 +2667,12 @@ impl EditorApp {
                     mods,
                     ..
                 } => {
-                    let act = self.harpoon.handle_click(x_px, y_px, mods);
-                    self.handle_harpoon_action(act, host);
+                    let act = self.pins_overlay.handle_click(x_px, y_px, mods);
+                    self.handle_pins_action(act, host);
                     return;
                 }
-                InputEvent::Command(AppCommand::ShowHarpoon) => {
-                    self.harpoon.close();
+                InputEvent::Command(AppCommand::ShowPins) => {
+                    self.pins_overlay.close();
                     self.mark_dirty();
                     host.request_redraw();
                     return;
@@ -2778,8 +2805,17 @@ impl EditorApp {
                     button: MouseButton::Left,
                     ..
                 } => {
-                    let act = self.palette.handle_click(x_px, y_px);
+                    let act = self.palette.handle_click(self.fs.as_ref(), x_px, y_px);
                     self.handle_palette_action(act, rasterizer, clipboard, host);
+                    return;
+                }
+                InputEvent::Scroll {
+                    dy_px, x_px, y_px, ..
+                } => {
+                    if self.palette.handle_scroll(self.fs.as_ref(), x_px, y_px, dy_px) {
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
                     return;
                 }
                 InputEvent::Command(cmd)
@@ -3592,6 +3628,7 @@ impl EditorApp {
     /// - Silently reloads clean open/split/parked buffers whose on-disk identity changed.
     /// - Never overwrites dirty buffers (shows a quiet notice instead).
     fn handle_fs_changed(&mut self, raw_paths: &[PathBuf], host: &mut dyn PlatformHost) {
+        self.palette.invalidate_file_index();
         let mut any_changed = false;
 
         // 1. Lazy sidebar refresh (strictly limited to already-loaded directories!).
@@ -3836,6 +3873,7 @@ impl EditorApp {
                     let _ = self.sidebar.refresh_dir(self.fs.as_ref(), p);
                 }
                 self.sidebar.set_selected(Some(to.to_path_buf()));
+                self.palette.invalidate_file_index();
                 let op = FsOp::Move {
                     from: from.to_path_buf(),
                     to: to.to_path_buf(),
@@ -3945,6 +3983,7 @@ impl EditorApp {
             }
         };
         if ok {
+            self.palette.invalidate_file_index();
             self.fs_undo.push_redo(op);
             self.show_toast(undone_msg, false, false);
         } else {
@@ -4112,6 +4151,7 @@ impl EditorApp {
                     match self.fs.write_atomic(&dst, &mut |_w| Ok(())) {
                         Ok(_) => {
                             let _ = self.sidebar.refresh_dir(self.fs.as_ref(), &parent);
+                            self.palette.invalidate_file_index();
                             self.sidebar.set_selected(Some(dst.clone()));
                             let _ = self.open_file_with_mode(&dst, OpenMode::Keep, host);
                             self.sidebar.set_focused(false);
@@ -4129,6 +4169,7 @@ impl EditorApp {
                 match self.fs.create_dir(&dst) {
                     Ok(()) => {
                         let _ = self.sidebar.refresh_dir(self.fs.as_ref(), &parent);
+                        self.palette.invalidate_file_index();
                         self.sidebar.set_selected(Some(dst.clone()));
                         let op = FsOp::CreateFolder { path: dst };
                         let msg = op.done_label();
@@ -4333,6 +4374,41 @@ impl EditorApp {
         entries
     }
 
+    fn dirty_open_files_snapshot(&mut self) -> Vec<(PathBuf, Vec<u8>)> {
+        const MAX_DIRTY_BYTES: u64 = 1024 * 1024;
+        let mut out = Vec::new();
+        if self.doc.is_dirty() {
+            if let Some(p) = self.doc.path().map(Path::to_path_buf) {
+                let len = self.doc.len_bytes();
+                if len > 0 && len <= MAX_DIRTY_BYTES {
+                    let mut buf = Vec::with_capacity(len as usize);
+                    self.doc.tree_mut().read_range(0, len as usize, &mut buf);
+                    out.push((p, buf));
+                }
+            }
+        }
+        for pane in &mut self.other_panes {
+            if pane.doc.is_dirty() {
+                if let Some(p) = pane.doc.path().map(Path::to_path_buf) {
+                    if !out.iter().any(|(ep, _)| ep == &p) {
+                        let len = pane.doc.len_bytes();
+                        if len > 0 && len <= MAX_DIRTY_BYTES {
+                            let mut buf = Vec::with_capacity(len as usize);
+                            pane.doc.tree_mut().read_range(0, len as usize, &mut buf);
+                            out.push((p, buf));
+                        }
+                    }
+                }
+            }
+        }
+        for (p, buf) in self.working_set.dirty_parked_snapshots(MAX_DIRTY_BYTES) {
+            if !out.iter().any(|(ep, _)| ep == &p) {
+                out.push((p, buf));
+            }
+        }
+        out
+    }
+
     fn handle_palette_action(
         &mut self,
         act: PaletteAction,
@@ -4350,7 +4426,17 @@ impl EditorApp {
                 path,
                 line_0based,
                 col_bytes,
+                target,
             } => {
+                match target {
+                    PaletteOpenTarget::Current => {}
+                    PaletteOpenTarget::SplitRight => {
+                        self.split_pane_with(None, host);
+                    }
+                    PaletteOpenTarget::SplitDown => {
+                        self.split_pane_down(None, host);
+                    }
+                }
                 self.open_at_location(&path, line_0based, col_bytes, rasterizer, host);
             }
             PaletteAction::RunCommand(id) => {
@@ -4368,15 +4454,18 @@ impl EditorApp {
         }
     }
 
-    fn handle_harpoon_action(&mut self, act: HarpoonAction, host: &mut dyn PlatformHost) {
+    fn handle_pins_action(&mut self, act: PinsAction, host: &mut dyn PlatformHost) {
         match act {
-            HarpoonAction::None => {}
-            HarpoonAction::Changed | HarpoonAction::Close => {
+            PinsAction::None => {}
+            PinsAction::Changed | PinsAction::Close => {
                 self.mark_dirty();
                 host.request_redraw();
             }
-            HarpoonAction::JumpToBuffer { id, split_right } => {
-                if split_right {
+            PinsAction::JumpToBuffer { id, target } => match target {
+                PaletteOpenTarget::Current => {
+                    self.activate_buffer(id, host);
+                }
+                PaletteOpenTarget::SplitRight => {
                     let a = self.active_id;
                     let zone = if self.arrangement.can_insert(a, DropZone::Right) {
                         DropZone::Right
@@ -4384,41 +4473,48 @@ impl EditorApp {
                         DropZone::Bottom
                     };
                     self.split_buffer_at(a, zone, id, host);
-                } else {
-                    self.activate_buffer(id, host);
                 }
-            }
-            HarpoonAction::JumpPin(slot) => {
+                PaletteOpenTarget::SplitDown => {
+                    let a = self.active_id;
+                    let zone = if self.arrangement.can_insert(a, DropZone::Bottom) {
+                        DropZone::Bottom
+                    } else {
+                        DropZone::Right
+                    };
+                    self.split_buffer_at(a, zone, id, host);
+                }
+            },
+            PinsAction::JumpPin(slot) => {
                 self.jump_to_pin(slot, host);
             }
-            HarpoonAction::MovePin { slot_0based, delta } => {
+            PinsAction::MovePin { slot_0based, delta } => {
                 let id_before = self.working_set.pinned.get(slot_0based).copied();
                 if self.working_set.nudge_pin(slot_0based, delta) {
-                    self.refresh_harpoon_overlay(id_before);
+                    self.refresh_pins_overlay(id_before);
                     self.mark_dirty();
                     host.request_redraw();
                 }
             }
-            HarpoonAction::TogglePin(id) => {
+            PinsAction::TogglePin(id) => {
                 self.toggle_pin_buffer(id, host);
-                self.refresh_harpoon_overlay(Some(id));
+                self.refresh_pins_overlay(Some(id));
                 self.mark_dirty();
                 host.request_redraw();
             }
-            HarpoonAction::RemoveOrClose(id) => {
+            PinsAction::RemoveOrClose(id) => {
                 if self.working_set.is_pinned(id) {
-                    // In Harpoon modal, `d` on a pinned slot unpins it cleanly without losing the file.
+                    // In Pinned & Open Files modal, `d` on a pinned slot unpins it cleanly without losing the file.
                     let _ = self.working_set.toggle_pin(id);
-                    self.refresh_harpoon_overlay(None);
+                    self.refresh_pins_overlay(None);
                     self.mark_dirty();
                     host.request_redraw();
                 } else {
                     if self.is_buffer_dirty(id) {
-                        self.harpoon.close();
+                        self.pins_overlay.close();
                         self.request_close_buffer(id, host);
                     } else {
                         self.force_close_buffer(id, host);
-                        self.refresh_harpoon_overlay(None);
+                        self.refresh_pins_overlay(None);
                         self.mark_dirty();
                         host.request_redraw();
                     }
@@ -4476,6 +4572,7 @@ impl EditorApp {
     ) {
         match cmd {
             AppCommand::NewFile | AppCommand::NewTab => {
+                self.sidebar.set_focused(false);
                 self.new_tab(host);
             }
             AppCommand::CloseTab => {
@@ -4684,14 +4781,16 @@ impl EditorApp {
                     .root()
                     .map(Path::to_path_buf)
                     .or_else(|| self.doc.path().and_then(|p| p.parent()).map(Path::to_path_buf));
-                self.palette.open_quick_open(self.fs.as_ref(), root.as_deref());
+                let dirty = self.dirty_open_files_snapshot();
+                self.palette
+                    .open_quick_open_with_dirty(self.fs.as_ref(), root.as_deref(), dirty);
                 self.mark_dirty();
                 host.request_redraw();
             }
             AppCommand::CommandPalette => {
                 self.goto_line.close();
                 self.shortcuts.close();
-                self.harpoon.close();
+                self.pins_overlay.close();
                 self.sidebar.set_focused(false);
                 let entries = self.palette_command_entries();
                 self.palette.open_commands(entries);
@@ -4707,8 +4806,13 @@ impl EditorApp {
                     .root()
                     .map(Path::to_path_buf)
                     .or_else(|| self.doc.path().and_then(|p| p.parent()).map(Path::to_path_buf));
-                self.palette
-                    .open_project_search(self.fs.as_ref(), root.as_deref(), seed.as_deref());
+                let dirty = self.dirty_open_files_snapshot();
+                self.palette.open_project_search_with_dirty(
+                    self.fs.as_ref(),
+                    root.as_deref(),
+                    seed.as_deref(),
+                    dirty,
+                );
                 self.mark_dirty();
                 host.request_redraw();
             }
@@ -4761,13 +4865,18 @@ impl EditorApp {
             AppCommand::ToggleSidebar => {
                 self.toggle_sidebar(host);
             }
+            AppCommand::FocusSidebar => {
+                self.focus_sidebar(host);
+            }
             AppCommand::ToggleSidebarSide => {
                 self.toggle_sidebar_side(host);
             }
             AppCommand::SplitPane => {
+                self.sidebar.set_focused(false);
                 self.split_pane_with(None, host);
             }
             AppCommand::SplitPaneDown => {
+                self.sidebar.set_focused(false);
                 self.split_pane_down(None, host);
             }
             AppCommand::CloseSplit => {
@@ -4784,37 +4893,58 @@ impl EditorApp {
                 self.toggle_pin_buffer(id, host);
             }
             AppCommand::JumpPin(slot) => {
+                self.sidebar.set_focused(false);
                 self.jump_to_pin(slot, host);
             }
-            AppCommand::ShowHarpoon => {
-                if self.harpoon.visible {
-                    self.harpoon.close();
+            AppCommand::ShowPins => {
+                if self.pins_overlay.visible {
+                    self.pins_overlay.close();
                 } else {
                     self.palette.close();
                     self.shortcuts.close();
                     self.goto_line.close();
-                    self.refresh_harpoon_overlay(None);
+                    self.sidebar.set_focused(false);
+                    self.refresh_pins_overlay(None);
                 }
                 self.mark_dirty();
                 host.request_redraw();
             }
             AppCommand::NextTab => {
+                self.sidebar.set_focused(false);
                 self.step_tab(1, host);
             }
             AppCommand::PrevTab => {
+                self.sidebar.set_focused(false);
                 self.step_tab(-1, host);
             }
             AppCommand::ToggleLastBuffer => {
+                self.sidebar.set_focused(false);
                 self.toggle_last_buffer(host);
             }
             AppCommand::SwapPanes => {
+                self.sidebar.set_focused(false);
                 self.swap_panes(host);
             }
-            AppCommand::FocusLeftPane => self.focus_direction(Direction::Left, host),
-            AppCommand::FocusRightPane => self.focus_direction(Direction::Right, host),
-            AppCommand::FocusUpPane => self.focus_direction(Direction::Up, host),
-            AppCommand::FocusDownPane => self.focus_direction(Direction::Down, host),
-            AppCommand::FocusNextPane => self.focus_next_pane(host),
+            AppCommand::FocusLeftPane => {
+                self.sidebar.set_focused(false);
+                self.focus_direction(Direction::Left, host);
+            }
+            AppCommand::FocusRightPane => {
+                self.sidebar.set_focused(false);
+                self.focus_direction(Direction::Right, host);
+            }
+            AppCommand::FocusUpPane => {
+                self.sidebar.set_focused(false);
+                self.focus_direction(Direction::Up, host);
+            }
+            AppCommand::FocusDownPane => {
+                self.sidebar.set_focused(false);
+                self.focus_direction(Direction::Down, host);
+            }
+            AppCommand::FocusNextPane => {
+                self.sidebar.set_focused(false);
+                self.focus_next_pane(host);
+            }
             AppCommand::ZoomIn => {
                 self.viewport.zoom_in();
                 self.save_preferences(host);
@@ -4947,6 +5077,32 @@ impl EditorApp {
 
         // Route to Find / Replace bar if focused.
         if self.find_bar.is_focused() {
+            if mods.primary() && mods.alt && !mods.shift && !mods.ctrl {
+                match key {
+                    Key::Char('c') | Key::Char('C') => {
+                        self.find_bar.case_sensitive = !self.find_bar.case_sensitive;
+                        self.refresh_search();
+                        self.mark_dirty();
+                        host.request_redraw();
+                        return;
+                    }
+                    Key::Char('w') | Key::Char('W') => {
+                        self.find_bar.whole_word = !self.find_bar.whole_word;
+                        self.refresh_search();
+                        self.mark_dirty();
+                        host.request_redraw();
+                        return;
+                    }
+                    Key::Char('r') | Key::Char('R') => {
+                        self.find_bar.regex = !self.find_bar.regex;
+                        self.refresh_search();
+                        self.mark_dirty();
+                        host.request_redraw();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
             if key == Key::Escape {
                 self.find_bar.close();
                 self.search_matches.clear();
@@ -5041,13 +5197,28 @@ impl EditorApp {
             let root_before = self.sidebar.root().map(Path::to_path_buf);
             match self
                 .sidebar
-                .handle_key(self.fs.as_ref(), key, self.layout.sidebar.h)
+                .handle_key(self.fs.as_ref(), key, mods, self.layout.sidebar.h)
             {
-                SidebarAction::OpenFile(p) => {
-                    if let Err(e) = self.open_file_with_mode(&p, OpenMode::Keep, host) {
+                SidebarAction::PreviewFile(p) => {
+                    // `Space` previews the selected file while keeping keyboard focus in the sidebar.
+                    if let Err(e) = self.open_file_with_mode(&p, OpenMode::Preview, host) {
                         self.set_notice(e, true);
-                    } else {
-                        self.sidebar.set_focused(false);
+                    }
+                }
+                SidebarAction::OpenFile(p) => {
+                    // 2-step `Enter` symmetrical with single- vs double-click:
+                    // - 1st Enter on a non-active file opens Preview and keeps sidebar focus so
+                    //   arrowing to browse more files works immediately.
+                    // - 2nd Enter (when already the active file) graduates to Kept and focuses editor.
+                    let already_active = self.doc.path() == Some(p.as_path());
+                    if already_active {
+                        if let Err(e) = self.open_file_with_mode(&p, OpenMode::Keep, host) {
+                            self.set_notice(e, true);
+                        } else {
+                            self.sidebar.set_focused(false);
+                        }
+                    } else if let Err(e) = self.open_file_with_mode(&p, OpenMode::Preview, host) {
+                        self.set_notice(e, true);
                     }
                 }
                 SidebarAction::DirectoryClicked(dir) => {
@@ -5822,6 +5993,7 @@ impl EditorApp {
             SearchOptions {
                 case_sensitive: true,
                 max_matches: 10_000,
+                ..SearchOptions::default()
             },
         );
         if matches.is_empty() {
@@ -6351,7 +6523,8 @@ impl EditorApp {
                         self.mark_dirty();
                         host.request_redraw();
                     }
-                    SidebarAction::StartNewFile
+                    SidebarAction::PreviewFile(_)
+                    | SidebarAction::StartNewFile
                     | SidebarAction::StartNewFolder
                     | SidebarAction::StartRename
                     | SidebarAction::RequestDelete { .. }
@@ -6369,7 +6542,7 @@ impl EditorApp {
             }
         }
 
-        // 1b. Unified Top Working-Set Strip (tabs, close `×`, `+`, zoom toggle, Harpoon menu).
+        // 1b. Unified Top Working-Set Strip (tabs, close `×`, `+`, zoom toggle, pinned/open menu).
         if self.layout.tab_strip.contains(xi, yi) {
             self.sidebar.set_focused(false);
             self.find_bar.find_input.focused = false;
@@ -6391,7 +6564,7 @@ impl EditorApp {
                     self.toggle_zoom_pane(host);
                 }
                 TabStripHit::OpenMenu => {
-                    self.refresh_harpoon_overlay(None);
+                    self.refresh_pins_overlay(None);
                     self.mark_dirty();
                     host.request_redraw();
                 }
@@ -6438,6 +6611,14 @@ impl EditorApp {
                 }
                 FindBarAction::ToggleCase => {
                     self.find_bar.case_sensitive = !self.find_bar.case_sensitive;
+                    self.refresh_search();
+                }
+                FindBarAction::ToggleWholeWord => {
+                    self.find_bar.whole_word = !self.find_bar.whole_word;
+                    self.refresh_search();
+                }
+                FindBarAction::ToggleRegex => {
+                    self.find_bar.regex = !self.find_bar.regex;
                     self.refresh_search();
                 }
                 FindBarAction::FindNext => {
@@ -6764,7 +6945,7 @@ impl EditorApp {
         let overlay_open = self.confirm_modal.visible
             || self.palette.is_open()
             || self.shortcuts.visible
-            || self.harpoon.visible;
+            || self.pins_overlay.visible;
         let mut needs_redraw = false;
 
         // 1. Sidebar hover (always reconciled so exiting to ResizeEdge, editor, or outside invalidates!)
@@ -6965,23 +7146,38 @@ impl EditorApp {
             self.active_match = None;
             self.find_bar.match_count = 0;
             self.find_bar.active_match = None;
+            self.find_bar.regex_error = None;
             return;
         }
         let opts = SearchOptions {
             case_sensitive: self.find_bar.case_sensitive,
+            whole_word: self.find_bar.whole_word,
+            regex: self.find_bar.regex,
             max_matches: 10_000,
         };
-        self.search_matches = self.doc.find_all(&query, opts);
-        self.find_bar.match_count = self.search_matches.len();
-        self.active_match = if self.search_matches.is_empty() {
-            None
-        } else {
-            self.search_matches
-                .iter()
-                .position(|m| m.start >= self.caret)
-                .or(Some(0))
-        };
-        self.find_bar.active_match = self.active_match;
+        match self.doc.find_all_checked(&query, opts) {
+            Ok(matches) => {
+                self.find_bar.regex_error = None;
+                self.search_matches = matches;
+                self.find_bar.match_count = self.search_matches.len();
+                self.active_match = if self.search_matches.is_empty() {
+                    None
+                } else {
+                    self.search_matches
+                        .iter()
+                        .position(|m| m.start >= self.caret)
+                        .or(Some(0))
+                };
+                self.find_bar.active_match = self.active_match;
+            }
+            Err(err) => {
+                self.search_matches.clear();
+                self.active_match = None;
+                self.find_bar.match_count = 0;
+                self.find_bar.active_match = None;
+                self.find_bar.regex_error = Some(err.message);
+            }
+        }
     }
 
     fn select_match(&mut self, idx: usize, rasterizer: &mut dyn GlyphRasterizer) {
@@ -7030,7 +7226,15 @@ impl EditorApp {
         let Some(m) = self.search_matches.get(idx).copied() else {
             return;
         };
-        let replacement = self.find_bar.replace_input.text.clone();
+        let query = self.find_bar.find_input.text.clone();
+        let template = self.find_bar.replace_input.text.clone();
+        let opts = SearchOptions {
+            case_sensitive: self.find_bar.case_sensitive,
+            whole_word: self.find_bar.whole_word,
+            regex: self.find_bar.regex,
+            max_matches: 10_000,
+        };
+        let replacement = self.doc.expand_replacement_at(&query, opts, m, &template);
         if let Ok(pos) = self
             .doc
             .edit(m.start, m.end - m.start, &replacement, self.now_ms, false)
@@ -7056,6 +7260,8 @@ impl EditorApp {
         let replacement = self.find_bar.replace_input.text.clone();
         let opts = SearchOptions {
             case_sensitive: self.find_bar.case_sensitive,
+            whole_word: self.find_bar.whole_word,
+            regex: self.find_bar.regex,
             max_matches: 100_000,
         };
         let count = self.doc.replace_all(&query, &replacement, opts, self.now_ms);
@@ -7206,7 +7412,7 @@ impl EditorApp {
             concat!(
                 "{{\"running\":true,\"path\":{},\"file_name\":{},\"dirty\":{},",
                 "\"split\":{},\"zoomed\":{},\"active_pane\":{},\"split_ratios\":{{\"col\":{:.3},\"rows\":[{:.3},{:.3}]}},\"panes\":{},",
-                "\"pins\":{},\"buffers\":{},\"harpoon_open\":{},",
+                "\"pins\":{},\"buffers\":{},\"pins_open\":{},",
                 "\"bytes\":{},\"line_count\":{},\"eol\":{},\"language\":{},\"language_id\":{},",
                 "\"rev\":{{\"dev\":\"{}\",\"ino\":\"{}\",\"size\":\"{}\",\"mtime_ns\":\"{}\",\"ctime_ns\":\"{}\"}},",
                 "\"can_undo\":{},\"can_redo\":{},",
@@ -7233,7 +7439,7 @@ impl EditorApp {
             panes_json,
             pins_json,
             buffers_json,
-            self.harpoon.visible,
+            self.pins_overlay.visible,
             self.doc.len_bytes(),
             line_count,
             json_quote(self.doc.eol().as_str()),
@@ -7447,9 +7653,9 @@ impl EditorApp {
                             self.toggle_pin_buffer(id, host);
                         }
                     }
-                    "harpoon" => {
+                    "pinned-files" | "pins" => {
                         activate = true;
-                        self.handle_command(AppCommand::ShowHarpoon, rasterizer, clipboard, host);
+                        self.handle_command(AppCommand::ShowPins, rasterizer, clipboard, host);
                     }
                     "next-tab" => self.handle_command(AppCommand::NextTab, rasterizer, clipboard, host),
                     "prev-tab" => self.handle_command(AppCommand::PrevTab, rasterizer, clipboard, host),
@@ -7532,6 +7738,9 @@ impl EditorApp {
                     }
                     "toggle-sidebar" => {
                         self.handle_command(AppCommand::ToggleSidebar, rasterizer, clipboard, host)
+                    }
+                    "focus-sidebar" => {
+                        self.handle_command(AppCommand::FocusSidebar, rasterizer, clipboard, host)
                     }
                     "toggle-sidebar-side" => self.handle_command(
                         AppCommand::ToggleSidebarSide,

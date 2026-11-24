@@ -2,7 +2,7 @@
 //!
 //! Stores up to [`MAX_RECENT_FOLDERS`] (12) recent workspace folders in MRU order,
 //! remembering each folder's:
-//! - Harpoon `1..=9` pinned file paths (exact slot order)
+//! - Numbered `1..=9` pinned file paths (exact slot order)
 //! - Kept open file paths
 //! - Active file path + `(line, col)` cursor position
 //!

@@ -178,9 +178,9 @@ fn print_usage() {
            editor resize cols <RATIO|50%|reset>                  (resize left/right split ratio)\n\
            editor resize rows [0|1] <RATIO|50%|reset>            (resize top/bottom split ratio)\n\
            editor resize reset                                   (reset all pane split ratios to 50/50)\n\
-           editor pin [PATH]                                     (pin current file or PATH to Harpoon 1..9)\n\
+           editor pin [PATH]                                     (pin current file or PATH to slot 1..9)\n\
            editor unpin [SLOT|PATH]                              (unpin current file, slot 1..9, or PATH)\n\
-           editor pins | buffers                                 (inspect Harpoon pins & open buffers)\n\
+           editor pins | buffers                                 (inspect pinned slots & open buffers)\n\
            editor zoom                                           (toggle fullscreen zoom on active pane)\n\
            editor new-tab | close-tab                            (create or close tab in Working-Set Strip)\n\
            editor status                                         (inspect live GUI state)\n\

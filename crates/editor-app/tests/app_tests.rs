@@ -1271,7 +1271,7 @@ fn grid_2x2_drag_and_drop_files_and_pane_headers_with_bit_exact_swapchain() {
 }
 
 #[test]
-fn harpoon_working_set_fullscreen_flicking_zoom_overlay_and_tab_drag_to_split() {
+fn pinned_working_set_fullscreen_flicking_zoom_overlay_and_tab_drag_to_split() {
     use editor_app::OpenMode;
     use editor_platform::{
         AppCommand, InputEvent, Key, Modifiers, MouseButton, PixelRect, SurfaceMut,
@@ -1330,7 +1330,7 @@ fn harpoon_working_set_fullscreen_flicking_zoom_overlay_and_tab_drag_to_split() 
         "saving a Kept tab must NEVER make it disappear"
     );
 
-    // 3. Pin 3 files into Harpoon slots 1, 2, 3 and flick between them in fullscreen!
+    // 3. Pin 3 files into numbered slots 1, 2, 3 and flick between them in fullscreen!
     app.toggle_pin_buffer(b_id, &mut host);
     let a_id = app
         .open_file_with_mode(&PathBuf::from("/repo/a.rs"), OpenMode::Keep, &mut host)
@@ -1389,7 +1389,7 @@ fn harpoon_working_set_fullscreen_flicking_zoom_overlay_and_tab_drag_to_split() 
     );
     assert_eq!(app.doc.file_name(), "c.rs");
 
-    // 5. `⌘E` Harpoon Overlay: reorder Pin 1 <-> Pin 2 with `⌥↓`, then jump via `1`!
+    // 5. `⌘E` Pinned & Open Files overlay: reorder Pin 1 <-> Pin 2 with `⌥↓`, then jump via `1`!
     app.handle_event(
         InputEvent::Command(AppCommand::JumpPin(1)),
         &mut raster,
@@ -1397,12 +1397,12 @@ fn harpoon_working_set_fullscreen_flicking_zoom_overlay_and_tab_drag_to_split() 
         &mut host,
     );
     app.handle_event(
-        InputEvent::Command(AppCommand::ShowHarpoon),
+        InputEvent::Command(AppCommand::ShowPins),
         &mut raster,
         &mut clip,
         &mut host,
     );
-    assert!(app.harpoon.visible);
+    assert!(app.pins_overlay.visible);
     app.render(&mut raster);
     app.handle_event(
         InputEvent::KeyDown {
@@ -1420,7 +1420,7 @@ fn harpoon_working_set_fullscreen_flicking_zoom_overlay_and_tab_drag_to_split() 
     assert_eq!(
         app.working_set.pinned,
         vec![a_id, b_id, c_id],
-        "Option+Down in Harpoon overlay must swap slot 1 and slot 2"
+        "Option+Down in Pinned & Open Files overlay must swap slot 1 and slot 2"
     );
     // Press `1` to jump directly to new Pin 1 (`a.rs`) and close overlay!
     app.handle_event(
@@ -1433,7 +1433,7 @@ fn harpoon_working_set_fullscreen_flicking_zoom_overlay_and_tab_drag_to_split() 
         &mut clip,
         &mut host,
     );
-    assert!(!app.harpoon.visible);
+    assert!(!app.pins_overlay.visible);
     assert_eq!(app.doc.file_name(), "a.rs");
 
     // 6. Fullscreen Zoom on a 1x2 split + `⌘2` teleport + unzoom restores exact grid!
@@ -2312,7 +2312,7 @@ fn per_folder_session_restore_lru_tab_cap_and_cursor_memory() {
     app1.open_file(Path::new("/ws/proj_b/util.ts"), &mut host).unwrap();
 
     app1.open_folder(Path::new("/ws/proj_a"), &mut host);
-    assert_eq!(app1.working_set.pinned.len(), 2, "switching back to Project A restores its Harpoon pins");
+    assert_eq!(app1.working_set.pinned.len(), 2, "switching back to Project A restores its pinned files");
     assert_eq!(app1.doc.path(), Some(Path::new("/ws/proj_a/f1.rs")));
 
     // 3. Simulate full app restart (`EditorApp::new` + `load_preferences`):
@@ -3687,7 +3687,8 @@ fn sidebar_single_click_keeps_focus_for_arrow_navigation_while_enter_or_double_c
     assert_eq!(app.sidebar.selected(), Some(Path::new("/proj/b.rs")));
     assert_eq!(app.doc.byte_to_line_col(app.caret).0, 0, "editor caret must not move");
 
-    // 3. Pressing Enter opens `b.rs` and hands focus to the editor -> Down arrow now moves in editor!
+    // 3. 1st Enter on `b.rs` (not active yet) previews `b.rs` AND keeps sidebar focused so
+    //    browsing with arrows continues without losing sidebar focus; 2nd Enter graduates & focuses editor!
     app.handle_event(
         InputEvent::KeyDown {
             key: Key::Enter,
@@ -3699,7 +3700,21 @@ fn sidebar_single_click_keeps_focus_for_arrow_navigation_while_enter_or_double_c
         &mut host,
     );
     assert_eq!(app.doc.path(), Some(Path::new("/proj/b.rs")));
-    assert!(!app.sidebar.is_focused(), "Enter on file must hand focus to editor");
+    assert!(app.sidebar.is_focused(), "1st Enter on non-active file must keep sidebar focus");
+
+    // 2nd Enter on already-active `b.rs` hands focus to the editor -> Down arrow now moves in editor!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.path(), Some(Path::new("/proj/b.rs")));
+    assert!(!app.sidebar.is_focused(), "2nd Enter on active file must hand focus to editor");
     app.handle_event(
         InputEvent::KeyDown {
             key: Key::Down,
@@ -3712,7 +3727,117 @@ fn sidebar_single_click_keeps_focus_for_arrow_navigation_while_enter_or_double_c
     );
     assert_eq!(app.doc.byte_to_line_col(app.caret).0, 1);
 
-    // 4. Double-clicking `a.rs` in sidebar opens it as Kept AND focuses the editor!
+    // 4. `FocusSidebar` (`⇧⌘E`) focuses sidebar; `Space` previews `a.rs` without leaving sidebar;
+    //    `F2` starts in-place rename; bare `Backspace` does NOT pop delete modal while `⌘Backspace` DOES!
+    app.handle_event(
+        InputEvent::Command(editor_platform::AppCommand::FocusSidebar),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.sidebar.is_focused());
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Up,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.sidebar.selected(), Some(Path::new("/proj/a.rs")));
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char(' '),
+            mods: Modifiers::NONE,
+            text: Some(" ".to_string()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.path(), Some(Path::new("/proj/a.rs")));
+    assert!(app.sidebar.is_focused(), "Space must preview while keeping sidebar focus");
+
+    // Bare Backspace must NOT trigger delete modal; primary+Backspace MUST.
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Backspace,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.confirm_modal.visible);
+    let mut primary = Modifiers::NONE;
+    #[cfg(target_os = "macos")]
+    {
+        primary.meta = true;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        primary.ctrl = true;
+    }
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Backspace,
+            mods: primary,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.confirm_modal.visible);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.confirm_modal.visible);
+
+    // F2 starts in-place rename!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::F(2),
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.sidebar.is_prompt_open(), "F2 must open in-place rename prompt");
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.sidebar.is_prompt_open());
+
+    // `NextTab` hands focus back to the editor cleanly.
+    app.handle_event(
+        InputEvent::Command(editor_platform::AppCommand::NextTab),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.sidebar.is_focused(), "tab navigation must clear sidebar focus");
+
+    // 5. Double-clicking `a.rs` in sidebar opens it as Kept AND focuses the editor!
     app.handle_event(
         InputEvent::MouseDown {
             x_px: 100.0,
@@ -3738,4 +3863,385 @@ fn sidebar_single_click_keeps_focus_for_arrow_navigation_while_enter_or_double_c
     );
     assert_eq!(app.doc.path(), Some(Path::new("/proj/a.rs")));
     assert!(!app.sidebar.is_focused(), "double-click must focus editor");
+}
+
+#[test]
+fn find_bar_whole_word_regex_capture_replace_and_two_pane_picker_preview_resume_and_splits() {
+    use editor_platform::{AppCommand, InputEvent, Key, Modifiers};
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    let mut long_file = String::new();
+    for i in 1..=60 {
+        if i == 30 {
+            long_file.push_str("pub fn compute_alpha(val: i32) -> i32 { val + 1 }\n");
+        } else {
+            long_file.push_str(&format!("// filler line {i}\n"));
+        }
+    }
+    fs.add_file("/proj/src/alpha.rs", long_file.into_bytes());
+    fs.add_file(
+        "/proj/src/beta.rs",
+        b"fn foo() {}\nfn foobar() {}\nfn compute_beta(n: u64) -> u64 { n }\n".to_vec(),
+    );
+
+    let mut app = EditorApp::new(fs.clone(), 1600, 1000, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_folder(Path::new("/proj"), &mut host);
+    app.open_file(Path::new("/proj/src/beta.rs"), &mut host).unwrap();
+    app.render(&mut raster);
+
+    let mut primary_alt = Modifiers::NONE;
+    primary_alt.alt = true;
+    #[cfg(target_os = "macos")]
+    {
+        primary_alt.meta = true;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        primary_alt.ctrl = true;
+    }
+
+    // 1. Inline Find/Replace bar: Whole Word (`⌥⌘W`) excludes `foobar` when searching `foo`.
+    app.handle_event(InputEvent::Command(AppCommand::Replace), &mut raster, &mut clip, &mut host);
+    app.find_bar.find_input.set_text("foo");
+    app.refresh_search();
+    assert_eq!(app.find_bar.match_count, 2);
+
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('w'),
+            mods: primary_alt,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.find_bar.whole_word);
+    assert_eq!(app.find_bar.match_count, 1, "whole-word must match `foo` and skip `foobar`");
+
+    // 2. Inline Find/Replace bar: Regex (`⌥⌘R`), invalid regex error reporting, and `$1` capture replace!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('w'),
+            mods: primary_alt,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('r'),
+            mods: primary_alt,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.find_bar.regex);
+
+    app.find_bar.find_input.set_text("(unclosed");
+    app.refresh_search();
+    assert!(app.find_bar.regex_error.is_some());
+    assert_eq!(app.find_bar.match_count, 0);
+
+    app.find_bar.find_input.set_text(r"fn\s+(foo\w*)\(\)");
+    app.find_bar.replace_input.set_text("pub fn $1()");
+    app.refresh_search();
+    assert!(app.find_bar.regex_error.is_none());
+    assert_eq!(app.find_bar.match_count, 2);
+    // Render FindBar with all 3 toggles visible (sanity check zero panic).
+    app.render(&mut raster);
+
+    // Replace All with capture group `$1` + atomic Undo.
+    let replace_all_btn = app.find_bar.layout.btn_replace_all;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: (replace_all_btn.x + replace_all_btn.w / 2) as f32,
+            y_px: (replace_all_btn.y + replace_all_btn.h / 2) as f32,
+            button: editor_platform::MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let text_after = app.doc.to_string_lossy();
+    assert!(text_after.contains("pub fn foo() {}"));
+    assert!(text_after.contains("pub fn foobar() {}"));
+
+    // Close Find bar cleanly.
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.find_bar.visible);
+
+    // 3. Two-pane Search in Files (`⇧⌘F`): sees unsaved dirty edits in `beta.rs`,
+    //    supports regex `⌥⌘R`, live-previews the selected match, scrolls preview (`⌃D`),
+    //    automatically resumes on reopen, and opens into a vertical split (`⌃V`)!
+    app.anchor = app.caret; // ensure no selection so ProjectSearch starts clean
+    app.handle_event(
+        InputEvent::Command(AppCommand::ProjectSearch),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.palette.mode, editor_render::PaletteMode::ProjectSearch);
+
+    // Toggle Regex mode via `⌥⌘R` and search for `compute_\w+`.
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('r'),
+            mods: primary_alt,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.palette.regex);
+    for ch in r"compute_\w+".chars() {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+    }
+    assert_eq!(app.palette.items.len(), 2, "must find compute_alpha and compute_beta");
+    app.render(&mut raster);
+
+    // Verify live preview loaded for item 0 (alpha.rs line 30 -> 0-based 29) and `⌃D` scrolls preview!
+    let (p0_path, p0_line, p0_scroll_before) = app.palette.preview_info().expect("preview loaded");
+    assert_eq!(p0_path, Path::new("/proj/src/alpha.rs"));
+    assert_eq!(p0_line, 29);
+    let ctrl_only = Modifiers {
+        ctrl: true,
+        ..Modifiers::NONE
+    };
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('d'),
+            mods: ctrl_only,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let (_, _, p0_scroll_after) = app.palette.preview_info().expect("preview loaded");
+    assert!(p0_scroll_after > p0_scroll_before, "Ctrl+D must scroll preview down");
+
+    // Move to item 1 via `⌃N` (`beta.rs`), verify preview switches, then Escape and reopen `⇧⌘F`:
+    // automatic resume restores query, regex toggle, AND selected index 1!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('n'),
+            mods: ctrl_only,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.palette.selected, 1);
+    assert_eq!(
+        app.palette.preview_info().map(|(p, _, _)| p),
+        Some(Path::new("/proj/src/beta.rs"))
+    );
+
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.palette.is_open());
+
+    // Reopen `⇧⌘F` with no selection -> resumes query, regex mode, and selection!
+    app.handle_event(
+        InputEvent::Command(AppCommand::ProjectSearch),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.palette.input.text, r"compute_\w+");
+    assert!(app.palette.regex);
+    assert_eq!(app.palette.selected, 1);
+
+    // Move back to item 0 (`alpha.rs`) via `⌃P` and open in a vertical split via `⌃V`!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('p'),
+            mods: ctrl_only,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.palette.selected, 0);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('v'),
+            mods: ctrl_only,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.palette.is_open());
+    assert!(app.is_split(), "Ctrl+V from picker must open a split pane");
+    assert_eq!(app.doc.path(), Some(Path::new("/proj/src/alpha.rs")));
+    assert_eq!(app.doc.byte_to_line_col(app.caret).0, 29);
+
+    // 4. Live Grep also finds unsaved edits in dirty open buffers (`pub fn foo()` we replaced earlier!).
+    app.anchor = app.caret;
+    app.handle_event(
+        InputEvent::Command(AppCommand::ProjectSearch),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    // Toggle regex off (`⌥⌘R`) and type literal `pub fn foobar` (which only exists in memory!).
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('r'),
+            mods: primary_alt,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.palette.input.set_text("pub fn foobar");
+    app.palette.refresh_results(fs.as_ref());
+    assert_eq!(app.palette.items.len(), 1, "Live Grep must see unsaved dirty buffer edits");
+    assert_eq!(app.palette.items[0].path, Path::new("/proj/src/beta.rs"));
+
+    // 5. `FsChanged` invalidates cached file index so newly added files appear in Quick Open!
+    fs.add_file("/proj/src/gamma_new.rs", b"pub fn gamma() {}\n".to_vec());
+    app.palette.close();
+    app.handle_event(
+        InputEvent::FsChanged(vec![PathBuf::from("/proj/src/gamma_new.rs")]),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::Command(AppCommand::QuickOpen),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    for ch in "gamma_new".chars() {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+    }
+    assert_eq!(app.palette.items.len(), 1);
+    assert_eq!(app.palette.items[0].path, Path::new("/proj/src/gamma_new.rs"));
+    app.render(&mut raster);
+    app.palette.close();
+
+    // 6. Vim mode leader chords: `<Space>ff` (Quick Open), `<Space>fg` & `<Space>/` (Search in Files),
+    //    `<Space>fb` (Pinned & Open Files), `<Space>fe` (Focus Sidebar)!
+    app.handle_event(InputEvent::Command(AppCommand::ToggleVimMode), &mut raster, &mut clip, &mut host);
+    assert!(app.vim.enabled);
+
+    let send_char = |app: &mut EditorApp,
+                     ch: char,
+                     raster: &mut BuiltinBitmapRasterizer,
+                     clip: &mut MemoryClipboard,
+                     host: &mut HeadlessHost| {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(ch),
+                mods: Modifiers::NONE,
+                text: Some(ch.to_string()),
+            },
+            raster,
+            clip,
+            host,
+        );
+    };
+    let send_esc = |app: &mut EditorApp,
+                    raster: &mut BuiltinBitmapRasterizer,
+                    clip: &mut MemoryClipboard,
+                    host: &mut HeadlessHost| {
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Escape,
+                mods: Modifiers::NONE,
+                text: None,
+            },
+            raster,
+            clip,
+            host,
+        );
+    };
+
+    // `<Space>ff` -> Quick Open
+    send_char(&mut app, ' ', &mut raster, &mut clip, &mut host);
+    send_char(&mut app, 'f', &mut raster, &mut clip, &mut host);
+    send_char(&mut app, 'f', &mut raster, &mut clip, &mut host);
+    assert_eq!(app.palette.mode, editor_render::PaletteMode::QuickOpen);
+    send_esc(&mut app, &mut raster, &mut clip, &mut host);
+
+    // `<Space>fg` -> Search in Files
+    send_char(&mut app, ' ', &mut raster, &mut clip, &mut host);
+    send_char(&mut app, 'f', &mut raster, &mut clip, &mut host);
+    send_char(&mut app, 'g', &mut raster, &mut clip, &mut host);
+    assert_eq!(app.palette.mode, editor_render::PaletteMode::ProjectSearch);
+    send_esc(&mut app, &mut raster, &mut clip, &mut host);
+
+    // `<Space>/` -> Search in Files shorthand
+    send_char(&mut app, ' ', &mut raster, &mut clip, &mut host);
+    send_char(&mut app, '/', &mut raster, &mut clip, &mut host);
+    assert_eq!(app.palette.mode, editor_render::PaletteMode::ProjectSearch);
+    send_esc(&mut app, &mut raster, &mut clip, &mut host);
+
+    // `<Space>fb` -> Pinned & Open Files
+    send_char(&mut app, ' ', &mut raster, &mut clip, &mut host);
+    send_char(&mut app, 'f', &mut raster, &mut clip, &mut host);
+    send_char(&mut app, 'b', &mut raster, &mut clip, &mut host);
+    assert!(app.pins_overlay.visible);
+    send_esc(&mut app, &mut raster, &mut clip, &mut host);
+
+    // `<Space>fe` -> Focus File Sidebar
+    send_char(&mut app, ' ', &mut raster, &mut clip, &mut host);
+    send_char(&mut app, 'f', &mut raster, &mut clip, &mut host);
+    send_char(&mut app, 'e', &mut raster, &mut clip, &mut host);
+    assert!(app.sidebar.is_focused());
 }

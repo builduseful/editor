@@ -1,19 +1,20 @@
-//! Custom-drawn Harpoon & Open Files Quick Overlay (`Cmd+E` / `<Space>e`).
+//! Custom-drawn Pinned & Open Files overlay (`Cmd+E` / `<Space>e` / `<Space>fb`).
 //!
 //! Built strictly with Build Useful design-system tokens:
-//! - Lists numbered Harpoon pins (`1`..`9`) first, then open unpinned buffers below.
-//! - `1`..`9` jumps immediately to that pin slot; `j`/`k`/`↑`/`↓` navigates;
+//! - Lists numbered pinned files (`1`..`9`) first, then open unpinned buffers below.
+//! - `1`..`9` jumps immediately to that pin slot; `j`/`k`/`↑`/`↓`/`⌃N`/`⌃P` navigates;
 //!   `J`/`K` or `⌥↑`/`⌥↓` reorders pins; `p`/`m` toggles pin; `d`/`⌫` unpins or closes;
-//!   `Enter` activates; `⌘Enter` splits right; `Esc` closes.
+//!   `Enter` activates; `⌃V`/`⌘Enter` splits right; `⌃X` splits down; `Esc`/`q` closes.
 
 use editor_platform::{FontStyle, GlyphRasterizer, Key, Modifiers, PixelRect};
 
 use crate::atlas::GlyphAtlas;
 use crate::painter::Painter;
+use crate::palette::PaletteOpenTarget;
 use crate::theme::{px, Color, Theme};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HarpoonEntry {
+pub struct PinEntry {
     pub id: u32,
     pub name: String,
     pub rel_path: String,
@@ -26,11 +27,11 @@ pub struct HarpoonEntry {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HarpoonAction {
+pub enum PinsAction {
     None,
     Changed,
     Close,
-    JumpToBuffer { id: u32, split_right: bool },
+    JumpToBuffer { id: u32, target: PaletteOpenTarget },
     JumpPin(u8),
     MovePin { slot_0based: usize, delta: isize },
     TogglePin(u32),
@@ -43,22 +44,22 @@ enum Row {
     Item(usize),
 }
 
-pub struct HarpoonOverlay {
+pub struct PinsOverlay {
     pub visible: bool,
-    entries: Vec<HarpoonEntry>,
+    entries: Vec<PinEntry>,
     rows: Vec<Row>,
     selected_row: usize,
     card_rect: PixelRect,
     item_rects: Vec<(usize, PixelRect)>,
 }
 
-impl Default for HarpoonOverlay {
+impl Default for PinsOverlay {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl HarpoonOverlay {
+impl PinsOverlay {
     pub fn new() -> Self {
         Self {
             visible: false,
@@ -70,7 +71,7 @@ impl HarpoonOverlay {
         }
     }
 
-    pub fn open(&mut self, entries: Vec<HarpoonEntry>) {
+    pub fn open(&mut self, entries: Vec<PinEntry>) {
         self.visible = true;
         self.refresh(entries, None);
     }
@@ -82,7 +83,7 @@ impl HarpoonOverlay {
         self.item_rects.clear();
     }
 
-    pub fn refresh(&mut self, entries: Vec<HarpoonEntry>, keep_selected_id: Option<u32>) {
+    pub fn refresh(&mut self, entries: Vec<PinEntry>, keep_selected_id: Option<u32>) {
         self.entries = entries;
         self.rows.clear();
 
@@ -136,7 +137,7 @@ impl HarpoonOverlay {
         }
     }
 
-    fn selected_entry(&self) -> Option<&HarpoonEntry> {
+    fn selected_entry(&self) -> Option<&PinEntry> {
         match self.rows.get(self.selected_row) {
             Some(Row::Item(idx)) => self.entries.get(*idx),
             _ => None,
@@ -161,144 +162,189 @@ impl HarpoonOverlay {
         }
     }
 
-    pub fn handle_key(&mut self, key: Key, mods: Modifiers) -> HarpoonAction {
+    pub fn handle_key(&mut self, key: Key, mods: Modifiers) -> PinsAction {
         if !self.visible {
-            return HarpoonAction::None;
+            return PinsAction::None;
         }
+        // Consistent modal ctrl ergonomics matching Quick Open & Search in Files (`⌃N`/`⌃P`/`⌃V`/`⌃X`).
+        if mods.ctrl && !mods.meta && !mods.alt {
+            match key {
+                Key::Char('n') | Key::Char('N') => {
+                    self.move_selection(1);
+                    return PinsAction::Changed;
+                }
+                Key::Char('p') | Key::Char('P') => {
+                    self.move_selection(-1);
+                    return PinsAction::Changed;
+                }
+                Key::Char('v') | Key::Char('V') => {
+                    if let Some(e) = self.selected_entry() {
+                        let id = e.id;
+                        self.close();
+                        return PinsAction::JumpToBuffer {
+                            id,
+                            target: PaletteOpenTarget::SplitRight,
+                        };
+                    }
+                    return PinsAction::None;
+                }
+                Key::Char('x') | Key::Char('X') => {
+                    if let Some(e) = self.selected_entry() {
+                        let id = e.id;
+                        self.close();
+                        return PinsAction::JumpToBuffer {
+                            id,
+                            target: PaletteOpenTarget::SplitDown,
+                        };
+                    }
+                    return PinsAction::None;
+                }
+                _ => {}
+            }
+        }
+
         match key {
             Key::Escape => {
                 self.close();
-                return HarpoonAction::Close;
+                return PinsAction::Close;
             }
             Key::Up => {
                 if mods.alt {
                     if let Some(e) = self.selected_entry() {
                         if let Some(slot) = e.pin_slot {
-                            return HarpoonAction::MovePin {
+                            return PinsAction::MovePin {
                                 slot_0based: (slot - 1) as usize,
                                 delta: -1,
                             };
                         }
                     }
-                    return HarpoonAction::None;
+                    return PinsAction::None;
                 }
                 self.move_selection(-1);
-                return HarpoonAction::Changed;
+                return PinsAction::Changed;
             }
             Key::Down => {
                 if mods.alt {
                     if let Some(e) = self.selected_entry() {
                         if let Some(slot) = e.pin_slot {
-                            return HarpoonAction::MovePin {
+                            return PinsAction::MovePin {
                                 slot_0based: (slot - 1) as usize,
                                 delta: 1,
                             };
                         }
                     }
-                    return HarpoonAction::None;
+                    return PinsAction::None;
                 }
                 self.move_selection(1);
-                return HarpoonAction::Changed;
+                return PinsAction::Changed;
             }
             Key::Enter => {
                 if let Some(e) = self.selected_entry() {
                     let id = e.id;
                     self.close();
-                    return HarpoonAction::JumpToBuffer {
+                    return PinsAction::JumpToBuffer {
                         id,
-                        split_right: mods.primary(),
+                        target: if mods.primary() {
+                            PaletteOpenTarget::SplitRight
+                        } else {
+                            PaletteOpenTarget::Current
+                        },
                     };
                 }
-                return HarpoonAction::None;
+                return PinsAction::None;
             }
             Key::Backspace | Key::Delete => {
                 if let Some(e) = self.selected_entry() {
-                    return HarpoonAction::RemoveOrClose(e.id);
+                    return PinsAction::RemoveOrClose(e.id);
                 }
-                return HarpoonAction::None;
+                return PinsAction::None;
             }
             Key::Char(c) if !mods.primary() && !mods.ctrl && !mods.alt => match c {
                 '1'..='9' => {
                     let slot = (c as u8) - b'0';
                     self.close();
-                    return HarpoonAction::JumpPin(slot);
+                    return PinsAction::JumpPin(slot);
                 }
                 'j' if !mods.shift => {
                     self.move_selection(1);
-                    return HarpoonAction::Changed;
+                    return PinsAction::Changed;
                 }
                 'k' if !mods.shift => {
                     self.move_selection(-1);
-                    return HarpoonAction::Changed;
+                    return PinsAction::Changed;
                 }
                 'J' | 'j' if mods.shift => {
                     if let Some(e) = self.selected_entry() {
                         if let Some(slot) = e.pin_slot {
-                            return HarpoonAction::MovePin {
+                            return PinsAction::MovePin {
                                 slot_0based: (slot - 1) as usize,
                                 delta: 1,
                             };
                         }
                     }
-                    return HarpoonAction::None;
+                    return PinsAction::None;
                 }
                 'K' | 'k' if mods.shift => {
                     if let Some(e) = self.selected_entry() {
                         if let Some(slot) = e.pin_slot {
-                            return HarpoonAction::MovePin {
+                            return PinsAction::MovePin {
                                 slot_0based: (slot - 1) as usize,
                                 delta: -1,
                             };
                         }
                     }
-                    return HarpoonAction::None;
+                    return PinsAction::None;
                 }
                 'p' | 'P' | 'm' | 'M' => {
                     if let Some(e) = self.selected_entry() {
-                        return HarpoonAction::TogglePin(e.id);
+                        return PinsAction::TogglePin(e.id);
                     }
-                    return HarpoonAction::None;
+                    return PinsAction::None;
                 }
                 'd' | 'D' | 'x' | 'X' => {
                     if let Some(e) = self.selected_entry() {
-                        return HarpoonAction::RemoveOrClose(e.id);
+                        return PinsAction::RemoveOrClose(e.id);
                     }
-                    return HarpoonAction::None;
+                    return PinsAction::None;
                 }
                 'q' => {
                     self.close();
-                    return HarpoonAction::Close;
+                    return PinsAction::Close;
                 }
                 _ => {}
             },
             _ => {}
         }
-        HarpoonAction::None
+        PinsAction::None
     }
 
-    pub fn handle_click(&mut self, x_px: f32, y_px: f32, mods: Modifiers) -> HarpoonAction {
+    pub fn handle_click(&mut self, x_px: f32, y_px: f32, mods: Modifiers) -> PinsAction {
         if !self.visible {
-            return HarpoonAction::None;
+            return PinsAction::None;
         }
         let xi = x_px.round() as i32;
         let yi = y_px.round() as i32;
         if !self.card_rect.contains(xi, yi) {
             self.close();
-            return HarpoonAction::Close;
+            return PinsAction::Close;
         }
         for &(entry_idx, rect) in &self.item_rects {
             if rect.contains(xi, yi) {
                 if let Some(e) = self.entries.get(entry_idx) {
                     let id = e.id;
                     self.close();
-                    return HarpoonAction::JumpToBuffer {
+                    return PinsAction::JumpToBuffer {
                         id,
-                        split_right: mods.primary(),
+                        target: if mods.primary() {
+                            PaletteOpenTarget::SplitRight
+                        } else {
+                            PaletteOpenTarget::Current
+                        },
                     };
                 }
             }
         }
-        HarpoonAction::None
+        PinsAction::None
     }
 
     pub fn draw(
@@ -343,7 +389,7 @@ impl HarpoonOverlay {
             }
         }
 
-        let card_w = px(520.0, scale).min((bounds.w - px(32.0, scale)).max(px(280.0, scale)));
+        let card_w = px(540.0, scale).min((bounds.w - px(32.0, scale)).max(px(280.0, scale)));
         let max_card_h = (bounds.h - px(72.0, scale)).max(px(140.0, scale));
         let card_h = (pad + title_h + px(8.0, scale) + list_h + px(8.0, scale) + footer_h + pad)
             .min(max_card_h);
@@ -451,6 +497,12 @@ impl HarpoonOverlay {
 
                         if r_idx == self.selected_row {
                             painter.fill_rounded_rect(r, 5.0 * scale, theme.selection);
+                            painter.stroke_rounded_rect(
+                                r,
+                                5.0 * scale,
+                                hairline as f32,
+                                theme.border_control,
+                            );
                         }
 
                         let mut x = (r.x + px(8.0, scale)) as f32;
@@ -518,7 +570,8 @@ impl HarpoonOverlay {
                         let mut right_limit = r.right() - px(8.0, scale);
                         let base = r.y as f32 + (r.h as f32 + nm.ascent - nm.descent) * 0.5;
                         if let Some(t) = tag {
-                            let tw = Painter::measure_text_ui(t, FontStyle::Ui, hint_px, atlas, rasterizer);
+                            let tw =
+                                Painter::measure_text_ui(t, FontStyle::Ui, hint_px, atlas, rasterizer);
                             let tx = (right_limit as f32 - tw).round();
                             painter.draw_text_ui(
                                 tx,
@@ -584,7 +637,7 @@ impl HarpoonOverlay {
         painter.draw_text_ui(
             (card.x + pad) as f32,
             fbase,
-            "1–9 jump  ·  Enter open  ·  ⌘Enter split  ·  p pin  ·  ⌥↑↓ reorder  ·  d remove",
+            "1–9 jump  ·  ↵ open  ·  ⌃V/⌃X split  ·  p pin  ·  ⌥↑↓ reorder  ·  d remove",
             FontStyle::Ui,
             hint_px,
             theme.text_muted,

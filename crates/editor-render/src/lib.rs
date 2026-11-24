@@ -6,9 +6,9 @@
 
 pub mod atlas;
 pub mod chrome;
-pub mod harpoon;
 pub mod painter;
 pub mod palette;
+pub mod pins;
 pub mod shortcuts;
 pub mod sidebar;
 pub mod tab_strip;
@@ -21,11 +21,12 @@ pub use chrome::{
     A11yNode, A11yRole, ActionToast, ConfirmModal, FindBarAction, FindBarLayout, FindBarState,
     GotoLineState, ImeComposition, StatusBarData, ToastHit,
 };
-pub use harpoon::{HarpoonAction, HarpoonEntry, HarpoonOverlay};
 pub use painter::Painter;
 pub use palette::{
     fuzzy_score, CommandPalette, PaletteAction, PaletteCommandEntry, PaletteItem, PaletteMode,
+    PaletteOpenTarget,
 };
+pub use pins::{PinEntry, PinsAction, PinsOverlay};
 pub use shortcuts::{ShortcutDisplayItem, ShortcutsAction, ShortcutsOverlay};
 pub use sidebar::{
     Sidebar, SidebarAction, SidebarBadge, SidebarContextAction, SidebarHit, SidebarPromptAction,

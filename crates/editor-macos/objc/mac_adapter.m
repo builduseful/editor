@@ -1177,7 +1177,7 @@ void mac_activate_app(void) {
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
     [editMenu addItem:[NSMenuItem separatorItem]];
     [editMenu addItem:[self menuItem:@"Find…" key:@"f" tag:12 mods:NSEventModifierFlagCommand]];
-    [editMenu addItem:[self menuItem:@"Find in Folder…" key:@"f" tag:23
+    [editMenu addItem:[self menuItem:@"Search in Files…" key:@"f" tag:23
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
     [editMenu addItem:[self menuItem:@"Replace…" key:@"f" tag:13
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
@@ -1192,6 +1192,8 @@ void mac_activate_app(void) {
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
     [viewMenu addItem:[NSMenuItem separatorItem]];
     [viewMenu addItem:[self menuItem:@"Toggle Sidebar" key:@"b" tag:16 mods:NSEventModifierFlagCommand]];
+    [viewMenu addItem:[self menuItem:@"Focus Sidebar" key:@"e" tag:50
+                                mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
     [viewMenu addItem:[self menuItem:@"Move Sidebar Left / Right" key:@"b" tag:47
                                 mods:NSEventModifierFlagCommand | NSEventModifierFlagOption]];
     [viewMenu addItem:[self menuItem:@"Toggle Word Wrap" key:@"z" tag:15 mods:NSEventModifierFlagOption]];
