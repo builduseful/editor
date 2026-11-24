@@ -326,6 +326,7 @@ fn search_crosses_64kb_window_boundary_and_replace_all_undoes_atomically() {
         SearchOptions {
             case_sensitive: false,
             max_matches: 100,
+            ..SearchOptions::default()
         },
     );
     assert_eq!(ci.len(), 2);
@@ -336,6 +337,7 @@ fn search_crosses_64kb_window_boundary_and_replace_all_undoes_atomically() {
         SearchOptions {
             case_sensitive: false,
             max_matches: 100,
+            ..SearchOptions::default()
         },
         10,
     );
@@ -345,6 +347,179 @@ fn search_crosses_64kb_window_boundary_and_replace_all_undoes_atomically() {
     // Single undo restores both replacements!
     doc.undo();
     assert_eq!(doc.to_string_lossy(), text);
+}
+
+#[test]
+fn whole_word_and_linear_time_regex_search_and_capture_replace() {
+    use editor_core::{CompiledQuery, SearchScratch};
+    use std::time::Instant;
+
+    // 1. Whole-word literal search (case-sensitive & case-insensitive) + boundary safety.
+    let mut doc = Document::from_str("foo foobar bar_foo FOO (foo) foo!", None);
+    let ww = doc.find_all(
+        "foo",
+        SearchOptions {
+            case_sensitive: true,
+            whole_word: true,
+            regex: false,
+            max_matches: 100,
+        },
+    );
+    assert_eq!(ww.len(), 3, "should match standalone `foo`, `(foo)`, and `foo!` only");
+
+    let ww_ci = doc.find_all(
+        "foo",
+        SearchOptions {
+            case_sensitive: false,
+            whole_word: true,
+            regex: false,
+            max_matches: 100,
+        },
+    );
+    assert_eq!(ww_ci.len(), 4);
+
+    // 2. Regex features: greedy vs lazy, classes, counted repeats, CRLF `$`, UTF-8 `.`, captures.
+    let mut rdoc = Document::from_str("fn alpha(x: i32) -> bool\r\nfn beta(y: u64) -> ()\r\ncafé 🚀\r\n", None);
+    let fn_hits = rdoc
+        .find_all_checked(
+            r"^fn\s+(\w+)\(([^)]*)\).*$",
+            SearchOptions {
+                case_sensitive: true,
+                whole_word: false,
+                regex: true,
+                max_matches: 100,
+            },
+        )
+        .unwrap();
+    assert_eq!(fn_hits.len(), 2);
+    // Verify `$` and `.` on CRLF did not eat `\r`!
+    let mut line0 = Vec::new();
+    rdoc.tree_mut()
+        .read_range(fn_hits[0].start, (fn_hits[0].end - fn_hits[0].start) as usize, &mut line0);
+    assert_eq!(std::str::from_utf8(&line0).unwrap(), "fn alpha(x: i32) -> bool");
+
+    // UTF-8 safety: `.` matches entire multi-byte chars `é` and `🚀`, never splits UTF-8!
+    let utf8_hits = rdoc
+        .find_all_checked(
+            "caf. .",
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(utf8_hits.len(), 1);
+    let mut ubuf = Vec::new();
+    rdoc.tree_mut()
+        .read_range(utf8_hits[0].start, (utf8_hits[0].end - utf8_hits[0].start) as usize, &mut ubuf);
+    assert_eq!(std::str::from_utf8(&ubuf).unwrap(), "café 🚀");
+
+    // Capture replacement (`$1`, `$2`, `$$`) + single atomic Undo!
+    let before = rdoc.to_string_lossy();
+    let replaced = rdoc.replace_all(
+        r"fn\s+(\w+)\((\w+):\s*(\w+)\)",
+        "pub fn $1($3 $2) $$",
+        SearchOptions {
+            regex: true,
+            ..SearchOptions::default()
+        },
+        42,
+    );
+    assert_eq!(replaced, 2);
+    let after = rdoc.to_string_lossy();
+    assert!(after.contains("pub fn alpha(i32 x) $ -> bool"));
+    assert!(after.contains("pub fn beta(u64 y) $ -> ()"));
+    rdoc.undo();
+    assert_eq!(rdoc.to_string_lossy(), before);
+
+    // 3. Lazy vs greedy quantifiers + zero-length match termination (`^`, `a*`).
+    let mut qdoc = Document::from_str("<b>one</b><b>two</b>", None);
+    let lazy = qdoc
+        .find_all_checked(
+            "<b>.*?</b>",
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(lazy.len(), 2);
+    let greedy = qdoc
+        .find_all_checked(
+            "<b>.*</b>",
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(greedy.len(), 1);
+
+    let zero_hits = qdoc
+        .find_all_checked(
+            "x*",
+            SearchOptions {
+                regex: true,
+                max_matches: 100,
+                ..SearchOptions::default()
+            },
+        )
+        .unwrap();
+    assert!(zero_hits.len() <= 25);
+
+    // 4. Invalid regex returns a clean error instead of panicking.
+    assert!(qdoc
+        .find_all_checked(
+            "(unclosed",
+            SearchOptions {
+                regex: true,
+                ..SearchOptions::default()
+            },
+        )
+        .is_err());
+
+    // 5. ReDoS immunity: `(a+)+b` against 10,000 `a`s must finish in linear time (well under 50ms)!
+    let evil_input = "a".repeat(10_000);
+    let compiled = CompiledQuery::compile(
+        "(a+)+b",
+        SearchOptions {
+            regex: true,
+            ..SearchOptions::default()
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let mut scratch = SearchScratch::new();
+    let mut out = Vec::new();
+    let t0 = Instant::now();
+    compiled.find_in_bytes(evil_input.as_bytes(), 10, &mut scratch, &mut out);
+    assert!(out.is_empty());
+    assert!(
+        t0.elapsed().as_millis() < 250,
+        "PikeVM must stay linear-time on ReDoS inputs (took {:?})",
+        t0.elapsed()
+    );
+
+    // 6. Verify two-byte SWAR exact & case-insensitive helpers and SWAR `count_byte` against naive!
+    let sample = b"    HeLLo_WoRLd    hello_world    HELLO_WORLD\nline2\nline3\n";
+    assert_eq!(editor_core::swar::find_subslice(sample, b"hello_world"), Some(19));
+    assert_eq!(editor_core::swar::find_subslice_ascii_ci(sample, b"hello_world"), Some(4));
+    assert_eq!(editor_core::swar::find_byte_ascii_ci(sample, b'w'), Some(10));
+    assert_eq!(editor_core::swar::count_byte(sample, b'\n'), 3);
+    // Case-insensitive regex with literal prefix uses SWAR prefilter cleanly.
+    let ci_re = CompiledQuery::compile(
+        r"hello_\w+",
+        SearchOptions {
+            case_sensitive: false,
+            regex: true,
+            ..SearchOptions::default()
+        },
+    )
+    .unwrap()
+    .unwrap();
+    out.clear();
+    ci_re.find_in_bytes(sample, 10, &mut scratch, &mut out);
+    assert_eq!(out.len(), 3);
 }
 
 #[test]
@@ -645,4 +820,102 @@ fn piece_tree_heavy_delete_compaction_5000_steps() {
         assert_eq!(tree.len_bytes() as usize, oracle.len());
     }
     assert_eq!(tree.to_string_lossy().as_bytes(), oracle.as_slice());
+}
+
+#[test]
+fn swar_unrolled_rare_pair_and_regex_span_parity() {
+    use editor_core::regex::{PikeVmScratch, Regex};
+    use editor_core::swar::{
+        count_byte, find_byte, find_byte_ascii_ci, find_subslice, find_subslice_ascii_ci,
+        rfind_byte,
+    };
+    use editor_core::{CompiledQuery, SearchScratch};
+
+    // 1. Exhaustively test 32-byte unrolled SWAR primitives across every alignment 0..100.
+    for len in 0..100usize {
+        let mut buf = vec![b'e'; len];
+        assert_eq!(find_byte(&buf, b'z'), None);
+        assert_eq!(rfind_byte(&buf, b'z'), None);
+        assert_eq!(find_byte_ascii_ci(&buf, b'z'), None);
+        assert_eq!(count_byte(&buf, b'e'), len);
+        for pos in 0..len {
+            buf[pos] = b'Z';
+            assert_eq!(find_byte(&buf, b'Z'), Some(pos));
+            assert_eq!(rfind_byte(&buf, b'Z'), Some(pos));
+            assert_eq!(find_byte_ascii_ci(&buf, b'z'), Some(pos));
+            assert_eq!(count_byte(&buf, b'Z'), 1);
+            buf[pos] = b'e';
+        }
+    }
+
+    // 2. Common-prefix & repeated-byte needles across 32-byte boundaries.
+    let hay = format!(
+        "{}    pub fn target_xyz(a: u8) {{ aaaaaab }}",
+        "    pub fn other(x: i32) { x }\n".repeat(5)
+    );
+    let b = hay.as_bytes();
+    assert_eq!(
+        find_subslice(b, b"    pub fn target_xyz"),
+        hay.find("    pub fn target_xyz")
+    );
+    assert_eq!(
+        find_subslice_ascii_ci(b, b"    pub fn target_xyz"),
+        hay.find("    pub fn target_xyz")
+    );
+    assert_eq!(find_subslice(b, b"aaaaaab"), hay.find("aaaaaab"));
+    assert_eq!(find_subslice(b, b"aaaaaa"), hay.find("aaaaaa"));
+    assert_eq!(find_subslice_ascii_ci(b, b"AAAAAB".to_ascii_lowercase().as_slice()), hay.find("aaaaab"));
+
+    // 3. Verify capture-free `find_span_with_context` matches `find_captures_with_context`
+    // identically across prefixed, unprefixed (`start_filter`), alternation (`alt_literals`),
+    // lazy, word-boundary, multiline, and UTF-8 emoji inputs!
+    let sample = "alpha 🚀 2026-11-24 FooBar_42 beta FIXME: check\nhello_world TODO: fix 9999\r\n";
+    let patterns = [
+        (r"TODO|FIXME|HACK", true, false),
+        (r"todo|fixme", false, true),
+        (r"\b[A-Z][a-zA-Z0-9_]+\b", true, false),
+        (r"\d{4}-\d{2}-\d{2}", true, false),
+        (r"a.+?b", true, false),
+        (r"^\w+", true, false),
+        (r"\d+$", true, false),
+        (r"🚀\s+\d+", true, false),
+        (r"check\nhello", true, false),
+    ];
+    let mut scratch = PikeVmScratch::new();
+    for (pat, cs, ww) in patterns {
+        let re = Regex::compile(pat, cs, ww).unwrap();
+        let mut pos = 0usize;
+        while pos <= sample.len() {
+            let span = re.find_span_with_context(sample, pos, None, None, &mut scratch);
+            let caps = re
+                .find_captures_with_context(sample, pos, None, None, &mut scratch)
+                .map(|c| c.full());
+            assert_eq!(span, caps, "parity mismatch for pattern `{pat}` at pos {pos}");
+            match span {
+                Some((s, e)) if e > s => pos = e,
+                Some((_, e)) if e < sample.len() => {
+                    pos = e + sample[e..].chars().next().unwrap().len_utf8();
+                }
+                _ => break,
+            }
+        }
+    }
+
+    // 4. Alternation SWAR prefilter returns all hits via CompiledQuery.
+    let q = CompiledQuery::compile(
+        "TODO|FIXME|HACK",
+        SearchOptions {
+            regex: true,
+            case_sensitive: true,
+            ..SearchOptions::default()
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let mut s = SearchScratch::new();
+    let mut hits = Vec::new();
+    q.find_in_bytes(sample.as_bytes(), 100, &mut s, &mut hits);
+    assert_eq!(hits.len(), 2);
+    assert_eq!(&sample[hits[0].0..hits[0].1], "FIXME");
+    assert_eq!(&sample[hits[1].0..hits[1].1], "TODO");
 }

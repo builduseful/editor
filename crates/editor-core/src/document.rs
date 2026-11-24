@@ -8,7 +8,11 @@ use editor_platform::{FileRev, FileSystem, FsError};
 
 use crate::grapheme::validate_utf8_offset;
 use crate::piece_tree::PieceTree;
-use crate::search::{find_all_matches, SearchMatch, SearchOptions};
+use crate::regex::RegexError;
+use crate::search::{
+    find_all_matches, find_all_matches_checked, CompiledQuery, SearchMatch, SearchOptions,
+    SearchScratch,
+};
 use crate::syntax::{Language, SyntaxCache, TokenSpan};
 use crate::undo::{EditOp, UndoStack};
 
@@ -617,6 +621,7 @@ impl Document {
     }
 
     /// Replace all occurrences of `query` with `replacement` in one atomic undo step.
+    /// When `options.regex` is enabled, expands `$0`..`$9`, `$$`, `\n`, `\t` captures per match.
     /// Returns the number of replacements made.
     pub fn replace_all(
         &mut self,
@@ -625,12 +630,21 @@ impl Document {
         options: SearchOptions,
         timestamp_ms: u64,
     ) -> usize {
-        let matches = find_all_matches(&mut self.tree, query, options);
+        let Ok(Some(compiled)) = CompiledQuery::compile(query, options) else {
+            return 0;
+        };
+        let matches = compiled.find_all_in_tree(&mut self.tree, options.max_matches);
         if matches.is_empty() {
             return 0;
         }
         let count = matches.len();
-        let inserted_bytes = self.normalize_insert_eol(replacement);
+        let is_regex = compiled.is_regex();
+        let literal_bytes = if is_regex {
+            Vec::new()
+        } else {
+            self.normalize_insert_eol(replacement)
+        };
+        let mut scratch = SearchScratch::new();
         let mut ops = Vec::with_capacity(count);
         let mut earliest_line = usize::MAX;
 
@@ -639,16 +653,26 @@ impl Document {
             let (line, _) = self.tree.byte_to_line_col(m.start);
             earliest_line = earliest_line.min(line);
             let deleted = self.tree.delete(m.start, m.end - m.start);
+            let inserted_bytes = if is_regex {
+                let matched_str = String::from_utf8_lossy(&deleted);
+                let expanded = compiled.expand_replacement(&matched_str, replacement, &mut scratch);
+                self.normalize_insert_eol(&expanded)
+            } else {
+                literal_bytes.clone()
+            };
             if !inserted_bytes.is_empty() {
                 self.tree.insert(m.start, &inserted_bytes);
             }
             ops.push(EditOp {
                 offset: m.start,
                 deleted,
-                inserted: inserted_bytes.clone(),
+                inserted: inserted_bytes,
                 cursor_before: m.end,
-                cursor_after: m.start + inserted_bytes.len() as u64,
+                cursor_after: m.start + (ops.last().map_or(0, |_| 0)),
             });
+            if let Some(op) = ops.last_mut() {
+                op.cursor_after = m.start + op.inserted.len() as u64;
+            }
         }
         self.undo.record_batch(ops, timestamp_ms);
         if earliest_line != usize::MAX {
@@ -658,8 +682,37 @@ impl Document {
         count
     }
 
+    /// Expand `replacement` for a single match `m` (literal verbatim, or `$0`..`$9` in regex mode).
+    pub fn expand_replacement_at(
+        &mut self,
+        query: &str,
+        options: SearchOptions,
+        m: SearchMatch,
+        replacement: &str,
+    ) -> String {
+        if !options.regex {
+            return replacement.to_string();
+        }
+        let Ok(Some(compiled)) = CompiledQuery::compile(query, options) else {
+            return replacement.to_string();
+        };
+        let mut buf = Vec::with_capacity((m.end - m.start) as usize);
+        self.tree.read_range(m.start, (m.end - m.start) as usize, &mut buf);
+        let matched = String::from_utf8_lossy(&buf);
+        let mut scratch = SearchScratch::new();
+        compiled.expand_replacement(&matched, replacement, &mut scratch)
+    }
+
     pub fn find_all(&mut self, query: &str, options: SearchOptions) -> Vec<SearchMatch> {
         find_all_matches(&mut self.tree, query, options)
+    }
+
+    pub fn find_all_checked(
+        &mut self,
+        query: &str,
+        options: SearchOptions,
+    ) -> Result<Vec<SearchMatch>, RegexError> {
+        find_all_matches_checked(&mut self.tree, query, options)
     }
 
     pub fn break_undo_coalescing(&mut self) {

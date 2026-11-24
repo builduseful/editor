@@ -12,6 +12,7 @@
 pub mod document;
 pub mod grapheme;
 pub mod piece_tree;
+pub mod regex;
 pub mod search;
 pub mod swar;
 pub mod syntax;
@@ -25,7 +26,11 @@ pub use grapheme::{
     prev_grapheme_boundary, prev_word_boundary, validate_utf8_offset, word_range_at,
 };
 pub use piece_tree::{PieceTree, Summary};
-pub use search::{find_all_matches, find_next_match, SearchMatch, SearchOptions};
+pub use regex::{is_word_char, Captures, PikeVmScratch, Regex, RegexError};
+pub use search::{
+    find_all_matches, find_all_matches_checked, find_next_match, CompiledQuery, SearchMatch,
+    SearchOptions, SearchScratch,
+};
 pub use syntax::{
     Language, LanguageMeta, LanguageRegistry, LexState, LineState, SyntaxCache, SyntaxPlugin,
     TokenKind, TokenSpan,

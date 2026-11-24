@@ -211,8 +211,21 @@ impl BaseBacking {
                 dst[..avail].copy_from_slice(&v[start..start + avail]);
             }
             BaseBacking::Paged { handle, cache, .. } => {
-                let mut guard = cache.lock().unwrap();
-                guard.read(handle.as_ref(), offset, dst);
+                if dst.len() >= PAGE_SIZE {
+                    // Large streaming read (e.g. 60 MB document search): read directly from the
+                    // backing handle to avoid locking the page cache, double-copying, or evicting
+                    // hot viewport pages!
+                    let mut got = 0usize;
+                    while got < dst.len() {
+                        match handle.read_at(offset + got as u64, &mut dst[got..]) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => got += n,
+                        }
+                    }
+                } else {
+                    let mut guard = cache.lock().unwrap();
+                    guard.read(handle.as_ref(), offset, dst);
+                }
             }
         }
     }
@@ -570,6 +583,61 @@ impl Node {
                     }
                 }
                 self.recompute_summary();
+            }
+        }
+    }
+
+    fn read_into_slice(
+        &self,
+        local_offset: u64,
+        mut dst: &mut [u8],
+        base: &BaseBacking,
+        add: &AddBuffer,
+    ) {
+        if dst.is_empty() || local_offset >= self.summary().bytes {
+            return;
+        }
+        match self {
+            Node::Leaf { pieces, .. } => {
+                let mut acc = 0u64;
+                for p in pieces {
+                    let p_end = acc + p.len();
+                    if p_end > local_offset {
+                        let start_in_p = local_offset.saturating_sub(acc);
+                        let avail = (p.len() - start_in_p) as usize;
+                        let take = avail.min(dst.len());
+                        read_piece_bytes(
+                            p.source,
+                            p.offset + start_in_p,
+                            &mut dst[..take],
+                            base,
+                            add,
+                        );
+                        dst = &mut dst[take..];
+                        if dst.is_empty() {
+                            return;
+                        }
+                    }
+                    acc = p_end;
+                }
+            }
+            Node::Internal { children, .. } => {
+                let mut acc = 0u64;
+                for c in children {
+                    let c_len = c.summary().bytes;
+                    let c_end = acc + c_len;
+                    if c_end > local_offset {
+                        let sub_off = local_offset.saturating_sub(acc);
+                        let avail = (c_len - sub_off) as usize;
+                        let take = avail.min(dst.len());
+                        c.read_into_slice(sub_off, &mut dst[..take], base, add);
+                        dst = &mut dst[take..];
+                        if dst.is_empty() {
+                            return;
+                        }
+                    }
+                    acc = c_end;
+                }
             }
         }
     }
@@ -1198,6 +1266,26 @@ impl PieceTree {
             .map(|(s, _, _)| s)
             .unwrap_or(0);
         (line, clamped.saturating_sub(line_start) as usize)
+    }
+
+    /// Read bytes `[offset, offset + dst.len())` directly into a pre-sized slice without
+    /// zeroing/reallocating on every streaming window. Returns the number of bytes written.
+    pub fn read_into_slice(&mut self, offset: u64, dst: &mut [u8]) -> usize {
+        if dst.is_empty() {
+            return 0;
+        }
+        let end = offset.saturating_add(dst.len() as u64);
+        if end > self.root.summary().bytes && !self.is_fully_indexed() {
+            let needed = end - self.root.summary().bytes;
+            self.index_base_until(self.indexed_base_end + needed + LAZY_CHUNK_BYTES);
+        }
+        let avail = self.root.summary().bytes.saturating_sub(offset) as usize;
+        let to_read = dst.len().min(avail);
+        if to_read > 0 {
+            self.root
+                .read_into_slice(offset, &mut dst[..to_read], &self.base, &self.add);
+        }
+        to_read
     }
 
     /// Read bytes `[offset, offset + len)` into `out`.

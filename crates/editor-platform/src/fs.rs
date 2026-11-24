@@ -134,6 +134,37 @@ pub trait FileHandle: Send + Sync {
 /// Minimal OS filesystem adapter.
 pub trait FileSystem: Send + Sync {
     fn open_read(&self, path: &Path) -> FsResult<Arc<dyn FileHandle>>;
+
+    /// Fast zero-handle prefix read into a caller-owned buffer (avoids `Arc`/`PathBuf` allocs
+    /// when scanning thousands of files). Returns `Ok(Some(total_file_len))` for regular files
+    /// (with `out` holding `min(total_file_len, max_bytes)` bytes), or `Ok(None)` if non-regular.
+    fn read_prefix_into(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+        out: &mut Vec<u8>,
+    ) -> FsResult<Option<u64>> {
+        let handle = match self.open_read(path) {
+            Ok(h) => h,
+            Err(FsError::NotRegularFile(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let total = handle.len();
+        let to_read = (total as usize).min(max_bytes);
+        out.clear();
+        out.resize(to_read, 0);
+        let mut got = 0usize;
+        while got < to_read {
+            match handle.read_at(got as u64, &mut out[got..]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(e) => return Err(e),
+            }
+        }
+        out.truncate(got);
+        Ok(Some(total))
+    }
+
     fn stat(&self, path: &Path) -> FsResult<FileStat>;
     fn lstat(&self, path: &Path) -> FsResult<FileStat>;
     fn canonicalize(&self, path: &Path) -> FsResult<PathBuf>;
@@ -291,17 +322,46 @@ fn unique_temp_path(target: &Path) -> PathBuf {
 
 impl FileSystem for StdFileSystem {
     fn open_read(&self, path: &Path) -> FsResult<Arc<dyn FileHandle>> {
-        let meta = std::fs::metadata(path).map_err(|e| map_io_err(path, e))?;
-        if !meta.file_type().is_file() {
-            return Err(FsError::NotRegularFile(path.to_path_buf()));
-        }
         let file = File::open(path).map_err(|e| map_io_err(path, e))?;
         let fmeta = file.metadata().map_err(|e| map_io_err(path, e))?;
+        if !fmeta.file_type().is_file() {
+            return Err(FsError::NotRegularFile(path.to_path_buf()));
+        }
         Ok(Arc::new(StdFileHandle {
             file,
             len: fmeta.len(),
             path: path.to_path_buf(),
         }))
+    }
+
+    fn read_prefix_into(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+        out: &mut Vec<u8>,
+    ) -> FsResult<Option<u64>> {
+        use std::io::Read;
+        let mut file = File::open(path).map_err(|e| map_io_err(path, e))?;
+        let fmeta = file.metadata().map_err(|e| map_io_err(path, e))?;
+        if !fmeta.file_type().is_file() {
+            return Ok(None);
+        }
+        let total = fmeta.len();
+        let to_read = (total as usize).min(max_bytes);
+        if out.len() < to_read {
+            out.resize(to_read, 0);
+        }
+        let mut got = 0usize;
+        while got < to_read {
+            match file.read(&mut out[got..to_read]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(map_io_err(path, e)),
+            }
+        }
+        out.truncate(got);
+        Ok(Some(total))
     }
 
     fn stat(&self, path: &Path) -> FsResult<FileStat> {
@@ -358,13 +418,18 @@ impl FileSystem for StdFileSystem {
                 kind,
             });
         }
-        // Deterministic ordering: directories first, then case-insensitive name, then byte name.
-        entries.sort_by(|a, b| {
+        // Deterministic ordering: directories first, then ASCII case-insensitive name (zero-alloc), then byte name.
+        entries.sort_unstable_by(|a, b| {
             let a_dir = a.kind == EntryKind::Directory;
             let b_dir = b.kind == EntryKind::Directory;
             b_dir
                 .cmp(&a_dir)
-                .then_with(|| a.name.to_ascii_lowercase().cmp(&b.name.to_ascii_lowercase()))
+                .then_with(|| {
+                    a.name
+                        .bytes()
+                        .map(|c| c.to_ascii_lowercase())
+                        .cmp(b.name.bytes().map(|c| c.to_ascii_lowercase()))
+                })
                 .then_with(|| a.name.cmp(&b.name))
         });
         Ok(entries)
