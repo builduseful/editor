@@ -3,21 +3,135 @@ name: CI
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".github/workflows/release.yml"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  # Fast (~2s) path classifier matching our workspace crate graph so OS-specific
+  # edits only trigger that OS's runner (e.g. Windows-only changes never build macOS).
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      macos: ${{ steps.filter.outputs.macos }}
+      windows: ${{ steps.filter.outputs.windows }}
+      linux: ${{ steps.filter.outputs.linux }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Classify changed paths
+        id: filter
+        shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import os, subprocess
+
+          event = os.environ["EVENT_NAME"]
+          head = os.environ["HEAD_SHA"]
+
+          def run_all():
+              print("macos=true")
+              print("windows=true")
+              print("linux=true")
+              raise SystemExit(0)
+
+          if event == "workflow_dispatch":
+              run_all()
+
+          if event == "pull_request":
+              base = os.environ.get("PR_BASE", "")
+              cmd = ["git", "diff", "--name-only", f"{base}...{head}"]
+          else:
+              before = os.environ.get("PUSH_BEFORE", "")
+              if not before or before == "0" * 40:
+                  run_all()
+              valid = subprocess.run(
+                  ["git", "cat-file", "-e", f"{before}^{{commit}}"],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
+              ).returncode == 0
+              if not valid:
+                  run_all()
+              cmd = ["git", "diff", "--name-only", f"{before}..{head}"]
+
+          files = [f for f in subprocess.check_output(cmd, text=True).splitlines() if f]
+
+          macos = windows = linux = False
+          shared_prefixes = (
+              "crates/editor-platform/",
+              "crates/editor-core/",
+              "crates/editor-render/",
+              "crates/editor-app/",
+              "crates/editor-cli/",
+          )
+          shared_exact = {"Cargo.toml", "Cargo.lock", ".github/workflows/ci.yml"}
+
+          for f in files:
+              if f in shared_exact or f.startswith(shared_prefixes):
+                  macos = windows = linux = True
+              elif f.startswith("crates/editor-macos/") or f == "scripts/install-macos.sh":
+                  macos = True
+              elif f.startswith("crates/editor-windows/") or f.startswith("scripts/install-windows"):
+                  windows = True
+              elif f.startswith("crates/editor-linux/") or f.startswith("scripts/install-linux"):
+                  linux = True
+
+          print(f"macos={'true' if macos else 'false'}")
+          print(f"windows={'true' if windows else 'false'}")
+          print(f"linux={'true' if linux else 'false'}")
+          PY
+
   test-and-bundle-macos:
+    needs: changes
+    if: needs.changes.outputs.macos == 'true'
     runs-on: macos-latest
+    env:
+      CARGO_INCREMENTAL: 0
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo build artifacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/debug/deps
+            target/debug/build
+            target/debug/.fingerprint
+            target/release/deps
+            target/release/build
+            target/release/.fingerprint
+          key: cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'crates/editor-macos/build.rs', 'crates/editor-macos/objc/mac_adapter.m') }}-${{ github.sha }}
+          restore-keys: |
+            cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.toml', 'crates/**/Cargo.toml', 'crates/editor-macos/build.rs', 'crates/editor-macos/objc/mac_adapter.m') }}-
+            cargo-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Run workspace tests
         run: cargo test --workspace
