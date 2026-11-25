@@ -1136,6 +1136,7 @@ void mac_activate_app(void) {
     [appMenu addItemWithTitle:@"About editor"
                        action:@selector(orderFrontStandardAboutPanel:)
                 keyEquivalent:@""];
+    [appMenu addItem:[self menuItem:@"Check for Updates…" key:@"" tag:51 mods:0]];
     [appMenu addItem:[NSMenuItem separatorItem]];
     [appMenu addItemWithTitle:@"Hide editor"
                        action:@selector(hide:)
@@ -1264,6 +1265,89 @@ void mac_activate_app(void) {
 }
 
 @end
+
+int mac_http_get(const char* url_cstr, size_t max_bytes, uint8_t** out_buf, size_t* out_len,
+                 char** out_err) {
+    if (out_buf) *out_buf = NULL;
+    if (out_len) *out_len = 0;
+    if (out_err) *out_err = NULL;
+    if (!url_cstr || !out_buf || !out_len) return -1;
+
+    @autoreleasepool {
+        NSString* urlStr = [NSString stringWithUTF8String:url_cstr];
+        NSURL* url = urlStr ? [NSURL URLWithString:urlStr] : nil;
+        if (!url || ![url.scheme.lowercaseString isEqualToString:@"https"]) {
+            if (out_err) *out_err = strdup("only https:// URLs are permitted");
+            return -1;
+        }
+
+        NSURLSessionConfiguration* cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+        cfg.timeoutIntervalForRequest = 15.0;
+        cfg.timeoutIntervalForResource = 60.0;
+        NSURLSession* session = [NSURLSession sessionWithConfiguration:cfg];
+
+        NSMutableURLRequest* req = [NSMutableURLRequest requestWithURL:url];
+        req.HTTPMethod = @"GET";
+        [req setValue:@"editor-updater/1" forHTTPHeaderField:@"User-Agent"];
+
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+        __block NSData* respData = nil;
+        __block NSHTTPURLResponse* httpResp = nil;
+        __block NSError* reqErr = nil;
+
+        NSURLSessionDataTask* task =
+            [session dataTaskWithRequest:req
+                       completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
+                           respData = data;
+                           if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
+                               httpResp = (NSHTTPURLResponse*)response;
+                           }
+                           reqErr = error;
+                           dispatch_semaphore_signal(sem);
+                       }];
+        [task resume];
+        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
+        [session finishTasksAndInvalidate];
+
+        if (reqErr) {
+            if (out_err) {
+                const char* msg = [[reqErr localizedDescription] UTF8String];
+                *out_err = strdup(msg ? msg : "network request failed");
+            }
+            return -1;
+        }
+        if (!httpResp || httpResp.statusCode != 200) {
+            NSInteger code = httpResp ? httpResp.statusCode : 0;
+            if (out_err) {
+                char tmp[64];
+                snprintf(tmp, sizeof(tmp), "HTTP %ld", (long)code);
+                *out_err = strdup(tmp);
+            }
+            return -1;
+        }
+        NSUInteger len = respData.length;
+        if (len > max_bytes) {
+            if (out_err) *out_err = strdup("response exceeded maximum allowed size");
+            return -1;
+        }
+        uint8_t* copy = (uint8_t*)malloc(len > 0 ? len : 1);
+        if (!copy) {
+            if (out_err) *out_err = strdup("out of memory");
+            return -1;
+        }
+        if (len > 0) {
+            memcpy(copy, respData.bytes, len);
+        }
+        *out_buf = copy;
+        *out_len = (size_t)len;
+        return 0;
+    }
+}
+
+void mac_free_bytes(uint8_t* ptr) {
+    if (ptr) free(ptr);
+}
 
 void mac_wake_main_loop(void) {
     dispatch_async(dispatch_get_main_queue(), ^{

@@ -13,13 +13,14 @@ pub mod input;
 pub mod ipc;
 pub mod raster;
 pub mod surface;
+pub mod update;
 pub mod version;
 
 pub use fs::{
     DirEntry, EntryKind, FileHandle, FileLock, FileRev, FileStat, FileSystem, FsError, FsResult,
     MemoryFileSystem, StdFileSystem,
 };
-pub use host::{Clipboard, HeadlessHost, MainLoopWaker, MemoryClipboard, PlatformHost};
+pub use host::{Clipboard, HeadlessHost, HttpFetcher, MainLoopWaker, MemoryClipboard, PlatformHost};
 pub use ignore::{is_gitignored, GitIgnoreLayer, IgnoreRules};
 pub use input::{
     AppCommand, ConfirmChoice, CursorShape, DragPhase, InputEvent, Key, Modifiers, MouseButton,
@@ -29,4 +30,8 @@ pub use raster::{
     BuiltinBitmapRasterizer, FontMetrics, FontStyle, GlyphFormat, GlyphRasterizer, RasterizedGlyph,
 };
 pub use surface::{DirtyRegion, Framebuffer, PixelRect, SurfaceMut};
+pub use update::{
+    check_manifest_bytes, enclosing_app_bundle, sha256_hex, ReleaseAsset, ReleaseManifest,
+    UpdateCheckOutcome, UpdateInfo, RELEASE_MANIFEST_URL,
+};
 pub use version::{compare_semver, SemVer, APP_VERSION, BUNDLE_IDENTIFIER};

@@ -167,6 +167,20 @@ enum PendingDiscardAction {
     Quit,
     DeletePath { path: PathBuf, is_dir: bool },
     MoveLargeFolder { src: PathBuf, dst_dir: PathBuf },
+    ConfirmUpdate(editor_platform::UpdateInfo),
+    RestartForUpdate(PathBuf),
+}
+
+enum UpdateWorkerEvent {
+    CheckDone {
+        manual: bool,
+        result: Result<editor_platform::UpdateCheckOutcome, String>,
+    },
+    InstallDone {
+        version: String,
+        target_app: PathBuf,
+        result: Result<(), String>,
+    },
 }
 
 pub struct EditorApp {
@@ -243,6 +257,11 @@ pub struct EditorApp {
     pub wrap_by_ext: BTreeMap<String, bool>,
     /// Auto-close brackets/quotes, wrap selections, paired backspace, and smart Enter indent.
     pub auto_pairs: bool,
+    /// Check GitHub Releases at most once every 24h on launch (zero background timers).
+    pub auto_check_updates: bool,
+    last_update_check_secs: u64,
+    available_update: Option<editor_platform::UpdateInfo>,
+    update_worker_slot: Option<Arc<std::sync::Mutex<Option<UpdateWorkerEvent>>>>,
 
     pub atlas: GlyphAtlas,
     pub framebuffer: Framebuffer,
@@ -339,6 +358,10 @@ impl EditorApp {
             default_word_wrap: false,
             wrap_by_ext: default_wrap_by_ext(),
             auto_pairs: true,
+            auto_check_updates: true,
+            last_update_check_secs: 0,
+            available_update: None,
+            update_worker_slot: None,
             atlas: GlyphAtlas::new(),
             framebuffer,
             layout: AppLayout::default(),
@@ -439,6 +462,15 @@ impl EditorApp {
         if let Some(ap) = host.load_pref("AutoPairs") {
             self.auto_pairs = ap == "1" || ap == "true";
         }
+        if let Some(au) = host.load_pref("AutoCheckUpdates") {
+            self.auto_check_updates = au == "1" || au == "true";
+        }
+        if let Some(ts) = host
+            .load_pref("LastUpdateCheckEpoch")
+            .and_then(|s| s.parse::<u64>().ok())
+        {
+            self.last_update_check_secs = ts;
+        }
         self.sync_wrap_for_panes();
         self.sync_languages_for_panes();
         self.recompute_layout();
@@ -476,6 +508,16 @@ impl EditorApp {
         host.save_pref("SyntaxExtMap", &format_str_map(&self.syntax_ext_map));
         host.save_pref("VimMode", if self.vim.enabled { "1" } else { "0" });
         host.save_pref("AutoPairs", if self.auto_pairs { "1" } else { "0" });
+        host.save_pref(
+            "AutoCheckUpdates",
+            if self.auto_check_updates { "1" } else { "0" },
+        );
+        if self.last_update_check_secs > 0 {
+            host.save_pref(
+                "LastUpdateCheckEpoch",
+                &self.last_update_check_secs.to_string(),
+            );
+        }
     }
 
     /// Resolve effective word wrap for `path` (per-extension override -> global default).
@@ -2594,11 +2636,20 @@ impl EditorApp {
         clipboard: &mut dyn Clipboard,
         host: &mut dyn PlatformHost,
     ) {
+        if matches!(event, InputEvent::Tick { .. }) {
+            self.poll_update_worker(host);
+        }
         // Intercept keyboard & mouse when the custom in-app confirmation modal is open.
         if self.confirm_modal.visible {
             match event {
                 InputEvent::KeyDown { key, .. } => {
-                    let choice = if self.confirm_modal.is_delete || self.confirm_modal.is_move_confirm {
+                    let choice = if self.confirm_modal.is_update_confirm {
+                        match key {
+                            Key::Enter => Some(ConfirmChoice::Discard),
+                            Key::Escape => Some(ConfirmChoice::Cancel),
+                            _ => None,
+                        }
+                    } else if self.confirm_modal.is_delete || self.confirm_modal.is_move_confirm {
                         match key {
                             Key::Enter | Key::Char('d') | Key::Char('D') => {
                                 Some(ConfirmChoice::Discard)
@@ -3001,6 +3052,7 @@ impl EditorApp {
                         }
                         _ => {}
                     }
+                    self.maybe_start_auto_update_check(host);
                 }
                 self.mark_dirty();
                 host.request_redraw();
@@ -3624,6 +3676,266 @@ impl EditorApp {
                     self.execute_move_entry(&src, &dst, true, true, host);
                 }
             }
+            PendingDiscardAction::ConfirmUpdate(info) => {
+                self.start_update_install(info, host);
+            }
+            PendingDiscardAction::RestartForUpdate(target_app) => {
+                if self.doc.is_dirty() {
+                    let cur = self.active_buf_id;
+                    self.force_close_buffer(cur, host);
+                }
+                if let Some(next_dirty) = self.first_dirty_buffer() {
+                    self.activate_buffer(next_dirty, host);
+                    self.request_discard_or_run(
+                        PendingDiscardAction::RestartForUpdate(target_app),
+                        host,
+                    );
+                } else {
+                    self.save_session(host);
+                    host.relaunch_after_update(&target_app);
+                    host.request_quit();
+                }
+            }
+        }
+    }
+
+    /// Run a passive once-per-24h GitHub Releases check (zero background timers, zero idle CPU).
+    pub fn maybe_start_auto_update_check(&mut self, host: &mut dyn PlatformHost) {
+        if self.update_worker_slot.is_some() || self.available_update.is_some() {
+            return;
+        }
+        let now = editor_platform::update::unix_now_secs();
+        if !editor_platform::update::should_auto_check(
+            self.auto_check_updates,
+            self.last_update_check_secs,
+            now,
+        ) {
+            return;
+        }
+        if host.http_fetcher().is_none() {
+            return;
+        }
+        self.check_for_updates(false, host);
+    }
+
+    /// Trigger a one-shot release manifest check (manual or passive 24h launch check).
+    pub fn check_for_updates(&mut self, manual: bool, host: &mut dyn PlatformHost) {
+        if manual {
+            if let Some(info) = self.available_update.clone() {
+                self.open_update_confirm_modal(info, host);
+                return;
+            }
+        }
+        if self.update_worker_slot.is_some() {
+            if manual {
+                self.set_notice("Update already in progress", false);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            return;
+        }
+        let Some(fetcher) = host.http_fetcher() else {
+            if manual {
+                self.set_notice("Updates are unavailable in headless mode", true);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            return;
+        };
+
+        let now = editor_platform::update::unix_now_secs();
+        self.last_update_check_secs = now;
+        host.save_pref("LastUpdateCheckEpoch", &now.to_string());
+
+        let waker = host.main_loop_waker();
+        let slot: Arc<std::sync::Mutex<Option<UpdateWorkerEvent>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot_bg = Arc::clone(&slot);
+        self.update_worker_slot = Some(slot);
+
+        if manual {
+            self.set_notice("Checking for updates…", false);
+            self.mark_dirty();
+            host.request_redraw();
+        }
+
+        std::thread::spawn(move || {
+            let res = fetcher(
+                editor_platform::RELEASE_MANIFEST_URL,
+                editor_platform::update::MAX_MANIFEST_BYTES,
+            )
+            .and_then(|bytes| editor_platform::check_manifest_bytes(&bytes));
+            if let Ok(mut guard) = slot_bg.lock() {
+                *guard = Some(UpdateWorkerEvent::CheckDone {
+                    manual,
+                    result: res,
+                });
+            }
+            if let Some(w) = waker {
+                w();
+            }
+        });
+    }
+
+    fn open_update_confirm_modal(
+        &mut self,
+        info: editor_platform::UpdateInfo,
+        host: &mut dyn PlatformHost,
+    ) {
+        let ver = info.version.clone();
+        self.pending_discard = Some(PendingDiscardAction::ConfirmUpdate(info));
+        self.confirm_modal
+            .open_update(&ver, editor_platform::APP_VERSION);
+        self.mark_dirty();
+        host.request_redraw();
+    }
+
+    fn start_update_install(
+        &mut self,
+        info: editor_platform::UpdateInfo,
+        host: &mut dyn PlatformHost,
+    ) {
+        if self.update_worker_slot.is_some() {
+            return;
+        }
+        let Some(fetcher) = host.http_fetcher() else {
+            self.set_notice("Updates are unavailable in headless mode", true);
+            self.mark_dirty();
+            host.request_redraw();
+            return;
+        };
+
+        #[cfg(target_os = "macos")]
+        let target_app = match editor_platform::update::resolve_updatable_macos_app() {
+            Ok(p) => p,
+            Err(msg) => {
+                self.set_notice(msg, true);
+                self.mark_dirty();
+                host.request_redraw();
+                return;
+            }
+        };
+        #[cfg(not(target_os = "macos"))]
+        let target_app: PathBuf = {
+            let _ = (&info, &fetcher);
+            self.set_notice("In-app updates are currently supported on macOS only", true);
+            self.mark_dirty();
+            host.request_redraw();
+            return;
+        };
+
+        #[cfg(target_os = "macos")]
+        {
+            let waker = host.main_loop_waker();
+            let slot: Arc<std::sync::Mutex<Option<UpdateWorkerEvent>>> =
+                Arc::new(std::sync::Mutex::new(None));
+            let slot_bg = Arc::clone(&slot);
+            self.update_worker_slot = Some(slot);
+
+            self.set_notice(format!("Downloading editor v{}…", info.version), false);
+            self.mark_dirty();
+            host.request_redraw();
+
+            std::thread::spawn(move || {
+                let res = fetcher(
+                    &info.asset_url,
+                    editor_platform::update::MAX_ARCHIVE_BYTES,
+                )
+                .and_then(|bytes| {
+                    editor_platform::update::install_macos_tar_gz(
+                        &bytes,
+                        &info.sha256,
+                        &info.version,
+                        &target_app,
+                    )
+                });
+                if let Ok(mut guard) = slot_bg.lock() {
+                    *guard = Some(UpdateWorkerEvent::InstallDone {
+                        version: info.version,
+                        target_app,
+                        result: res,
+                    });
+                }
+                if let Some(w) = waker {
+                    w();
+                }
+            });
+        }
+    }
+
+    fn poll_update_worker(&mut self, host: &mut dyn PlatformHost) {
+        let ev = {
+            let Some(ref slot) = self.update_worker_slot else {
+                return;
+            };
+            let Ok(mut guard) = slot.lock() else {
+                return;
+            };
+            guard.take()
+        };
+        let Some(ev) = ev else {
+            return;
+        };
+        self.update_worker_slot = None;
+
+        match ev {
+            UpdateWorkerEvent::CheckDone { manual, result } => match result {
+                Ok(editor_platform::UpdateCheckOutcome::Available(info)) => {
+                    let ver = info.version.clone();
+                    self.available_update = Some(info.clone());
+                    if manual {
+                        self.open_update_confirm_modal(info, host);
+                    } else {
+                        self.set_notice(
+                            format!("Update v{ver} available — Run Check for Updates"),
+                            false,
+                        );
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                }
+                Ok(editor_platform::UpdateCheckOutcome::UpToDate { current, .. }) => {
+                    self.available_update = None;
+                    if manual {
+                        self.set_notice(format!("editor {current} is up to date"), false);
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                }
+                Err(e) => {
+                    if manual {
+                        self.set_notice(format!("Update check failed: {e}"), true);
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                }
+            },
+            UpdateWorkerEvent::InstallDone {
+                version,
+                target_app,
+                result,
+            } => match result {
+                Ok(()) => {
+                    self.available_update = None;
+                    self.set_notice(format!("Updated to v{version} — restarting"), false);
+                    if let Some(dirty_id) = self.first_dirty_buffer() {
+                        self.activate_buffer(dirty_id, host);
+                        self.request_discard_or_run(
+                            PendingDiscardAction::RestartForUpdate(target_app),
+                            host,
+                        );
+                    } else {
+                        self.save_session(host);
+                        host.relaunch_after_update(&target_app);
+                        host.request_quit();
+                    }
+                }
+                Err(e) => {
+                    self.set_notice(format!("Update failed: {e}"), true);
+                    self.mark_dirty();
+                    host.request_redraw();
+                }
+            },
         }
     }
 
@@ -4390,6 +4702,8 @@ impl EditorApp {
             ("sidebar-undo", "Sidebar: Undo file action", "File & Navigation"),
             ("sidebar-redo", "Sidebar: Redo file action", "File & Navigation"),
             ("reload", "Reload file from disk", "File & Navigation"),
+            ("check-updates", "Check for updates", "Application"),
+            ("toggle-auto-updates", "Toggle automatic update checks", "Application"),
         ];
         for &(id, title, category) in extras {
             entries.push(editor_render::PaletteCommandEntry {
@@ -5034,6 +5348,9 @@ impl EditorApp {
                 );
                 self.mark_dirty();
                 host.request_redraw();
+            }
+            AppCommand::CheckForUpdates => {
+                self.check_for_updates(true, host);
             }
             AppCommand::Quit => {
                 if let Some(dirty_id) = self.first_dirty_buffer() {
@@ -7987,6 +8304,23 @@ impl EditorApp {
                     "open-dialog" => self.handle_command(AppCommand::OpenFile, rasterizer, clipboard, host),
                     "open-folder" => self.handle_command(AppCommand::OpenFolder, rasterizer, clipboard, host),
                     "save-as" => self.handle_command(AppCommand::SaveAs, rasterizer, clipboard, host),
+                    "check-updates" => {
+                        self.handle_command(AppCommand::CheckForUpdates, rasterizer, clipboard, host)
+                    }
+                    "toggle-auto-updates" => {
+                        self.auto_check_updates = !self.auto_check_updates;
+                        self.save_preferences(host);
+                        self.set_notice(
+                            if self.auto_check_updates {
+                                "Automatic update checks enabled"
+                            } else {
+                                "Automatic update checks disabled"
+                            },
+                            false,
+                        );
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
                     "quit" => self.handle_command(AppCommand::Quit, rasterizer, clipboard, host),
                     "focus" => activate = true,
                     other if other.starts_with("pin:") => {

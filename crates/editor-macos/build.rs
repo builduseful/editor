@@ -10,20 +10,31 @@ fn main() {
         return;
     }
 
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let obj_path = out_dir.join("mac_adapter.o");
     let lib_path = out_dir.join("libmac_adapter.a");
 
-    let status = Command::new("/usr/bin/clang")
-        .args([
-            "-c",
-            "-fobjc-arc",
-            "-O2",
-            "-Wall",
-            "-Wextra",
-            "objc/mac_adapter.m",
-            "-o",
-        ])
+    let mut clang = Command::new("/usr/bin/clang");
+    clang.args([
+        "-c",
+        "-fobjc-arc",
+        "-O2",
+        "-Wall",
+        "-Wextra",
+        "-mmacosx-version-min=13.0",
+    ]);
+    match target_arch.as_str() {
+        "aarch64" => {
+            clang.args(["-arch", "arm64"]);
+        }
+        "x86_64" => {
+            clang.args(["-arch", "x86_64"]);
+        }
+        _ => {}
+    }
+    let status = clang
+        .args(["objc/mac_adapter.m", "-o"])
         .arg(&obj_path)
         .status()
         .expect("failed to invoke clang");

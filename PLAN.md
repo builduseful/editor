@@ -86,12 +86,11 @@ scripts/
 - [x] **Two-Pane Quick Open (`⌘P`) & Search in Files (`⇧⌘F`)**: live syntax-highlighted preview, automatic resume, bounded 20 MB modal-lifetime `SearchSlab` (100% freed on close).
 - [x] **Per-OS Ignore Rules, `.gitignore`, & Hybrid Streaming**: declarative per-OS ignore tables + hierarchical `.gitignore` in `editor-platform::ignore`; 8 ms sync head-start → cancellable background streaming via `MainLoopWaker` so huge directories like `$HOME` stay instant and 0% idle CPU.
 - [x] **Sidebar Polish**: lazy tree, drag-resizable width, left/right dock, keyboard navigation, and right-click `Copy Path` / `Copy Relative Path`.
-- [x] **Single-Source Versioning & Minimal macOS Installer**: `editor-platform::version` (`SemVer` + build numbers), `README.md`, updated `ARCHITECTURE.md` / `PLAN.md`, and `scripts/install-macos.sh` (atomic install + clean `--uninstall` / `--purge`).
+- [x] **Single-Source Versioning, Minimal macOS Installer & GitHub Releases Auto-Updater**: `editor-platform::{version, update}` (SemVer, pure-Rust SHA-256, CDN `release.json` manifest, host allowlist, App Translocation/dev guards, atomic bundle swap), `NSURLSession` native HTTPS check (once per 24h on launch + manual **Check for Updates…** / `editor update`), `scripts/install-macos.sh` (source build, `--from-release`, and standalone `curl | sh`), `.github/workflows/{ci,release}.yml`, `README.md`, and updated `ARCHITECTURE.md` / `PLAN.md`.
 
 ---
 
 ## 4. Next Planned Milestones
 
-- [ ] **GitHub Releases Auto-Updater**: zero-dependency, zero-idle-CPU update flow reading a static `release.json` asset from public GitHub Releases (`releases/latest/download/release.json`), SHA-256 + `codesign` verification, atomic `Editor.app` swap (updating GUI + bundled CLI together), and CI release workflow.
 - [ ] **Subtle, Zero-Idle-CPU Git Awareness**: status bar branch badge (direct `.git/HEAD` read on open/focus/`FsChanged`), quiet gutter diff ticks, and optional `.gitignore` dimming in sidebar.
 - [ ] **Cross-Platform Adapters & Native Seams**: Linux/Windows adapters behind `editor-platform`, plus native `NSTextInputClient` (IME) and `NSAccessibility` wired to the existing `ImeComposition` / `A11yNode` seams.

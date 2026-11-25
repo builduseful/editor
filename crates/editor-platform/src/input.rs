@@ -154,6 +154,7 @@ pub enum AppCommand {
     ToggleSyntaxStyle,
     ShowShortcuts,
     ToggleVimMode,
+    CheckForUpdates,
     Quit,
 }
 

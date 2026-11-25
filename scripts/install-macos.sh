@@ -9,9 +9,13 @@
 #
 # The CLI in PATH is a single symlink pointing into Editor.app/Contents/MacOS/editor,
 # so GUI and CLI stay version-locked with zero scattered files on disk.
+#
+# Works both inside a local git checkout (builds from source) and standalone via:
+#   curl -fsSL https://raw.githubusercontent.com/builduseful/editor/main/scripts/install-macos.sh | sh
 
 set -eu
 
+REPO="builduseful/editor"
 BUNDLE_ID="com.builduseful.editor"
 APP_NAME="Editor.app"
 BIN_NAME="editor"
@@ -19,6 +23,8 @@ BIN_NAME="editor"
 MODE="install"
 USER_INSTALL=0
 NO_BUILD=0
+FROM_RELEASE=0
+RELEASE_TAG=""
 NO_CLI=0
 PURGE=0
 FORCE=0
@@ -33,16 +39,18 @@ Usage: scripts/install-macos.sh [OPTIONS]
 Install or remove editor on macOS with zero scattered files.
 
 Options:
-  --user            Install to ~/Applications and ~/.local/bin (no sudo required)
-  --app-dir DIR     Target directory for Editor.app (default: /Applications)
-  --bin-dir DIR     Target directory for the `editor` symlink (default: /usr/local/bin)
-  --app PATH        Install an existing Editor.app bundle (implies --no-build)
-  --no-build        Skip `cargo build` and install target/release/Editor.app
-  --no-cli          Do not create or remove the `editor` CLI symlink
-  --force           Replace an existing non-editor file at the CLI symlink path
-  --uninstall       Remove Editor.app and its `editor` symlink
-  --purge           With --uninstall, also remove saved macOS preferences and IPC socket
-  -h, --help        Show this help message
+  --user              Install to ~/Applications and ~/.local/bin (no sudo required)
+  --app-dir DIR       Target directory for Editor.app (default: /Applications)
+  --bin-dir DIR       Target directory for the `editor` symlink (default: /usr/local/bin)
+  --from-release      Download and verify the latest prebuilt GitHub Release
+  --tag TAG           With --from-release, install a specific release tag (e.g. v0.2.0)
+  --app PATH          Install an existing Editor.app bundle (implies --no-build)
+  --no-build          Skip `cargo build` and install target/release/Editor.app
+  --no-cli            Do not create or remove the `editor` CLI symlink
+  --force             Replace an existing non-editor file at the CLI symlink path
+  --uninstall         Remove Editor.app and its `editor` symlink
+  --purge             With --uninstall, also remove saved macOS preferences and IPC socket
+  -h, --help          Show this help message
 EOF
 }
 
@@ -57,6 +65,13 @@ while [ "$#" -gt 0 ]; do
         --bin-dir)
             [ "$#" -ge 2 ] || { echo "error: --bin-dir requires a path" >&2; exit 2; }
             BIN_DIR="$2"
+            shift
+            ;;
+        --from-release) FROM_RELEASE=1 ;;
+        --tag)
+            [ "$#" -ge 2 ] || { echo "error: --tag requires a release tag" >&2; exit 2; }
+            FROM_RELEASE=1
+            RELEASE_TAG="$2"
             shift
             ;;
         --app)
@@ -96,8 +111,19 @@ else
     [ -n "$BIN_DIR" ] || BIN_DIR="/usr/local/bin"
 fi
 
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
-REPO_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+# Detect whether running inside a local source checkout or standalone (e.g. `curl | sh`).
+REPO_ROOT=""
+if [ -n "${0:-}" ] && [ -f "$0" ]; then
+    SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+    CANDIDATE_ROOT=$(CDPATH= cd -- "$SCRIPT_DIR/.." && pwd)
+    if [ -f "$CANDIDATE_ROOT/Cargo.toml" ] && [ -d "$CANDIDATE_ROOT/crates/editor-macos" ]; then
+        REPO_ROOT="$CANDIDATE_ROOT"
+    fi
+fi
+
+if [ -z "$REPO_ROOT" ] && [ "$MODE" = "install" ] && [ -z "$SRC_APP" ]; then
+    FROM_RELEASE=1
+fi
 
 DEST_APP="$APP_DIR/$APP_NAME"
 LINK_PATH="$BIN_DIR/$BIN_NAME"
@@ -166,15 +192,76 @@ do_uninstall() {
 
 STAGING_APP=""
 PREV_APP=""
+DL_TMP=""
 cleanup() {
     if [ -n "$STAGING_APP" ] && [ -d "$STAGING_APP" ]; then
         run_priv "$APP_DIR" rm -rf "$STAGING_APP" 2>/dev/null || true
     fi
+    if [ -n "$DL_TMP" ] && [ -d "$DL_TMP" ]; then
+        rm -rf "$DL_TMP" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT INT TERM
 
+download_release_app() {
+    if [ -n "$RELEASE_TAG" ]; then
+        MANIFEST_URL="https://github.com/${REPO}/releases/download/${RELEASE_TAG}/release.json"
+    else
+        MANIFEST_URL="https://github.com/${REPO}/releases/latest/download/release.json"
+    fi
+
+    DL_TMP=$(mktemp -d "${TMPDIR:-/tmp}/editor-install.XXXXXX")
+    MANIFEST_FILE="$DL_TMP/release.json"
+
+    echo "Fetching release manifest..."
+    /usr/bin/curl -fsSL --proto =https --max-time 20 "$MANIFEST_URL" -o "$MANIFEST_FILE"
+
+    # Extract macos-universal URL and SHA-256 using macOS's built-in Python 3 or plutil/awk.
+    PARSED=$(/usr/bin/python3 - "$MANIFEST_FILE" <<'PY'
+import json, sys
+with open(sys.argv[1], "r", encoding="utf-8") as f:
+    m = json.load(f)
+assets = m.get("assets", {})
+a = assets.get("macos-universal") or assets.get("macos-arm64") or assets.get("macos-x86_64")
+if not a or "url" not in a or "sha256" not in a:
+    sys.exit("release manifest missing macOS asset")
+url = a["url"]
+sha = a["sha256"].strip().lower()
+ver = m.get("version", "")
+if not url.startswith("https://github.com/") and not url.startswith("https://objects.githubusercontent.com/"):
+    sys.exit("disallowed asset URL host")
+print(ver)
+print(url)
+print(sha)
+PY
+)
+    REL_VER=$(printf '%s\n' "$PARSED" | sed -n '1p')
+    ASSET_URL=$(printf '%s\n' "$PARSED" | sed -n '2p')
+    EXPECTED_SHA=$(printf '%s\n' "$PARSED" | sed -n '3p')
+
+    ARCHIVE="$DL_TMP/editor.tar.gz"
+    echo "Downloading editor v${REL_VER}..."
+    /usr/bin/curl -fsSL --proto =https --max-time 60 "$ASSET_URL" -o "$ARCHIVE"
+
+    ACTUAL_SHA=$(/usr/bin/shasum -a 256 "$ARCHIVE" | awk '{print $1}')
+    if [ "$ACTUAL_SHA" != "$EXPECTED_SHA" ]; then
+        echo "error: SHA-256 verification failed (expected $EXPECTED_SHA, got $ACTUAL_SHA)" >&2
+        exit 1
+    fi
+
+    /usr/bin/tar -xzf "$ARCHIVE" -C "$DL_TMP"
+    SRC_APP="$DL_TMP/$APP_NAME"
+    /usr/bin/codesign --verify --deep --strict "$SRC_APP"
+}
+
 do_install() {
-    if [ "$NO_BUILD" -eq 0 ]; then
+    if [ "$FROM_RELEASE" -eq 1 ]; then
+        download_release_app
+    elif [ "$NO_BUILD" -eq 0 ]; then
+        if [ -z "$REPO_ROOT" ]; then
+            echo "error: not inside an editor checkout (pass --from-release or --app PATH)" >&2
+            exit 1
+        fi
         echo "Building release binaries..."
         (
             cd "$REPO_ROOT"

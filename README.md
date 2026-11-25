@@ -11,7 +11,13 @@ An ultra-lightweight, zero-dependency, custom-drawn native text editor written i
 
 ## Install (macOS)
 
-Requires macOS 13+, Xcode Command Line Tools (`clang`), and a Rust toolchain (`cargo`).
+Requires macOS 13+. Install the latest prebuilt universal (`arm64` + `x86_64`) GitHub Release with one command (verifies SHA-256 and code signature):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/builduseful/editor/main/scripts/install-macos.sh | sh
+```
+
+Or build from source (requires Xcode Command Line Tools and Rust `cargo`):
 
 ```sh
 # System-wide install (/Applications/Editor.app + /usr/local/bin/editor)
@@ -19,6 +25,13 @@ Requires macOS 13+, Xcode Command Line Tools (`clang`), and a Rust toolchain (`c
 
 # User-only install (~/Applications/Editor.app + ~/.local/bin/editor, no sudo)
 ./scripts/install-macos.sh --user
+```
+
+Update anytime from the app menu (**editor → Check for Updates…**), Command Palette (`Check for updates`), or terminal:
+
+```sh
+editor update --check   # check for a newer GitHub Release
+editor update           # download, verify SHA-256 + codesign, and swap Editor.app atomically
 ```
 
 Uninstall cleanly (removes `Editor.app` and the `editor` symlink without touching unrelated files):

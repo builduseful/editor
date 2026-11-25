@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-bundle-macos:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Build release binaries and package Editor.app
+        run: |
+          cargo build --release --workspace --bins
+          ./target/release/bundle-app
+          codesign --verify --deep --strict target/release/Editor.app
+          ./target/release/Editor.app/Contents/MacOS/editor --version
+          ./target/release/Editor.app/Contents/MacOS/editor-gui --version
+          sh -n scripts/install-macos.sh

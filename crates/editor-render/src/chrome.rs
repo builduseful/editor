@@ -585,6 +585,7 @@ pub struct ConfirmModal {
     pub is_delete: bool,
     pub delete_is_dir: bool,
     pub is_move_confirm: bool,
+    pub is_update_confirm: bool,
     pub move_body: String,
     pub btn_save: PixelRect,
     pub btn_discard: PixelRect,
@@ -597,6 +598,7 @@ impl ConfirmModal {
         self.is_delete = false;
         self.delete_is_dir = false;
         self.is_move_confirm = false;
+        self.is_update_confirm = false;
         self.move_body.clear();
         self.file_name = file_name.to_string();
     }
@@ -606,6 +608,7 @@ impl ConfirmModal {
         self.is_delete = true;
         self.delete_is_dir = is_dir;
         self.is_move_confirm = false;
+        self.is_update_confirm = false;
         self.move_body.clear();
         self.file_name = name.to_string();
     }
@@ -615,14 +618,28 @@ impl ConfirmModal {
         self.is_delete = false;
         self.delete_is_dir = false;
         self.is_move_confirm = true;
+        self.is_update_confirm = false;
         self.file_name = name.to_string();
         self.move_body = format!("Move \"{name}\" ({summary}) into \"{dest_name}\"?");
+    }
+
+    pub fn open_update(&mut self, new_version: &str, current_version: &str) {
+        self.visible = true;
+        self.is_delete = false;
+        self.delete_is_dir = false;
+        self.is_move_confirm = false;
+        self.is_update_confirm = true;
+        self.file_name = new_version.to_string();
+        self.move_body = format!(
+            "Version {new_version} is available (installed: {current_version})."
+        );
     }
 
     pub fn close(&mut self) {
         self.visible = false;
         self.is_delete = false;
         self.is_move_confirm = false;
+        self.is_update_confirm = false;
     }
 
     pub fn hit_test(&self, x_px: f32, y_px: f32) -> Option<ConfirmChoice> {
@@ -691,6 +708,11 @@ impl ConfirmModal {
             )
         } else if self.is_move_confirm {
             ("Move Large Folder?".to_string(), self.move_body.as_str())
+        } else if self.is_update_confirm {
+            (
+                format!("Update to v{}?", self.file_name),
+                self.move_body.as_str(),
+            )
         } else {
             (
                 format!("Save Changes to {}?", self.file_name),
@@ -762,6 +784,21 @@ impl ConfirmModal {
             self.btn_cancel = PixelRect::new(card.x + pad, btn_y, cancel_w, btn_h);
             draw_button(painter, self.btn_cancel, "Cancel", false, theme, atlas, rasterizer);
             draw_button(painter, self.btn_discard, "Move", true, theme, atlas, rasterizer);
+        } else if self.is_update_confirm {
+            let upd_w = px(136.0, scale);
+            self.btn_save = PixelRect::ZERO;
+            self.btn_discard = PixelRect::new(card.right() - pad - upd_w, btn_y, upd_w, btn_h);
+            self.btn_cancel = PixelRect::new(card.x + pad, btn_y, cancel_w, btn_h);
+            draw_button(painter, self.btn_cancel, "Later", false, theme, atlas, rasterizer);
+            draw_button(
+                painter,
+                self.btn_discard,
+                "Update & Restart",
+                true,
+                theme,
+                atlas,
+                rasterizer,
+            );
         } else {
             let save_w = px(72.0, scale);
             let discard_w = px(92.0, scale);

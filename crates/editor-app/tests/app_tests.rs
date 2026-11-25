@@ -4347,3 +4347,100 @@ fn find_bar_whole_word_regex_capture_replace_and_two_pane_picker_preview_resume_
     send_char(&mut app, 'e', &mut raster, &mut clip, &mut host);
     assert!(app.sidebar.is_focused());
 }
+
+#[test]
+fn in_app_updater_checks_manifest_opens_modal_and_respects_24h_throttle() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    let mut app = EditorApp::new(fs, 1280, 800, 1.0);
+    app.use_in_app_modal = true;
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    let hits = Arc::new(AtomicUsize::new(0));
+    let hits_bg = Arc::clone(&hits);
+    let manifest_json = r#"{
+        "version": "9.9.9",
+        "build": 90909,
+        "notes_url": "https://github.com/builduseful/editor/releases/tag/v9.9.9",
+        "assets": {
+            "macos-universal": {
+                "url": "https://github.com/builduseful/editor/releases/download/v9.9.9/Editor-v9.9.9-macos-universal.tar.gz",
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "windows-x86_64": {
+                "url": "https://github.com/builduseful/editor/releases/download/v9.9.9/editor-v9.9.9-windows-x86_64.zip",
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            },
+            "linux-x86_64": {
+                "url": "https://github.com/builduseful/editor/releases/download/v9.9.9/editor-v9.9.9-linux-x86_64.tar.gz",
+                "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            }
+        }
+    }"#;
+    host.mock_http_fetcher = Some(Arc::new(move |_url: &str, _max: usize| {
+        hits_bg.fetch_add(1, Ordering::SeqCst);
+        Ok(manifest_json.as_bytes().to_vec())
+    }));
+
+    // 1. Passive launch check runs once when never checked before, then throttles for 24h!
+    app.maybe_start_auto_update_check(&mut host);
+    for tick in 1..=80 {
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        app.handle_event(
+            InputEvent::Tick { now_ms: tick * 10 },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        if hits.load(Ordering::SeqCst) > 0 && host.prefs.contains_key("LastUpdateCheckEpoch") {
+            break;
+        }
+    }
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+    assert!(
+        !app.confirm_modal.visible,
+        "passive check must never interrupt with a modal"
+    );
+
+    // Repeating passive check immediately makes ZERO additional network requests.
+    app.maybe_start_auto_update_check(&mut host);
+    assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+    // 2. Manual `CheckForUpdates` opens our custom Build Useful confirmation modal immediately!
+    app.handle_event(
+        InputEvent::Command(AppCommand::CheckForUpdates),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.confirm_modal.visible);
+    assert!(app.confirm_modal.is_update_confirm);
+    assert_eq!(app.confirm_modal.file_name, "9.9.9");
+    app.render(&mut raster);
+
+    // Dismissing with Escape closes the modal cleanly.
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.confirm_modal.visible);
+
+    // 3. Toggling `AutoCheckUpdates` persists `"0"` to host preferences.
+    let _ = app.execute_ipc(
+        &editor_platform::ipc::IpcCommand::Action("toggle-auto-updates".to_string()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.auto_check_updates);
+    assert_eq!(host.prefs.get("AutoCheckUpdates").map(String::as_str), Some("0"));
+}

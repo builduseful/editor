@@ -99,6 +99,14 @@ extern "C" {
     fn mac_watch_directory(dir_path: *const c_char);
     fn mac_activate_app();
     fn mac_wake_main_loop();
+    fn mac_http_get(
+        url: *const c_char,
+        max_bytes: usize,
+        out_buf: *mut *mut u8,
+        out_len: *mut usize,
+        out_err: *mut *mut c_char,
+    ) -> c_int;
+    fn mac_free_bytes(ptr: *mut u8);
     fn mac_run_app(cb: MacCallbacks);
 }
 
@@ -386,6 +394,40 @@ impl PlatformHost for MacHost {
     fn main_loop_waker(&self) -> Option<editor_platform::MainLoopWaker> {
         Some(Arc::new(|| unsafe { mac_wake_main_loop() }))
     }
+
+    fn http_fetcher(&self) -> Option<editor_platform::HttpFetcher> {
+        Some(Arc::new(|url: &str, max_bytes: usize| {
+            let c_url = CString::new(url).map_err(|_| "invalid URL".to_string())?;
+            let mut buf: *mut u8 = std::ptr::null_mut();
+            let mut len: usize = 0;
+            let mut err: *mut c_char = std::ptr::null_mut();
+            let rc = unsafe { mac_http_get(c_url.as_ptr(), max_bytes, &mut buf, &mut len, &mut err) };
+            if rc == 0 {
+                let bytes = if !buf.is_null() && len > 0 {
+                    unsafe { std::slice::from_raw_parts(buf, len) }.to_vec()
+                } else {
+                    Vec::new()
+                };
+                if !buf.is_null() {
+                    unsafe { mac_free_bytes(buf) };
+                }
+                Ok(bytes)
+            } else {
+                let msg = if !err.is_null() {
+                    let s = unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned();
+                    unsafe { mac_free_cstr(err) };
+                    s
+                } else {
+                    "network error".to_string()
+                };
+                Err(msg)
+            }
+        }))
+    }
+
+    fn relaunch_after_update(&mut self, app_bundle: &Path) {
+        let _ = editor_platform::update::schedule_macos_relaunch(app_bundle);
+    }
 }
 
 // ============================================================================
@@ -500,6 +542,7 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
         48 => Some(AppCommand::CommandPalette),
         49 => Some(AppCommand::SelectNextOccurrence),
         50 => Some(AppCommand::FocusSidebar),
+        51 => Some(AppCommand::CheckForUpdates),
         100 => Some(AppCommand::SetTheme(ThemePreference::System)),
         101 => Some(AppCommand::SetTheme(ThemePreference::Light)),
         102 => Some(AppCommand::SetTheme(ThemePreference::Dark)),
@@ -1187,6 +1230,7 @@ fn main() {
         let _ = bridge.app.open_path_or_dir(&p, &mut bridge.host);
     }
     bridge.app.sync_fs_watch(&mut bridge.host);
+    bridge.app.maybe_start_auto_update_check(&mut bridge.host);
 
     let ud = (&mut *bridge as *mut Bridge) as *mut c_void;
     let cbs = MacCallbacks {

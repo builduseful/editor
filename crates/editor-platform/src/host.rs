@@ -8,6 +8,10 @@ use crate::input::{ConfirmChoice, CursorShape};
 /// when a short-lived background worker finishes a batch.
 pub type MainLoopWaker = Arc<dyn Fn() + Send + Sync>;
 
+/// Thread-safe HTTPS GET callback `(url, max_bytes) -> Result<Vec<u8>, String>` backed by the
+/// host OS's native TLS/HTTP stack (`NSURLSession` on macOS, `WinHTTP` on Windows).
+pub type HttpFetcher = Arc<dyn Fn(&str, usize) -> Result<Vec<u8>, String> + Send + Sync>;
+
 pub trait Clipboard {
     fn get_text(&self) -> Option<String>;
     fn set_text(&mut self, text: &str);
@@ -65,9 +69,16 @@ pub trait PlatformHost {
     fn main_loop_waker(&self) -> Option<MainLoopWaker> {
         None
     }
+    /// Return a thread-safe native HTTPS fetcher for update checks and downloads.
+    /// Returns `None` on headless/test hosts so tests never touch the network.
+    fn http_fetcher(&self) -> Option<HttpFetcher> {
+        None
+    }
+    /// Schedule relaunching the newly swapped application bundle right after this process exits.
+    fn relaunch_after_update(&mut self, _app_bundle: &Path) {}
 }
 
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct HeadlessHost {
     pub title: String,
     pub cursor: Option<CursorShape>,
@@ -82,6 +93,20 @@ pub struct HeadlessHost {
     pub next_save_file: Option<PathBuf>,
     pub next_confirm: Option<ConfirmChoice>,
     pub prefs: BTreeMap<String, String>,
+    /// Optional mock HTTPS fetcher for offline updater tests.
+    pub mock_http_fetcher: Option<HttpFetcher>,
+    /// Recorded app bundle path if `relaunch_after_update` was invoked.
+    pub relaunched_app: Option<PathBuf>,
+}
+
+impl std::fmt::Debug for HeadlessHost {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HeadlessHost")
+            .field("title", &self.title)
+            .field("quit_requested", &self.quit_requested)
+            .field("prefs_len", &self.prefs.len())
+            .finish()
+    }
 }
 
 impl HeadlessHost {
@@ -140,5 +165,13 @@ impl PlatformHost for HeadlessHost {
 
     fn watch_directory(&mut self, dir: Option<&Path>) {
         self.watched_dir = dir.map(Path::to_path_buf);
+    }
+
+    fn http_fetcher(&self) -> Option<HttpFetcher> {
+        self.mock_http_fetcher.clone()
+    }
+
+    fn relaunch_after_update(&mut self, app_bundle: &Path) {
+        self.relaunched_app = Some(app_bundle.to_path_buf());
     }
 }

@@ -117,6 +117,7 @@ fn main() -> ExitCode {
         "syntax" => cmd_syntax(&fs, &globals, rest, start),
         "languages" => cmd_syntax_list(start),
         "action" => cmd_action(&fs, &globals, rest, start),
+        "update" => cmd_update(rest, start),
         "close" | "quit" => cmd_quit(cmd, rest, start),
         other => {
             // VS Code-style shorthand: `editor .`, `editor src/`, `editor file.rs`
@@ -200,6 +201,7 @@ fn print_usage() {
            editor syntax reset [--mode all|light|dark]           (clear custom syntax colour overrides)\n\
            editor syntax style <editorial|monochrome|studio|warm>\n\
            editor action <NAME> [ARG]                            (run any UI command)\n\
+           editor update [--check] [--app PATH]                  (check or install latest GitHub Release)\n\
            editor close [--force]   (alias: quit)\n\
            editor version\n\
            editor schema [COMMAND]"
@@ -1467,24 +1469,6 @@ fn resolve_open_path(
 }
 
 #[cfg(target_os = "macos")]
-fn enclosing_app_bundle(exe_path: &Path) -> Option<PathBuf> {
-    let macos_dir = exe_path.parent()?;
-    if macos_dir.file_name().and_then(|n| n.to_str()) != Some("MacOS") {
-        return None;
-    }
-    let contents_dir = macos_dir.parent()?;
-    if contents_dir.file_name().and_then(|n| n.to_str()) != Some("Contents") {
-        return None;
-    }
-    let app_dir = contents_dir.parent()?;
-    let ext = app_dir.extension().and_then(|e| e.to_str())?;
-    if ext.eq_ignore_ascii_case("app") {
-        Some(app_dir.to_path_buf())
-    } else {
-        None
-    }
-}
-
 fn launch_gui_process(sidebar_root: Option<&Path>, target: Option<&Path>) -> Result<(), String> {
     // Prefer the enclosing `Editor.app` bundle when `editor` is invoked from inside
     // `Editor.app/Contents/MacOS/editor` (including via a `/usr/local/bin/editor` symlink),
@@ -1518,7 +1502,7 @@ fn launch_gui_process(sidebar_root: Option<&Path>, target: Option<&Path>) -> Res
     {
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(ref exe) = canonical_exe {
-            if let Some(bundle) = enclosing_app_bundle(exe) {
+            if let Some(bundle) = editor_platform::enclosing_app_bundle(exe) {
                 candidates.push(bundle);
             }
         }
@@ -2548,4 +2532,206 @@ fn cmd_action(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start:
         &editor_platform::ipc::IpcCommand::Action(name.clone()),
         start,
     )
+}
+
+fn cli_https_get(url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    editor_platform::update::validate_release_url(url)?;
+    let curl = if cfg!(target_os = "windows") {
+        "curl.exe"
+    } else if Path::new("/usr/bin/curl").exists() {
+        "/usr/bin/curl"
+    } else {
+        "curl"
+    };
+    let out = std::process::Command::new(curl)
+        .args([
+            "-fsSL",
+            "--proto",
+            "=https",
+            "--max-time",
+            "60",
+            "--max-filesize",
+            &max_bytes.to_string(),
+            url,
+        ])
+        .output()
+        .map_err(|e| format!("failed to execute {curl}: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let msg = stderr.trim();
+        return Err(if msg.is_empty() {
+            format!("download failed with status {}", out.status)
+        } else {
+            msg.to_string()
+        });
+    }
+    if out.stdout.len() > max_bytes {
+        return Err("downloaded payload exceeded size limit".to_string());
+    }
+    Ok(out.stdout)
+}
+
+fn cmd_update(args: &[String], start: Instant) -> u8 {
+    let mut check_only = false;
+    let mut app_override: Option<PathBuf> = None;
+    let mut manifest_url = editor_platform::RELEASE_MANIFEST_URL.to_string();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--check" => {
+                check_only = true;
+                i += 1;
+            }
+            "--app" if i + 1 < args.len() => {
+                app_override = Some(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--manifest" if i + 1 < args.len() => {
+                manifest_url = args[i + 1].clone();
+                i += 2;
+            }
+            other => {
+                emit_err(
+                    "update",
+                    start,
+                    "E_USAGE",
+                    &format!("unexpected arg: {other} (usage: editor update [--check] [--app PATH])"),
+                    None,
+                );
+                return 3;
+            }
+        }
+    }
+
+    let manifest_bytes = match cli_https_get(
+        &manifest_url,
+        editor_platform::update::MAX_MANIFEST_BYTES,
+    ) {
+        Ok(b) => b,
+        Err(e) => {
+            emit_err("update", start, "E_NETWORK", &e, None);
+            return 1;
+        }
+    };
+
+    let outcome = match editor_platform::check_manifest_bytes(&manifest_bytes) {
+        Ok(o) => o,
+        Err(e) => {
+            emit_err("update", start, "E_UPDATE", &e, None);
+            return 1;
+        }
+    };
+
+    match outcome {
+        editor_platform::UpdateCheckOutcome::UpToDate { current, latest } => {
+            let mut res = JsonBuf::new();
+            res.push_raw("[{\"current\":");
+            res.push_str(&current);
+            res.push_raw(",\"latest\":");
+            res.push_str(&latest);
+            res.push_raw(",\"update_available\":false,\"updated\":false}]");
+            emit_ok("update", start, &res.into_string());
+            0
+        }
+        editor_platform::UpdateCheckOutcome::Available(info) => {
+            if check_only {
+                let mut res = JsonBuf::new();
+                res.push_raw("[{\"current\":");
+                res.push_str(VERSION);
+                res.push_raw(",\"latest\":");
+                res.push_str(&info.version);
+                res.push_raw(",\"build\":");
+                res.push_u64(info.build as u64);
+                res.push_raw(",\"update_available\":true,\"updated\":false,\"url\":");
+                res.push_str(&info.asset_url);
+                res.push_raw("}]");
+                emit_ok("update", start, &res.into_string());
+                return 0;
+            }
+
+            #[cfg(target_os = "macos")]
+            {
+                let target_app = if let Some(p) = app_override {
+                    p
+                } else {
+                    let exe = std::env::current_exe()
+                        .ok()
+                        .and_then(|p| std::fs::canonicalize(&p).ok().or(Some(p)));
+                    let enclosing = exe
+                        .as_deref()
+                        .and_then(editor_platform::enclosing_app_bundle)
+                        .filter(|p| {
+                            !editor_platform::update::is_dev_build_path(p)
+                                && !editor_platform::update::is_app_translocated(p)
+                        });
+                    let mut candidates: Vec<PathBuf> = Vec::new();
+                    if let Some(b) = enclosing {
+                        candidates.push(b);
+                    }
+                    candidates.push(PathBuf::from("/Applications/Editor.app"));
+                    if let Ok(home) = std::env::var("HOME") {
+                        candidates.push(PathBuf::from(home).join("Applications/Editor.app"));
+                    }
+                    match candidates.into_iter().find(|p| p.exists()) {
+                        Some(p) => p,
+                        None => {
+                            emit_err(
+                                "update",
+                                start,
+                                "E_NOT_FOUND",
+                                "Editor.app not found (pass --app PATH or run scripts/install-macos.sh)",
+                                None,
+                            );
+                            return 2;
+                        }
+                    }
+                };
+
+                let archive = match cli_https_get(
+                    &info.asset_url,
+                    editor_platform::update::MAX_ARCHIVE_BYTES,
+                ) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        emit_err("update", start, "E_NETWORK", &e, None);
+                        return 1;
+                    }
+                };
+
+                if let Err(e) = editor_platform::update::install_macos_tar_gz(
+                    &archive,
+                    &info.sha256,
+                    &info.version,
+                    &target_app,
+                ) {
+                    emit_err("update", start, "E_UPDATE", &e, Some(&target_app));
+                    return 1;
+                }
+
+                let mut res = JsonBuf::new();
+                res.push_raw("[{\"current\":");
+                res.push_str(VERSION);
+                res.push_raw(",\"latest\":");
+                res.push_str(&info.version);
+                res.push_raw(",\"update_available\":true,\"updated\":true,\"target\":");
+                res.push_str(&target_app.to_string_lossy());
+                res.push_raw("}]");
+                emit_ok("update", start, &res.into_string());
+                0
+            }
+
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = app_override;
+                emit_err(
+                    "update",
+                    start,
+                    "E_UNSUPPORTED",
+                    "automatic CLI install is currently supported on macOS; pass --check to inspect available releases",
+                    None,
+                );
+                1
+            }
+        }
+    }
 }

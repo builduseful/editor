@@ -1,0 +1,194 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (must match Cargo.toml version, e.g. v0.2.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-version:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify tag matches Cargo.toml workspace version
+        id: check
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="${GITHUB_REF_NAME}"
+          fi
+          CARGO_VER=$(python3 - <<'PY'
+          import re
+          s = open("Cargo.toml", "r", encoding="utf-8").read()
+          m = re.search(r'(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"', s)
+          assert m, "could not find [workspace.package] version in Cargo.toml"
+          print(m.group(1))
+          PY
+          )
+          if [ "$TAG" != "v$CARGO_VER" ]; then
+            echo "error: tag '$TAG' does not match Cargo.toml version 'v$CARGO_VER'" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$CARGO_VER" >> "$GITHUB_OUTPUT"
+
+  # Cross-platform design: add future `build-windows` / `build-linux` jobs alongside
+  # `build-macos` and upload their archive + `<key>.meta.json` into `publish`.
+  build-macos:
+    needs: verify-version
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain and macOS targets
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Run workspace tests
+        run: cargo test --workspace
+
+      - name: Build universal macOS binaries (arm64 + x86_64)
+        run: |
+          set -euo pipefail
+          cargo build --release --target aarch64-apple-darwin --bin editor --bin editor-gui
+          cargo build --release --target x86_64-apple-darwin --bin editor --bin editor-gui
+          cargo build --release --bin bundle-app
+
+          mkdir -p target/release
+          lipo -create \
+            target/aarch64-apple-darwin/release/editor-gui \
+            target/x86_64-apple-darwin/release/editor-gui \
+            -output target/release/editor-gui
+          lipo -create \
+            target/aarch64-apple-darwin/release/editor \
+            target/x86_64-apple-darwin/release/editor \
+            -output target/release/editor
+          chmod +x target/release/editor-gui target/release/editor
+
+          ./target/release/bundle-app
+          lipo -info target/release/Editor.app/Contents/MacOS/editor-gui
+          lipo -info target/release/Editor.app/Contents/MacOS/editor
+          codesign --verify --deep --strict target/release/Editor.app
+
+      - name: Package archive and compute metadata
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+          TAG: ${{ needs.verify-version.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          VER_JSON=$(./target/release/Editor.app/Contents/MacOS/editor --version)
+          echo "$VER_JSON"
+          BUILD=$(python3 -c 'import json,sys; print(json.loads(sys.argv[1])["results"][0]["build"])' "$VER_JSON")
+
+          mkdir -p dist
+          ARCHIVE="Editor-v${VERSION}-macos-universal.tar.gz"
+          COPYFILE_DISABLE=1 tar -czf "dist/${ARCHIVE}" -C target/release Editor.app
+          SHA256=$(shasum -a 256 "dist/${ARCHIVE}" | awk '{print $1}')
+
+          python3 - "$ARCHIVE" "$SHA256" "$BUILD" "$TAG" "$REPO" <<'PY'
+          import json, sys
+          archive, sha, build, tag, repo = sys.argv[1:]
+          meta = {
+              "asset_key": "macos-universal",
+              "filename": archive,
+              "build": int(build),
+              "url": f"https://github.com/{repo}/releases/download/{tag}/{archive}",
+              "sha256": sha,
+          }
+          with open("dist/macos-universal.meta.json", "w", encoding="utf-8") as f:
+              json.dump(meta, f, indent=2)
+              f.write("\n")
+          PY
+
+      - name: Upload macOS release artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-macos-universal
+          path: dist/
+
+  publish:
+    needs: [verify-version, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all platform release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate release.json and SHA256SUMS.txt
+        env:
+          VERSION: ${{ needs.verify-version.outputs.version }}
+          TAG: ${{ needs.verify-version.outputs.tag }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          python3 - "$VERSION" "$TAG" "$REPO" <<'PY'
+          import glob, json, os, sys
+
+          version, tag, repo = sys.argv[1:]
+          assets = {}
+          checksums = []
+          build = 0
+
+          for path in sorted(glob.glob("artifacts/*.meta.json")):
+              with open(path, "r", encoding="utf-8") as f:
+                  meta = json.load(f)
+              build = max(build, int(meta["build"]))
+              assets[meta["asset_key"]] = {
+                  "url": meta["url"],
+                  "sha256": meta["sha256"],
+              }
+              checksums.append(f"{meta['sha256']}  {meta['filename']}")
+              os.remove(path)
+
+          manifest = {
+              "version": version,
+              "build": build,
+              "notes_url": f"https://github.com/{repo}/releases/tag/{tag}",
+              "assets": assets,
+          }
+          with open("artifacts/release.json", "w", encoding="utf-8") as f:
+              json.dump(manifest, f, indent=2)
+              f.write("\n")
+          with open("artifacts/SHA256SUMS.txt", "w", encoding="utf-8") as f:
+              f.write("\n".join(checksums) + "\n")
+          PY
+          cat artifacts/release.json
+          cat artifacts/SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.verify-version.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/* --clobber
+          else
+            gh release create "$TAG" artifacts/* \
+              --title "editor $TAG" \
+              --generate-notes
+          fi
