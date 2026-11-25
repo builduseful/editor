@@ -275,16 +275,21 @@ impl TextInput {
                     changed = true;
                 }
             }
-            _ => {
+            Key::Char(_) => {
                 if !mods.primary() && !mods.ctrl {
                     if let Some(s) = text {
-                        if !s.is_empty() && !s.chars().all(|c| c.is_control()) {
+                        if !s.is_empty()
+                            && !s
+                                .chars()
+                                .all(|c| c.is_control() || matches!(c, '\u{F700}'..='\u{F8FF}'))
+                        {
                             self.insert_str(s);
                             changed = true;
                         }
                     }
                 }
             }
+            _ => {}
         }
         (changed, copied)
     }

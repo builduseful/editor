@@ -19,14 +19,18 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use editor_core::swar::{count_byte, find_byte, rfind_byte};
 use editor_core::{
     CompiledQuery, Language, SearchOptions, SearchScratch, SyntaxCache, TokenSpan,
 };
-use editor_platform::{EntryKind, FileSystem, FontStyle, GlyphRasterizer, Key, Modifiers, PixelRect};
+use editor_platform::{
+    is_gitignored, EntryKind, FileSystem, FontStyle, GitIgnoreLayer, GlyphRasterizer, IgnoreRules,
+    Key, MainLoopWaker, Modifiers, PixelRect,
+};
 
 use crate::atlas::GlyphAtlas;
 use crate::painter::Painter;
@@ -35,6 +39,7 @@ use crate::theme::{px, Color, Theme};
 
 const MAX_PROJECT_FILES: usize = 50_000;
 const MAX_WALK_DEPTH: usize = 24;
+const MAX_GITIGNORE_BYTES: usize = 32 * 1024;
 const STREAM_CHUNK_BYTES: usize = 64 * 1024;
 const MAX_STREAM_FILE_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_SLAB_BYTES: usize = 20 * 1024 * 1024;
@@ -42,6 +47,11 @@ const MAX_SLAB_FILE_BYTES: usize = 256 * 1024;
 const MAX_SEARCH_RESULTS: usize = 200;
 const MAX_QUICK_OPEN_ITEMS: usize = 80;
 const SEARCH_TIME_BUDGET_MS: u64 = 500;
+/// Short synchronous head-start before seamlessly offloading large folders (like `$HOME`)
+/// to a short-lived background worker: normal projects finish in 1 frame with zero flicker,
+/// while huge folders open in <= 8 ms and stream results live.
+const SYNC_HEAD_START_MS: u64 = 8;
+const STREAM_FLUSH_MS: u64 = 24;
 const PREVIEW_READ_BYTES: usize = 16 * 1024;
 const PREVIEW_MAX_LINES: usize = 180;
 const PREVIEW_MIN_WINDOW_PT: f32 = 760.0;
@@ -242,6 +252,74 @@ impl SearchSlab {
             fully_loaded: file_count == 0,
         }
     }
+
+    fn ensure_len(&mut self, file_count: usize) {
+        if self.slots.len() < file_count {
+            self.slots.resize(file_count, SlabSlot::Unloaded);
+            self.fully_loaded = false;
+        }
+    }
+
+    /// Commit one worker's local chunk & slot updates safely (assigns the real `chunk_id` on
+    /// commit so panicking workers or empty chunks can never cause out-of-bounds indices).
+    fn commit_worker_chunk(&mut self, data: Vec<u8>, slots: Vec<(usize, SlabSlot)>) {
+        if !data.is_empty() && self.chunks.len() < u16::MAX as usize {
+            let cid = self.chunks.len() as u16;
+            self.chunks.push(data);
+            for (idx, mut slot) in slots {
+                if let SlabSlot::Cached { ref mut chunk, .. } = slot {
+                    *chunk = cid;
+                }
+                if let Some(dst) = self.slots.get_mut(idx) {
+                    *dst = slot;
+                }
+            }
+        } else {
+            for (idx, slot) in slots {
+                if let Some(dst) = self.slots.get_mut(idx) {
+                    *dst = match slot {
+                        SlabSlot::Cached { .. } => SlabSlot::StreamFromDisk,
+                        other => other,
+                    };
+                }
+            }
+        }
+    }
+
+    /// Recompute `fully_loaded` from ground truth (impossible for partial slices to drift).
+    fn refresh_fully_loaded(&mut self) {
+        self.fully_loaded = !self.slots.iter().any(|s| matches!(s, SlabSlot::Unloaded));
+    }
+}
+
+struct AsyncRuntime {
+    fs: Arc<dyn FileSystem>,
+    waker: MainLoopWaker,
+}
+
+#[derive(Default)]
+struct IndexProgress {
+    files: Vec<IndexedFile>,
+    done: bool,
+    hit_limit: bool,
+}
+
+struct IndexTask {
+    gen: u64,
+    progress: Arc<Mutex<IndexProgress>>,
+}
+
+#[derive(Default)]
+struct SearchProgress {
+    batches: Vec<(usize, Vec<PaletteItem>)>,
+    done: bool,
+    timed_out: bool,
+    returned_slab: Option<SearchSlab>,
+}
+
+struct SearchTask {
+    gen: u64,
+    progress: Arc<Mutex<SearchProgress>>,
 }
 
 #[derive(Debug, Clone)]
@@ -265,9 +343,13 @@ pub struct CommandPalette {
     pub whole_word: bool,
     pub regex: bool,
     pub regex_error: Option<String>,
+    ignore_rules: IgnoreRules,
+    async_runtime: Option<AsyncRuntime>,
     root: Option<PathBuf>,
     file_cache_root: Option<PathBuf>,
     files_dirty: bool,
+    files_complete: bool,
+    files_hit_limit: bool,
     all_files: Vec<IndexedFile>,
     dirty_files: Vec<(PathBuf, Vec<u8>)>,
     all_commands: Vec<PaletteCommandEntry>,
@@ -279,8 +361,20 @@ pub struct CommandPalette {
     // Remembered Search in Files state for zero-friction resume on `⇧⌘F`.
     last_search_query: String,
     last_search_selected: usize,
-    // Modal-lifetime-only bounded text slab (<= 32 MB while Search in Files is open; 0 B closed).
+    // Modal-lifetime-only bounded text slab (<= 20 MB while Search in Files is open; 0 B closed).
     search_slab: Option<SearchSlab>,
+    /// Reclaim slot so cancelled background search workers return partial slabs instead of
+    /// discarding disk reads when the user types rapidly.
+    slab_stash: Arc<Mutex<Option<SearchSlab>>>,
+    // Generation-stamped short-lived background workers (0.00% idle CPU when closed!).
+    index_gen: Arc<AtomicU64>,
+    index_task: Option<IndexTask>,
+    search_gen: Arc<AtomicU64>,
+    search_task: Option<SearchTask>,
+    active_query: Option<CompiledQuery>,
+    searched_file_count: usize,
+    streaming_buckets: Vec<(usize, Vec<PaletteItem>)>,
+    search_timed_out: bool,
     // Single-item lazy syntax-highlighted preview (dropped on `close()`).
     preview: Option<PreviewBuffer>,
     preview_visible_lines: usize,
@@ -309,9 +403,13 @@ impl CommandPalette {
             whole_word: false,
             regex: false,
             regex_error: None,
+            ignore_rules: IgnoreRules::for_current_os(),
+            async_runtime: None,
             root: None,
             file_cache_root: None,
             files_dirty: true,
+            files_complete: false,
+            files_hit_limit: false,
             all_files: Vec::new(),
             dirty_files: Vec::new(),
             all_commands: Vec::new(),
@@ -323,6 +421,15 @@ impl CommandPalette {
             last_search_query: String::new(),
             last_search_selected: 0,
             search_slab: None,
+            slab_stash: Arc::new(Mutex::new(None)),
+            index_gen: Arc::new(AtomicU64::new(0)),
+            index_task: None,
+            search_gen: Arc::new(AtomicU64::new(0)),
+            search_task: None,
+            active_query: None,
+            searched_file_count: 0,
+            streaming_buckets: Vec::new(),
+            search_timed_out: false,
             preview: None,
             preview_visible_lines: 20,
             card_rect: PixelRect::ZERO,
@@ -335,8 +442,25 @@ impl CommandPalette {
         }
     }
 
+    /// Configure the optional async background runtime (`Arc<dyn FileSystem>` + host main-loop
+    /// waker). When `None` (headless/test hosts), walks and searches run synchronously.
+    pub fn set_async_runtime(&mut self, runtime: Option<(Arc<dyn FileSystem>, MainLoopWaker)>) {
+        self.async_runtime = runtime.map(|(fs, waker)| AsyncRuntime { fs, waker });
+    }
+
+    /// Override OS ignore rules (useful for tests or future user customization).
+    pub fn set_ignore_rules(&mut self, rules: IgnoreRules) {
+        self.ignore_rules = rules;
+        self.invalidate_file_index();
+    }
+
     pub fn is_open(&self) -> bool {
         self.mode != PaletteMode::Closed
+    }
+
+    /// True if a short-lived background index or search worker is currently streaming results.
+    pub fn is_streaming(&self) -> bool {
+        self.index_task.is_some() || self.search_task.is_some()
     }
 
     /// Number of indexed project files currently cached.
@@ -344,10 +468,45 @@ impl CommandPalette {
         self.all_files.len()
     }
 
+    fn cancel_index(&mut self) {
+        self.index_gen.fetch_add(1, Ordering::Relaxed);
+        self.index_task = None;
+    }
+
+    fn cancel_search(&mut self) {
+        self.search_gen.fetch_add(1, Ordering::Relaxed);
+        self.search_task = None;
+        self.active_query = None;
+        self.searched_file_count = 0;
+        self.streaming_buckets.clear();
+        self.search_timed_out = false;
+    }
+
+    fn reclaim_stashed_slab(&mut self) {
+        if self.search_slab.is_none() {
+            if let Ok(mut guard) = self.slab_stash.try_lock() {
+                if let Some(s) = guard.take() {
+                    self.search_slab = Some(s);
+                }
+            }
+        }
+    }
+
+    fn clear_slab(&mut self) {
+        self.search_slab = None;
+        if let Ok(mut guard) = self.slab_stash.try_lock() {
+            *guard = None;
+        }
+    }
+
     /// Mark cached project file list dirty (called lazily on `FsChanged` or sidebar file ops).
     pub fn invalidate_file_index(&mut self) {
+        self.cancel_index();
+        self.cancel_search();
         self.files_dirty = true;
-        self.search_slab = None;
+        self.files_complete = false;
+        self.files_hit_limit = false;
+        self.clear_slab();
     }
 
     /// Current previewed file path & target line (useful for inspection & tests).
@@ -362,29 +521,209 @@ impl CommandPalette {
             self.last_search_query = self.input.text.clone();
             self.last_search_selected = self.selected;
         }
+        self.cancel_index();
+        self.cancel_search();
+        if !self.files_complete {
+            // Do not treat an interrupted partial walk as a complete cached index next open.
+            self.files_dirty = true;
+        }
         self.mode = PaletteMode::Closed;
         self.input.focused = false;
         self.all_commands.clear();
         self.dirty_files.clear();
         self.items.clear();
         self.item_rects.clear();
-        self.search_slab = None;
+        self.clear_slab();
         self.preview = None;
         self.regex_error = None;
     }
 
     fn ensure_file_index(&mut self, fs: &dyn FileSystem, root: Option<&Path>) {
         self.root = root.map(Path::to_path_buf);
-        if !self.files_dirty && self.file_cache_root.as_deref() == root {
+        if !self.files_dirty
+            && self.file_cache_root.as_deref() == root
+            && (self.files_complete || self.index_task.is_some())
+        {
             return;
         }
+        self.cancel_index();
         self.all_files.clear();
-        self.search_slab = None;
+        self.clear_slab();
         self.file_cache_root = root.map(Path::to_path_buf);
         self.files_dirty = false;
-        if let Some(r) = root {
-            collect_project_files_parallel(fs, r, &mut self.all_files);
+        self.files_complete = false;
+        self.files_hit_limit = false;
+
+        let Some(r) = root else {
+            self.files_complete = true;
+            return;
+        };
+
+        if let Some(rt) = &self.async_runtime {
+            // Hybrid 8 ms sync head-start: normal projects finish completely in frame 1 with
+            // zero flicker; huge roots (like `$HOME`) open immediately and stream via BFS!
+            let mut queue: VecDeque<WalkDir> = VecDeque::new();
+            queue.push_back(WalkDir {
+                abs: r.to_path_buf(),
+                rel: String::new(),
+                depth: 0,
+                gitignore: Vec::new(),
+            });
+            let budget = Duration::from_millis(SYNC_HEAD_START_MS);
+            let done = walk_bfs_budgeted(
+                fs,
+                &self.ignore_rules,
+                &mut queue,
+                MAX_PROJECT_FILES,
+                Some(budget),
+                &mut self.all_files,
+            );
+            if done || self.all_files.len() >= MAX_PROJECT_FILES {
+                self.files_complete = true;
+                self.files_hit_limit = self.all_files.len() >= MAX_PROJECT_FILES;
+                self.all_files.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
+                return;
+            }
+
+            // Still have directories queued -> spawn ONE short-lived background BFS worker.
+            let my_gen = self.index_gen.fetch_add(1, Ordering::Relaxed) + 1;
+            let progress = Arc::new(Mutex::new(IndexProgress::default()));
+            self.index_task = Some(IndexTask {
+                gen: my_gen,
+                progress: Arc::clone(&progress),
+            });
+            spawn_index_worker(
+                Arc::clone(&rt.fs),
+                Arc::clone(&rt.waker),
+                self.ignore_rules.clone(),
+                queue,
+                self.all_files.len(),
+                Arc::clone(&self.index_gen),
+                my_gen,
+                progress,
+            );
+        } else {
+            // Synchronous headless/test/benchmark path (parallel BFS-seeded walk).
+            collect_project_files_parallel(fs, r, &self.ignore_rules, &mut self.all_files);
+            self.files_complete = true;
+            self.files_hit_limit = self.all_files.len() >= MAX_PROJECT_FILES;
         }
+    }
+
+    /// Drain any batches produced by background index/search workers.
+    /// Returns `true` if visible state changed and a redraw should be scheduled.
+    pub fn poll_background(&mut self, fs: &dyn FileSystem) -> bool {
+        if !self.is_open() {
+            return false;
+        }
+        let mut changed = false;
+
+        // 1. Drain newly discovered files from `IndexTask`.
+        let mut newly_added_range: Option<(usize, usize)> = None;
+        let mut index_finished = false;
+        if let Some(task) = &self.index_task {
+            if task.gen == self.index_gen.load(Ordering::Relaxed) {
+                if let Ok(mut guard) = task.progress.lock() {
+                    if !guard.files.is_empty() {
+                        let before = self.all_files.len();
+                        let room = MAX_PROJECT_FILES.saturating_sub(before);
+                        if room > 0 {
+                            if guard.files.len() <= room {
+                                self.all_files.append(&mut guard.files);
+                            } else {
+                                self.all_files.extend(guard.files.drain(..room));
+                                guard.files.clear();
+                            }
+                            if self.all_files.len() > before {
+                                newly_added_range = Some((before, self.all_files.len()));
+                                changed = true;
+                            }
+                        } else {
+                            guard.files.clear();
+                        }
+                    }
+                    if guard.done {
+                        self.files_complete = true;
+                        self.files_hit_limit =
+                            guard.hit_limit || self.all_files.len() >= MAX_PROJECT_FILES;
+                        index_finished = true;
+                        changed = true;
+                    }
+                }
+            } else {
+                index_finished = true;
+            }
+        }
+        if index_finished {
+            self.index_task = None;
+            if self.files_complete
+                && self.mode == PaletteMode::QuickOpen
+                && self.search_task.is_none()
+            {
+                self.all_files.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
+                // Reordering `all_files` invalidates index-keyed slab slots cleanly.
+                self.clear_slab();
+            }
+        }
+
+        // 2. Drain newly matched hits from `SearchTask`.
+        let mut search_finished = false;
+        let mut got_search_hits = false;
+        if let Some(task) = &self.search_task {
+            if task.gen == self.search_gen.load(Ordering::Relaxed) {
+                if let Ok(mut guard) = task.progress.lock() {
+                    if !guard.batches.is_empty() {
+                        self.streaming_buckets.append(&mut guard.batches);
+                        got_search_hits = true;
+                        changed = true;
+                    }
+                    if guard.done {
+                        self.search_timed_out |= guard.timed_out;
+                        if let Some(returned) = guard.returned_slab.take() {
+                            self.search_slab = Some(returned);
+                        }
+                        search_finished = true;
+                        changed = true;
+                    }
+                }
+            } else {
+                search_finished = true;
+            }
+        }
+        if search_finished {
+            self.search_task = None;
+        }
+
+        // 3. Reconcile visible results for the active mode.
+        match self.mode {
+            PaletteMode::QuickOpen => {
+                if newly_added_range.is_some() || index_finished {
+                    self.refresh_quick_open_items(fs);
+                    changed = true;
+                }
+            }
+            PaletteMode::ProjectSearch => {
+                if got_search_hits || search_finished {
+                    self.rebuild_items_from_buckets(fs);
+                }
+                // If `IndexTask` delivered new files and no `SearchTask` is currently in flight,
+                // continue searching the newly discovered files live (up to `MAX_SEARCH_RESULTS`)!
+                if self.search_task.is_none() && self.items.len() < MAX_SEARCH_RESULTS {
+                    if let Some(compiled) = self.active_query.clone() {
+                        if self.searched_file_count < self.all_files.len() {
+                            self.continue_project_search_slice(fs, &compiled);
+                            changed = true;
+                        }
+                    }
+                }
+                if changed {
+                    self.update_project_search_status();
+                }
+            }
+            _ => {}
+        }
+
+        changed
     }
 
     pub fn open_commands(&mut self, commands: Vec<PaletteCommandEntry>) {
@@ -392,6 +731,7 @@ impl CommandPalette {
             self.last_search_query = self.input.text.clone();
             self.last_search_selected = self.selected;
         }
+        self.cancel_search();
         self.mode = PaletteMode::Commands;
         self.input = TextInput::new("Run a command");
         self.input.focused = true;
@@ -418,6 +758,7 @@ impl CommandPalette {
             self.last_search_query = self.input.text.clone();
             self.last_search_selected = self.selected;
         }
+        self.cancel_search();
         self.mode = PaletteMode::QuickOpen;
         self.input = TextInput::new("Open file by name");
         self.input.focused = true;
@@ -530,11 +871,230 @@ impl CommandPalette {
         self.status_summary = format!("{total} matches");
     }
 
+    fn refresh_quick_open_items(&mut self, fs: &dyn FileSystem) {
+        let prev_selected_path = self.items.get(self.selected).map(|it| it.path.clone());
+        self.items.clear();
+        let query = self.input.text.trim();
+        let suffix = if !self.files_complete {
+            " · indexing…"
+        } else if self.files_hit_limit {
+            " (limit)"
+        } else {
+            ""
+        };
+        if query.is_empty() {
+            for f in self.all_files.iter().take(MAX_QUICK_OPEN_ITEMS) {
+                let name = &f.rel[f.basename_start as usize..];
+                self.items.push(PaletteItem {
+                    path: f.abs.clone(),
+                    command_id: None,
+                    primary: name.to_string(),
+                    secondary: f.rel.clone(),
+                    shortcut: String::new(),
+                    line_0based: None,
+                    col_bytes: None,
+                    match_len_bytes: None,
+                    byte_offset: Some(0),
+                    snippet_match: None,
+                });
+            }
+            self.status_summary = if !self.files_complete {
+                format!("Indexing… {} files", self.all_files.len())
+            } else {
+                format!("{} files{suffix}", self.all_files.len())
+            };
+        } else {
+            // Zero-allocation fuzzy pass with 1-instruction ASCII bitmask prefilter + O(N) top-K!
+            let pat_lower: Vec<u8> = query.bytes().map(|b| b.to_ascii_lowercase()).collect();
+            let pat_mask = ascii_char_mask(&pat_lower);
+            let mut scored: Vec<(i32, usize)> = Vec::new();
+            for (idx, f) in self.all_files.iter().enumerate() {
+                if (f.char_mask & pat_mask) != pat_mask {
+                    continue;
+                }
+                if let Some(score) = fuzzy_score_prelowered(
+                    &pat_lower,
+                    f.rel_lower.as_bytes(),
+                    f.basename_start as usize,
+                ) {
+                    scored.push((score, idx));
+                }
+            }
+            let total_hits = scored.len();
+            let cmp = |a: &(i32, usize), b: &(i32, usize)| {
+                b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
+            };
+            if scored.len() > MAX_QUICK_OPEN_ITEMS {
+                scored.select_nth_unstable_by(MAX_QUICK_OPEN_ITEMS, cmp);
+                scored.truncate(MAX_QUICK_OPEN_ITEMS);
+            }
+            scored.sort_unstable_by(cmp);
+            for (_, idx) in scored {
+                let f = &self.all_files[idx];
+                let name = &f.rel[f.basename_start as usize..];
+                self.items.push(PaletteItem {
+                    path: f.abs.clone(),
+                    command_id: None,
+                    primary: name.to_string(),
+                    secondary: f.rel.clone(),
+                    shortcut: String::new(),
+                    line_0based: None,
+                    col_bytes: None,
+                    match_len_bytes: None,
+                    byte_offset: Some(0),
+                    snippet_match: None,
+                });
+            }
+            self.status_summary = format!("{total_hits} matches{suffix}");
+        }
+        // Preserve user's highlighted file across streaming batches when still present.
+        if let Some(prev_path) = prev_selected_path {
+            if let Some(new_idx) = self.items.iter().position(|it| it.path == prev_path) {
+                self.selected = new_idx;
+            } else {
+                self.selected = 0;
+                self.scroll_row = 0;
+            }
+        } else {
+            self.selected = 0;
+            self.scroll_row = 0;
+        }
+        self.sync_scroll_to_selected();
+        self.ensure_preview(fs);
+    }
+
+    fn rebuild_items_from_buckets(&mut self, fs: &dyn FileSystem) {
+        let prev_sel_key = self
+            .items
+            .get(self.selected)
+            .map(|it| (it.path.clone(), it.line_0based));
+        self.streaming_buckets.sort_unstable_by_key(|(idx, _)| *idx);
+        let mut out = Vec::with_capacity(MAX_SEARCH_RESULTS);
+        for (_, items) in &self.streaming_buckets {
+            if out.len() >= MAX_SEARCH_RESULTS {
+                break;
+            }
+            let room = MAX_SEARCH_RESULTS - out.len();
+            out.extend(items.iter().take(room).cloned());
+        }
+        self.items = out;
+        if let Some((ref p, ln)) = prev_sel_key {
+            if let Some(new_idx) = self
+                .items
+                .iter()
+                .position(|it| &it.path == p && it.line_0based == ln)
+            {
+                self.selected = new_idx;
+            } else {
+                self.selected = 0;
+                self.scroll_row = 0;
+            }
+        } else {
+            self.selected = 0;
+            self.scroll_row = 0;
+        }
+        self.sync_scroll_to_selected();
+        self.ensure_preview(fs);
+    }
+
+    fn update_project_search_status(&mut self) {
+        let mut matched_files = 0usize;
+        let mut counted = 0usize;
+        for (_, items) in &self.streaming_buckets {
+            if counted >= MAX_SEARCH_RESULTS {
+                break;
+            }
+            let take_n = items.len().min(MAX_SEARCH_RESULTS - counted);
+            if take_n > 0 {
+                matched_files += 1;
+                counted += take_n;
+            }
+        }
+        let still_working = self.search_task.is_some()
+            || (!self.files_complete && self.items.len() < MAX_SEARCH_RESULTS);
+        if still_working {
+            if self.items.is_empty() {
+                self.status_summary = "Searching…".to_string();
+            } else {
+                self.status_summary =
+                    format!("Searching… {} in {matched_files} files", self.items.len());
+            }
+        } else {
+            let partial = if self.search_timed_out { " (partial)" } else { "" };
+            self.status_summary = if self.items.len() >= MAX_SEARCH_RESULTS {
+                format!("{MAX_SEARCH_RESULTS}+ in {matched_files} files{partial}")
+            } else {
+                format!("{} in {matched_files} files{partial}", self.items.len())
+            };
+        }
+    }
+
+    fn continue_project_search_slice(&mut self, fs: &dyn FileSystem, compiled: &CompiledQuery) {
+        let start_idx = self.searched_file_count;
+        if start_idx >= self.all_files.len() || self.items.len() >= MAX_SEARCH_RESULTS {
+            return;
+        }
+        self.reclaim_stashed_slab();
+        let remaining_cap = MAX_SEARCH_RESULTS - self.items.len();
+        let slab = self
+            .search_slab
+            .get_or_insert_with(|| SearchSlab::new(self.all_files.len()));
+        slab.ensure_len(self.all_files.len());
+
+        let sync_budget = Duration::from_millis(SYNC_HEAD_START_MS);
+        let (buckets, next_idx, finished_slice) = search_slice_sync_budgeted(
+            fs,
+            &self.all_files,
+            start_idx,
+            slab,
+            &self.dirty_files,
+            compiled,
+            remaining_cap,
+            sync_budget,
+        );
+        self.searched_file_count = next_idx;
+        if !buckets.is_empty() {
+            self.streaming_buckets.extend(buckets);
+            self.rebuild_items_from_buckets(fs);
+        }
+
+        if !finished_slice && self.items.len() < MAX_SEARCH_RESULTS {
+            if let Some(rt) = &self.async_runtime {
+                let slice_end = self.all_files.len();
+                let files_slice: Vec<(usize, IndexedFile)> = (next_idx..slice_end)
+                    .map(|i| (i, self.all_files[i].clone()))
+                    .collect();
+                self.searched_file_count = slice_end;
+                let my_gen = self.search_gen.fetch_add(1, Ordering::Relaxed) + 1;
+                let progress = Arc::new(Mutex::new(SearchProgress::default()));
+                self.search_task = Some(SearchTask {
+                    gen: my_gen,
+                    progress: Arc::clone(&progress),
+                });
+                let taken_slab = self.search_slab.take();
+                spawn_search_worker(
+                    Arc::clone(&rt.fs),
+                    Arc::clone(&rt.waker),
+                    files_slice,
+                    taken_slab,
+                    Arc::clone(&self.slab_stash),
+                    self.dirty_files.clone(),
+                    compiled.clone(),
+                    MAX_SEARCH_RESULTS.saturating_sub(self.items.len()),
+                    Arc::clone(&self.search_gen),
+                    my_gen,
+                    progress,
+                );
+            }
+        }
+    }
+
     pub fn refresh_results(&mut self, fs: &dyn FileSystem) {
         if self.mode == PaletteMode::Commands {
             self.refresh_command_results();
             return;
         }
+        self.cancel_search();
         self.items.clear();
         self.selected = 0;
         self.scroll_row = 0;
@@ -548,74 +1108,16 @@ impl CommandPalette {
         match self.mode {
             PaletteMode::Closed | PaletteMode::Commands => {}
             PaletteMode::QuickOpen => {
-                if query.is_empty() {
-                    for f in self.all_files.iter().take(MAX_QUICK_OPEN_ITEMS) {
-                        let name = &f.rel[f.basename_start as usize..];
-                        self.items.push(PaletteItem {
-                            path: f.abs.clone(),
-                            command_id: None,
-                            primary: name.to_string(),
-                            secondary: f.rel.clone(),
-                            shortcut: String::new(),
-                            line_0based: None,
-                            col_bytes: None,
-                            match_len_bytes: None,
-                            byte_offset: Some(0),
-                            snippet_match: None,
-                        });
-                    }
-                    self.status_summary = format!("{} files", self.all_files.len());
-                } else {
-                    // Zero-allocation fuzzy pass with 1-instruction ASCII bitmask prefilter + O(N) top-K!
-                    let pat_lower: Vec<u8> =
-                        query.bytes().map(|b| b.to_ascii_lowercase()).collect();
-                    let pat_mask = ascii_char_mask(&pat_lower);
-                    let mut scored: Vec<(i32, usize)> = Vec::new();
-                    for (idx, f) in self.all_files.iter().enumerate() {
-                        if (f.char_mask & pat_mask) != pat_mask {
-                            continue;
-                        }
-                        if let Some(score) = fuzzy_score_prelowered(
-                            &pat_lower,
-                            f.rel_lower.as_bytes(),
-                            f.basename_start as usize,
-                        ) {
-                            scored.push((score, idx));
-                        }
-                    }
-                    let total_hits = scored.len();
-                    let cmp = |a: &(i32, usize), b: &(i32, usize)| {
-                        b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1))
-                    };
-                    if scored.len() > MAX_QUICK_OPEN_ITEMS {
-                        scored.select_nth_unstable_by(MAX_QUICK_OPEN_ITEMS, cmp);
-                        scored.truncate(MAX_QUICK_OPEN_ITEMS);
-                    }
-                    scored.sort_unstable_by(cmp);
-                    for (_, idx) in scored {
-                        let f = &self.all_files[idx];
-                        let name = &f.rel[f.basename_start as usize..];
-                        self.items.push(PaletteItem {
-                            path: f.abs.clone(),
-                            command_id: None,
-                            primary: name.to_string(),
-                            secondary: f.rel.clone(),
-                            shortcut: String::new(),
-                            line_0based: None,
-                            col_bytes: None,
-                            match_len_bytes: None,
-                            byte_offset: Some(0),
-                            snippet_match: None,
-                        });
-                    }
-                    self.status_summary = format!("{total_hits} matches");
-                }
-                self.ensure_preview(fs);
+                self.refresh_quick_open_items(fs);
             }
             PaletteMode::ProjectSearch => {
                 if query.is_empty() || (!self.regex && query.len() < 2) {
                     self.status_summary = if query.is_empty() {
-                        format!("{} files indexed", self.all_files.len())
+                        if !self.files_complete {
+                            format!("Indexing… {} files", self.all_files.len())
+                        } else {
+                            format!("{} files indexed", self.all_files.len())
+                        }
                     } else {
                         "Type at least 2 characters".to_string()
                     };
@@ -642,30 +1144,57 @@ impl CommandPalette {
                     }
                 };
 
-                let slab = self
-                    .search_slab
-                    .get_or_insert_with(|| SearchSlab::new(self.all_files.len()));
-                let (mut found_items, matched_files, timed_out) = search_project_parallel(
-                    fs,
-                    &self.all_files,
-                    slab,
-                    &self.dirty_files,
-                    &compiled,
-                );
-                if found_items.len() > MAX_SEARCH_RESULTS {
-                    found_items.truncate(MAX_SEARCH_RESULTS);
-                }
-                self.items = found_items;
-
-                let partial = if timed_out { " (partial)" } else { "" };
-                self.status_summary = if self.items.len() >= MAX_SEARCH_RESULTS {
-                    format!("{MAX_SEARCH_RESULTS}+ in {matched_files} files{partial}")
-                } else {
-                    format!("{} in {} files{partial}", self.items.len(), matched_files)
-                };
                 self.last_search_query = self.input.text.clone();
                 self.last_search_selected = 0;
-                self.ensure_preview(fs);
+
+                if self.async_runtime.is_some() {
+                    self.reclaim_stashed_slab();
+                    self.active_query = Some(compiled.clone());
+                    self.searched_file_count = 0;
+                    self.streaming_buckets.clear();
+                    self.search_timed_out = false;
+                    // If slab is already fully warm for all files, run our fast parallel memory
+                    // sweep right now (~1.7 ms!) inside frame 1; otherwise use 8 ms sync
+                    // head-start + non-blocking streaming worker!
+                    let slab_warm = self.files_complete
+                        && self.search_slab.as_ref().is_some_and(|s| {
+                            s.fully_loaded && s.slots.len() >= self.all_files.len()
+                        });
+                    if slab_warm {
+                        let slab = self.search_slab.as_mut().unwrap();
+                        let (buckets, timed_out) = search_project_parallel_buckets(
+                            fs,
+                            &self.all_files,
+                            slab,
+                            &self.dirty_files,
+                            &compiled,
+                        );
+                        self.searched_file_count = self.all_files.len();
+                        self.streaming_buckets = buckets;
+                        self.search_timed_out = timed_out;
+                        self.rebuild_items_from_buckets(fs);
+                    } else {
+                        self.continue_project_search_slice(fs, &compiled);
+                    }
+                    self.update_project_search_status();
+                } else {
+                    // Synchronous headless/test/benchmark path.
+                    let slab = self
+                        .search_slab
+                        .get_or_insert_with(|| SearchSlab::new(self.all_files.len()));
+                    slab.ensure_len(self.all_files.len());
+                    let (buckets, timed_out) = search_project_parallel_buckets(
+                        fs,
+                        &self.all_files,
+                        slab,
+                        &self.dirty_files,
+                        &compiled,
+                    );
+                    self.streaming_buckets = buckets;
+                    self.search_timed_out = timed_out;
+                    self.rebuild_items_from_buckets(fs);
+                    self.update_project_search_status();
+                }
             }
         }
     }
@@ -1735,22 +2264,274 @@ impl CommandPalette {
 // ============================================================================
 
 /// Worker-local slab writer used only while `!slab.fully_loaded`.
+/// Emits placeholder `chunk = 0`; the real `chunk_id` is assigned safely on commit.
 struct SlabWriter<'a> {
-    chunk_id: Option<u16>,
+    can_cache: bool,
     bytes_used: &'a AtomicUsize,
     local_data: Vec<u8>,
     local_slots: Vec<(usize, SlabSlot)>,
 }
 
-fn search_project_parallel(
+/// Short synchronous search head-start (`<= 8 ms`) over `files[start_idx..]`.
+/// Returns `(hit_buckets, next_unsearched_idx, finished_slice)`.
+#[allow(clippy::too_many_arguments)]
+fn search_slice_sync_budgeted(
+    fs: &dyn FileSystem,
+    files: &[IndexedFile],
+    start_idx: usize,
+    slab: &mut SearchSlab,
+    dirty_files: &[(PathBuf, Vec<u8>)],
+    compiled: &CompiledQuery,
+    max_matches: usize,
+    budget: Duration,
+) -> (Vec<(usize, Vec<PaletteItem>)>, usize, bool) {
+    if start_idx >= files.len() || max_matches == 0 {
+        return (Vec::new(), files.len(), true);
+    }
+    let started = Instant::now();
+    let filling = !slab.fully_loaded;
+    let can_cache = filling && slab.chunks.len() < u16::MAX as usize;
+    let bytes_used = AtomicUsize::new(slab.bytes_used);
+    let mut writer = filling.then(|| SlabWriter {
+        can_cache,
+        bytes_used: &bytes_used,
+        local_data: Vec::new(),
+        local_slots: Vec::new(),
+    });
+    let mut read_buf = Vec::new();
+    let mut scratch = SearchScratch::new();
+    let mut file_hits = Vec::new();
+    let mut buckets: Vec<(usize, Vec<PaletteItem>)> = Vec::new();
+    let mut total_found = 0usize;
+    let mut idx = start_idx;
+    let mut finished = true;
+
+    while idx < files.len() && total_found < max_matches {
+        if idx > start_idx && ((idx - start_idx) & 7) == 0 && started.elapsed() >= budget {
+            finished = false;
+            break;
+        }
+        let mut items = Vec::new();
+        search_single_file(
+            fs,
+            idx,
+            &files[idx],
+            slab,
+            writer.as_mut(),
+            dirty_files,
+            compiled,
+            max_matches - total_found,
+            &mut read_buf,
+            &mut scratch,
+            &mut file_hits,
+            &mut items,
+        );
+        if !items.is_empty() {
+            total_found += items.len();
+            buckets.push((idx, items));
+        }
+        idx += 1;
+    }
+
+    if let Some(w) = writer {
+        slab.commit_worker_chunk(w.local_data, w.local_slots);
+        slab.bytes_used = bytes_used.load(Ordering::Relaxed);
+        slab.refresh_fully_loaded();
+    }
+    (buckets, idx, finished)
+}
+
+/// Short-lived background parallel search worker for remaining files after the 8 ms head-start.
+/// Streams hit batches every ~24 ms, cancels instantaneously on `search_gen` bump, preserves
+/// partially-loaded slabs in `slab_stash` even on cancellation, and exits with 0.00% idle CPU.
+#[allow(clippy::too_many_arguments)]
+fn spawn_search_worker(
+    fs: Arc<dyn FileSystem>,
+    waker: MainLoopWaker,
+    files: Vec<(usize, IndexedFile)>,
+    mut slab_opt: Option<SearchSlab>,
+    slab_stash: Arc<Mutex<Option<SearchSlab>>>,
+    dirty_files: Vec<(PathBuf, Vec<u8>)>,
+    compiled: CompiledQuery,
+    max_matches: usize,
+    gen_atomic: Arc<AtomicU64>,
+    my_gen: u64,
+    progress: Arc<Mutex<SearchProgress>>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("editor-search".to_string())
+        .spawn(move || {
+            let started = Instant::now();
+            let budget = Duration::from_millis(SEARCH_TIME_BUDGET_MS * 4);
+            let mut slab = slab_opt.take().unwrap_or_else(|| SearchSlab::new(0));
+            let max_idx = files.iter().map(|(i, _)| *i + 1).max().unwrap_or(0);
+            slab.ensure_len(max_idx);
+
+            let cores = std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1)
+                .min(6);
+            let worker_count = if files.len() < 32 || cores <= 1 {
+                1
+            } else {
+                cores.min((files.len() + 15) / 16)
+            };
+
+            let filling = !slab.fully_loaded;
+            let can_cache = filling && slab.chunks.len() + worker_count <= u16::MAX as usize;
+            let bytes_used = AtomicUsize::new(slab.bytes_used);
+            let next_pos = AtomicUsize::new(0);
+            let total_found = AtomicUsize::new(0);
+            let timed_out_flag = AtomicBool::new(false);
+            let cancel = AtomicBool::new(false);
+            let last_wake_ms = AtomicU64::new(0);
+            let slab_ref: &SearchSlab = &slab;
+            let fs_ref: &dyn FileSystem = fs.as_ref();
+
+            let slab_deltas: Vec<Option<(Vec<u8>, Vec<(usize, SlabSlot)>)>> =
+                std::thread::scope(|s| {
+                    let mut handles = Vec::with_capacity(worker_count);
+                    for _ in 0..worker_count {
+                        let next_ref = &next_pos;
+                        let found_ref = &total_found;
+                        let timeout_ref = &timed_out_flag;
+                        let cancel_ref = &cancel;
+                        let used_ref = &bytes_used;
+                        let files_ref = &files;
+                        let dirty_ref = &dirty_files;
+                        let compiled_ref = &compiled;
+                        let gen_ref = &gen_atomic;
+                        let prog_ref = &progress;
+                        let waker_ref = &waker;
+                        let wake_ms_ref = &last_wake_ms;
+
+                        handles.push(s.spawn(move || {
+                            let mut read_buf = Vec::new();
+                            let mut scratch = SearchScratch::new();
+                            let mut file_hits = Vec::new();
+                            let mut pending_hits: Vec<(usize, Vec<PaletteItem>)> = Vec::new();
+                            let mut checked = 0usize;
+                            let mut writer = filling.then(|| SlabWriter {
+                                can_cache,
+                                bytes_used: used_ref,
+                                local_data: Vec::new(),
+                                local_slots: Vec::new(),
+                            });
+
+                            loop {
+                                if cancel_ref.load(Ordering::Relaxed)
+                                    || gen_ref.load(Ordering::Relaxed) != my_gen
+                                {
+                                    break;
+                                }
+                                let start = next_ref.fetch_add(16, Ordering::Relaxed);
+                                if start >= files_ref.len() {
+                                    break;
+                                }
+                                let end = (start + 16).min(files_ref.len());
+                                for pos in start..end {
+                                    if cancel_ref.load(Ordering::Relaxed)
+                                        || gen_ref.load(Ordering::Relaxed) != my_gen
+                                    {
+                                        break;
+                                    }
+                                    checked += 1;
+                                    if (checked & 31) == 0 && started.elapsed() >= budget {
+                                        timeout_ref.store(true, Ordering::Relaxed);
+                                        cancel_ref.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                    let cur_total = found_ref.load(Ordering::Relaxed);
+                                    if cur_total >= max_matches {
+                                        cancel_ref.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                    let (file_idx, ref file) = files_ref[pos];
+                                    let remaining = (max_matches - cur_total).max(1);
+                                    let mut items = Vec::new();
+                                    search_single_file(
+                                        fs_ref,
+                                        file_idx,
+                                        file,
+                                        slab_ref,
+                                        writer.as_mut(),
+                                        dirty_ref,
+                                        compiled_ref,
+                                        remaining,
+                                        &mut read_buf,
+                                        &mut scratch,
+                                        &mut file_hits,
+                                        &mut items,
+                                    );
+                                    if !items.is_empty() {
+                                        let prev =
+                                            found_ref.fetch_add(items.len(), Ordering::Relaxed);
+                                        if prev + items.len() >= max_matches {
+                                            cancel_ref.store(true, Ordering::Relaxed);
+                                        }
+                                        pending_hits.push((file_idx, items));
+                                        let now_ms = started.elapsed().as_millis() as u64;
+                                        let prev_wake = wake_ms_ref.load(Ordering::Relaxed);
+                                        if now_ms.saturating_sub(prev_wake) >= STREAM_FLUSH_MS {
+                                            wake_ms_ref.store(now_ms, Ordering::Relaxed);
+                                            if let Ok(mut g) = prog_ref.lock() {
+                                                g.batches.append(&mut pending_hits);
+                                            }
+                                            waker_ref();
+                                        }
+                                    }
+                                }
+                            }
+
+                            if !pending_hits.is_empty() {
+                                if let Ok(mut g) = prog_ref.lock() {
+                                    g.batches.append(&mut pending_hits);
+                                }
+                            }
+                            writer.map(|w| (w.local_data, w.local_slots))
+                        }));
+                    }
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().unwrap_or(None))
+                        .collect()
+                });
+
+            // Commit loaded slab chunks safely before returning ownership to `CommandPalette`.
+            for (chunk_data, chunk_slots) in slab_deltas.into_iter().flatten() {
+                slab.commit_worker_chunk(chunk_data, chunk_slots);
+            }
+            slab.bytes_used = bytes_used.load(Ordering::Relaxed);
+            slab.refresh_fully_loaded();
+
+            if gen_atomic.load(Ordering::Relaxed) == my_gen {
+                if let Ok(mut g) = progress.lock() {
+                    g.done = true;
+                    g.timed_out = timed_out_flag.load(Ordering::Relaxed);
+                    g.returned_slab = Some(slab);
+                }
+                waker();
+            } else if let Ok(mut stash) = slab_stash.lock() {
+                // Keep the richer partially-filled slab available for the next keystroke!
+                let replace = stash
+                    .as_ref()
+                    .is_none_or(|prev| slab.bytes_used > prev.bytes_used);
+                if replace {
+                    *stash = Some(slab);
+                }
+            }
+        });
+}
+
+fn search_project_parallel_buckets(
     fs: &dyn FileSystem,
     files: &[IndexedFile],
     slab: &mut SearchSlab,
     dirty_files: &[(PathBuf, Vec<u8>)],
     compiled: &CompiledQuery,
-) -> (Vec<PaletteItem>, usize, bool) {
+) -> (Vec<(usize, Vec<PaletteItem>)>, bool) {
     if files.is_empty() {
-        return (Vec::new(), 0, false);
+        return (Vec::new(), false);
     }
 
     let started = Instant::now();
@@ -1767,37 +2548,32 @@ fn search_project_parallel(
     };
 
     let filling = !slab.fully_loaded;
-    let base_chunks = slab.chunks.len();
-    let can_add_chunks = filling && base_chunks + worker_count <= u16::MAX as usize;
+    let can_cache = filling && slab.chunks.len() + worker_count <= u16::MAX as usize;
     let bytes_used = AtomicUsize::new(slab.bytes_used);
 
     if worker_count <= 1 {
         let mut read_buf = Vec::new();
         let mut scratch = SearchScratch::new();
         let mut file_hits = Vec::new();
-        let mut out = Vec::new();
-        let mut matched_files = 0usize;
+        let mut buckets: Vec<(usize, Vec<PaletteItem>)> = Vec::new();
+        let mut total_found = 0usize;
         let mut timed_out = false;
-        let mut stopped_early = false;
         let mut writer = filling.then(|| SlabWriter {
-            chunk_id: can_add_chunks.then_some(base_chunks as u16),
+            can_cache,
             bytes_used: &bytes_used,
             local_data: Vec::new(),
             local_slots: Vec::new(),
         });
 
         for (i, f) in files.iter().enumerate() {
-            if out.len() >= MAX_SEARCH_RESULTS {
-                stopped_early = true;
+            if total_found >= MAX_SEARCH_RESULTS {
                 break;
             }
             if i > 0 && (i & 31) == 0 && started.elapsed() >= budget {
                 timed_out = true;
-                stopped_early = true;
                 break;
             }
-            let before = out.len();
-            let remaining = MAX_SEARCH_RESULTS - before;
+            let mut items = Vec::new();
             search_single_file(
                 fs,
                 i,
@@ -1806,29 +2582,23 @@ fn search_project_parallel(
                 writer.as_mut(),
                 dirty_files,
                 compiled,
-                remaining,
+                MAX_SEARCH_RESULTS - total_found,
                 &mut read_buf,
                 &mut scratch,
                 &mut file_hits,
-                &mut out,
+                &mut items,
             );
-            if out.len() > before {
-                matched_files += 1;
+            if !items.is_empty() {
+                total_found += items.len();
+                buckets.push((i, items));
             }
         }
         if let Some(w) = writer {
-            if w.chunk_id.is_some() {
-                slab.chunks.push(w.local_data);
-            }
-            for (idx, slot) in w.local_slots {
-                slab.slots[idx] = slot;
-            }
+            slab.commit_worker_chunk(w.local_data, w.local_slots);
             slab.bytes_used = bytes_used.load(Ordering::Relaxed);
-            if !stopped_early {
-                slab.fully_loaded = true;
-            }
+            slab.refresh_fully_loaded();
         }
-        return (out, matched_files, timed_out);
+        return (buckets, timed_out);
     }
 
     // Dynamic work-stealing across `worker_count` scoped threads.
@@ -1845,7 +2615,7 @@ fn search_project_parallel(
         Option<(Vec<u8>, Vec<(usize, SlabSlot)>)>,
     )> = std::thread::scope(|s| {
         let mut handles = Vec::with_capacity(worker_count);
-        for worker_id in 0..worker_count {
+        for _ in 0..worker_count {
             let next_ref = &next_idx;
             let found_ref = &total_found;
             let timeout_ref = &timed_out_flag;
@@ -1859,7 +2629,7 @@ fn search_project_parallel(
                 let mut local_by_file: Vec<(usize, Vec<PaletteItem>)> = Vec::new();
                 let mut batch_files = 0usize;
                 let mut writer = filling.then(|| SlabWriter {
-                    chunk_id: can_add_chunks.then_some((base_chunks + worker_id) as u16),
+                    can_cache,
                     bytes_used: used_ref,
                     local_data: Vec::new(),
                     local_slots: Vec::new(),
@@ -1926,41 +2696,19 @@ fn search_project_parallel(
             .collect()
     });
 
-    // Commit any lazily-loaded slab chunks (zero-copy Vec move!) and merge results deterministically.
+    // Commit any lazily-loaded slab chunks safely (zero-copy Vec move!).
     let mut merged_files: Vec<(usize, Vec<PaletteItem>)> = Vec::new();
     for (local_hits, slab_delta) in worker_outputs {
         merged_files.extend(local_hits);
         if let Some((chunk_data, chunk_slots)) = slab_delta {
-            if can_add_chunks {
-                slab.chunks.push(chunk_data);
-            }
-            for (idx, slot) in chunk_slots {
-                slab.slots[idx] = slot;
-            }
+            slab.commit_worker_chunk(chunk_data, chunk_slots);
         }
     }
     if filling {
         slab.bytes_used = bytes_used.load(Ordering::Relaxed);
-        if !cancel.load(Ordering::Relaxed) && !timed_out_flag.load(Ordering::Relaxed) {
-            slab.fully_loaded = true;
-        }
+        slab.refresh_fully_loaded();
     }
-
-    merged_files.sort_unstable_by_key(|(idx, _)| *idx);
-    let mut out = Vec::with_capacity(MAX_SEARCH_RESULTS);
-    let mut matched_files = 0usize;
-    for (_, items) in merged_files {
-        if out.len() >= MAX_SEARCH_RESULTS {
-            break;
-        }
-        let room = MAX_SEARCH_RESULTS - out.len();
-        let take_n = items.len().min(room);
-        if take_n > 0 {
-            matched_files += 1;
-            out.extend(items.into_iter().take(take_n));
-        }
-    }
-    (out, matched_files, timed_out_flag.load(Ordering::Relaxed))
+    (merged_files, timed_out_flag.load(Ordering::Relaxed))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2016,7 +2764,7 @@ fn search_single_file(
                 return;
             }
             if let Some(w) = writer {
-                if w.chunk_id.is_some() && w.bytes_used.load(Ordering::Relaxed) < MAX_SLAB_BYTES {
+                if w.can_cache && w.bytes_used.load(Ordering::Relaxed) < MAX_SLAB_BYTES {
                     match fs.read_prefix_into(&file.abs, MAX_SLAB_FILE_BYTES, read_buf) {
                         Ok(Some(total_len)) => {
                             if total_len == 0
@@ -2036,7 +2784,7 @@ fn search_single_file(
                                     w.local_slots.push((
                                         file_idx,
                                         SlabSlot::Cached {
-                                            chunk: w.chunk_id.unwrap(),
+                                            chunk: 0, // Stamped safely on `commit_worker_chunk`.
                                             start: off,
                                             end: end_off,
                                         },
@@ -2418,33 +3166,192 @@ fn draw_toggle_pill(
 }
 
 // ============================================================================
-// Parallel Scoped Project File Walk & Zero-Allocation Fuzzy Scorer
+// Platform-Aware, `.gitignore`-Respecting BFS & Parallel File Walk
 // ============================================================================
 
-fn should_skip_dir(name: &str) -> bool {
-    matches!(
-        name,
-        ".git"
-            | "target"
-            | "node_modules"
-            | "build"
-            | "build-asan"
-            | "dist"
-            | ".next"
-            | ".nuxt"
-            | ".venv"
-            | "venv"
-            | ".hg"
-            | ".svn"
-            | "__pycache__"
-            | ".cache"
-            | ".turbo"
-    )
+#[derive(Clone)]
+struct WalkDir {
+    abs: PathBuf,
+    rel: String,
+    depth: usize,
+    gitignore: Vec<Arc<GitIgnoreLayer>>,
+}
+
+/// Process a single directory: loads any local `.gitignore` (zero extra `stat()` when absent),
+/// appends non-ignored files to `out`, and pushes child directories via `push_dir`.
+fn visit_walk_dir(
+    fs: &dyn FileSystem,
+    ignore: &IgnoreRules,
+    dir: &WalkDir,
+    limit: usize,
+    current_count: usize,
+    gi_buf: &mut Vec<u8>,
+    out: &mut Vec<IndexedFile>,
+    mut push_dir: impl FnMut(WalkDir),
+) -> usize {
+    if dir.depth > MAX_WALK_DEPTH || current_count >= limit {
+        return 0;
+    }
+    let Ok(entries) = fs.read_dir(&dir.abs) else {
+        return 0;
+    };
+
+    // Load `.gitignore` ONLY when `read_dir` actually reported one (zero extra syscalls!).
+    let mut active_layers = dir.gitignore.clone();
+    if let Some(gi) = entries
+        .iter()
+        .find(|e| e.kind == EntryKind::File && e.name == ".gitignore")
+    {
+        if let Ok(Some(len)) = fs.read_prefix_into(&gi.path, MAX_GITIGNORE_BYTES, gi_buf) {
+            if len > 0 {
+                let text = String::from_utf8_lossy(gi_buf);
+                if let Some(layer) = GitIgnoreLayer::parse(dir.rel.clone(), &text) {
+                    active_layers.push(Arc::new(layer));
+                }
+            }
+        }
+    }
+
+    let mut added = 0usize;
+    for entry in entries {
+        if current_count + added >= limit {
+            break;
+        }
+        let rel = if dir.rel.is_empty() {
+            entry.name.clone()
+        } else {
+            format!("{}/{}", dir.rel, entry.name)
+        };
+        match entry.kind {
+            EntryKind::Directory => {
+                if dir.depth < MAX_WALK_DEPTH
+                    && !ignore.should_skip_dir(&dir.abs, &entry.name)
+                    && !is_gitignored(&active_layers, &rel, &entry.name, true)
+                {
+                    push_dir(WalkDir {
+                        abs: entry.path,
+                        rel,
+                        depth: dir.depth + 1,
+                        gitignore: active_layers.clone(),
+                    });
+                }
+            }
+            EntryKind::File => {
+                if !ignore.should_skip_file(&entry.name)
+                    && !is_gitignored(&active_layers, &rel, &entry.name, false)
+                {
+                    out.push(IndexedFile::new(entry.path, rel));
+                    added += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+    added
+}
+
+/// Walk BFS from `queue` for up to `budget` (or until finished if `budget` is `None`).
+/// Returns `true` if `queue` is completely drained or `limit` was reached.
+fn walk_bfs_budgeted(
+    fs: &dyn FileSystem,
+    ignore: &IgnoreRules,
+    queue: &mut VecDeque<WalkDir>,
+    limit: usize,
+    budget: Option<Duration>,
+    out: &mut Vec<IndexedFile>,
+) -> bool {
+    let started = Instant::now();
+    let mut gi_buf = Vec::new();
+    let mut dirs_visited = 0usize;
+    while let Some(dir) = queue.pop_front() {
+        if out.len() >= limit {
+            queue.clear();
+            return true;
+        }
+        visit_walk_dir(
+            fs,
+            ignore,
+            &dir,
+            limit,
+            out.len(),
+            &mut gi_buf,
+            out,
+            |child| queue.push_back(child),
+        );
+        dirs_visited += 1;
+        if let Some(b) = budget {
+            if (dirs_visited & 7) == 0 && started.elapsed() >= b {
+                return queue.is_empty() || out.len() >= limit;
+            }
+        }
+    }
+    true
+}
+
+/// Short-lived background BFS index worker (exits immediately when done or `index_gen` changes).
+#[allow(clippy::too_many_arguments)]
+fn spawn_index_worker(
+    fs: Arc<dyn FileSystem>,
+    waker: MainLoopWaker,
+    ignore: IgnoreRules,
+    mut queue: VecDeque<WalkDir>,
+    mut total_seen: usize,
+    gen_atomic: Arc<AtomicU64>,
+    my_gen: u64,
+    progress: Arc<Mutex<IndexProgress>>,
+) {
+    let _ = std::thread::Builder::new()
+        .name("editor-index".to_string())
+        .spawn(move || {
+            let mut gi_buf = Vec::new();
+            let mut batch: Vec<IndexedFile> = Vec::with_capacity(256);
+            let mut last_flush = Instant::now();
+
+            while let Some(dir) = queue.pop_front() {
+                if gen_atomic.load(Ordering::Relaxed) != my_gen || total_seen >= MAX_PROJECT_FILES {
+                    break;
+                }
+                let added = visit_walk_dir(
+                    fs.as_ref(),
+                    &ignore,
+                    &dir,
+                    MAX_PROJECT_FILES,
+                    total_seen,
+                    &mut gi_buf,
+                    &mut batch,
+                    |child| queue.push_back(child),
+                );
+                total_seen += added;
+
+                if batch.len() >= 256
+                    || (!batch.is_empty()
+                        && last_flush.elapsed() >= Duration::from_millis(STREAM_FLUSH_MS))
+                {
+                    if let Ok(mut g) = progress.lock() {
+                        g.files.append(&mut batch);
+                    }
+                    last_flush = Instant::now();
+                    waker();
+                }
+            }
+
+            if gen_atomic.load(Ordering::Relaxed) == my_gen {
+                if let Ok(mut g) = progress.lock() {
+                    if !batch.is_empty() {
+                        g.files.append(&mut batch);
+                    }
+                    g.done = true;
+                    g.hit_limit = total_seen >= MAX_PROJECT_FILES;
+                }
+                waker();
+            }
+        });
 }
 
 fn collect_project_files_parallel(
     fs: &dyn FileSystem,
     root: &Path,
+    ignore: &IgnoreRules,
     out: &mut Vec<IndexedFile>,
 ) {
     let cores = std::thread::available_parallelism()
@@ -2454,40 +3361,29 @@ fn collect_project_files_parallel(
     // BFS-seed until we have enough subtrees (`cores * 4`) to keep every worker busy even in
     // skewed or single-folder repos (`src/`, `crates/`, `packages/`).
     let target_seeds = if cores <= 1 { 0 } else { cores * 4 };
-    let mut queue: VecDeque<(PathBuf, usize)> = VecDeque::new();
-    queue.push_back((root.to_path_buf(), 0));
+    let mut queue: VecDeque<WalkDir> = VecDeque::new();
+    queue.push_back(WalkDir {
+        abs: root.to_path_buf(),
+        rel: String::new(),
+        depth: 0,
+        gitignore: Vec::new(),
+    });
+    let mut gi_buf = Vec::new();
 
-    while let Some((dir, depth)) = queue.pop_front() {
-        if depth > MAX_WALK_DEPTH || out.len() >= MAX_PROJECT_FILES {
-            continue;
+    while let Some(dir) = queue.pop_front() {
+        if out.len() >= MAX_PROJECT_FILES {
+            break;
         }
-        let Ok(entries) = fs.read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries {
-            if out.len() >= MAX_PROJECT_FILES {
-                break;
-            }
-            match entry.kind {
-                EntryKind::Directory => {
-                    if !should_skip_dir(&entry.name) && depth < MAX_WALK_DEPTH {
-                        queue.push_back((entry.path, depth + 1));
-                    }
-                }
-                EntryKind::File => {
-                    if entry.name != ".DS_Store" {
-                        let rel = entry
-                            .path
-                            .strip_prefix(root)
-                            .unwrap_or(&entry.path)
-                            .to_string_lossy()
-                            .into_owned();
-                        out.push(IndexedFile::new(entry.path, rel));
-                    }
-                }
-                _ => {}
-            }
-        }
+        visit_walk_dir(
+            fs,
+            ignore,
+            &dir,
+            MAX_PROJECT_FILES,
+            out.len(),
+            &mut gi_buf,
+            out,
+            |child| queue.push_back(child),
+        );
         if target_seeds > 0 && queue.len() >= target_seeds {
             break;
         }
@@ -2498,10 +3394,24 @@ fn collect_project_files_parallel(
         return;
     }
 
-    let subdirs: Vec<(PathBuf, usize)> = queue.into_iter().collect();
+    let subdirs: Vec<WalkDir> = queue.into_iter().collect();
     if subdirs.len() < 3 || cores <= 1 {
         let mut stack = subdirs;
-        walk_stack(fs, root, &mut stack, MAX_PROJECT_FILES, out);
+        while let Some(dir) = stack.pop() {
+            if out.len() >= MAX_PROJECT_FILES {
+                break;
+            }
+            visit_walk_dir(
+                fs,
+                ignore,
+                &dir,
+                MAX_PROJECT_FILES,
+                out.len(),
+                &mut gi_buf,
+                out,
+                |child| stack.push(child),
+            );
+        }
         out.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
         return;
     }
@@ -2519,6 +3429,7 @@ fn collect_project_files_parallel(
             handles.push(s.spawn(move || {
                 let mut local = Vec::new();
                 let mut stack = Vec::new();
+                let mut local_gi = Vec::new();
                 loop {
                     if count_ref.load(Ordering::Relaxed) >= MAX_PROJECT_FILES {
                         break;
@@ -2529,40 +3440,23 @@ fn collect_project_files_parallel(
                     }
                     stack.clear();
                     stack.push(sub_ref[idx].clone());
-                    while let Some((dir, depth)) = stack.pop() {
-                        if depth > MAX_WALK_DEPTH
-                            || count_ref.load(Ordering::Relaxed) >= MAX_PROJECT_FILES
-                        {
-                            continue;
+                    while let Some(dir) = stack.pop() {
+                        let cur = count_ref.load(Ordering::Relaxed);
+                        if cur >= MAX_PROJECT_FILES {
+                            break;
                         }
-                        let Ok(entries) = fs.read_dir(&dir) else {
-                            continue;
-                        };
-                        for entry in entries {
-                            match entry.kind {
-                                EntryKind::Directory => {
-                                    if !should_skip_dir(&entry.name) && depth < MAX_WALK_DEPTH {
-                                        stack.push((entry.path, depth + 1));
-                                    }
-                                }
-                                EntryKind::File => {
-                                    if entry.name == ".DS_Store" {
-                                        continue;
-                                    }
-                                    if count_ref.fetch_add(1, Ordering::Relaxed) >= MAX_PROJECT_FILES
-                                    {
-                                        break;
-                                    }
-                                    let rel = entry
-                                        .path
-                                        .strip_prefix(root)
-                                        .unwrap_or(&entry.path)
-                                        .to_string_lossy()
-                                        .into_owned();
-                                    local.push(IndexedFile::new(entry.path, rel));
-                                }
-                                _ => {}
-                            }
+                        let added = visit_walk_dir(
+                            fs,
+                            ignore,
+                            &dir,
+                            MAX_PROJECT_FILES,
+                            cur,
+                            &mut local_gi,
+                            &mut local,
+                            |child| stack.push(child),
+                        );
+                        if added > 0 {
+                            count_ref.fetch_add(added, Ordering::Relaxed);
                         }
                     }
                 }
@@ -2581,48 +3475,6 @@ fn collect_project_files_parallel(
     out.sort_unstable_by(|a, b| a.rel.cmp(&b.rel));
     if out.len() > MAX_PROJECT_FILES {
         out.truncate(MAX_PROJECT_FILES);
-    }
-}
-
-fn walk_stack(
-    fs: &dyn FileSystem,
-    root: &Path,
-    stack: &mut Vec<(PathBuf, usize)>,
-    limit: usize,
-    out: &mut Vec<IndexedFile>,
-) {
-    while let Some((dir, depth)) = stack.pop() {
-        if depth > MAX_WALK_DEPTH || out.len() >= limit {
-            continue;
-        }
-        let Ok(entries) = fs.read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries {
-            if out.len() >= limit {
-                break;
-            }
-            match entry.kind {
-                EntryKind::Directory => {
-                    if !should_skip_dir(&entry.name) && depth < MAX_WALK_DEPTH {
-                        stack.push((entry.path, depth + 1));
-                    }
-                }
-                EntryKind::File => {
-                    if entry.name == ".DS_Store" {
-                        continue;
-                    }
-                    let rel = entry
-                        .path
-                        .strip_prefix(root)
-                        .unwrap_or(&entry.path)
-                        .to_string_lossy()
-                        .into_owned();
-                    out.push(IndexedFile::new(entry.path, rel));
-                }
-                _ => {}
-            }
-        }
     }
 }
 

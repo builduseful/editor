@@ -109,6 +109,8 @@ pub enum SidebarPromptAction {
 pub enum SidebarContextAction {
     NewFile,
     NewFolder,
+    CopyPath,
+    CopyRelativePath,
     Rename,
     Delete,
 }
@@ -700,7 +702,7 @@ impl Sidebar {
                     false
                 }
             }
-            _ => self.selected_row().is_some(),
+            _ => false,
         };
         self.focused = true;
         self.context_menu = Some(SidebarContextMenu {
@@ -753,25 +755,46 @@ impl Sidebar {
             return;
         };
         let scale = painter.scale();
-        let items: Vec<(SidebarContextAction, &str, bool)> = if menu.has_target {
+        // `None` entries render a quiet hairline separator between logical groups.
+        let entries: Vec<Option<(SidebarContextAction, &str, bool)>> = if menu.has_target {
             vec![
-                (SidebarContextAction::NewFile, "New File…", false),
-                (SidebarContextAction::NewFolder, "New Folder…", false),
-                (SidebarContextAction::Rename, "Rename…", false),
-                (SidebarContextAction::Delete, "Delete…", true),
+                Some((SidebarContextAction::NewFile, "New File…", false)),
+                Some((SidebarContextAction::NewFolder, "New Folder…", false)),
+                None,
+                Some((SidebarContextAction::CopyPath, "Copy Path", false)),
+                Some((
+                    SidebarContextAction::CopyRelativePath,
+                    "Copy Relative Path",
+                    false,
+                )),
+                None,
+                Some((SidebarContextAction::Rename, "Rename…", false)),
+                Some((SidebarContextAction::Delete, "Delete…", true)),
             ]
         } else {
             vec![
-                (SidebarContextAction::NewFile, "New File…", false),
-                (SidebarContextAction::NewFolder, "New Folder…", false),
+                Some((SidebarContextAction::NewFile, "New File…", false)),
+                Some((SidebarContextAction::NewFolder, "New Folder…", false)),
             ]
         };
         let pad = px(4.0, scale);
         let row_h = px(24.0, scale);
-        let card_w = px(142.0, scale);
-        let card_h = pad * 2 + (items.len() as i32) * row_h;
-        let x = menu.anchor_x.min(bounds.right() - card_w - px(6.0, scale)).max(bounds.x + px(4.0, scale));
-        let y = menu.anchor_y.min(bounds.bottom() - card_h - px(6.0, scale)).max(bounds.y + px(4.0, scale));
+        let sep_h = px(7.0, scale);
+        let hairline = (1.0 * scale).round().max(1.0) as i32;
+        let card_w = px(164.0, scale);
+        let content_h: i32 = entries
+            .iter()
+            .map(|e| if e.is_some() { row_h } else { sep_h })
+            .sum();
+        let card_h = pad * 2 + content_h;
+        let x = menu
+            .anchor_x
+            .min(bounds.right() - card_w - px(6.0, scale))
+            .max(bounds.x + px(4.0, scale));
+        let y = menu
+            .anchor_y
+            .min(bounds.bottom() - card_h - px(6.0, scale))
+            .max(bounds.y + px(4.0, scale));
         let card = PixelRect::new(x, y, card_w, card_h);
         menu.card_rect = card;
         menu.item_rects.clear();
@@ -781,15 +804,21 @@ impl Sidebar {
 
         let font_px = 12.0 * scale;
         let m = atlas.metrics(rasterizer, FontStyle::Ui, font_px);
-        for (idx, (act, label, is_danger)) in items.into_iter().enumerate() {
-            let r = PixelRect::new(
-                card.x + pad,
-                card.y + pad + (idx as i32) * row_h,
-                card.w - pad * 2,
-                row_h,
-            );
+        let mut cy = card.y + pad;
+        let mut item_idx = 0usize;
+        for entry in entries {
+            let Some((act, label, is_danger)) = entry else {
+                let sy = cy + (sep_h - hairline) / 2;
+                painter.fill_rect(
+                    PixelRect::new(card.x + pad + px(4.0, scale), sy, card.w - (pad + px(4.0, scale)) * 2, hairline),
+                    theme.border_subtle,
+                );
+                cy += sep_h;
+                continue;
+            };
+            let r = PixelRect::new(card.x + pad, cy, card.w - pad * 2, row_h);
             menu.item_rects.push((act, r));
-            if menu.hovered == Some(idx) {
+            if menu.hovered == Some(item_idx) {
                 painter.fill_rounded_rect(r, 4.0 * scale, theme.selection);
             }
             let baseline = r.y as f32 + (r.h as f32 + m.ascent - m.descent) * 0.5;
@@ -808,6 +837,8 @@ impl Sidebar {
                 atlas,
                 rasterizer,
             );
+            cy += row_h;
+            item_idx += 1;
         }
     }
 

@@ -401,3 +401,90 @@ fn pins_overlay_navigation_reorder_split_and_remove() {
     );
     assert!(!overlay.visible);
 }
+
+#[test]
+fn palette_respects_os_home_ignore_rules_gitignore_and_async_streaming() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use editor_platform::IgnoreRules;
+    use editor_render::CommandPalette;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    let home = PathBuf::from("/mock_home/dev");
+    // Home-dir OS vaults & hidden toolchains must be skipped at `$HOME`.
+    fs.add_file(home.join("Library/Caches/huge.txt"), b"needle_ignored_lib".to_vec());
+    fs.add_file(home.join(".cargo/registry/crate.rs"), b"needle_ignored_cargo".to_vec());
+    fs.add_file(home.join("Apps/MyTool.app/Contents/Info.plist"), b"needle_ignored_app".to_vec());
+    // Real user workspace files (including a project's own `Library/` and `.github/`!) must be kept.
+    fs.add_file(home.join("Projects/app/.gitignore"), b"*.log\ngenerated/\n!keep.log\n".to_vec());
+    fs.add_file(home.join("Projects/app/src/main.rs"), b"pub fn needle_real() {}\n".to_vec());
+    fs.add_file(home.join("Projects/app/Library/book.rs"), b"pub fn needle_project_lib() {}\n".to_vec());
+    fs.add_file(home.join("Projects/app/.github/ci.yml"), b"name: needle_ci\n".to_vec());
+    fs.add_file(home.join("Projects/app/debug.log"), b"needle_gitignored_log\n".to_vec());
+    fs.add_file(home.join("Projects/app/keep.log"), b"needle_unignored_log\n".to_vec());
+    fs.add_file(home.join("Projects/app/generated/out.rs"), b"needle_gitignored_dir\n".to_vec());
+
+    let mut palette = CommandPalette::new();
+    palette.set_ignore_rules(IgnoreRules::macos(Some(home.clone())));
+
+    // 1. Verify Quick Open & Search in Files prune OS vaults + hidden toolchains + `.gitignore`.
+    palette.open_project_search(fs.as_ref(), Some(&home), Some("needle_"));
+    let paths: Vec<String> = palette
+        .items
+        .iter()
+        .map(|it| it.path.to_string_lossy().into_owned())
+        .collect();
+    assert!(paths.iter().any(|p| p.ends_with("src/main.rs")));
+    assert!(
+        paths.iter().any(|p| p.ends_with("Projects/app/Library/book.rs")),
+        "project subfolder named Library must NOT be skipped: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with(".github/ci.yml")),
+        "project .github folder should stay searchable: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("keep.log")),
+        "negated !keep.log in .gitignore should stay searchable: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains("/Library/Caches/")),
+        "$HOME/Library must be pruned: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains(".cargo")),
+        "$HOME/.cargo must be pruned: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.contains(".app/")),
+        "macOS .app bundles must be pruned: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| p.ends_with("debug.log") || p.contains("/generated/")),
+        ".gitignore rules must be respected: {paths:?}"
+    );
+    palette.close();
+
+    // 2. Verify async runtime path (with waker) opens cleanly, streams to completion, and stops on close.
+    let wakes = Arc::new(AtomicUsize::new(0));
+    let wakes_clone = Arc::clone(&wakes);
+    palette.set_async_runtime(Some((
+        fs.clone(),
+        Arc::new(move || {
+            wakes_clone.fetch_add(1, Ordering::Relaxed);
+        }),
+    )));
+    palette.invalidate_file_index();
+    palette.open_project_search(fs.as_ref(), Some(&home), Some("needle_real"));
+    for _ in 0..50 {
+        palette.poll_background(fs.as_ref());
+        if !palette.is_streaming() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(palette.items.len(), 1);
+    assert!(palette.items[0].path.ends_with("src/main.rs"));
+    palette.close();
+    assert!(!palette.is_streaming());
+}

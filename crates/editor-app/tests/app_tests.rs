@@ -3189,8 +3189,68 @@ fn sidebar_file_operations_create_rename_delete_and_context_menu() {
     );
     assert!(fs.stat(Path::new("/proj/docs")).map(|s| s.is_dir).unwrap_or(false));
 
-    // 4. Right-click inside sidebar opens custom context menu; MouseUp, Tick, and MouseMove hover
-    //    must keep it open cleanly, and Escape dismisses it.
+    // 4. Right-click inside sidebar opens custom context menu; Copy Path & Copy Relative Path
+    //    copy the clicked item's paths to the clipboard, and Escape dismisses cleanly.
+    //    Row 0 is `docs/` (y = 60..108 px), Row 1 is `main.rs` (y = 108..156 px @ 2x).
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: 80.0,
+            y_px: 120.0,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.sidebar.is_context_menu_open());
+    app.render(&mut raster);
+    // Click "Copy Path" (item 2: pad 8 + 2*48 + sep 14 + half row 24 = +142 px from anchor y=120 -> y=262).
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: 120.0,
+            y_px: 262.0,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.sidebar.is_context_menu_open());
+    assert_eq!(clip.get_text().as_deref(), Some("/proj/main.rs"));
+
+    // Right-click again and click "Copy Relative Path" (one row lower: y=310).
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: 80.0,
+            y_px: 120.0,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.render(&mut raster);
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: 120.0,
+            y_px: 310.0,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(clip.get_text().as_deref(), Some("main.rs"));
+
+    // Right-click again; MouseUp, Tick, and MouseMove hover must keep it open cleanly.
     app.handle_event(
         InputEvent::MouseDown {
             x_px: 80.0,
@@ -3344,7 +3404,49 @@ fn multi_cursor_cmd_d_alt_click_atomic_edit_paste_and_undo() {
     );
     assert_eq!(read_all(&mut app), "let baz = 1;\nlet bar = baz + baz;\n");
 
-    // 4. Alt-click adds an extra cursor, Escape collapses back to single cursor!
+    // 4. Multi-cursor Up/Down navigation moves every caret cleanly and NEVER inserts
+    //    macOS AppKit PUA function-key codepoints (`\u{F700}` / `\u{F701}`) as text!
+    let fs2 = Arc::new(MemoryFileSystem::new());
+    fs2.add_file("/proj/lines.rs", b"aaaa\nbbbb\ncccc\ndddd\n".to_vec());
+    let mut app2 = EditorApp::new(fs2, 1400, 900, 2.0);
+    app2.open_file(Path::new("/proj/lines.rs"), &mut host).unwrap();
+    // Place two carets: line 1 col 2 (`bb|bb`) and line 2 col 2 (`cc|cc`).
+    app2.caret = 7;
+    app2.anchor = 7;
+    app2.extra_cursors.push((12, 12));
+    // Press Down (simulating AppKit passing PUA `\u{F701}` in `text`!) -> moves to lines 2 & 3!
+    app2.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Down,
+            mods: Modifiers::NONE,
+            text: Some("\u{F701}".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(read_all(&mut app2), "aaaa\nbbbb\ncccc\ndddd\n");
+    assert_eq!(app2.doc.byte_to_line_col(app2.caret), (2, 2));
+    assert_eq!(app2.extra_cursors.len(), 1);
+    assert_eq!(app2.doc.byte_to_line_col(app2.extra_cursors[0].1), (3, 2));
+    // Press Up twice (simulating AppKit passing PUA `\u{F700}`) -> moves to lines 0 & 1!
+    for _ in 0..2 {
+        app2.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Up,
+                mods: Modifiers::NONE,
+                text: Some("\u{F700}".into()),
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+    }
+    assert_eq!(read_all(&mut app2), "aaaa\nbbbb\ncccc\ndddd\n");
+    assert_eq!(app2.doc.byte_to_line_col(app2.caret), (0, 2));
+    assert_eq!(app2.doc.byte_to_line_col(app2.extra_cursors[0].1), (1, 2));
+
+    // 5. Alt-click adds an extra cursor, Escape collapses back to single cursor!
     app.render(&mut raster);
     let mut alt = Modifiers::NONE;
     alt.alt = true;

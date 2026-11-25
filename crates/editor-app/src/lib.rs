@@ -2845,9 +2845,13 @@ impl EditorApp {
                 }
                 InputEvent::Tick { now_ms } => {
                     self.now_ms = now_ms;
+                    let mut need_redraw = self.palette.poll_background(self.fs.as_ref());
                     if self.window_focused && now_ms.saturating_sub(self.last_blink_ms) >= 530 {
                         self.caret_visible = !self.caret_visible;
                         self.last_blink_ms = now_ms;
+                        need_redraw = true;
+                    }
+                    if need_redraw {
                         self.mark_dirty();
                         host.request_redraw();
                     }
@@ -2903,7 +2907,7 @@ impl EditorApp {
                     self.mark_dirty();
                     host.request_redraw();
                     if let Some(a) = act {
-                        self.execute_sidebar_context_action(a, host);
+                        self.execute_sidebar_context_action(a, clipboard, host);
                     }
                     return;
                 }
@@ -3729,6 +3733,7 @@ impl EditorApp {
     fn execute_sidebar_context_action(
         &mut self,
         act: SidebarContextAction,
+        clipboard: &mut dyn Clipboard,
         host: &mut dyn PlatformHost,
     ) {
         if !self.sidebar.is_visible() {
@@ -3743,6 +3748,29 @@ impl EditorApp {
             SidebarContextAction::NewFolder => {
                 if !self.sidebar.start_new_folder(self.fs.as_ref()) {
                     self.set_notice("Open a folder first", true);
+                }
+            }
+            SidebarContextAction::CopyPath => {
+                if let Some(row) = self.sidebar.selected_row() {
+                    let path_str = row.path.to_string_lossy().into_owned();
+                    clipboard.set_text(&path_str);
+                    self.set_notice("Copied path", false);
+                } else {
+                    self.set_notice("Select a file or folder first", true);
+                }
+            }
+            SidebarContextAction::CopyRelativePath => {
+                if let Some(row) = self.sidebar.selected_row() {
+                    let rel = self
+                        .sidebar
+                        .root()
+                        .and_then(|r| row.path.strip_prefix(r).ok())
+                        .unwrap_or(&row.path);
+                    let path_str = rel.to_string_lossy().into_owned();
+                    clipboard.set_text(&path_str);
+                    self.set_notice("Copied relative path", false);
+                } else {
+                    self.set_notice("Select a file or folder first", true);
                 }
             }
             SidebarContextAction::Rename => {
@@ -4776,6 +4804,9 @@ impl EditorApp {
             AppCommand::QuickOpen => {
                 self.goto_line.close();
                 self.sidebar.set_focused(false);
+                self.palette.set_async_runtime(
+                    host.main_loop_waker().map(|w| (Arc::clone(&self.fs), w)),
+                );
                 let root = self
                     .sidebar
                     .root()
@@ -4800,6 +4831,9 @@ impl EditorApp {
             AppCommand::ProjectSearch => {
                 self.goto_line.close();
                 self.sidebar.set_focused(false);
+                self.palette.set_async_runtime(
+                    host.main_loop_waker().map(|w| (Arc::clone(&self.fs), w)),
+                );
                 let seed = self.selected_text();
                 let root = self
                     .sidebar
@@ -5230,13 +5264,25 @@ impl EditorApp {
                     self.set_sidebar_visible_user(false, host);
                 }
                 SidebarAction::StartNewFile => {
-                    self.execute_sidebar_context_action(SidebarContextAction::NewFile, host);
+                    self.execute_sidebar_context_action(
+                        SidebarContextAction::NewFile,
+                        clipboard,
+                        host,
+                    );
                 }
                 SidebarAction::StartNewFolder => {
-                    self.execute_sidebar_context_action(SidebarContextAction::NewFolder, host);
+                    self.execute_sidebar_context_action(
+                        SidebarContextAction::NewFolder,
+                        clipboard,
+                        host,
+                    );
                 }
                 SidebarAction::StartRename => {
-                    self.execute_sidebar_context_action(SidebarContextAction::Rename, host);
+                    self.execute_sidebar_context_action(
+                        SidebarContextAction::Rename,
+                        clipboard,
+                        host,
+                    );
                 }
                 SidebarAction::RequestDelete { path, is_dir } => {
                     self.request_delete_path(path, is_dir, host);
@@ -5777,10 +5823,14 @@ impl EditorApp {
                     self.after_document_mutated(rasterizer, host);
                 }
             }
-            _ => {
+            Key::Char(_) => {
                 if !mods.primary() && !mods.ctrl {
                     if let Some(s) = text {
-                        if !s.is_empty() && !s.chars().all(|c| c.is_control()) {
+                        if !s.is_empty()
+                            && !s
+                                .chars()
+                                .all(|c| c.is_control() || matches!(c, '\u{F700}'..='\u{F8FF}'))
+                        {
                             self.preferred_x_px = None;
                             if self.auto_pairs && s.len() == 1 {
                                 let b = s.as_bytes()[0];
@@ -5874,6 +5924,7 @@ impl EditorApp {
                     }
                 }
             }
+            _ => {}
         }
     }
 
@@ -6180,6 +6231,44 @@ impl EditorApp {
                 host.request_redraw();
                 true
             }
+            Key::Up | Key::Down | Key::PageUp | Key::PageDown => {
+                self.doc.break_undo_coalescing();
+                self.preferred_x_px = None;
+                let page_lines = ((self.layout.viewport.h / metrics.line_height.max(1) as i32)
+                    .max(1) as isize)
+                    .saturating_sub(1)
+                    .max(1);
+                let delta: isize = match key {
+                    Key::Up => -1,
+                    Key::Down => 1,
+                    Key::PageUp => -page_lines,
+                    Key::PageDown => page_lines,
+                    _ => 0,
+                };
+                if mods.primary() && matches!(key, Key::Down) {
+                    self.doc.tree_mut().ensure_fully_indexed();
+                }
+                let doc_end = self.doc.len_bytes();
+                let all = self.all_cursors_sorted();
+                let mut next = Vec::with_capacity(all.len());
+                for (a, c, is_p) in all {
+                    let nc = if mods.primary() && matches!(key, Key::Up) {
+                        0
+                    } else if mods.primary() && matches!(key, Key::Down) {
+                        doc_end
+                    } else {
+                        self.move_offset_vertical(c, delta, None, metrics).0
+                    };
+                    let na = if mods.shift { a } else { nc };
+                    next.push((na, nc, is_p));
+                }
+                self.set_cursors_from_list(next);
+                self.viewport
+                    .ensure_caret_visible(&mut self.doc, self.caret, metrics, scale);
+                self.mark_dirty();
+                host.request_redraw();
+                true
+            }
             Key::Backspace => {
                 self.preferred_x_px = None;
                 let all = self.all_cursors_sorted();
@@ -6278,10 +6367,14 @@ impl EditorApp {
                 self.multi_cursor_apply_text(&spaces, rasterizer, host);
                 true
             }
-            _ => {
+            Key::Char(_) => {
                 if !mods.primary() && !mods.ctrl {
                     if let Some(s) = text {
-                        if !s.is_empty() && !s.chars().all(|c| c.is_control()) {
+                        if !s.is_empty()
+                            && !s
+                                .chars()
+                                .all(|c| c.is_control() || matches!(c, '\u{F700}'..='\u{F8FF}'))
+                        {
                             self.preferred_x_px = None;
                             self.multi_cursor_apply_text(s, rasterizer, host);
                             return true;
@@ -6290,6 +6383,7 @@ impl EditorApp {
                 }
                 false
             }
+            _ => false,
         }
     }
 
@@ -6380,15 +6474,21 @@ impl EditorApp {
         }
     }
 
-    fn move_vertical(&mut self, delta_lines: isize, metrics: editor_platform::FontMetrics) {
-        let (line, col) = self.doc.byte_to_line_col(self.caret);
-        let target_x = match self.preferred_x_px {
+    /// Move `offset` vertically by `delta_lines`, preserving `target_x_px` (or measuring its
+    /// current visual X coordinate). Shared by single-cursor and multi-cursor navigation.
+    fn move_offset_vertical(
+        &mut self,
+        offset: u64,
+        delta_lines: isize,
+        target_x_px: Option<f32>,
+        metrics: editor_platform::FontMetrics,
+    ) -> (u64, f32) {
+        let (line, col) = self.doc.byte_to_line_col(offset);
+        let target_x = match target_x_px {
             Some(x) => x,
             None => {
                 let text = self.doc.line_content(line).unwrap_or_default();
-                let x = self.viewport.measure_prefix_px(&text, col, metrics.cell_width);
-                self.preferred_x_px = Some(x);
-                x
+                self.viewport.measure_prefix_px(&text, col, metrics.cell_width)
             }
         };
 
@@ -6418,7 +6518,14 @@ impl EditorApp {
             }
             cur_cells += cw;
         }
-        self.caret = start + best_col as u64;
+        (start + best_col as u64, target_x)
+    }
+
+    fn move_vertical(&mut self, delta_lines: isize, metrics: editor_platform::FontMetrics) {
+        let (next_caret, target_x) =
+            self.move_offset_vertical(self.caret, delta_lines, self.preferred_x_px, metrics);
+        self.preferred_x_px = Some(target_x);
+        self.caret = next_caret;
     }
 
     fn handle_mouse_down(
@@ -7753,16 +7860,46 @@ impl EditorApp {
                     "sidebar-show" => self.set_sidebar_visible_user(true, host),
                     "sidebar-hide" => self.set_sidebar_visible_user(false, host),
                     "sidebar-new-file" => {
-                        self.execute_sidebar_context_action(SidebarContextAction::NewFile, host);
+                        self.execute_sidebar_context_action(
+                            SidebarContextAction::NewFile,
+                            clipboard,
+                            host,
+                        );
                     }
                     "sidebar-new-folder" => {
-                        self.execute_sidebar_context_action(SidebarContextAction::NewFolder, host);
+                        self.execute_sidebar_context_action(
+                            SidebarContextAction::NewFolder,
+                            clipboard,
+                            host,
+                        );
+                    }
+                    "sidebar-copy-path" => {
+                        self.execute_sidebar_context_action(
+                            SidebarContextAction::CopyPath,
+                            clipboard,
+                            host,
+                        );
+                    }
+                    "sidebar-copy-relative-path" => {
+                        self.execute_sidebar_context_action(
+                            SidebarContextAction::CopyRelativePath,
+                            clipboard,
+                            host,
+                        );
                     }
                     "sidebar-rename" => {
-                        self.execute_sidebar_context_action(SidebarContextAction::Rename, host);
+                        self.execute_sidebar_context_action(
+                            SidebarContextAction::Rename,
+                            clipboard,
+                            host,
+                        );
                     }
                     "sidebar-delete" => {
-                        self.execute_sidebar_context_action(SidebarContextAction::Delete, host);
+                        self.execute_sidebar_context_action(
+                            SidebarContextAction::Delete,
+                            clipboard,
+                            host,
+                        );
                     }
                     "sidebar-undo" => {
                         self.undo_sidebar_fs_op(host);

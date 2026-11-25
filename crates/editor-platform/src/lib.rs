@@ -8,6 +8,7 @@
 
 pub mod fs;
 pub mod host;
+pub mod ignore;
 pub mod input;
 pub mod ipc;
 pub mod raster;
@@ -17,7 +18,8 @@ pub use fs::{
     DirEntry, EntryKind, FileHandle, FileLock, FileRev, FileStat, FileSystem, FsError, FsResult,
     MemoryFileSystem, StdFileSystem,
 };
-pub use host::{Clipboard, HeadlessHost, MemoryClipboard, PlatformHost};
+pub use host::{Clipboard, HeadlessHost, MainLoopWaker, MemoryClipboard, PlatformHost};
+pub use ignore::{is_gitignored, GitIgnoreLayer, IgnoreRules};
 pub use input::{
     AppCommand, ConfirmChoice, CursorShape, DragPhase, InputEvent, Key, Modifiers, MouseButton,
     SystemTheme, ThemePreference,

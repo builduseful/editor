@@ -114,6 +114,14 @@ impl FileSystem for MacFileSystem {
     fn open_read(&self, path: &Path) -> FsResult<Arc<dyn FileHandle>> {
         self.inner.open_read(path)
     }
+    fn read_prefix_into(
+        &self,
+        path: &Path,
+        max_bytes: usize,
+        out: &mut Vec<u8>,
+    ) -> FsResult<Option<u64>> {
+        self.inner.read_prefix_into(path, max_bytes, out)
+    }
     fn stat(&self, path: &Path) -> FsResult<FileStat> {
         self.inner.stat(path)
     }
@@ -374,6 +382,10 @@ impl PlatformHost for MacHost {
             None => unsafe { mac_watch_directory(std::ptr::null()) },
         }
     }
+
+    fn main_loop_waker(&self) -> Option<editor_platform::MainLoopWaker> {
+        Some(Arc::new(|| unsafe { mac_wake_main_loop() }))
+    }
 }
 
 // ============================================================================
@@ -534,10 +546,16 @@ extern "C" fn cb_key(
     let Some(key) = decode_key(keycode, if key_str.is_empty() { text_str } else { key_str }) else {
         return;
     };
-    let text_opt = if text_str.is_empty() {
-        None
-    } else {
+    // AppKit sets `NSEvent.characters` to Private Use Area codepoints (`U+F700..=U+F8FF`) for
+    // arrows, Home/End, PageUp/PageDown, and function keys. Non-character keys must NEVER emit
+    // printable `text`!
+    let text_opt = if matches!(key, Key::Char(_))
+        && !text_str.is_empty()
+        && !text_str.chars().any(|c| matches!(c, '\u{F700}'..='\u{F8FF}'))
+    {
         Some(text_str.to_string())
+    } else {
+        None
     };
     b.app.handle_event(
         InputEvent::KeyDown {

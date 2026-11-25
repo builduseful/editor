@@ -1,7 +1,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use crate::input::{ConfirmChoice, CursorShape};
+
+/// Thread-safe callback that wakes the host event loop (delivering `InputEvent::Tick`)
+/// when a short-lived background worker finishes a batch.
+pub type MainLoopWaker = Arc<dyn Fn() + Send + Sync>;
 
 pub trait Clipboard {
     fn get_text(&self) -> Option<String>;
@@ -55,6 +60,11 @@ pub trait PlatformHost {
     /// `inotify`, `ReadDirectoryChangesW`). Passing `None` stops watching.
     /// Default is a no-op for headless/test hosts.
     fn watch_directory(&mut self, _dir: Option<&Path>) {}
+    /// Return a thread-safe waker for the host's main runloop (delivering `InputEvent::Tick`).
+    /// Returns `None` on headless/test hosts so operations stay synchronous and deterministic.
+    fn main_loop_waker(&self) -> Option<MainLoopWaker> {
+        None
+    }
 }
 
 #[derive(Debug, Default)]
