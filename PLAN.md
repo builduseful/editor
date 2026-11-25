@@ -55,7 +55,7 @@ scripts/
 ## 3. Completed Milestones
 
 ### Chunk 1 — Archive + Plan + Foundation
-- [x] Move original C++ implementation to `original-implementation/`.
+- [x] Archive original C++ v1 implementation (subsequently removed; preserved in git history).
 - [x] Establish 6-crate Rust workspace with zero external crates.
 - [x] Commit archived original implementation, `PLAN.md`, and initial 6-crate foundation.
 

@@ -6,8 +6,7 @@
 implemented in **Rust** (`std` only, zero third-party crates), with a minimal
 platform adapter boundary (`editor-platform`) and a deterministic CLI (`editor`).
 `PLAN.md` and `ARCHITECTURE.md` are the sources of truth for scope, decisions,
-and architecture. The archived C++ v1 implementation lives in
-`original-implementation/`.
+and architecture.
 
 ## Design and brand
 

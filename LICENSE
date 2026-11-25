@@ -13,8 +13,8 @@ The Build Useful design system
 editor's interface follows the Build Useful design system, used under its own
 licence. The design system is not vendored into this repository: its colour,
 type, space, shape and motion tokens are implemented natively (see
-viewcore/include/theme.hpp), as the design system's web CSS/JS is not copied
-into a native app (PLAN.md D13).
+crates/editor-render/src/theme.rs), as the design system's web CSS/JS is not
+copied into a native app (PLAN.md R8).
 
 Third-party software
 
