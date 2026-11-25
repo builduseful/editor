@@ -11,7 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use editor_platform::Framebuffer;
+use editor_platform::{version, Framebuffer, APP_VERSION, BUNDLE_IDENTIFIER};
 
 const TILE_R: u8 = 0x11;
 const TILE_G: u8 = 0x11;
@@ -118,7 +118,12 @@ fn build_icns() -> Vec<u8> {
 }
 
 fn write_info_plist(dst: &Path) {
-    let plist = r#"<?xml version="1.0" encoding="UTF-8"?>
+    let build_number = std::env::var("EDITOR_BUILD_NUMBER")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| version::build_number().to_string());
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
@@ -131,7 +136,7 @@ fn write_info_plist(dst: &Path) {
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.builduseful.editor</string>
+    <string>{BUNDLE_IDENTIFIER}</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
@@ -139,13 +144,15 @@ fn write_info_plist(dst: &Path) {
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>0.2.0</string>
+    <string>{APP_VERSION}</string>
     <key>CFBundleVersion</key>
-    <string>2</string>
+    <string>{build_number}</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
+    <key>NSHumanReadableCopyright</key>
+    <string>Copyright © 2026 Build Useful. All rights reserved.</string>
     <key>CFBundleDocumentTypes</key>
     <array>
         <dict>
@@ -167,15 +174,17 @@ fn write_info_plist(dst: &Path) {
     </array>
 </dict>
 </plist>
-"#;
+"#
+    );
     fs::write(dst, plist).expect("failed to write Info.plist");
 }
 
 fn main() {
     let target_dir = PathBuf::from("target/release");
-    let bin_src = target_dir.join("editor-gui");
-    if !bin_src.exists() {
-        eprintln!("error: build release binary first (`cargo build --release --workspace`)");
+    let gui_src = target_dir.join("editor-gui");
+    let cli_src = target_dir.join("editor");
+    if !gui_src.exists() {
+        eprintln!("error: build release binaries first (`cargo build --release --workspace --bins`)");
         std::process::exit(1);
     }
 
@@ -188,7 +197,17 @@ fn main() {
     fs::create_dir_all(&macos_dir).expect("create MacOS dir");
     fs::create_dir_all(&res_dir).expect("create Resources dir");
 
-    fs::copy(&bin_src, macos_dir.join("editor-gui")).expect("copy editor-gui binary");
+    fs::copy(&gui_src, macos_dir.join("editor-gui")).expect("copy editor-gui binary");
+    // Bundle the deterministic CLI binary inside Editor.app so GUI + CLI stay atomically
+    // version-locked and `/usr/local/bin/editor` (or `~/.local/bin/editor`) is a single symlink.
+    if cli_src.exists() {
+        fs::copy(&cli_src, macos_dir.join("editor")).expect("copy editor CLI binary");
+    } else {
+        eprintln!(
+            "warning: {} not found; Editor.app packaged without bundled CLI",
+            cli_src.display()
+        );
+    }
     write_info_plist(&contents.join("Info.plist"));
     fs::write(res_dir.join("AppIcon.icns"), build_icns()).expect("write AppIcon.icns");
 
@@ -206,5 +225,10 @@ fn main() {
         .arg(&app_dir)
         .status();
 
-    println!("Packaged {}", app_dir.display());
+    println!(
+        "Packaged {} (v{} / build {})",
+        app_dir.display(),
+        APP_VERSION,
+        version::build_number()
+    );
 }

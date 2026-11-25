@@ -13,6 +13,7 @@ pub mod input;
 pub mod ipc;
 pub mod raster;
 pub mod surface;
+pub mod version;
 
 pub use fs::{
     DirEntry, EntryKind, FileHandle, FileLock, FileRev, FileStat, FileSystem, FsError, FsResult,
@@ -28,3 +29,4 @@ pub use raster::{
     BuiltinBitmapRasterizer, FontMetrics, FontStyle, GlyphFormat, GlyphRasterizer, RasterizedGlyph,
 };
 pub use surface::{DirtyRegion, Framebuffer, PixelRect, SurfaceMut};
+pub use version::{compare_semver, SemVer, APP_VERSION, BUNDLE_IDENTIFIER};

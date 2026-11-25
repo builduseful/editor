@@ -13,14 +13,15 @@
 
 | ID | Decision | Rationale |
 | --- | --- | --- |
-| R1 | **100% Pure Rust (`std` only), zero third-party crates.** | Full control, sub-second incremental compiles, ~500 KB binaries, zero supply-chain bloat, offline builds. |
-| R2 | **Minimal Adapter Pattern (`editor-platform`).** | Only irreducible OS boundaries sit behind traits: `FileSystem`, 2-method `GlyphRasterizer`, `Clipboard`, `PlatformHost`, and raw BGRA8 framebuffer presentation. 95%+ of the editor compiles untouched on any OS. |
+| R1 | **100% Pure Rust (`std` only), zero third-party crates.** | Full control, sub-second incremental compiles, tiny binaries, zero supply-chain bloat, offline builds. |
+| R2 | **Minimal Adapter Pattern (`editor-platform`).** | Only irreducible OS boundaries sit behind traits: `FileSystem`, 2-method `GlyphRasterizer`, `Clipboard`, `PlatformHost`, `MainLoopWaker`, and raw BGRA8 framebuffer presentation. 95%+ of the editor compiles untouched on any OS. |
 | R3 | **Custom CPU Software Rasterizer + Shelf-Packed Glyph Atlas (`editor-render`).** | Pixel-identical rendering across all OSes, zero native-control hybrids (`NSOutlineView`/`NSScrollView`/`NSTextField`), O(1) 96-entry direct-indexed ASCII table, sub-millisecond dirty-rect & scroll-blit frames. |
 | R4 | **Monoid Order-Statistic B-Tree Piece Table (`editor-core`).** | Associative CRLF-aware `Summary { bytes, breaks, starts_with_lf, ends_with_cr }` keeps exact line counts across arbitrary edits in O(log N). Paged 512 KB base cache + 16 KB lazy SWAR indexing opens multi-GB files in < 1 ms. |
-| R5 | **64-bit SWAR in 100% Safe Rust.** | 8-byte-at-a-time ASCII validation, newline scanning, and literal search at > 3 GB/s without unsafe platform intrinsics. |
+| R5 | **32-Byte SWAR & Linear-Time Regex in 100% Safe Rust.** | 4×`u64` unrolled SWAR scanning, rarest-pair byte filtering, and a ReDoS-proof Thompson NFA / PikeVM regex engine (`O(N × M)`) with literal/alternation prefilters and `$0`–`$9` capture replacement. |
 | R6 | **Focused Unicode: UTF-8, English, Code, & Emoji Subset.** | Fast 1-byte ASCII path + clean UAX #29 Emoji subset (combining marks, VS15/VS16, skin tones, flag pairs, ZWJ chains, keycaps). |
 | R7 | **Future-Ready IME & Accessibility Seams.** | `ImeComposition` (preedit + caret rect) and `A11yNode` snapshot live in the core render/app contracts without bloating v1. |
-| R8 | **Build Useful Design System Tokens Only.** | Exact Light & Dark tokens in `editor-render::theme`; one ink, neutral grey ladder, 2px spacing rhythm, hairlines, color strictly for state (danger/success/info). |
+| R8 | **Build Useful Design System Tokens Only.** | Exact Light & Dark tokens in `editor-render::theme`; one ink, neutral grey ladder, 2px spacing rhythm, hairlines, colour strictly for state (danger/success/info). |
+| R9 | **Single-Source Versioning & Self-Contained Distribution.** | `[workspace.package] version` in `Cargo.toml` feeds every binary and `Info.plist`. On macOS, `Editor.app` bundles both `editor-gui` and `editor` inside `Contents/MacOS/` so GUI and CLI stay atomically version-locked with a single symlink in `PATH`. |
 
 ---
 
@@ -30,67 +31,67 @@
 crates/
 ├── editor-platform/   # Pure traits + POD types + StdFileSystem + MemoryFileSystem
 │                      # + BuiltinBitmapRasterizer + Framebuffer + PNG encoder
-├── editor-core/       # PieceTree, SWAR, Grapheme/Emoji, Undo, Search, Syntax, Document
+│                      # + Per-OS IgnoreRules & .gitignore + SemVer version + IPC
+├── editor-core/       # PieceTree, 32-byte SWAR, linear-time Regex, Search,
+│                      # Grapheme/Emoji, Undo, Syntax plugins, Document
 ├── editor-render/     # Build Useful Theme, GlyphAtlas, Painter, Viewport, Sidebar,
-│                      # TextInput, Find/Replace, Go-To-Line, Modal Confirm, Status Bar
-├── editor-app/        # Platform-agnostic App controller (shortcuts, mouse, focus,
+│                      # TabStrip, TextInput, Find/Replace, Two-Pane Palette & SearchSlab,
+│                      # Pins, Shortcuts Overlay, Modal Confirm, Status Bar
+├── editor-app/        # Platform-agnostic App controller (Keymap, Buffers, 2×2 Panes,
+│                      # Multi-Cursor, Vim mode, Session store, AutoPairs, FS Undo,
 │                      # partial dirty-rect redraws, preferences, a11y snapshot)
 ├── editor-cli/        # Deterministic JSON CLI (`editor` binary): read, write, edit,
-│                      # info, validate, batch, version, schema
-└── editor-macos/      # Minimal macOS adapter (~480 lines ObjC/C via build.rs):
-                       # CoreText single-cluster rasterizer, CALayer BGRA8 blit,
-                       # events, menus, drag-and-drop, NSUserDefaults, APFS clonefile,
-                       # + Editor.app bundle generator with Build Useful icon
+│                      # info, validate, batch, live IPC commands, version, schema
+└── editor-macos/      # Minimal macOS adapter (ObjC/C via build.rs):
+                       # CoreText single-cluster rasterizer, IOSurface zero-copy blit,
+                       # FSEvents watcher, events, menus, drag-and-drop, NSUserDefaults,
+                       # APFS clonefile, + Editor.app packager with pure-Rust icon
+scripts/
+└── install-macos.sh   # Minimal atomic macOS installer & uninstaller (zero scattered files)
 ```
 
 ---
 
-## 3. Hardening & Feature Completion Milestones (Reviewed Twice)
+## 3. Completed Milestones
 
-### Chunk 1 — Archive + Plan + Foundation Commit
+### Chunk 1 — Archive + Plan + Foundation
 - [x] Move original C++ implementation to `original-implementation/`.
 - [x] Establish 6-crate Rust workspace with zero external crates.
 - [x] Commit archived original implementation, `PLAN.md`, and initial 6-crate foundation.
 
 ### Chunk 2 — Core Engine Hardening (`editor-core` + `editor-platform`)
-- [x] **Lockfile + APFS Tail CoW Save**:
-  - Add advisory lockfile (`<path>.editor.lock`, `O_CREAT|O_EXCL`) to `FileSystem` so concurrent saves never race.
-  - Add `clone_pwrite_tail` save path (length-changing edits with tail <= 25% of file use APFS `clone_file` + `pwrite` + `ftruncate` + atomic `rename`).
-- [x] **External Mutation Detection**: `Document::check_identity(fs)` returning `Unchanged | ReloadedClean | StaleDirty`, wired into `FocusChanged(true)`.
-- [x] **Pathological Single-Line Protection**: `Document::read_line_window(line, byte_start, max_bytes)` + `line_byte_len(line)` so a 100 MB single-line file never allocates 100 MB in the viewport!
+- [x] **Lockfile + APFS Tail CoW Save**: advisory lockfile (`<path>.editor.lock`, `O_CREAT|O_EXCL`) and `clone_pwrite_tail` CoW save path.
+- [x] **External Mutation Detection**: `Document::check_identity(fs)` returning `Unchanged | ReloadedClean | StaleDirty`, wired into `FocusChanged(true)` and `FSEvents`.
+- [x] **Pathological Single-Line Protection**: `Document::read_line_window(line, byte_start, max_bytes)` + `line_byte_len(line)`.
 - [x] **Multi-Line Bracket Matching + Tree Hygiene**: `find_matching_bracket` (up to 32 KB scan) + leaf-merging on sparse B-tree deletes.
 - [x] **Expanded Stress & Fuzz Tests**: randomized PieceTree oracle, heavy delete compaction, lockfile tests, external mutation tests, 2 MB single-line window tests.
 
-### Chunk 3 — Renderer & Custom UI Excellence (`editor-render` + `editor-app`)
-- [x] **True Dirty-Rect Partial Redraws**: Caret blink marks only the caret line rect dirty (skipping sidebar, status bar, and untouched lines -> sub-0.05 ms blink frames!).
-- [x] **Huge Single-Line Viewport Fast Path**: O(1) ASCII column calculation + windowed line reading so a 10 MB+ single line renders in < 1 ms with flat RAM.
-- [x] **Custom-Drawn In-App Confirm Modal**: Pure-Rust modal overlay ("Save Changes to …?" with Save / Don't Save / Cancel buttons & keyboard shortcuts) so unsaved-change prompts work identically on every OS.
-- [x] **Pro Editor Ergonomics**:
-  - Matching bracket 1px subtle highlight box in viewport.
-  - Subtle vertical indent guides (`border_subtle` hairlines).
-  - Gutter click/drag selects full logical lines.
-  - Multi-line Tab / Shift+Tab indent & outdent.
-  - Line actions: Duplicate Line (`Cmd+Shift+D`), Move Line Up/Down (`Option+Up/Down`), Delete Line (`Cmd+Shift+K`), Toggle Line Comment (`Cmd+/`).
-  - Mouse click & drag selection inside `TextInput` (Find / Replace / Go-To-Line).
-  - Menu `Copy`/`Cut`/`Paste`/`SelectAll` correctly routed to focused `TextInput` when Find/Go-To-Line is active!
+### Chunk 3 — Renderer & Custom UI (`editor-render` + `editor-app`)
+- [x] **True Dirty-Rect Partial Redraws**: caret blink marks only the caret line rect dirty (`~5–10 µs` frames).
+- [x] **Huge Single-Line Viewport Fast Path**: O(1) ASCII column calculation + windowed line reading.
+- [x] **Custom-Drawn In-App Confirm Modal**: pure-Rust modal overlay ("Save Changes to …?") with keyboard shortcuts.
+- [x] **Editor Ergonomics**: matching bracket highlight, indent guides, gutter line selection, multi-line Tab/Shift+Tab, Duplicate/Move/Delete Line, Toggle Line Comment, multi-cursor (`⌘D`, `⌥`+Click, vertical/horizontal arrows), 2×2 split panes with drag-and-drop, pinned working set (`⌘1`–`⌘9`), Vim mode + leader chords, and data-driven `Keymap` + `⌘K` Shortcuts overlay.
 
-### Chunk 4 — Complete Deterministic CLI (`editor-cli`)
+### Chunk 4 — Deterministic CLI (`editor-cli`)
 - [x] Hand-rolled strict zero-dependency JSON parser (`json_parse.rs`) with unit tests.
-- [x] Complete CLI features:
-  - Global `--root DIR` symlink-safe confinement (`E_OUTSIDE_ROOT`).
-  - `read` byte axis (`--from-offset B --length L`) in addition to line axis (`--from`/`--to`).
-  - `edit` positional form (`--at LINE[:COL] --op insert|replace|delete --text ... --length ...`), `--count N`, `--dry-run`, and `@FILE` / `-` payloads.
-  - `batch` JSON-lines transactional multi-file command (`--file F` / stdin, `--check`, atomic rollback on commit failure).
-- [x] Comprehensive CLI integration test suite covering every command, error code, and rollback path.
+- [x] Global `--root DIR` symlink-safe confinement (`E_OUTSIDE_ROOT`), `read` line & byte axes, `edit` match & positional forms with `--dry-run`, transactional `batch` JSON-lines with `--check` and rollback.
+- [x] Per-user `0600` Unix-socket IPC (`status`, `open`, `split`, `pin`, `goto`, `select`, `insert`, `find`, `save`, `syntax`, `action`, `close`/`quit`) and enclosing-bundle launch resolution.
 
-### Chunk 5 — macOS Adapter Polish, Preferences, Drag-and-Drop & `Editor.app` Bundle (`editor-macos`)
-- [x] Fix `keyDown:` to pass both `charactersIgnoringModifiers` (for reliable `Option+Z`, `Cmd+/`, `Option+Up/Down`, etc.) AND `characters` (for UTF-8/emoji text entry).
-- [x] Persisted preferences via `PlatformHost` (`load_pref` / `save_pref` backed by `NSUserDefaults`: `SidebarWidth`, `Theme`, `FontSize`, `WordWrap`).
-- [x] Window drag-and-drop for files and folders + `application:openFiles:` (Finder "Open With").
-- [x] Pure-Rust **Build Useful App Icon generator** + `Editor.app` packager binary (`crates/editor-macos/src/bin/bundle_app.rs`) rendering the 512pt dark tile (`#111111`, 112pt radius) with crisp caret motif (`#f1f1f1`) at 16/32/128/256/512 @1x/@2x into `.iconset` -> `iconutil` -> `target/release/Editor.app`!
+### Chunk 5 — macOS Adapter, Preferences, Drag-and-Drop & `Editor.app` Bundle (`editor-macos`)
+- [x] `IOSurface` zero-copy dirty-rect presentation, `FSEvents` directory watcher, `keyDown:` modifier-safe + UTF-8/emoji dispatch (blocking AppKit PUA function keys from text entry), `NSUserDefaults` preferences, drag-and-drop, Finder Open With (`CFBundleDocumentTypes`), and standard macOS App Menu (`About editor`, Hide, Quit).
+- [x] Pure-Rust Build Useful `.icns` generator + `bundle-app` packager embedding both `editor-gui` and `editor` inside `Editor.app/Contents/MacOS/`.
 
-### Chunk 6 — Final Full Verification, Performance Benchmarks & Visual QA
-- [x] Run full `cargo test --workspace` (zero warnings, all unit/property/integration tests green).
-- [x] Run release benchmarks (60 MB / 1M lines + 10 MB single-line pathological file + caret-blink partial frame + Retina frame times + binary sizes).
-- [x] Render & visually inspect fresh Light & Dark macOS CoreText Retina PNG snapshots.
-- [x] Build & verify `target/release/Editor.app`.
+### Chunk 6 — Search Engine, Huge-Folder Streaming, Versioning & Distribution
+- [x] **32-Byte SWAR & Linear-Time Regex**: rarest-pair SWAR scanning, branchless ASCII CI search, ReDoS-proof Thompson NFA / PikeVM regex engine, `$0`–`$9` capture replacement, and Find/Replace `W` & `.*` toggles.
+- [x] **Two-Pane Quick Open (`⌘P`) & Search in Files (`⇧⌘F`)**: live syntax-highlighted preview, automatic resume, bounded 20 MB modal-lifetime `SearchSlab` (100% freed on close).
+- [x] **Per-OS Ignore Rules, `.gitignore`, & Hybrid Streaming**: declarative per-OS ignore tables + hierarchical `.gitignore` in `editor-platform::ignore`; 8 ms sync head-start → cancellable background streaming via `MainLoopWaker` so huge directories like `$HOME` stay instant and 0% idle CPU.
+- [x] **Sidebar Polish**: lazy tree, drag-resizable width, left/right dock, keyboard navigation, and right-click `Copy Path` / `Copy Relative Path`.
+- [x] **Single-Source Versioning & Minimal macOS Installer**: `editor-platform::version` (`SemVer` + build numbers), `README.md`, updated `ARCHITECTURE.md` / `PLAN.md`, and `scripts/install-macos.sh` (atomic install + clean `--uninstall` / `--purge`).
+
+---
+
+## 4. Next Planned Milestones
+
+- [ ] **GitHub Releases Auto-Updater**: zero-dependency, zero-idle-CPU update flow reading a static `release.json` asset from public GitHub Releases (`releases/latest/download/release.json`), SHA-256 + `codesign` verification, atomic `Editor.app` swap (updating GUI + bundled CLI together), and CI release workflow.
+- [ ] **Subtle, Zero-Idle-CPU Git Awareness**: status bar branch badge (direct `.git/HEAD` read on open/focus/`FsChanged`), quiet gutter diff ticks, and optional `.gitignore` dimming in sidebar.
+- [ ] **Cross-Platform Adapters & Native Seams**: Linux/Windows adapters behind `editor-platform`, plus native `NSTextInputClient` (IME) and `NSAccessibility` wired to the existing `ImeComposition` / `A11yNode` seams.

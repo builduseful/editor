@@ -845,6 +845,16 @@ fn parse_size(s: &str) -> Option<(u32, u32)> {
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--version")
+        || args.first().map(String::as_str) == Some("-V")
+    {
+        println!(
+            "editor-gui {} (build {})",
+            editor_platform::APP_VERSION,
+            editor_platform::version::build_number()
+        );
+        return;
+    }
     let mut snapshot_path: Option<PathBuf> = None;
     let mut theme_override: Option<ThemePreference> = None;
     let mut syntax_style_override: Option<editor_render::SyntaxStylePreference> = None;

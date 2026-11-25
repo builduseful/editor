@@ -6,52 +6,72 @@ following the **Build Useful** design system.
 ## Core Design Principles
 
 1. **Zero third-party libraries.** Every layer — text buffer, line index, UTF-8 /
-   emoji grapheme segmentation, syntax tokenizer, glyph atlas, 2D software
-   rasterizer, custom UI controls, JSON serializer/parser, CLI — is written in
+   emoji grapheme segmentation, 32-byte SWAR scanner, linear-time regex engine,
+   syntax tokenizer, glyph atlas, 2D software rasterizer, custom UI controls,
+   OS/`.`gitignore` walker, JSON serializer/parser, IPC, and CLI — is written in
    pure Rust (`std` only). Zero external crates means sub-second incremental
    builds, full auditability, tiny binaries, and complete architectural control.
 2. **Minimal, razor-thin Platform Adapter boundary (`editor-platform`).** Only
    irreducible OS services sit behind Rust traits:
-   - `FileSystem`: file I/O (`pread`/`pwrite`), stat/identity, directory reads,
-     atomic temp+rename, CoW clone (`clonefile` on APFS with portable copy
-     fallback), advisory lockfile.
+   - `FileSystem`: file I/O (`pread`/`pwrite`), `read_prefix_into`, stat/identity,
+     directory reads, atomic temp+rename, CoW clone (`clonefile` on APFS with
+     portable copy fallback), advisory lockfile.
    - `GlyphRasterizer`: **2 methods** (`font_metrics`, `rasterize`) returning an
      `Alpha8` coverage bitmap (text) or `Rgba32` bitmap (color emoji) for a
-     single grapheme cluster. The OS font engine is ONLY called on atlas misses.
+     single grapheme cluster. The OS font engine is only called on atlas misses.
    - `Clipboard`: `get_text` / `set_text`.
    - `PlatformHost`: window title, cursor shape, open/save/confirm dialogs,
-     redraw/quit signals.
-   - **Presentation**: the renderer produces a premultiplied BGRA8 framebuffer +
-     dirty rectangles; the platform adapter blits it directly to the window.
-     Porting to Windows, Linux, or WASM requires ~300–500 lines of adapter glue
-     with 100% pixel-identical rendering across every OS.
-3. **Unbelievable speed & tiny memory footprint.**
+     persisted preferences, directory watcher (`FSEvents` on macOS), redraw/quit
+     signals, and optional `MainLoopWaker` for zero-polling background wakeups.
+   - `IgnoreRules` & `GitIgnoreLayer`: declarative per-OS workspace ignore tables
+     (`macos`, `linux`, `windows`, `unix_generic`) plus lightweight hierarchical
+     `.gitignore` matching (read only when a directory actually contains `.gitignore`).
+   - `version`: single-source-of-truth SemVer parsing and monotonic build numbers
+     derived from `[workspace.package] version` in `Cargo.toml`.
+   - **Presentation**: the renderer paints directly into a premultiplied BGRA8
+     surface (`IOSurface` zero-copy on macOS) with dirty rectangles. Porting to
+     Windows or Linux requires only a thin OS adapter with pixel-identical output.
+3. **Speed, memory, CPU, and battery first.**
    - **Monoid B-Tree Piece Table (`editor-core::piece_tree`)**: immutable
      windowed/paged base file (opens multi-GB files lazily in < 1 ms without
      loading them into RAM), append-only segmented add buffer, order-statistic
      B-tree with a CRLF-aware monoid summary `(bytes, breaks, starts_with_lf,
      ends_with_cr)` for O(log N) exact line/offset queries and O(1) typing
-     coalescing.
-   - **SWAR (64-bit word) hot paths**: 8-byte-at-a-time ASCII validation and
-     newline scanning in 100% safe portable Rust.
-   - **L1-hot Shelf-Packed Glyph Atlas + Software Tile/Dirty-Rect Compositor
-     (`editor-render`)**: flat 96-entry direct-index ASCII table (zero hashing),
-     open-addressed cache for Unicode/Emoji/UI glyphs, framebuffer scroll-blit
-     (`memmove` surviving viewport rows + rasterize only newly exposed lines),
-     dirty-rect tracking so caret blink touches < 200 pixels.
+     coalescing. Large streaming reads (`>= 64 KB`) bypass the page cache.
+   - **32-Byte SWAR & Linear-Time Regex (`editor-core::{swar, regex, search}`)**:
+     4×`u64` unrolled SWAR byte search, rarest-pair byte filtering using an
+     empirical 256-byte frequency table, branchless ASCII case-insensitive search,
+     and a ReDoS-proof Thompson NFA / PikeVM regex engine (`O(N × M)`) with
+     literal/alternation prefilters and `$0`–`$9` capture replacement.
+   - **L1-Hot Shelf-Packed Glyph Atlas + Dirty-Rect Compositor (`editor-render`)**:
+     flat 96-entry direct-index ASCII table (zero hashing), open-addressed cache
+     for Unicode/Emoji/UI glyphs, scroll-blit (`memmove` surviving rows), and
+     dirty-rect tracking so caret blink touches < 200 pixels (`~5–10 µs`).
+   - **Instant Workspace Search (`editor-render::palette`)**:
+     two-pane Quick Open (`⌘P`) and Search in Files (`⇧⌘F`) with live syntax-
+     highlighted preview, hybrid 8 ms sync head-start → cancellable background
+     streaming for huge directories (e.g. `$HOME`), and a unified lazy-filling
+     20 MB modal-lifetime `SearchSlab` that frees 100% of its RAM on close.
+   - **Zero idle CPU**: event-driven main loop with coalesced OS events and no
+     background polling timers or speculative filesystem scans.
 4. **Focused Unicode support**: strict UTF-8, English, programming languages,
    and an ergonomic UAX #29 Emoji grapheme cluster subset (combining marks,
    variation selectors, skin tones, regional indicator flags, ZWJ sequences,
    keycaps).
-5. **Future-ready seams**: `ImeComposition` (preedit text + caret rect) and
-   `A11yNode` snapshots are structurally modeled so IME and screen-reader
-   support can plug in cleanly without rewriting core or rendering layers.
+5. **Self-contained distribution**: on macOS, `bundle-app` renders the Build
+   Useful `.icns` icon in pure Rust and packages both `editor-gui` and `editor`
+   into one `Editor.app` bundle (`Contents/MacOS/`). `scripts/install-macos.sh`
+   installs `Editor.app` atomically and links a single `editor` symlink into
+   `PATH` so GUI and CLI stay atomically version-locked with zero scattered files.
+6. **Future-ready seams**: `ImeComposition` (preedit text + caret rect) and
+   `A11yNode` snapshots are structurally modeled so native IME and accessibility
+   plug in cleanly without rewriting core or rendering layers.
 
 ## Crate Dependency Graph
 
 ```text
                 ┌───────────────┐
-                │editor-platform│  (pure traits + POD types + headless mocks)
+                │editor-platform│  (traits, POD types, ignore, version, IPC, mocks)
                 └───────┬───────┘
                         │
         ┌───────────────┼───────────────┐
@@ -70,6 +90,16 @@ following the **Build Useful** design system.
  └─────────────┘
         ▲
  ┌──────┴──────┐
- │ editor-cli  │ (shares editor-core directly)
+ │ editor-cli  │ (shares editor-core + editor-platform directly)
  └─────────────┘
 ```
+
+## Module Overview
+
+- `crates/editor-platform`: `fs`, `host`, `ignore`, `input`, `ipc`, `raster`, `surface`, `version`.
+- `crates/editor-core`: `piece_tree`, `document`, `swar`, `regex`, `search`, `grapheme`, `undo`, `syntax`.
+- `crates/editor-render`: `theme`, `atlas`, `painter`, `viewport`, `sidebar`, `tab_strip`, `chrome`, `text_input`, `palette`, `pins`, `shortcuts`.
+- `crates/editor-app`: `lib` (`EditorApp` controller), `keymap`, `buffers`, `panes`, `session`, `autopairs`, `fs_undo`, `vim`, `vim_exec`.
+- `crates/editor-cli`: `main`, `json`, `json_parse`.
+- `crates/editor-macos`: `main` (`editor-gui`), `bin/bundle_app` (`Editor.app` + pure-Rust `.icns` packager), `objc/mac_adapter.m`.
+- `scripts/install-macos.sh`: zero-clutter macOS installer and uninstaller.

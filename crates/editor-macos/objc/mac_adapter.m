@@ -1133,6 +1133,21 @@ void mac_activate_app(void) {
     // App Menu
     NSMenuItem* appItem = [[NSMenuItem alloc] init];
     NSMenu* appMenu = [[NSMenu alloc] initWithTitle:@"editor"];
+    [appMenu addItemWithTitle:@"About editor"
+                       action:@selector(orderFrontStandardAboutPanel:)
+                keyEquivalent:@""];
+    [appMenu addItem:[NSMenuItem separatorItem]];
+    [appMenu addItemWithTitle:@"Hide editor"
+                       action:@selector(hide:)
+                keyEquivalent:@"h"];
+    NSMenuItem* hideOthers = [appMenu addItemWithTitle:@"Hide Others"
+                                                action:@selector(hideOtherApplications:)
+                                         keyEquivalent:@"h"];
+    hideOthers.keyEquivalentModifierMask = NSEventModifierFlagCommand | NSEventModifierFlagOption;
+    [appMenu addItemWithTitle:@"Show All"
+                       action:@selector(unhideAllApplications:)
+                keyEquivalent:@""];
+    [appMenu addItem:[NSMenuItem separatorItem]];
     [appMenu addItem:[self menuItem:@"Quit editor" key:@"q" tag:21 mods:NSEventModifierFlagCommand]];
     appItem.submenu = appMenu;
     [mainMenu addItem:appItem];

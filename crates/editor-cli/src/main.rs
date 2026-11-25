@@ -25,7 +25,7 @@ use editor_platform::{FileRev, FileSystem, StdFileSystem};
 use crate::json::JsonBuf;
 use crate::json_parse::{parse_json, JsonValue};
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION: &str = editor_platform::APP_VERSION;
 
 struct GlobalOpts {
     root: PathBuf,
@@ -59,10 +59,12 @@ fn main() -> ExitCode {
         print_usage();
         return ExitCode::SUCCESS;
     }
-    if args[0] == "--version" || args[0] == "version" {
+    if args[0] == "--version" || args[0] == "-V" || args[0] == "version" {
         let mut res = JsonBuf::new();
         res.push_raw("[{\"version\":");
         res.push_str(VERSION);
+        res.push_raw(",\"build\":");
+        res.push_u64(editor_platform::version::build_number() as u64);
         res.push_raw("}]");
         emit_ok("version", start, &res.into_string());
         return ExitCode::SUCCESS;
@@ -1464,11 +1466,36 @@ fn resolve_open_path(
         .map_err(|e| ("E_NOT_FOUND", e.to_string()))
 }
 
+#[cfg(target_os = "macos")]
+fn enclosing_app_bundle(exe_path: &Path) -> Option<PathBuf> {
+    let macos_dir = exe_path.parent()?;
+    if macos_dir.file_name().and_then(|n| n.to_str()) != Some("MacOS") {
+        return None;
+    }
+    let contents_dir = macos_dir.parent()?;
+    if contents_dir.file_name().and_then(|n| n.to_str()) != Some("Contents") {
+        return None;
+    }
+    let app_dir = contents_dir.parent()?;
+    let ext = app_dir.extension().and_then(|e| e.to_str())?;
+    if ext.eq_ignore_ascii_case("app") {
+        Some(app_dir.to_path_buf())
+    } else {
+        None
+    }
+}
+
 fn launch_gui_process(sidebar_root: Option<&Path>, target: Option<&Path>) -> Result<(), String> {
-    // Prefer sibling `Editor.app` bundle if present next to `editor`, else `/Applications/Editor.app`,
-    // else sibling `editor-gui`.
-    let exe_dir = std::env::current_exe()
-        .ok()
+    // Prefer the enclosing `Editor.app` bundle when `editor` is invoked from inside
+    // `Editor.app/Contents/MacOS/editor` (including via a `/usr/local/bin/editor` symlink),
+    // else sibling `Editor.app`, else `/Applications/Editor.app`, else sibling `editor-gui`.
+    let current_exe = std::env::current_exe().ok();
+    let canonical_exe = current_exe
+        .as_deref()
+        .and_then(|p| std::fs::canonicalize(p).ok())
+        .or(current_exe);
+    let exe_dir = canonical_exe
+        .as_deref()
         .and_then(|p| p.parent().map(Path::to_path_buf));
 
     let mut gui_args: Vec<String> = Vec::new();
@@ -1490,6 +1517,11 @@ fn launch_gui_process(sidebar_root: Option<&Path>, target: Option<&Path>) -> Res
     #[cfg(target_os = "macos")]
     {
         let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(ref exe) = canonical_exe {
+            if let Some(bundle) = enclosing_app_bundle(exe) {
+                candidates.push(bundle);
+            }
+        }
         if let Some(ref dir) = exe_dir {
             candidates.push(dir.join("Editor.app"));
         }
