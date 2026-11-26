@@ -97,6 +97,7 @@ extern "C" {
     fn mac_close_window();
     fn mac_request_quit();
     fn mac_watch_directory(dir_path: *const c_char);
+    fn mac_watch_extra_directory(dir_path: *const c_char);
     fn mac_activate_app();
     fn mac_wake_main_loop();
     fn mac_http_get(
@@ -388,6 +389,13 @@ impl PlatformHost for MacHost {
         match dir.and_then(|p| p.to_str()).and_then(|s| CString::new(s).ok()) {
             Some(cs) => unsafe { mac_watch_directory(cs.as_ptr()) },
             None => unsafe { mac_watch_directory(std::ptr::null()) },
+        }
+    }
+
+    fn watch_extra_directory(&mut self, dir: Option<&Path>) {
+        match dir.and_then(|p| p.to_str()).and_then(|s| CString::new(s).ok()) {
+            Some(cs) => unsafe { mac_watch_extra_directory(cs.as_ptr()) },
+            None => unsafe { mac_watch_extra_directory(std::ptr::null()) },
         }
     }
 
@@ -1230,6 +1238,8 @@ fn main() {
         let _ = bridge.app.open_path_or_dir(&p, &mut bridge.host);
     }
     bridge.app.sync_fs_watch(&mut bridge.host);
+    bridge.app.refresh_git_workspace(&mut bridge.host, true);
+    bridge.app.refresh_git_head_for_active_doc(&mut bridge.host);
     bridge.app.maybe_start_auto_update_check(&mut bridge.host);
 
     let ud = (&mut *bridge as *mut Bridge) as *mut c_void;

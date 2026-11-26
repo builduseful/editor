@@ -4,8 +4,9 @@
 use std::collections::HashMap;
 
 use editor_core::{
-    cluster_cell_width, grapheme_clusters, swar::{find_byte, is_all_ascii}, Document, SearchMatch,
-    TokenKind, TokenSpan,
+    cluster_cell_width, grapheme_clusters, lookup_line_diff,
+    swar::{find_byte, is_all_ascii},
+    Document, LineDiffKind, LineDiffMark, SearchMatch, TokenKind, TokenSpan,
 };
 use editor_platform::{FontMetrics, FontStyle, GlyphRasterizer, PixelRect};
 
@@ -85,6 +86,8 @@ pub struct Viewport {
     pub block_caret: bool,
     /// Optional secondary `(anchor, caret)` byte-offset pairs for multi-cursor rendering.
     pub extra_cursors: Vec<(u64, u64)>,
+    /// Sorted compact live Git gutter diff marks (`O(log H)` lookup per visible line).
+    pub git_diff: Vec<LineDiffMark>,
 }
 
 impl Default for Viewport {
@@ -117,6 +120,7 @@ impl Viewport {
             last_caret_rect: PixelRect::ZERO,
             block_caret: false,
             extra_cursors: Vec::new(),
+            git_diff: Vec::new(),
         }
     }
 
@@ -844,6 +848,54 @@ impl Viewport {
                     let g = atlas.get_ascii_mono(rasterizer, false, font_px, b);
                     painter.draw_glyph(gx, num_baseline, g, num_color, atlas);
                     gx += cell_w;
+                }
+                if !self.git_diff.is_empty() {
+                    if let Some(diff_kind) = lookup_line_diff(&self.git_diff, line_idx) {
+                        let bar_w = px(2.0, scale).max(2);
+                        let bar_x = layout.gutter.right() - hairline - px(3.0, scale) - bar_w;
+                        let ly = cur_y.round() as i32;
+                        let bh = block_h.round().max(1.0) as i32;
+                        match diff_kind {
+                            LineDiffKind::Added => {
+                                painter.fill_rect(
+                                    PixelRect::new(bar_x, ly + 1, bar_w, (bh - 2).max(2)),
+                                    theme.state_success,
+                                );
+                            }
+                            LineDiffKind::Modified => {
+                                painter.fill_rect(
+                                    PixelRect::new(bar_x, ly + 1, bar_w, (bh - 2).max(2)),
+                                    theme.state_info,
+                                );
+                            }
+                            LineDiffKind::DeletedAbove => {
+                                let tw = px(5.0, scale).max(4);
+                                let th = px(2.0, scale).max(2);
+                                painter.fill_rect(
+                                    PixelRect::new(
+                                        layout.gutter.right() - hairline - px(2.0, scale) - tw,
+                                        ly,
+                                        tw,
+                                        th,
+                                    ),
+                                    theme.state_danger,
+                                );
+                            }
+                            LineDiffKind::DeletedBelow => {
+                                let tw = px(5.0, scale).max(4);
+                                let th = px(2.0, scale).max(2);
+                                painter.fill_rect(
+                                    PixelRect::new(
+                                        layout.gutter.right() - hairline - px(2.0, scale) - tw,
+                                        (ly + bh - th).max(ly),
+                                        tw,
+                                        th,
+                                    ),
+                                    theme.state_danger,
+                                );
+                            }
+                        }
+                    }
                 }
                 painter.pop_clip();
             }

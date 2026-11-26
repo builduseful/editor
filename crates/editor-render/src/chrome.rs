@@ -435,6 +435,7 @@ pub struct StatusBarData<'a> {
     pub theme_pref: ThemePreference,
     pub notice: Option<(&'a str, bool)>, // (message, is_error)
     pub vim_badge: Option<&'a str>,
+    pub git_branch: Option<&'a str>,
 }
 
 pub fn status_bar_height_px(scale: f32) -> i32 {
@@ -495,6 +496,31 @@ pub fn draw_status_bar(
             rasterizer,
         );
         lx = pill_rect.right() as f32 + px(10.0, scale) as f32;
+    }
+
+    if let Some(branch) = data.git_branch {
+        lx = painter.draw_text_ui(
+            lx,
+            baseline,
+            branch,
+            FontStyle::Ui,
+            font_px,
+            theme.text_muted,
+            atlas,
+            rasterizer,
+        );
+        lx += px(8.0, scale) as f32;
+        lx = painter.draw_text_ui(
+            lx,
+            baseline,
+            "·",
+            FontStyle::Ui,
+            font_px,
+            theme.border_control,
+            atlas,
+            rasterizer,
+        );
+        lx += px(8.0, scale) as f32;
     }
 
     let left_text = if data.dirty {
@@ -586,6 +612,7 @@ pub struct ConfirmModal {
     pub delete_is_dir: bool,
     pub is_move_confirm: bool,
     pub is_update_confirm: bool,
+    pub is_replace_all_confirm: bool,
     pub move_body: String,
     pub btn_save: PixelRect,
     pub btn_discard: PixelRect,
@@ -599,6 +626,7 @@ impl ConfirmModal {
         self.delete_is_dir = false;
         self.is_move_confirm = false;
         self.is_update_confirm = false;
+        self.is_replace_all_confirm = false;
         self.move_body.clear();
         self.file_name = file_name.to_string();
     }
@@ -609,6 +637,7 @@ impl ConfirmModal {
         self.delete_is_dir = is_dir;
         self.is_move_confirm = false;
         self.is_update_confirm = false;
+        self.is_replace_all_confirm = false;
         self.move_body.clear();
         self.file_name = name.to_string();
     }
@@ -619,6 +648,7 @@ impl ConfirmModal {
         self.delete_is_dir = false;
         self.is_move_confirm = true;
         self.is_update_confirm = false;
+        self.is_replace_all_confirm = false;
         self.file_name = name.to_string();
         self.move_body = format!("Move \"{name}\" ({summary}) into \"{dest_name}\"?");
     }
@@ -629,10 +659,27 @@ impl ConfirmModal {
         self.delete_is_dir = false;
         self.is_move_confirm = false;
         self.is_update_confirm = true;
+        self.is_replace_all_confirm = false;
         self.file_name = new_version.to_string();
         self.move_body = format!(
             "Version {new_version} is available (installed: {current_version})."
         );
+    }
+
+    pub fn open_confirm_replace_all(&mut self, match_count: usize, file_count: usize) {
+        self.visible = true;
+        self.is_delete = false;
+        self.delete_is_dir = false;
+        self.is_move_confirm = false;
+        self.is_update_confirm = false;
+        self.is_replace_all_confirm = true;
+        self.file_name = format!(
+            "{match_count} match{} in {file_count} file{}",
+            if match_count == 1 { "" } else { "es" },
+            if file_count == 1 { "" } else { "s" }
+        );
+        self.move_body = "Open buffers remain undoable; unopened files will be saved atomically."
+            .to_string();
     }
 
     pub fn close(&mut self) {
@@ -640,6 +687,7 @@ impl ConfirmModal {
         self.is_delete = false;
         self.is_move_confirm = false;
         self.is_update_confirm = false;
+        self.is_replace_all_confirm = false;
     }
 
     pub fn hit_test(&self, x_px: f32, y_px: f32) -> Option<ConfirmChoice> {
@@ -711,6 +759,11 @@ impl ConfirmModal {
         } else if self.is_update_confirm {
             (
                 format!("Update to v{}?", self.file_name),
+                self.move_body.as_str(),
+            )
+        } else if self.is_replace_all_confirm {
+            (
+                format!("Replace {}?", self.file_name),
                 self.move_body.as_str(),
             )
         } else {
@@ -799,6 +852,13 @@ impl ConfirmModal {
                 atlas,
                 rasterizer,
             );
+        } else if self.is_replace_all_confirm {
+            let rep_w = px(106.0, scale);
+            self.btn_save = PixelRect::ZERO;
+            self.btn_discard = PixelRect::new(card.right() - pad - rep_w, btn_y, rep_w, btn_h);
+            self.btn_cancel = PixelRect::new(card.x + pad, btn_y, cancel_w, btn_h);
+            draw_button(painter, self.btn_cancel, "Cancel", false, theme, atlas, rasterizer);
+            draw_button(painter, self.btn_discard, "Replace All", true, theme, atlas, rasterizer);
         } else {
             let save_w = px(72.0, scale);
             let discard_w = px(92.0, scale);

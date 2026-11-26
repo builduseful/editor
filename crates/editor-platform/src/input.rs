@@ -117,6 +117,8 @@ pub enum AppCommand {
     FindNext,
     FindPrev,
     GoToLine,
+    NextGitChange,
+    PrevGitChange,
     QuickOpen,
     CommandPalette,
     ProjectSearch,

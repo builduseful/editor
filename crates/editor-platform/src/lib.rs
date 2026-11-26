@@ -7,6 +7,7 @@
 //! without an OS windowing server.
 
 pub mod fs;
+pub mod git;
 pub mod host;
 pub mod ignore;
 pub mod input;
@@ -20,8 +21,11 @@ pub use fs::{
     DirEntry, EntryKind, FileHandle, FileLock, FileRev, FileStat, FileSystem, FsError, FsResult,
     MemoryFileSystem, StdFileSystem,
 };
+pub use git::{GitFileStatus, GitRepo, GitStatusCache, GitStatusMap};
 pub use host::{Clipboard, HeadlessHost, HttpFetcher, MainLoopWaker, MemoryClipboard, PlatformHost};
-pub use ignore::{is_gitignored, GitIgnoreLayer, IgnoreRules};
+pub use ignore::{
+    collect_ancestor_gitignores, is_gitignored, matches_path_filter, GitIgnoreLayer, IgnoreRules,
+};
 pub use input::{
     AppCommand, ConfirmChoice, CursorShape, DragPhase, InputEvent, Key, Modifiers, MouseButton,
     SystemTheme, ThemePreference,

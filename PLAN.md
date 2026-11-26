@@ -31,9 +31,10 @@
 crates/
 ├── editor-platform/   # Pure traits + POD types + StdFileSystem + MemoryFileSystem
 │                      # + BuiltinBitmapRasterizer + Framebuffer + PNG encoder
-│                      # + Per-OS IgnoreRules & .gitignore + SemVer version + IPC
+│                      # + Per-OS IgnoreRules & .gitignore + Git discovery/status
+│                      # + SemVer version, GitHub Releases updater & IPC
 ├── editor-core/       # PieceTree, 32-byte SWAR, linear-time Regex, Search,
-│                      # Grapheme/Emoji, Undo, Syntax plugins, Document
+│                      # Myers line diff, Grapheme/Emoji, Undo, Syntax plugins, Document
 ├── editor-render/     # Build Useful Theme, GlyphAtlas, Painter, Viewport, Sidebar,
 │                      # TabStrip, TextInput, Find/Replace, Two-Pane Palette & SearchSlab,
 │                      # Pins, Shortcuts Overlay, Modal Confirm, Status Bar
@@ -88,9 +89,14 @@ scripts/
 - [x] **Sidebar Polish**: lazy tree, drag-resizable width, left/right dock, keyboard navigation, and right-click `Copy Path` / `Copy Relative Path`.
 - [x] **Single-Source Versioning, Minimal macOS Installer & GitHub Releases Auto-Updater**: `editor-platform::{version, update}` (SemVer, pure-Rust SHA-256, CDN `release.json` manifest, host allowlist, App Translocation/dev guards, atomic bundle swap), `NSURLSession` native HTTPS check (once per 24h on launch + manual **Check for Updates…** / `editor update`), `scripts/install-macos.sh` (source build, `--from-release`, and standalone `curl | sh`), `.github/workflows/{ci,release}.yml`, `README.md`, and updated `ARCHITECTURE.md` / `PLAN.md`.
 
+### Chunk 7 — Zero-Idle-CPU Git Awareness, Monorepo/Nested-Repo Support & Search/Multi-Cursor Polish
+- [x] **OS-Agnostic Git Awareness (`editor-platform::git` + `editor-core::diff`)**: pure-Rust `.git/HEAD` branch display (supporting worktrees, submodules, detached HEAD, rebase/merge/cherry-pick), live in-memory Myers O(ND) gutter diff ticks over FNV-1a line hashes with `⌥F5`/`⇧⌥F5` hunk navigation, lazy sidebar `.gitignore` dimming and `M`/`A`/`U`/`!` + folder dirty-dot cues via single-flight, pathspec-scoped, lock-free `git --no-optional-locks status` with adaptive backoff.
+- [x] **Monorepos & Repos-within-Repos**: innermost-repo resolution for active file branch & gutter diff, bounded 4-repo `GitStatusCache`, ancestor `.gitignore` loading with exact Git anchoring (`LayerScope::Ancestor`), nested `.git` boundary isolation in sidebar and workspace walker, and dual-path single-stream `FSEvents` watching of external `.git` directories with C-level filtering.
+- [x] **Multi-Cursor Completion & Search in Files Polish**: atomic `Document::edit_multi` for `⌘⌫`, `Shift+Tab`, `⇧⌘D`, `⇧⌘K`, and `⌘/` across all carets; opt-in `Paths` glob/negation filter (`*.rs, crates/, !tests/`) and opt-in `Replace` in Files gated by custom `ConfirmModal` (updating open/split/parked buffers in-memory + undoable, unopened files atomically).
+
 ---
 
 ## 4. Next Planned Milestones
 
-- [ ] **Subtle, Zero-Idle-CPU Git Awareness**: status bar branch badge (direct `.git/HEAD` read on open/focus/`FsChanged`), quiet gutter diff ticks, and optional `.gitignore` dimming in sidebar.
-- [ ] **Cross-Platform Adapters & Native Seams**: Linux/Windows adapters behind `editor-platform`, plus native `NSTextInputClient` (IME) and `NSAccessibility` wired to the existing `ImeComposition` / `A11yNode` seams.
+- [ ] **Cross-Platform Adapters & Native Seams**: Linux (`editor-linux`) and Windows (`editor-windows`) adapters behind `editor-platform`, plus native `NSTextInputClient` (IME) and `NSAccessibility` wired to the existing `ImeComposition` / `A11yNode` seams.
+- [ ] **Distribution Polish (Optional)**: Apple Developer ID signing & notarization in `.github/workflows/release.yml` and Homebrew cask.

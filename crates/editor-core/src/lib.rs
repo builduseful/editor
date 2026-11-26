@@ -9,6 +9,7 @@
 //! - 1-byte-state incremental lexical syntax highlighter (`syntax`)
 //! - Atomic + APFS-CoW document persistence (`document`)
 
+pub mod diff;
 pub mod document;
 pub mod grapheme;
 pub mod piece_tree;
@@ -17,6 +18,11 @@ pub mod search;
 pub mod swar;
 pub mod syntax;
 pub mod undo;
+
+pub use diff::{
+    compute_line_diff, hash_document_lines, hash_lines_bytes, lookup_line_diff, LineDiffKind,
+    LineDiffMark,
+};
 
 pub use document::{
     Document, DocumentError, DocumentInfo, Eol, IdentityCheck, SaveMethod, SaveReport,

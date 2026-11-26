@@ -28,8 +28,9 @@ use editor_core::{
     CompiledQuery, Language, SearchOptions, SearchScratch, SyntaxCache, TokenSpan,
 };
 use editor_platform::{
-    is_gitignored, EntryKind, FileSystem, FontStyle, GitIgnoreLayer, GlyphRasterizer, IgnoreRules,
-    Key, MainLoopWaker, Modifiers, PixelRect,
+    collect_ancestor_gitignores, is_gitignored, matches_path_filter, EntryKind, FileSystem,
+    FontStyle, GitIgnoreLayer, GlyphRasterizer, IgnoreRules, Key, MainLoopWaker, Modifiers,
+    PixelRect,
 };
 
 use crate::atlas::GlyphAtlas;
@@ -106,7 +107,22 @@ pub enum PaletteAction {
         target: PaletteOpenTarget,
     },
     RunCommand(String),
+    RequestReplaceAll {
+        query: String,
+        replacement: String,
+        options: SearchOptions,
+        files: Vec<PathBuf>,
+        match_count: usize,
+    },
     Changed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum PaletteFocus {
+    #[default]
+    Query,
+    PathFilter,
+    Replace,
 }
 
 /// Precomputed per-file metadata for zero-allocation fuzzy Quick Open and fast grep filtering.
@@ -339,6 +355,11 @@ struct PreviewBuffer {
 pub struct CommandPalette {
     pub mode: PaletteMode,
     pub input: TextInput,
+    pub path_filter_input: TextInput,
+    pub replace_input: TextInput,
+    pub show_path_filter: bool,
+    pub show_replace: bool,
+    focus: PaletteFocus,
     pub case_sensitive: bool,
     pub whole_word: bool,
     pub regex: bool,
@@ -382,9 +403,15 @@ pub struct CommandPalette {
     card_rect: PixelRect,
     list_rect: PixelRect,
     preview_rect: PixelRect,
+    query_rect: PixelRect,
+    filter_rect: PixelRect,
+    replace_rect: PixelRect,
     btn_case: PixelRect,
     btn_word: PixelRect,
     btn_regex: PixelRect,
+    btn_filter: PixelRect,
+    btn_replace_toggle: PixelRect,
+    btn_replace_all: PixelRect,
     item_rects: Vec<(usize, PixelRect)>,
 }
 
@@ -399,6 +426,11 @@ impl CommandPalette {
         Self {
             mode: PaletteMode::Closed,
             input: TextInput::new("Type to search"),
+            path_filter_input: TextInput::new("Filter paths (e.g. *.rs, crates/, !tests/)"),
+            replace_input: TextInput::new("Replace with"),
+            show_path_filter: false,
+            show_replace: false,
+            focus: PaletteFocus::Query,
             case_sensitive: false,
             whole_word: false,
             regex: false,
@@ -435,9 +467,15 @@ impl CommandPalette {
             card_rect: PixelRect::ZERO,
             list_rect: PixelRect::ZERO,
             preview_rect: PixelRect::ZERO,
+            query_rect: PixelRect::ZERO,
+            filter_rect: PixelRect::ZERO,
+            replace_rect: PixelRect::ZERO,
             btn_case: PixelRect::ZERO,
             btn_word: PixelRect::ZERO,
             btn_regex: PixelRect::ZERO,
+            btn_filter: PixelRect::ZERO,
+            btn_replace_toggle: PixelRect::ZERO,
+            btn_replace_all: PixelRect::ZERO,
             item_rects: Vec::new(),
         }
     }
@@ -567,7 +605,7 @@ impl CommandPalette {
                 abs: r.to_path_buf(),
                 rel: String::new(),
                 depth: 0,
-                gitignore: Vec::new(),
+                gitignore: collect_ancestor_gitignores(fs, r),
             });
             let budget = Duration::from_millis(SYNC_HEAD_START_MS);
             let done = walk_bfs_budgeted(
@@ -734,7 +772,10 @@ impl CommandPalette {
         self.cancel_search();
         self.mode = PaletteMode::Commands;
         self.input = TextInput::new("Run a command");
+        self.focus = PaletteFocus::Query;
         self.input.focused = true;
+        self.path_filter_input.focused = false;
+        self.replace_input.focused = false;
         self.selected = 0;
         self.scroll_row = 0;
         self.preview = None;
@@ -761,7 +802,10 @@ impl CommandPalette {
         self.cancel_search();
         self.mode = PaletteMode::QuickOpen;
         self.input = TextInput::new("Open file by name");
+        self.focus = PaletteFocus::Query;
         self.input.focused = true;
+        self.path_filter_input.focused = false;
+        self.replace_input.focused = false;
         self.selected = 0;
         self.scroll_row = 0;
         self.regex_error = None;
@@ -800,7 +844,10 @@ impl CommandPalette {
             self.input.select_all();
             restore_selected = Some(self.last_search_selected);
         }
+        self.focus = PaletteFocus::Query;
         self.input.focused = true;
+        self.path_filter_input.focused = false;
+        self.replace_input.focused = false;
         self.selected = 0;
         self.scroll_row = 0;
         self.all_commands.clear();
@@ -813,6 +860,140 @@ impl CommandPalette {
                 self.sync_scroll_to_selected();
                 self.ensure_preview(fs);
             }
+        }
+    }
+
+    #[inline]
+    fn active_path_filter(&self) -> &str {
+        if self.mode == PaletteMode::ProjectSearch {
+            self.path_filter_input.text.trim()
+        } else {
+            ""
+        }
+    }
+
+    fn set_focus(&mut self, focus: PaletteFocus) {
+        self.focus = focus;
+        self.input.focused = focus == PaletteFocus::Query;
+        self.path_filter_input.focused = focus == PaletteFocus::PathFilter;
+        self.replace_input.focused = focus == PaletteFocus::Replace;
+    }
+
+    fn cycle_focus(&mut self, reverse: bool) {
+        if self.mode != PaletteMode::ProjectSearch {
+            return;
+        }
+        let mut order = Vec::with_capacity(3);
+        order.push(PaletteFocus::Query);
+        if self.show_path_filter {
+            order.push(PaletteFocus::PathFilter);
+        }
+        if self.show_replace {
+            order.push(PaletteFocus::Replace);
+        }
+        if order.len() <= 1 {
+            return;
+        }
+        let cur = order.iter().position(|&f| f == self.focus).unwrap_or(0);
+        let next = if reverse {
+            (cur + order.len() - 1) % order.len()
+        } else {
+            (cur + 1) % order.len()
+        };
+        self.set_focus(order[next]);
+    }
+
+    /// Programmatically set the Search in Files path filter and refresh results.
+    pub fn set_path_filter(&mut self, fs: &dyn FileSystem, expr: &str) {
+        self.path_filter_input.set_text(expr);
+        self.show_path_filter = !expr.trim().is_empty();
+        if self.mode == PaletteMode::ProjectSearch {
+            self.refresh_results(fs);
+        }
+    }
+
+    /// Count exact matches across all indexed files passing the active path filter
+    /// for a safe, confirmed Replace in Files operation.
+    pub fn prepare_replace_all(&mut self, fs: &dyn FileSystem) -> PaletteAction {
+        if self.mode != PaletteMode::ProjectSearch {
+            return PaletteAction::None;
+        }
+        let query = self.input.text.clone();
+        if query.is_empty() || (!self.regex && query.len() < 2) {
+            return PaletteAction::None;
+        }
+        let options = SearchOptions {
+            case_sensitive: self.case_sensitive,
+            whole_word: self.whole_word,
+            regex: self.regex,
+            max_matches: usize::MAX,
+        };
+        let compiled = match CompiledQuery::compile(&query, options) {
+            Ok(Some(c)) => c,
+            Ok(None) => return PaletteAction::None,
+            Err(err) => {
+                self.regex_error = Some(err.message);
+                return PaletteAction::Changed;
+            }
+        };
+
+        self.reclaim_stashed_slab();
+        let path_filter = self.active_path_filter().to_string();
+        let mut files_with_hits: Vec<PathBuf> = Vec::new();
+        let mut total_matches = 0usize;
+        let mut read_buf = Vec::new();
+        let mut scratch = SearchScratch::new();
+        let mut hits = Vec::new();
+
+        for (idx, f) in self.all_files.iter().enumerate() {
+            if f.skip_grep {
+                continue;
+            }
+            if !path_filter.is_empty() && !matches_path_filter(&f.rel, &path_filter) {
+                continue;
+            }
+            let bytes: Option<&[u8]> = if let Some((_, mem)) =
+                self.dirty_files.iter().find(|(p, _)| p == &f.abs)
+            {
+                Some(mem.as_slice())
+            } else if let Some(SlabSlot::Cached { chunk, start, end }) =
+                self.search_slab.as_ref().and_then(|sl| sl.slots.get(idx)).copied()
+            {
+                self.search_slab
+                    .as_ref()
+                    .and_then(|sl| sl.chunks.get(chunk as usize))
+                    .and_then(|c| c.get(start as usize..end as usize))
+            } else {
+                const MAX_REPLACE_FILE_BYTES: usize = 8 * 1024 * 1024;
+                match fs.read_prefix_into(&f.abs, MAX_REPLACE_FILE_BYTES, &mut read_buf) {
+                    Ok(Some(sz)) if sz <= MAX_REPLACE_FILE_BYTES as u64 => {
+                        let sample = &read_buf[..read_buf.len().min(4096)];
+                        if find_byte(sample, 0).is_some() {
+                            None
+                        } else {
+                            Some(read_buf.as_slice())
+                        }
+                    }
+                    _ => None,
+                }
+            };
+            let Some(data) = bytes else {
+                continue;
+            };
+            hits.clear();
+            compiled.find_in_bytes(data, usize::MAX, &mut scratch, &mut hits);
+            if !hits.is_empty() {
+                total_matches += hits.len();
+                files_with_hits.push(f.abs.clone());
+            }
+        }
+
+        PaletteAction::RequestReplaceAll {
+            query,
+            replacement: self.replace_input.text.clone(),
+            options,
+            files: files_with_hits,
+            match_count: total_matches,
         }
     }
 
@@ -1035,6 +1216,7 @@ impl CommandPalette {
             return;
         }
         self.reclaim_stashed_slab();
+        let path_filter = self.active_path_filter().to_string();
         let remaining_cap = MAX_SEARCH_RESULTS - self.items.len();
         let slab = self
             .search_slab
@@ -1049,6 +1231,7 @@ impl CommandPalette {
             slab,
             &self.dirty_files,
             compiled,
+            &path_filter,
             remaining_cap,
             sync_budget,
         );
@@ -1061,10 +1244,18 @@ impl CommandPalette {
         if !finished_slice && self.items.len() < MAX_SEARCH_RESULTS {
             if let Some(rt) = &self.async_runtime {
                 let slice_end = self.all_files.len();
+                let filter_str = path_filter.as_str();
                 let files_slice: Vec<(usize, IndexedFile)> = (next_idx..slice_end)
+                    .filter(|&i| {
+                        filter_str.is_empty()
+                            || matches_path_filter(&self.all_files[i].rel, filter_str)
+                    })
                     .map(|i| (i, self.all_files[i].clone()))
                     .collect();
                 self.searched_file_count = slice_end;
+                if files_slice.is_empty() {
+                    return;
+                }
                 let my_gen = self.search_gen.fetch_add(1, Ordering::Relaxed) + 1;
                 let progress = Arc::new(Mutex::new(SearchProgress::default()));
                 self.search_task = Some(SearchTask {
@@ -1161,6 +1352,7 @@ impl CommandPalette {
                             s.fully_loaded && s.slots.len() >= self.all_files.len()
                         });
                     if slab_warm {
+                        let path_filter = self.active_path_filter().to_string();
                         let slab = self.search_slab.as_mut().unwrap();
                         let (buckets, timed_out) = search_project_parallel_buckets(
                             fs,
@@ -1168,6 +1360,7 @@ impl CommandPalette {
                             slab,
                             &self.dirty_files,
                             &compiled,
+                            &path_filter,
                         );
                         self.searched_file_count = self.all_files.len();
                         self.streaming_buckets = buckets;
@@ -1179,6 +1372,7 @@ impl CommandPalette {
                     self.update_project_search_status();
                 } else {
                     // Synchronous headless/test/benchmark path.
+                    let path_filter = self.active_path_filter().to_string();
                     let slab = self
                         .search_slab
                         .get_or_insert_with(|| SearchSlab::new(self.all_files.len()));
@@ -1189,6 +1383,7 @@ impl CommandPalette {
                         slab,
                         &self.dirty_files,
                         &compiled,
+                        &path_filter,
                     );
                     self.streaming_buckets = buckets;
                     self.search_timed_out = timed_out;
@@ -1568,7 +1763,17 @@ impl CommandPalette {
                 }
                 return (PaletteAction::Changed, None);
             }
+            Key::Tab if self.mode == PaletteMode::ProjectSearch => {
+                self.cycle_focus(mods.shift);
+                return (PaletteAction::Changed, None);
+            }
             Key::Enter => {
+                if self.mode == PaletteMode::ProjectSearch
+                    && self.focus == PaletteFocus::Replace
+                    && mods.primary()
+                {
+                    return (self.prepare_replace_all(fs), None);
+                }
                 let target = if mods.primary() && self.mode != PaletteMode::Commands {
                     PaletteOpenTarget::SplitRight
                 } else {
@@ -1579,8 +1784,12 @@ impl CommandPalette {
             _ => {}
         }
 
-        let (changed, copied) = self.input.handle_key(key, mods, text, clipboard);
-        if changed {
+        let (changed, copied) = match self.focus {
+            PaletteFocus::Query => self.input.handle_key(key, mods, text, clipboard),
+            PaletteFocus::PathFilter => self.path_filter_input.handle_key(key, mods, text, clipboard),
+            PaletteFocus::Replace => self.replace_input.handle_key(key, mods, text, clipboard),
+        };
+        if changed && self.focus != PaletteFocus::Replace {
             self.refresh_results(fs);
         }
         (PaletteAction::Changed, copied)
@@ -1597,6 +1806,18 @@ impl CommandPalette {
             return PaletteAction::Close;
         }
         if self.mode == PaletteMode::ProjectSearch {
+            if self.query_rect.contains(xi, yi) {
+                self.set_focus(PaletteFocus::Query);
+                return PaletteAction::Changed;
+            }
+            if !self.filter_rect.is_empty() && self.filter_rect.contains(xi, yi) {
+                self.set_focus(PaletteFocus::PathFilter);
+                return PaletteAction::Changed;
+            }
+            if !self.replace_rect.is_empty() && self.replace_rect.contains(xi, yi) {
+                self.set_focus(PaletteFocus::Replace);
+                return PaletteAction::Changed;
+            }
             if self.btn_case.contains(xi, yi) {
                 self.case_sensitive = !self.case_sensitive;
                 self.refresh_results(fs);
@@ -1611,6 +1832,27 @@ impl CommandPalette {
                 self.regex = !self.regex;
                 self.refresh_results(fs);
                 return PaletteAction::Changed;
+            }
+            if self.btn_filter.contains(xi, yi) {
+                self.show_path_filter = !self.show_path_filter;
+                if self.show_path_filter {
+                    self.set_focus(PaletteFocus::PathFilter);
+                } else {
+                    self.set_focus(PaletteFocus::Query);
+                }
+                return PaletteAction::Changed;
+            }
+            if self.btn_replace_toggle.contains(xi, yi) {
+                self.show_replace = !self.show_replace;
+                if self.show_replace {
+                    self.set_focus(PaletteFocus::Replace);
+                } else {
+                    self.set_focus(PaletteFocus::Query);
+                }
+                return PaletteAction::Changed;
+            }
+            if !self.btn_replace_all.is_empty() && self.btn_replace_all.contains(xi, yi) {
+                return self.prepare_replace_all(fs);
             }
         }
         for &(idx, rect) in &self.item_rects {
@@ -1748,22 +1990,33 @@ impl CommandPalette {
             );
         }
 
-        // 2. Prompt row (+ quiet inline `Aa` / `W` / `.*` toggles in Search in Files).
+        // 2. Prompt row (+ quiet inline `Aa` / `W` / `.*` / `Paths` / `Replace` toggles in Search in Files).
         let input_y = card.y + pad + header_h + px(4.0, scale);
+        self.query_rect = PixelRect::ZERO;
+        self.filter_rect = PixelRect::ZERO;
+        self.replace_rect = PixelRect::ZERO;
         self.btn_case = PixelRect::ZERO;
         self.btn_word = PixelRect::ZERO;
         self.btn_regex = PixelRect::ZERO;
+        self.btn_filter = PixelRect::ZERO;
+        self.btn_replace_toggle = PixelRect::ZERO;
+        self.btn_replace_all = PixelRect::ZERO;
 
         let input_w = if self.mode == PaletteMode::ProjectSearch {
-            let toggle_block = px(28.0 + 4.0 + 26.0 + 4.0 + 28.0 + 6.0, scale);
+            let toggle_block = px(
+                28.0 + 4.0 + 26.0 + 4.0 + 28.0 + 4.0 + 46.0 + 4.0 + 56.0 + 6.0,
+                scale,
+            );
             (card.w - pad * 2 - toggle_block).max(px(120.0, scale))
         } else {
             card.w - pad * 2
         };
         let input_rect = PixelRect::new(card.x + pad, input_y, input_w, input_h);
+        self.query_rect = input_rect;
         self.input
             .draw(painter, input_rect, theme, atlas, rasterizer, caret_visible);
 
+        let mut last_prompt_bottom = input_rect.bottom();
         if self.mode == PaletteMode::ProjectSearch {
             let mut bx = input_rect.right() + px(6.0, scale);
             self.btn_case = PixelRect::new(bx, input_y, px(28.0, scale), input_h);
@@ -1800,10 +2053,69 @@ impl CommandPalette {
                 atlas,
                 rasterizer,
             );
+            bx = self.btn_regex.right() + px(4.0, scale);
+
+            self.btn_filter = PixelRect::new(bx, input_y, px(46.0, scale), input_h);
+            draw_toggle_pill(
+                painter,
+                self.btn_filter,
+                "Paths",
+                self.show_path_filter || !self.path_filter_input.text.trim().is_empty(),
+                theme,
+                atlas,
+                rasterizer,
+            );
+            bx = self.btn_filter.right() + px(4.0, scale);
+
+            self.btn_replace_toggle = PixelRect::new(bx, input_y, px(56.0, scale), input_h);
+            draw_toggle_pill(
+                painter,
+                self.btn_replace_toggle,
+                "Replace",
+                self.show_replace,
+                theme,
+                atlas,
+                rasterizer,
+            );
+
+            let sub_h = px(26.0, scale);
+            if self.show_path_filter {
+                let fy = last_prompt_bottom + px(6.0, scale);
+                let fr = PixelRect::new(card.x + pad, fy, card.w - pad * 2, sub_h);
+                self.filter_rect = fr;
+                self.path_filter_input
+                    .draw(painter, fr, theme, atlas, rasterizer, caret_visible);
+                last_prompt_bottom = fr.bottom();
+            }
+            if self.show_replace {
+                let ry = last_prompt_bottom + px(6.0, scale);
+                let btn_w = px(82.0, scale);
+                let rr = PixelRect::new(
+                    card.x + pad,
+                    ry,
+                    (card.w - pad * 2 - btn_w - px(6.0, scale)).max(px(120.0, scale)),
+                    sub_h,
+                );
+                self.replace_rect = rr;
+                self.replace_input
+                    .draw(painter, rr, theme, atlas, rasterizer, caret_visible);
+                self.btn_replace_all =
+                    PixelRect::new(rr.right() + px(6.0, scale), ry, btn_w, sub_h);
+                draw_toggle_pill(
+                    painter,
+                    self.btn_replace_all,
+                    "Replace All",
+                    !self.items.is_empty(),
+                    theme,
+                    atlas,
+                    rasterizer,
+                );
+                last_prompt_bottom = rr.bottom();
+            }
         }
 
         // Hairline below prompt.
-        let body_top = input_rect.bottom() + px(8.0, scale);
+        let body_top = last_prompt_bottom + px(8.0, scale);
         let footer_top = card.bottom() - footer_h;
         let body_h = (footer_top - body_top).max(0);
         painter.fill_rect(
@@ -2282,6 +2594,7 @@ fn search_slice_sync_budgeted(
     slab: &mut SearchSlab,
     dirty_files: &[(PathBuf, Vec<u8>)],
     compiled: &CompiledQuery,
+    path_filter: &str,
     max_matches: usize,
     budget: Duration,
 ) -> (Vec<(usize, Vec<PaletteItem>)>, usize, bool) {
@@ -2289,7 +2602,8 @@ fn search_slice_sync_budgeted(
         return (Vec::new(), files.len(), true);
     }
     let started = Instant::now();
-    let filling = !slab.fully_loaded;
+    let has_filter = !path_filter.is_empty();
+    let filling = !slab.fully_loaded && !has_filter;
     let can_cache = filling && slab.chunks.len() < u16::MAX as usize;
     let bytes_used = AtomicUsize::new(slab.bytes_used);
     let mut writer = filling.then(|| SlabWriter {
@@ -2310,6 +2624,10 @@ fn search_slice_sync_budgeted(
         if idx > start_idx && ((idx - start_idx) & 7) == 0 && started.elapsed() >= budget {
             finished = false;
             break;
+        }
+        if has_filter && !matches_path_filter(&files[idx].rel, path_filter) {
+            idx += 1;
+            continue;
         }
         let mut items = Vec::new();
         search_single_file(
@@ -2529,6 +2847,7 @@ fn search_project_parallel_buckets(
     slab: &mut SearchSlab,
     dirty_files: &[(PathBuf, Vec<u8>)],
     compiled: &CompiledQuery,
+    path_filter: &str,
 ) -> (Vec<(usize, Vec<PaletteItem>)>, bool) {
     if files.is_empty() {
         return (Vec::new(), false);
@@ -2536,6 +2855,7 @@ fn search_project_parallel_buckets(
 
     let started = Instant::now();
     let budget = Duration::from_millis(SEARCH_TIME_BUDGET_MS);
+    let has_filter = !path_filter.is_empty();
 
     let cores = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -2547,7 +2867,7 @@ fn search_project_parallel_buckets(
         cores.min((files.len() + 31) / 32)
     };
 
-    let filling = !slab.fully_loaded;
+    let filling = !slab.fully_loaded && !has_filter;
     let can_cache = filling && slab.chunks.len() + worker_count <= u16::MAX as usize;
     let bytes_used = AtomicUsize::new(slab.bytes_used);
 
@@ -2572,6 +2892,9 @@ fn search_project_parallel_buckets(
             if i > 0 && (i & 31) == 0 && started.elapsed() >= budget {
                 timed_out = true;
                 break;
+            }
+            if has_filter && !matches_path_filter(&f.rel, path_filter) {
+                continue;
             }
             let mut items = Vec::new();
             search_single_file(
@@ -2658,6 +2981,9 @@ fn search_project_parallel_buckets(
                         if cur_total >= MAX_SEARCH_RESULTS {
                             cancel_ref.store(true, Ordering::Relaxed);
                             break;
+                        }
+                        if has_filter && !matches_path_filter(&files[idx].rel, path_filter) {
+                            continue;
                         }
                         let remaining = (MAX_SEARCH_RESULTS - cur_total).max(1);
                         let mut items = Vec::new();
@@ -3196,8 +3522,14 @@ fn visit_walk_dir(
         return 0;
     };
 
-    // Load `.gitignore` ONLY when `read_dir` actually reported one (zero extra syscalls!).
-    let mut active_layers = dir.gitignore.clone();
+    // Respect nested repo boundaries (submodules / repo-within-repo): start a fresh `.gitignore`
+    // stack when descending into a directory that owns its own `.git` entry (zero extra syscalls).
+    let is_nested_repo = dir.depth > 0 && entries.iter().any(|e| e.name == ".git");
+    let mut active_layers = if is_nested_repo {
+        Vec::new()
+    } else {
+        dir.gitignore.clone()
+    };
     if let Some(gi) = entries
         .iter()
         .find(|e| e.kind == EntryKind::File && e.name == ".gitignore")
@@ -3366,7 +3698,7 @@ fn collect_project_files_parallel(
         abs: root.to_path_buf(),
         rel: String::new(),
         depth: 0,
-        gitignore: Vec::new(),
+        gitignore: collect_ancestor_gitignores(fs, root),
     });
     let mut gi_buf = Vec::new();
 

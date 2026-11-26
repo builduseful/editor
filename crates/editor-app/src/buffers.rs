@@ -192,6 +192,42 @@ impl WorkingSet {
         any
     }
 
+    /// Apply `replace_all_with_options` to a parked buffer matching `path` (keeps edits undoable!).
+    /// Returns `Some(replaced_count)` if `path` was parked in the working set.
+    pub fn replace_all_in_parked_by_path(
+        &mut self,
+        path: &Path,
+        query: &str,
+        replacement: &str,
+        options: editor_core::SearchOptions,
+        now_ms: u64,
+    ) -> Option<usize> {
+        let mut found: Option<(BufferId, usize)> = None;
+        for (&id, parked) in &mut self.parked {
+            if parked.doc.path() == Some(path) {
+                let n = parked
+                    .doc
+                    .replace_all(query, replacement, options, now_ms);
+                let len = parked.doc.len_bytes();
+                parked.caret = parked.caret.min(len);
+                parked.anchor = parked.anchor.min(len);
+                found = Some((id, n));
+                break;
+            }
+        }
+        if let Some((id, n)) = found {
+            if n > 0 {
+                if let Some(m) = self.meta.get_mut(&id) {
+                    m.dirty = true;
+                }
+                self.graduate_preview(id);
+            }
+            Some(n)
+        } else {
+            None
+        }
+    }
+
     /// Snapshot in-memory bytes of dirty parked buffers (bounded by `max_bytes`) so
     /// Live Grep and Live Preview reflect unsaved edits.
     pub fn dirty_parked_snapshots(&mut self, max_bytes: u64) -> Vec<(PathBuf, Vec<u8>)> {

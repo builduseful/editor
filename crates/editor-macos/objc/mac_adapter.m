@@ -800,10 +800,33 @@ static NSWindow* g_window = nil;
 static EditorSurfaceView* g_view = nil;
 static FSEventStreamRef g_fs_stream = NULL;
 static NSString* g_watched_dir = nil;
+static NSString* g_watched_extra_dir = nil;
+static char g_watched_extra_dir_cstr[4096] = {0};
+
+static BOOL is_interesting_git_meta(const char* p) {
+    size_t len = strlen(p);
+    if (len >= 5 && strcmp(p + len - 5, "/HEAD") == 0) return YES;
+    if (len >= 6 && strcmp(p + len - 6, "/index") == 0) return YES;
+    if (len >= 11 && strcmp(p + len - 11, "/MERGE_HEAD") == 0) return YES;
+    if (len >= 17 && strcmp(p + len - 17, "/CHERRY_PICK_HEAD") == 0) return YES;
+    if (len >= 12 && strcmp(p + len - 12, "/packed-refs") == 0) return YES;
+    if (strstr(p, "/refs/heads/") != NULL || strstr(p, "/refs/remotes/") != NULL) return YES;
+    return NO;
+}
 
 static BOOL is_noisy_fs_path(const char* p) {
     if (!p || p[0] == '\0') return YES;
-    if (strstr(p, "/.git/") != NULL || strstr(p, "/target/") != NULL ||
+    if (strstr(p, "/.git/") != NULL) {
+        return !is_interesting_git_meta(p);
+    }
+    if (g_watched_extra_dir_cstr[0] != '\0') {
+        size_t glen = strlen(g_watched_extra_dir_cstr);
+        if (strncmp(p, g_watched_extra_dir_cstr, glen) == 0 &&
+            (p[glen] == '/' || p[glen] == '\0')) {
+            return !is_interesting_git_meta(p);
+        }
+    }
+    if (strstr(p, "/target/") != NULL ||
         strstr(p, "/node_modules/") != NULL || strstr(p, "/.DS_Store") != NULL ||
         strstr(p, ".editor.lock") != NULL || strstr(p, ".editor.tmp") != NULL) {
         return YES;
@@ -893,12 +916,21 @@ static void fsevents_callback(
 
 static void start_fs_watcher_stream_if_needed(void) {
     stop_fs_watcher_stream();
-    if (!g_watched_dir || g_watched_dir.length == 0 || !g_delegate) return;
+    if (!g_delegate) return;
     if (g_window && !g_window.visible) return;
 
-    NSArray* paths = @[ g_watched_dir ];
+    NSMutableArray* paths = [NSMutableArray arrayWithCapacity:2];
+    if (g_watched_dir && g_watched_dir.length > 0) {
+        [paths addObject:g_watched_dir];
+    }
+    if (g_watched_extra_dir && g_watched_extra_dir.length > 0 &&
+        (!g_watched_dir || ![g_watched_extra_dir isEqualToString:g_watched_dir])) {
+        [paths addObject:g_watched_extra_dir];
+    }
+    if (paths.count == 0) return;
+
     FSEventStreamContext ctx = {0, NULL, NULL, NULL, NULL};
-    // Kernel-coalesced (0.25s) event stream on main dispatch queue:
+    // Single kernel-coalesced (0.25s) event stream on main dispatch queue:
     // zero polling threads, zero wakeups while idle, ignores our own process's writes.
     FSEventStreamCreateFlags flags =
         kFSEventStreamCreateFlagUseCFTypes |
@@ -922,8 +954,9 @@ static void start_fs_watcher_stream_if_needed(void) {
 void mac_watch_directory(const char* dir_path) {
     @autoreleasepool {
         if (!dir_path || dir_path[0] == '\0') {
+            if (!g_watched_dir) return;
             g_watched_dir = nil;
-            stop_fs_watcher_stream();
+            start_fs_watcher_stream_if_needed();
             return;
         }
         NSString* next = [NSString stringWithUTF8String:dir_path];
@@ -931,6 +964,25 @@ void mac_watch_directory(const char* dir_path) {
             return;
         }
         g_watched_dir = next;
+        start_fs_watcher_stream_if_needed();
+    }
+}
+
+void mac_watch_extra_directory(const char* dir_path) {
+    @autoreleasepool {
+        if (!dir_path || dir_path[0] == '\0') {
+            if (!g_watched_extra_dir) return;
+            g_watched_extra_dir = nil;
+            g_watched_extra_dir_cstr[0] = '\0';
+            start_fs_watcher_stream_if_needed();
+            return;
+        }
+        NSString* next = [NSString stringWithUTF8String:dir_path];
+        if (g_watched_extra_dir && [g_watched_extra_dir isEqualToString:next] && g_fs_stream != NULL) {
+            return;
+        }
+        g_watched_extra_dir = next;
+        snprintf(g_watched_extra_dir_cstr, sizeof(g_watched_extra_dir_cstr), "%s", dir_path);
         start_fs_watcher_stream_if_needed();
     }
 }

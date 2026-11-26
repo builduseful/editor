@@ -64,6 +64,10 @@ pub trait PlatformHost {
     /// `inotify`, `ReadDirectoryChangesW`). Passing `None` stops watching.
     /// Default is a no-op for headless/test hosts.
     fn watch_directory(&mut self, _dir: Option<&Path>) {}
+    /// Watch an optional secondary metadata directory (e.g. an enclosing monorepo's or worktree's
+    /// `.git` directory when it lies outside the watched workspace root) on the same OS event
+    /// stream. Passing `None` clears the secondary path. Default is a no-op.
+    fn watch_extra_directory(&mut self, _dir: Option<&Path>) {}
     /// Return a thread-safe waker for the host's main runloop (delivering `InputEvent::Tick`).
     /// Returns `None` on headless/test hosts so operations stay synchronous and deterministic.
     fn main_loop_waker(&self) -> Option<MainLoopWaker> {
@@ -88,6 +92,7 @@ pub struct HeadlessHost {
     /// Test knob: when `true`, mimics macOS stay-in-Dock semantics (`request_close_window` does not quit).
     pub stay_alive_on_close: bool,
     pub watched_dir: Option<PathBuf>,
+    pub watched_extra_dir: Option<PathBuf>,
     pub next_open_file: Option<PathBuf>,
     pub next_open_folder: Option<PathBuf>,
     pub next_save_file: Option<PathBuf>,
@@ -165,6 +170,10 @@ impl PlatformHost for HeadlessHost {
 
     fn watch_directory(&mut self, dir: Option<&Path>) {
         self.watched_dir = dir.map(Path::to_path_buf);
+    }
+
+    fn watch_extra_directory(&mut self, dir: Option<&Path>) {
+        self.watched_extra_dir = dir.map(Path::to_path_buf);
     }
 
     fn http_fetcher(&self) -> Option<HttpFetcher> {

@@ -401,6 +401,8 @@ fn default_shortcuts() -> Vec<ShortcutEntry> {
         bind("replace", "Find and replace", "File & Navigation", KeyScope::Global, vec![KeyChord::primary_alt(Key::Char('f'))], None, false, AppCommand::Replace),
         bind("find-next", "Find next match (when Find is open)", "File & Navigation", KeyScope::FindBar, vec![KeyChord::primary(Key::Char('g'))], Some("⌘G"), false, AppCommand::FindNext),
         bind("find-prev", "Find previous match (when Find is open)", "File & Navigation", KeyScope::FindBar, vec![KeyChord::primary_shift(Key::Char('g'))], Some("⇧⌘G"), false, AppCommand::FindPrev),
+        bind("next-git-change", "Jump to next Git change", "File & Navigation", KeyScope::Global, vec![KeyChord::new(Key::F(5), false, false, true, false)], Some("⌥F5"), false, AppCommand::NextGitChange),
+        bind("prev-git-change", "Jump to previous Git change", "File & Navigation", KeyScope::Global, vec![KeyChord::new(Key::F(5), false, true, true, false)], Some("⇧⌥F5"), false, AppCommand::PrevGitChange),
         bind("quit", "Quit editor", "File & Navigation", KeyScope::Global, vec![KeyChord::primary(Key::Char('q'))], None, false, AppCommand::Quit),
 
         // ── Editing (Document scope — 100% Keymap-dispatched!) ──

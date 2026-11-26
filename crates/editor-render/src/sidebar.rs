@@ -11,9 +11,11 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use editor_platform::{
-    DirEntry, EntryKind, FileSystem, FontStyle, GlyphRasterizer, Key, Modifiers, PixelRect,
+    collect_ancestor_gitignores, is_gitignored, DirEntry, EntryKind, FileSystem, FontStyle,
+    GitFileStatus, GitIgnoreLayer, GlyphRasterizer, Key, Modifiers, PixelRect,
 };
 
 use crate::atlas::GlyphAtlas;
@@ -68,12 +70,15 @@ pub struct FlatRow {
     pub kind: EntryKind,
     pub depth: usize,
     pub expanded: bool,
+    pub ignored: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct SidebarBadge {
     pub pin_slot: Option<u8>,
     pub dirty: bool,
+    pub git_status: Option<GitFileStatus>,
+    pub git_dir_dirty: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +171,10 @@ pub struct Sidebar {
     expanded: HashSet<PathBuf>,
     /// Cached immediate children of read directories (lazy!).
     dir_cache: BTreeMap<PathBuf, Vec<DirEntry>>,
+    /// Lazily parsed `.gitignore` rules for loaded directories only (zero speculative scans).
+    gitignore_cache: BTreeMap<PathBuf, Option<Arc<GitIgnoreLayer>>>,
+    /// Ancestor `.gitignore` layers from enclosing repo root down to `root` (monorepo subfolders).
+    ancestor_gitignores: Vec<Arc<GitIgnoreLayer>>,
     /// Flattened visible rows derived from `root`, `expanded`, and `dir_cache`.
     rows: Vec<FlatRow>,
     /// Currently selected entry held strictly by path.
@@ -212,6 +221,8 @@ impl Sidebar {
             root: None,
             expanded: HashSet::new(),
             dir_cache: BTreeMap::new(),
+            gitignore_cache: BTreeMap::new(),
+            ancestor_gitignores: Vec::new(),
             rows: Vec::new(),
             selected: None,
             hovered_row: None,
@@ -311,11 +322,29 @@ impl Sidebar {
         }
     }
 
+    fn rekey_gitignores_for_root(&mut self, fs: &dyn FileSystem, root: &Path) {
+        self.ancestor_gitignores = collect_ancestor_gitignores(fs, root);
+        self.gitignore_cache.clear();
+        let cached_dirs: Vec<PathBuf> = self
+            .dir_cache
+            .keys()
+            .filter(|d| d.starts_with(root))
+            .cloned()
+            .collect();
+        for d in cached_dirs {
+            if let Some(entries) = self.dir_cache.get(&d) {
+                let layer = self.read_gitignore_if_present(fs, &d, entries);
+                self.gitignore_cache.insert(d, layer);
+            }
+        }
+    }
+
     /// Set the sidebar root directory (reads ONLY the root's immediate children).
     pub fn set_root(&mut self, fs: &dyn FileSystem, dir: &Path) {
         let canonical = fs.canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         self.root = Some(canonical.clone());
         self.ensure_dir_loaded(fs, &canonical);
+        self.rekey_gitignores_for_root(fs, &canonical);
         self.scroll_y_px = 0.0;
         self.rebuild_rows();
     }
@@ -325,6 +354,7 @@ impl Sidebar {
         let canonical = fs.canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
         self.root = Some(canonical.clone());
         self.ensure_dir_loaded(fs, &canonical);
+        self.rekey_gitignores_for_root(fs, &canonical);
         self.scroll_y_px = 0.0;
         self.rebuild_rows();
     }
@@ -357,8 +387,12 @@ impl Sidebar {
     pub fn refresh(&mut self, fs: &dyn FileSystem) {
         let keys: Vec<PathBuf> = self.dir_cache.keys().cloned().collect();
         self.dir_cache.clear();
+        self.gitignore_cache.clear();
         if let Some(root) = self.root.clone() {
+            self.ancestor_gitignores = collect_ancestor_gitignores(fs, &root);
             self.ensure_dir_loaded(fs, &root);
+        } else {
+            self.ancestor_gitignores.clear();
         }
         for k in keys {
             if self.expanded.contains(&k) {
@@ -377,9 +411,12 @@ impl Sidebar {
             return false;
         }
         if let Ok(entries) = fs.read_dir(&canonical) {
+            let layer = self.read_gitignore_if_present(fs, &canonical, &entries);
+            self.gitignore_cache.insert(canonical.clone(), layer);
             self.dir_cache.insert(canonical, entries);
         } else {
             self.dir_cache.remove(&canonical);
+            self.gitignore_cache.remove(&canonical);
         }
         self.rebuild_rows();
         true
@@ -388,6 +425,7 @@ impl Sidebar {
     /// Remove cached entries for a deleted or moved directory subtree and refresh its parent.
     pub fn invalidate_subtree(&mut self, fs: &dyn FileSystem, path: &Path) {
         self.dir_cache.retain(|k, _| !k.starts_with(path));
+        self.gitignore_cache.retain(|k, _| !k.starts_with(path));
         self.expanded.retain(|k| !k.starts_with(path));
         if self.selected.as_deref().map(|s| s.starts_with(path)).unwrap_or(false) {
             self.selected = None;
@@ -842,13 +880,37 @@ impl Sidebar {
         }
     }
 
+    fn read_gitignore_if_present(
+        &self,
+        fs: &dyn FileSystem,
+        dir: &Path,
+        entries: &[DirEntry],
+    ) -> Option<Arc<GitIgnoreLayer>> {
+        let gi = entries
+            .iter()
+            .find(|e| e.kind != EntryKind::Directory && e.name == ".gitignore")?;
+        let mut buf = Vec::new();
+        let _ = fs.read_prefix_into(&gi.path, 64 * 1024, &mut buf).ok()?;
+        let text = std::str::from_utf8(&buf).ok()?;
+        let rel_dir = self
+            .root
+            .as_deref()
+            .and_then(|r| dir.strip_prefix(r).ok())
+            .map(slash_rel_path)
+            .unwrap_or_default();
+        GitIgnoreLayer::parse(rel_dir, text).map(Arc::new)
+    }
+
     fn ensure_dir_loaded(&mut self, fs: &dyn FileSystem, dir: &Path) {
         if self.dir_cache.contains_key(dir) {
             return;
         }
         if let Ok(entries) = fs.read_dir(dir) {
+            let layer = self.read_gitignore_if_present(fs, dir, &entries);
+            self.gitignore_cache.insert(dir.to_path_buf(), layer);
             self.dir_cache.insert(dir.to_path_buf(), entries);
         } else {
+            self.gitignore_cache.insert(dir.to_path_buf(), None);
             self.dir_cache.insert(dir.to_path_buf(), Vec::new());
         }
     }
@@ -858,26 +920,63 @@ impl Sidebar {
         let Some(root) = self.root.clone() else {
             return;
         };
-        self.push_children(&root, 0);
+        let mut layers: Vec<Arc<GitIgnoreLayer>> = self.ancestor_gitignores.clone();
+        self.push_children(&root, &root, 0, &mut layers, false);
     }
 
-    fn push_children(&mut self, dir: &Path, depth: usize) {
+    fn push_children(
+        &mut self,
+        root: &Path,
+        dir: &Path,
+        depth: usize,
+        layers: &mut Vec<Arc<GitIgnoreLayer>>,
+        parent_ignored: bool,
+    ) {
         let Some(entries) = self.dir_cache.get(dir).cloned() else {
             return;
+        };
+        // Respect nested repo boundaries (submodules or repo-within-repo): once inside a child
+        // directory that has its own `.git` entry (already in `dir_cache`, zero extra syscalls),
+        // start a fresh `.gitignore` stack so outer rules never bleed into the inner repository.
+        let is_nested_repo_root = depth > 0 && entries.iter().any(|e| e.name == ".git");
+        let mut nested_layers: Vec<Arc<GitIgnoreLayer>> = Vec::new();
+        let (active_layers, effective_parent_ignored) = if is_nested_repo_root {
+            (&mut nested_layers, false)
+        } else {
+            (layers, parent_ignored)
+        };
+        let pushed_layer = if let Some(Some(layer)) = self.gitignore_cache.get(dir) {
+            active_layers.push(Arc::clone(layer));
+            true
+        } else {
+            false
         };
         for entry in entries {
             let is_dir = entry.kind == EntryKind::Directory;
             let is_expanded = is_dir && self.expanded.contains(&entry.path);
+            let rel = entry
+                .path
+                .strip_prefix(root)
+                .map(slash_rel_path)
+                .unwrap_or_else(|_| entry.name.clone());
+            let ignored = effective_parent_ignored
+                || entry.name == ".git"
+                || (!active_layers.is_empty()
+                    && is_gitignored(active_layers, &rel, &entry.name, is_dir));
             self.rows.push(FlatRow {
                 path: entry.path.clone(),
                 name: entry.name,
                 kind: entry.kind,
                 depth,
                 expanded: is_expanded,
+                ignored,
             });
             if is_expanded {
-                self.push_children(&entry.path, depth + 1);
+                self.push_children(root, &entry.path, depth + 1, active_layers, ignored);
             }
+        }
+        if pushed_layer {
+            active_layers.pop();
         }
     }
 
@@ -1413,11 +1512,7 @@ impl Sidebar {
             let is_hovered = self.hovered_row == Some(idx);
             let is_drop_target =
                 row.kind == EntryKind::Directory && self.drop_target_dir.as_deref() == Some(row.path.as_path());
-            let badge = if row.kind == EntryKind::Directory {
-                SidebarBadge::default()
-            } else {
-                badge_for(&row.path)
-            };
+            let badge = badge_for(&row.path);
 
             if is_drop_target {
                 let pill = PixelRect::new(
@@ -1473,7 +1568,9 @@ impl Sidebar {
 
             let baseline =
                 row_rect.y as f32 + (row_rect.h as f32 + metrics.ascent - metrics.descent) * 0.5;
-            let label_color = if row.kind == EntryKind::Directory || is_selected || badge.pin_slot.is_some() {
+            let label_color = if row.ignored && !is_selected {
+                theme.text_muted.with_alpha(150)
+            } else if row.kind == EntryKind::Directory || is_selected || badge.pin_slot.is_some() {
                 theme.text
             } else {
                 theme.text_muted
@@ -1487,6 +1584,9 @@ impl Sidebar {
             if row.kind == EntryKind::Directory {
                 right_reserve = px(24.0, scale);
             } else {
+                if badge.git_status.is_some() {
+                    right_reserve += px(14.0, scale);
+                }
                 if badge.pin_slot.is_some() {
                     right_reserve += px(20.0, scale);
                 }
@@ -1513,9 +1613,39 @@ impl Sidebar {
             );
             painter.pop_clip();
 
-            // Quiet right-aligned dirty dot & pinned slot badge (`1`..`9`) on file rows.
+            // Quiet right-aligned Git status (`M`/`A`/`U`/`!`), dirty dot & pinned slot badge (`1`..`9`).
             if row.kind != EntryKind::Directory {
                 let mut rx = row_rect.right() - px(8.0, scale);
+                if let Some(gs) = badge.git_status {
+                    let (ch, col) = match gs {
+                        GitFileStatus::Modified => ("M", theme.state_info),
+                        GitFileStatus::Added => ("A", theme.state_success),
+                        GitFileStatus::Untracked => ("U", theme.state_success),
+                        GitFileStatus::Conflicted => ("!", theme.state_danger),
+                    };
+                    let gw = Painter::measure_text_ui(
+                        ch,
+                        FontStyle::MonoBold,
+                        badge_px,
+                        atlas,
+                        rasterizer,
+                    );
+                    let gw_i = gw.ceil() as i32;
+                    rx -= gw_i;
+                    let gbase = row_rect.y as f32
+                        + (row_rect.h as f32 + bmetrics.ascent - bmetrics.descent) * 0.5;
+                    painter.draw_text_ui(
+                        rx as f32,
+                        gbase,
+                        ch,
+                        FontStyle::MonoBold,
+                        badge_px,
+                        col,
+                        atlas,
+                        rasterizer,
+                    );
+                    rx -= px(6.0, scale);
+                }
                 if let Some(slot) = badge.pin_slot {
                     let bsz = px(15.0, scale);
                     rx -= bsz;
@@ -1549,10 +1679,20 @@ impl Sidebar {
                 }
             }
 
-            // Right-edge enter-folder affordance on hovered/selected directory rows.
-            if row.kind == EntryKind::Directory && (is_hovered || is_selected) {
-                let enter_x = (row_rect.right() - px(13.0, scale)) as f32;
-                painter.draw_chevron(enter_x, cy, 5.0 * scale, false, theme.text_muted);
+            // Right-edge enter-folder affordance (or subtle Git change dot when not hovered).
+            if row.kind == EntryKind::Directory {
+                if is_hovered || is_selected {
+                    let enter_x = (row_rect.right() - px(13.0, scale)) as f32;
+                    painter.draw_chevron(enter_x, cy, 5.0 * scale, false, theme.text_muted);
+                } else if badge.git_dir_dirty {
+                    let dot = px(4.0, scale).max(2);
+                    let dx = row_rect.right() - px(11.0, scale) - dot / 2;
+                    painter.fill_rounded_rect(
+                        PixelRect::new(dx, (cy - dot as f32 * 0.5).round() as i32, dot, dot),
+                        dot as f32 * 0.5,
+                        theme.state_info,
+                    );
+                }
             }
         }
 
@@ -1683,4 +1823,15 @@ pub(crate) fn draw_sidebar_panel_icon(
         painter.fill_rect(PixelRect::new(tx, ty1, tick_w, t), color.with_alpha(165));
         painter.fill_rect(PixelRect::new(tx, ty2, tick_w, t), color.with_alpha(165));
     }
+}
+
+fn slash_rel_path(rel: &Path) -> String {
+    let mut out = String::new();
+    for (i, comp) in rel.components().enumerate() {
+        if i > 0 {
+            out.push('/');
+        }
+        out.push_str(&comp.as_os_str().to_string_lossy());
+    }
+    out
 }

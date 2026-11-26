@@ -4444,3 +4444,481 @@ fn in_app_updater_checks_manifest_opens_modal_and_respects_24h_throttle() {
     assert!(!app.auto_check_updates);
     assert_eq!(host.prefs.get("AutoCheckUpdates").map(String::as_str), Some("0"));
 }
+
+#[test]
+fn git_awareness_branch_sidebar_dimming_and_live_myers_gutter_diff() {
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/ws/.gitignore", b"*.log\nbuild/\n".to_vec());
+    fs.add_file(
+        "/ws/src/main.rs",
+        b"fn main() {\n    let x = 1;\n    let y = 2;\n}\n".to_vec(),
+    );
+    fs.add_file("/ws/debug.log", b"noise\n".to_vec());
+    fs.add_file("/ws/build/out.txt", b"artifact\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1280, 800, 1.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.set_sidebar_root(Path::new("/ws"));
+    app.open_file(Path::new("/ws/src/main.rs"), &mut host).unwrap();
+
+    // 1. Sidebar lazily parses `.gitignore` and flags ignored rows cleanly.
+    let rows = app.sidebar.rows();
+    assert!(rows.iter().any(|r| r.name == "debug.log" && r.ignored));
+    assert!(rows.iter().any(|r| r.name == "build" && r.ignored));
+    assert!(rows.iter().any(|r| r.name == "src" && !r.ignored));
+
+    // 2. Attach Git HEAD baseline + status map and edit line 2 -> live gutter diff updates immediately!
+    app.git_branch = Some("main".to_string());
+    app.git_status.upsert(
+        std::path::PathBuf::from("/ws"),
+        editor_platform::git::parse_porcelain_z(
+            Path::new("/ws"),
+            b" M src/main.rs\0?? notes.txt\0",
+        ),
+    );
+    app.set_git_head_baseline(b"fn main() {\n    let x = 1;\n    let y = 2;\n}\n");
+    assert!(app.viewport.git_diff.is_empty());
+
+    // Edit `let x = 1;` -> `let x = 99;` and add a new line.
+    app.caret = 20;
+    app.anchor = 20;
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('9'),
+            mods: Modifiers::NONE,
+            text: Some("9".to_string()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(
+        editor_core::lookup_line_diff(&app.viewport.git_diff, 1),
+        Some(editor_core::LineDiffKind::Modified)
+    );
+    app.render(&mut raster);
+}
+
+#[test]
+fn multi_cursor_duplicate_delete_comment_outdent_and_cmd_backspace_are_atomic() {
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/mc.rs", b"    alpha\n    beta\n    gamma\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1280, 800, 1.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+    app.open_file(Path::new("/mc.rs"), &mut host).unwrap();
+
+    // Place carets at the end of line 0 ("    alpha") and line 1 ("    beta").
+    let l0_end = app.doc.line_byte_range(0).unwrap().1;
+    let l1_end = app.doc.line_byte_range(1).unwrap().1;
+    app.caret = l0_end;
+    app.anchor = l0_end;
+    app.extra_cursors = vec![(l1_end, l1_end)];
+
+    // 1. Toggle comment across both carets -> comments both lines in one undo step!
+    app.handle_event(
+        InputEvent::Command(AppCommand::ToggleComment),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.to_string_lossy(), "    // alpha\n    // beta\n    gamma\n");
+
+    // Undo reverts BOTH lines atomically!
+    app.handle_event(
+        InputEvent::Command(AppCommand::Undo),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.to_string_lossy(), "    alpha\n    beta\n    gamma\n");
+
+    // 2. Shift+Tab outdents BOTH lines atomically!
+    app.caret = l0_end;
+    app.anchor = l0_end;
+    app.extra_cursors = vec![(l1_end, l1_end)];
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Tab,
+            mods: Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.to_string_lossy(), "alpha\nbeta\n    gamma\n");
+
+    // 3. DuplicateLine duplicates BOTH lines atomically!
+    app.handle_event(
+        InputEvent::Command(AppCommand::DuplicateLine),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(
+        app.doc.to_string_lossy(),
+        "alpha\nalpha\nbeta\nbeta\n    gamma\n"
+    );
+
+    // 4. DeleteLine deletes BOTH duplicated lines atomically!
+    app.handle_event(
+        InputEvent::Command(AppCommand::DeleteLine),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.to_string_lossy(), "alpha\nbeta\n    gamma\n");
+
+    // 5. Cmd+Backspace deletes to line start across BOTH carets atomically!
+    let l0_end = app.doc.line_byte_range(0).unwrap().1;
+    let l1_end = app.doc.line_byte_range(1).unwrap().1;
+    app.caret = l0_end;
+    app.anchor = l0_end;
+    app.extra_cursors = vec![(l1_end, l1_end)];
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Backspace,
+            mods: Modifiers {
+                meta: true,
+                ..Modifiers::NONE
+            },
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.to_string_lossy(), "\n\n    gamma\n");
+}
+
+#[test]
+fn project_search_path_filter_and_confirmed_replace_in_files() {
+    use editor_platform::FileSystem;
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/proj/src/a.rs", b"let old_val = 1;\n".to_vec());
+    fs.add_file("/proj/src/b.rs", b"let old_val = 2;\nlet old_val = 3;\n".to_vec());
+    fs.add_file("/proj/tests/t.rs", b"let old_val = 99;\n".to_vec());
+    fs.add_file("/proj/README.md", b"old_val docs\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1280, 800, 1.0);
+    app.use_in_app_modal = true;
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.set_sidebar_root(Path::new("/proj"));
+    // Keep `a.rs` open in the editor so we test in-memory undoable replacement alongside atomic disk replacement!
+    app.open_file(Path::new("/proj/src/a.rs"), &mut host).unwrap();
+
+    app.handle_event(
+        InputEvent::Command(AppCommand::ProjectSearch),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.palette.input.set_text("old_val");
+    app.palette.set_path_filter(fs.as_ref(), "*.rs, !tests/");
+    assert_eq!(
+        app.palette.items.len(),
+        3,
+        "filter `*.rs, !tests/` must match only src/a.rs (1) + src/b.rs (2), excluding tests/t.rs & README.md"
+    );
+
+    app.palette.show_replace = true;
+    app.palette.replace_input.set_text("new_val");
+    app.render(&mut raster);
+    let act = app.palette.prepare_replace_all(fs.as_ref());
+    match act {
+        editor_render::PaletteAction::RequestReplaceAll {
+            match_count,
+            ref files,
+            ..
+        } => {
+            assert_eq!(match_count, 3);
+            assert_eq!(files.len(), 2);
+        }
+        other => panic!("expected RequestReplaceAll, got {other:?}"),
+    }
+
+    // Trigger via Cmd+Enter in Replace field -> opens custom ConfirmModal!
+    // Focus Replace input by toggling filter/replace or pressing Tab twice.
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Tab,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Tab,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers {
+                meta: cfg!(target_os = "macos"),
+                ctrl: !cfg!(target_os = "macos"),
+                ..Modifiers::NONE
+            },
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.confirm_modal.visible);
+    assert!(app.confirm_modal.is_replace_all_confirm);
+
+    // Confirm with Enter!
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.confirm_modal.visible);
+
+    // Open buffer `src/a.rs` updated in-memory and stays undoable!
+    assert_eq!(app.doc.to_string_lossy(), "let new_val = 1;\n");
+    assert!(app.doc.is_dirty());
+    app.handle_event(
+        InputEvent::Command(AppCommand::Undo),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.to_string_lossy(), "let old_val = 1;\n");
+
+    // Unopened `src/b.rs` updated atomically on disk; filtered-out `tests/t.rs` and `README.md` untouched!
+    let read_str = |p: &str| {
+        let mut v = Vec::new();
+        fs.read_prefix_into(Path::new(p), 4096, &mut v).unwrap();
+        String::from_utf8(v).unwrap()
+    };
+    assert_eq!(
+        read_str("/proj/src/b.rs"),
+        "let new_val = 2;\nlet new_val = 3;\n"
+    );
+    assert_eq!(read_str("/proj/tests/t.rs"), "let old_val = 99;\n");
+    assert_eq!(read_str("/proj/README.md"), "old_val docs\n");
+}
+
+#[test]
+fn monorepo_subfolder_and_nested_repo_gitignore_isolation() {
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/mono/.git/HEAD", b"ref: refs/heads/main\n".to_vec());
+    fs.add_file(
+        "/mono/.gitignore",
+        b"*.log\n/root_only.txt\nservices/api/gen/\n".to_vec(),
+    );
+    fs.add_file("/mono/root_only.txt", b"ignored at root\n".to_vec());
+    fs.add_file("/mono/services/api/src/main.rs", b"fn main() {}\n".to_vec());
+    fs.add_file("/mono/services/api/app.log", b"noise\n".to_vec());
+    fs.add_file("/mono/services/api/root_only.txt", b"kept in subfolder\n".to_vec());
+    fs.add_file("/mono/services/api/gen/auto.rs", b"// generated\n".to_vec());
+    // Nested repo inside `/mono/vendor/inner` with its own `.git` and NO `.gitignore` ->
+    // outer `/mono/.gitignore`'s `*.log` must NOT bleed into `inner/`!
+    fs.add_file("/mono/vendor/inner/.git", b"gitdir: /somewhere\n".to_vec());
+    fs.add_file("/mono/vendor/inner/audit.log", b"keep me\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1280, 800, 1.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    // 1. Open monorepo subdirectory `/mono/services/api`.
+    app.set_sidebar_root(Path::new("/mono/services/api"));
+    let rows = app.sidebar.rows();
+    assert!(rows.iter().any(|r| r.name == "app.log" && r.ignored));
+    assert!(rows.iter().any(|r| r.name == "gen" && r.ignored));
+    assert!(rows.iter().any(|r| r.name == "root_only.txt" && !r.ignored));
+    assert!(rows.iter().any(|r| r.name == "src" && !r.ignored));
+
+    // Quick Open inside `/mono/services/api` respects ancestor `/mono/.gitignore` too!
+    app.handle_event(
+        InputEvent::Command(AppCommand::QuickOpen),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let indexed: Vec<String> = app
+        .palette
+        .items
+        .iter()
+        .map(|it| it.path.to_string_lossy().to_string())
+        .collect();
+    assert!(indexed.iter().any(|p| p.ends_with("/src/main.rs")));
+    assert!(indexed.iter().any(|p| p.ends_with("/root_only.txt")));
+    assert!(!indexed.iter().any(|p| p.ends_with("app.log")));
+    assert!(!indexed.iter().any(|p| p.contains("gen/auto.rs")));
+
+    // 2. Navigate up to `/mono` via sidebar `navigate_to`: root `.gitignore` re-keys cleanly,
+    // and expanding nested repo `/mono/vendor/inner` resets outer `.gitignore` rules!
+    app.sidebar.navigate_to(fs.as_ref(), Path::new("/mono"));
+    app.sidebar.toggle_expand(fs.as_ref(), Path::new("/mono/vendor"));
+    app.sidebar
+        .toggle_expand(fs.as_ref(), Path::new("/mono/vendor/inner"));
+    let rows = app.sidebar.rows();
+    assert!(rows
+        .iter()
+        .any(|r| r.path == Path::new("/mono/root_only.txt") && r.ignored));
+    assert!(rows
+        .iter()
+        .any(|r| r.path == Path::new("/mono/vendor/inner/audit.log") && !r.ignored));
+}
+
+#[test]
+fn nested_repos_and_multi_repo_workspace_track_active_file_branch() {
+    use editor_platform::StdFileSystem;
+
+    let base = std::env::temp_dir().join(format!("editor_nested_git_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&base);
+    let outer = base.join("outer");
+    let inner = outer.join("sub");
+    let multi = base.join("multi");
+    let repo_a = multi.join("repo-a");
+    let repo_b = multi.join("repo-b");
+
+    std::fs::create_dir_all(outer.join(".git")).unwrap();
+    std::fs::create_dir_all(inner.join(".git")).unwrap();
+    std::fs::create_dir_all(repo_a.join(".git")).unwrap();
+    std::fs::create_dir_all(repo_b.join(".git")).unwrap();
+
+    std::fs::write(outer.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    std::fs::write(inner.join(".git/HEAD"), "ref: refs/heads/feat/inner\n").unwrap();
+    std::fs::write(repo_a.join(".git/HEAD"), "ref: refs/heads/alpha\n").unwrap();
+    std::fs::write(repo_b.join(".git/HEAD"), "ref: refs/heads/beta\n").unwrap();
+
+    std::fs::write(outer.join("README.md"), "# outer\n").unwrap();
+    std::fs::write(inner.join("lib.rs"), "pub fn inner() {}\n").unwrap();
+    std::fs::write(repo_a.join("a.rs"), "fn a() {}\n").unwrap();
+    std::fs::write(repo_b.join("b.rs"), "fn b() {}\n").unwrap();
+
+    let fs = Arc::new(StdFileSystem);
+    let mut app = EditorApp::new(fs, 1280, 800, 1.0);
+    let mut host = HeadlessHost::new();
+
+    // 1. Repo within repo: status bar branch follows the active file's innermost repo!
+    app.open_folder(&outer, &mut host);
+    assert_eq!(app.git_branch.as_deref(), Some("main"));
+
+    app.open_file(&outer.join("README.md"), &mut host).unwrap();
+    assert_eq!(app.git_branch.as_deref(), Some("main"));
+
+    app.open_file(&inner.join("lib.rs"), &mut host).unwrap();
+    assert_eq!(app.git_branch.as_deref(), Some("feat/inner"));
+
+    // Switching back to outer's tab restores outer's branch immediately.
+    app.open_file(&outer.join("README.md"), &mut host).unwrap();
+    assert_eq!(app.git_branch.as_deref(), Some("main"));
+
+    // 2. Non-repo parent workspace containing multiple repos: branch tracks each opened repo!
+    app.open_folder(&multi, &mut host);
+    app.open_file(&repo_a.join("a.rs"), &mut host).unwrap();
+    assert_eq!(app.git_branch.as_deref(), Some("alpha"));
+    app.open_file(&repo_b.join("b.rs"), &mut host).unwrap();
+    assert_eq!(app.git_branch.as_deref(), Some("beta"));
+
+    // 3. Monorepo subfolder watches enclosing `.git` as `watched_extra_dir`, whereas repo root does not.
+    let sub_pkg = outer.join("pkg");
+    std::fs::create_dir_all(&sub_pkg).unwrap();
+    std::fs::write(sub_pkg.join("mod.rs"), "fn m() {}\n").unwrap();
+    app.open_folder(&outer, &mut host);
+    app.open_file(&outer.join("README.md"), &mut host).unwrap();
+    assert_eq!(host.watched_extra_dir, None);
+
+    app.open_folder(&sub_pkg, &mut host);
+    app.open_file(&sub_pkg.join("mod.rs"), &mut host).unwrap();
+    let expected_git_dir = std::fs::canonicalize(outer.join(".git")).unwrap();
+    assert_eq!(host.watched_extra_dir.as_deref(), Some(expected_git_dir.as_path()));
+
+    // Simulate external `git checkout` writing `.git/HEAD` -> live FsChanged updates branch immediately!
+    std::fs::write(outer.join(".git/HEAD"), "ref: refs/heads/release/0.3\n").unwrap();
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    app.handle_event(
+        InputEvent::FsChanged(vec![expected_git_dir.join("HEAD")]),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.git_branch.as_deref(), Some("release/0.3"));
+
+    // 4. NextGitChange / PrevGitChange jumps between contiguous diff hunks and wraps cleanly.
+    let mem_fs = Arc::new(MemoryFileSystem::new());
+    mem_fs.add_file(
+        "/diff.rs",
+        b"line0\nNEW1\nNEW2\nline3\nline4\nMOD5\nline6\n".to_vec(),
+    );
+    let mut dapp = EditorApp::new(mem_fs, 1280, 800, 1.0);
+    dapp.open_file(std::path::Path::new("/diff.rs"), &mut host)
+        .unwrap();
+    dapp.set_git_head_baseline(b"line0\nline3\nline4\nold5\nline6\n");
+    dapp.caret = 0;
+    dapp.anchor = 0;
+
+    // Hunks start at line 1 (NEW1..NEW2) and line 5 (MOD5).
+    dapp.handle_event(
+        InputEvent::Command(AppCommand::NextGitChange),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(dapp.doc.byte_to_line_col(dapp.caret).0, 1);
+    dapp.handle_event(
+        InputEvent::Command(AppCommand::NextGitChange),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(dapp.doc.byte_to_line_col(dapp.caret).0, 5);
+    // Wraps to first hunk!
+    dapp.handle_event(
+        InputEvent::Command(AppCommand::NextGitChange),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(dapp.doc.byte_to_line_col(dapp.caret).0, 1);
+    // Prev wraps back to last hunk!
+    dapp.handle_event(
+        InputEvent::Command(AppCommand::PrevGitChange),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(dapp.doc.byte_to_line_col(dapp.caret).0, 5);
+
+    let _ = std::fs::remove_dir_all(&base);
+}

@@ -3,7 +3,7 @@
 An ultra-lightweight, zero-dependency, custom-drawn native text editor written in pure **Rust** (`std` only), following the **Build Useful** design system.
 
 - **Zero external crates.** Every layer — piece-tree text buffer, 32-byte SWAR scanner, linear-time regex engine, syntax highlighter, glyph atlas, 2D software rasterizer, UI controls, `.gitignore` matcher, IPC, and JSON CLI — is built on Rust `std` alone.
-- **Zero idle CPU, minimal memory.** Event-driven redraws with true dirty-rect tracking (`~5–10 µs` caret blink frames), lazy paged base files for multi-GB documents, lazy directory sidebar, and bounded modal-lifetime caches.
+- **Zero idle CPU, minimal memory.** Event-driven redraws with true dirty-rect tracking (`~5–10 µs` caret blink frames), lazy paged base files for multi-GB documents, lazy directory sidebar, subtle event-driven Git awareness (branch badge, live Myers gutter diff, sidebar `.gitignore` dimming & status cues across monorepos and nested repos), and bounded modal-lifetime caches.
 - **100% custom-drawn UI.** Light and Dark themes using a neutral ink/grey palette, 2px spacing ladder, hairline borders, and colour reserved strictly for state (`danger`, `success`, `info`).
 - **One self-contained bundle.** On macOS, `Editor.app` holds both `editor-gui` and the deterministic `editor` CLI inside `Contents/MacOS/`, with a single symlink in `PATH`.
 
@@ -74,7 +74,7 @@ Press `⌘K` (or `⇧⌘/`) inside the app to search and run any shortcut.
 | Action | Shortcut |
 | --- | --- |
 | Quick Open (two-pane with live preview) | `⌘P` |
-| Search in Files (SWAR + regex + live preview) | `⇧⌘F` |
+| Search in Files (SWAR + regex + path filter + Replace in Files) | `⇧⌘F` |
 | Command Palette | `⇧⌘P` |
 | Pinned & Open Files | `⌘E` |
 | Pin / Unpin Current File (slots `1–9`) | `⌘M` |
@@ -84,6 +84,7 @@ Press `⌘K` (or `⇧⌘/`) inside the app to search and run any shortcut.
 | Find / Find & Replace | `⌘F` / `⌥⌘F` |
 | Find Next / Previous (while Find is open) | `⌘G` / `⇧⌘G` |
 | Go to Line | `⌘G` |
+| Next / Previous Git Change | `⌥F5` / `⇧⌥F5` |
 | New Tab / New File | `⌘T` / `⌘N` |
 | Open File / Open Folder | `⌘O` / `⇧⌘O` |
 | Save / Save As | `⌘S` / `⇧⌘S` |

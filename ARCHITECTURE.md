@@ -21,13 +21,22 @@ following the **Build Useful** design system.
      single grapheme cluster. The OS font engine is only called on atlas misses.
    - `Clipboard`: `get_text` / `set_text`.
    - `PlatformHost`: window title, cursor shape, open/save/confirm dialogs,
-     persisted preferences, directory watcher (`FSEvents` on macOS), redraw/quit
-     signals, and optional `MainLoopWaker` for zero-polling background wakeups.
-   - `IgnoreRules` & `GitIgnoreLayer`: declarative per-OS workspace ignore tables
-     (`macos`, `linux`, `windows`, `unix_generic`) plus lightweight hierarchical
-     `.gitignore` matching (read only when a directory actually contains `.gitignore`).
-   - `version`: single-source-of-truth SemVer parsing and monotonic build numbers
-     derived from `[workspace.package] version` in `Cargo.toml`.
+     persisted preferences, single-stream directory watcher (`FSEvents` on macOS,
+     with optional secondary `.git` metadata directory for monorepo subfolders
+     and worktrees), redraw/quit signals, native HTTPS fetcher, and optional
+     `MainLoopWaker` for zero-polling background wakeups.
+   - `IgnoreRules`, `GitIgnoreLayer` & `matches_path_filter`: declarative per-OS
+     workspace ignore tables (`macos`, `linux`, `windows`, `unix_generic`),
+     hierarchical `.gitignore` matching (including ancestor `.gitignore` layers
+     for monorepo subfolders and boundary resets at nested `.git` repos), and
+     interactive glob/exclusion path filtering for Search in Files.
+   - `git`: pure-Rust repo discovery (`discover_repo`, supporting worktrees and
+     submodules) and `.git/HEAD` branch parsing (`< 50 µs`, zero subprocesses),
+     bounded multi-repo `GitStatusCache`, and lock-free `git --no-optional-locks`
+     status/HEAD helpers (pathspec-scoped, single-flight, adaptive cooldown).
+   - `version` & `update`: single-source-of-truth SemVer parsing, pure-Rust
+     SHA-256 verification, CDN `release.json` manifest validation, and atomic
+     bundle swap for GitHub Releases auto-updates.
    - **Presentation**: the renderer paints directly into a premultiplied BGRA8
      surface (`IOSurface` zero-copy on macOS) with dirty rectangles. Porting to
      Windows or Linux requires only a thin OS adapter with pixel-identical output.
@@ -47,11 +56,14 @@ following the **Build Useful** design system.
      flat 96-entry direct-index ASCII table (zero hashing), open-addressed cache
      for Unicode/Emoji/UI glyphs, scroll-blit (`memmove` surviving rows), and
      dirty-rect tracking so caret blink touches < 200 pixels (`~5–10 µs`).
-   - **Instant Workspace Search (`editor-render::palette`)**:
+   - **Instant Workspace Search & Live Myers Diff (`editor-render::palette`, `editor-core::diff`)**:
      two-pane Quick Open (`⌘P`) and Search in Files (`⇧⌘F`) with live syntax-
-     highlighted preview, hybrid 8 ms sync head-start → cancellable background
-     streaming for huge directories (e.g. `$HOME`), and a unified lazy-filling
-     20 MB modal-lifetime `SearchSlab` that frees 100% of its RAM on close.
+     highlighted preview, opt-in `Paths` glob filter and confirmed `Replace in Files`,
+     hybrid 8 ms sync head-start → cancellable background streaming for huge
+     directories (e.g. `$HOME`), and a unified lazy-filling 20 MB modal-lifetime
+     `SearchSlab` that frees 100% of its RAM on close. Live gutter diff ticks run
+     an in-memory Myers O(ND) diff over CRLF-normalized FNV-1a 64-bit line hashes
+     (`< 0.1 ms` on edits, zero subprocesses while typing).
    - **Zero idle CPU**: event-driven main loop with coalesced OS events and no
      background polling timers or speculative filesystem scans.
 4. **Focused Unicode support**: strict UTF-8, English, programming languages,
@@ -96,8 +108,8 @@ following the **Build Useful** design system.
 
 ## Module Overview
 
-- `crates/editor-platform`: `fs`, `host`, `ignore`, `input`, `ipc`, `raster`, `surface`, `version`.
-- `crates/editor-core`: `piece_tree`, `document`, `swar`, `regex`, `search`, `grapheme`, `undo`, `syntax`.
+- `crates/editor-platform`: `fs`, `git`, `host`, `ignore`, `input`, `ipc`, `raster`, `surface`, `update`, `version`.
+- `crates/editor-core`: `piece_tree`, `document`, `diff`, `swar`, `regex`, `search`, `grapheme`, `undo`, `syntax`.
 - `crates/editor-render`: `theme`, `atlas`, `painter`, `viewport`, `sidebar`, `tab_strip`, `chrome`, `text_input`, `palette`, `pins`, `shortcuts`.
 - `crates/editor-app`: `lib` (`EditorApp` controller), `keymap`, `buffers`, `panes`, `session`, `autopairs`, `fs_undo`, `vim`, `vim_exec`.
 - `crates/editor-cli`: `main`, `json`, `json_parse`.

@@ -4,7 +4,9 @@
 //! exclusions in one declarative table here so adding Linux, Windows, or BSD support
 //! requires zero OS-specific branches in `editor-render` or `editor-app`.
 
+use crate::fs::FileSystem;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 /// Exact directory names ignored across every operating system (VCS internals, build outputs,
 /// and package/tool caches that drown out real source files).
@@ -303,6 +305,10 @@ impl IgnoreRules {
     /// Return true if file `name` should be skipped during workspace traversal.
     #[inline]
     pub fn should_skip_file(&self, name: &str) -> bool {
+        // Submodules and worktrees store a `.git` file pointing to their gitdir; never index it.
+        if self.name_matches(name, ".git") {
+            return true;
+        }
         self.file_names.iter().any(|&r| self.name_matches(name, r))
     }
 }
@@ -328,18 +334,45 @@ struct GitIgnoreRule {
     has_slash: bool,
 }
 
-/// Parsed rules from a single `.gitignore` file, scoped to its directory prefix (`base_rel`).
+#[derive(Debug, Clone)]
+enum LayerScope {
+    /// `.gitignore` lives at or below the traversal root (`""` for root, `"crates/foo"` for subdirs).
+    Descendant(String),
+    /// `.gitignore` lives strictly above the traversal root (e.g. a monorepo root `.gitignore`
+    /// when the user opened a subdirectory). `prefix` is the traversal root's forward-slash path
+    /// relative to this `.gitignore`'s directory (e.g. `"services/api"`).
+    Ancestor(String),
+}
+
+/// Parsed rules from a single `.gitignore` file, scoped to its directory relative to the traversal root.
 #[derive(Debug, Clone)]
 pub struct GitIgnoreLayer {
-    /// Forward-slash relative path from search root (`""` for root `.gitignore`).
-    base_rel: String,
+    scope: LayerScope,
+    has_path_rule: bool,
     rules: Vec<GitIgnoreRule>,
 }
 
 impl GitIgnoreLayer {
-    /// Parse a `.gitignore` file located at `base_rel` relative to the workspace root.
+    /// Parse a `.gitignore` file located at `base_rel` at or below the workspace root.
     pub fn parse(base_rel: String, content: &str) -> Option<Self> {
+        Self::parse_scoped(LayerScope::Descendant(base_rel), content)
+    }
+
+    /// Parse an ancestor `.gitignore` file located strictly above the workspace root, where
+    /// `root_rel_to_ancestor` is the workspace root's forward-slash path relative to that ancestor
+    /// directory (e.g. `"services/api"` when root is `/monorepo/services/api` and `.gitignore` is
+    /// in `/monorepo`).
+    pub fn parse_ancestor(root_rel_to_ancestor: String, content: &str) -> Option<Self> {
+        if root_rel_to_ancestor.is_empty() {
+            Self::parse(String::new(), content)
+        } else {
+            Self::parse_scoped(LayerScope::Ancestor(root_rel_to_ancestor), content)
+        }
+    }
+
+    fn parse_scoped(scope: LayerScope, content: &str) -> Option<Self> {
         let mut rules = Vec::new();
+        let mut has_path_rule = false;
         for raw_line in content.lines() {
             let line = raw_line.trim_end_matches('\r').trim_end_matches([' ', '\t']);
             if line.is_empty() || line.starts_with('#') {
@@ -375,6 +408,9 @@ impl GitIgnoreLayer {
             }
             let has_slash = rest.contains('/');
             let anchored = leading_slash || (has_slash && !has_leading_dstar);
+            if anchored || has_slash {
+                has_path_rule = true;
+            }
             rules.push(GitIgnoreRule {
                 pattern: rest.to_string(),
                 negated,
@@ -386,18 +422,39 @@ impl GitIgnoreLayer {
         if rules.is_empty() {
             None
         } else {
-            Some(Self { base_rel, rules })
+            Some(Self {
+                scope,
+                has_path_rule,
+                rules,
+            })
         }
     }
 
     /// Evaluate all rules in this layer against `rel_path` (relative to workspace root).
     /// Returns `Some(true)` if ignored, `Some(false)` if explicitly un-ignored (`!`), `None` if no rule matched.
     pub fn matches(&self, rel_path: &str, name: &str, is_dir: bool) -> Option<bool> {
-        let local_rel = if self.base_rel.is_empty() {
-            rel_path
-        } else {
-            let rest = rel_path.strip_prefix(&self.base_rel)?;
-            rest.strip_prefix('/')?
+        let owned_local: String;
+        let local_rel: &str = match &self.scope {
+            LayerScope::Descendant(base_rel) => {
+                if base_rel.is_empty() {
+                    rel_path
+                } else {
+                    let rest = rel_path.strip_prefix(base_rel.as_str())?;
+                    rest.strip_prefix('/')?
+                }
+            }
+            LayerScope::Ancestor(prefix) => {
+                if self.has_path_rule {
+                    let mut s = String::with_capacity(prefix.len() + 1 + rel_path.len());
+                    s.push_str(prefix);
+                    s.push('/');
+                    s.push_str(rel_path);
+                    owned_local = s;
+                    owned_local.as_str()
+                } else {
+                    ""
+                }
+            }
         };
         let mut decision: Option<bool> = None;
         for rule in &self.rules {
@@ -416,6 +473,85 @@ impl GitIgnoreLayer {
         }
         decision
     }
+}
+
+/// Collect `.gitignore` layers from ancestor directories strictly above `root` up to the enclosing
+/// Git repository root (if any), plus `.git/info/exclude` at the repo root.
+///
+/// Cost: a single `stat` when `root` itself is a repo root, or `O(depth)` (typically 1–4 `stat`s)
+/// when `root` is a subdirectory inside a monorepo. Never walks above the enclosing `.git` root.
+pub fn collect_ancestor_gitignores(fs: &dyn FileSystem, root: &Path) -> Vec<Arc<GitIgnoreLayer>> {
+    const MAX_ANCESTOR_DEPTH: usize = 32;
+    const MAX_GITIGNORE_BYTES: usize = 32 * 1024;
+
+    let canonical = fs.canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    // If `root` itself has a `.git` entry (dir or submodule/worktree file), it is already a repo
+    // root — outer `.gitignore` files outside this repo must NOT bleed in.
+    if fs.stat(&canonical.join(".git")).is_ok() {
+        return Vec::new();
+    }
+
+    let mut ancestors: Vec<PathBuf> = Vec::new();
+    let mut cur = canonical.parent().map(Path::to_path_buf);
+    let mut repo_root: Option<(PathBuf, bool)> = None;
+    let mut steps = 0usize;
+    while let Some(dir) = cur {
+        if steps >= MAX_ANCESTOR_DEPTH {
+            break;
+        }
+        steps += 1;
+        ancestors.push(dir.clone());
+        if let Ok(st) = fs.stat(&dir.join(".git")) {
+            repo_root = Some((dir, st.is_dir));
+            break;
+        }
+        cur = dir.parent().map(Path::to_path_buf);
+    }
+
+    let Some((workdir, git_is_dir)) = repo_root else {
+        return Vec::new();
+    };
+
+    let mut layers = Vec::new();
+    let mut buf = Vec::new();
+
+    // Outermost (repo root) to innermost (immediate parent of `root`), matching Git precedence.
+    for dir in ancestors.into_iter().rev() {
+        let Ok(rel_root) = canonical.strip_prefix(&dir) else {
+            continue;
+        };
+        let mut prefix = String::new();
+        for (i, comp) in rel_root.components().enumerate() {
+            if i > 0 {
+                prefix.push('/');
+            }
+            prefix.push_str(&comp.as_os_str().to_string_lossy());
+        }
+        if prefix.is_empty() {
+            continue;
+        }
+        if dir == workdir && git_is_dir {
+            let exclude = dir.join(".git").join("info").join("exclude");
+            if let Ok(Some(len)) = fs.read_prefix_into(&exclude, MAX_GITIGNORE_BYTES, &mut buf) {
+                if len > 0 {
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(layer) = GitIgnoreLayer::parse_ancestor(prefix.clone(), &text) {
+                        layers.push(Arc::new(layer));
+                    }
+                }
+            }
+        }
+        let gi = dir.join(".gitignore");
+        if let Ok(Some(len)) = fs.read_prefix_into(&gi, MAX_GITIGNORE_BYTES, &mut buf) {
+            if len > 0 {
+                let text = String::from_utf8_lossy(&buf);
+                if let Some(layer) = GitIgnoreLayer::parse_ancestor(prefix, &text) {
+                    layers.push(Arc::new(layer));
+                }
+            }
+        }
+    }
+    layers
 }
 
 /// Evaluate a stack of ancestor `.gitignore` layers (root-most to deepest); deepest match wins.
@@ -563,6 +699,99 @@ fn glob_match_suffix(pat: &str, path: &str) -> bool {
     false
 }
 
+/// Return true if a workspace-relative path (`crates/editor-app/src/lib.rs`) matches
+/// an interactive comma-separated path filter expression (e.g. `"*.rs, crates/, !tests/"`).
+///
+/// Semantics:
+/// - Empty / whitespace-only filter matches everything (`O(1)`).
+/// - Patterns prefixed with `!` exclude matching paths.
+/// - If any positive (include) patterns are present, at least one must match.
+/// - Patterns containing `*`, `?`, or `[` use our iterative glob matcher against the full path,
+///   any suffix, or the basename; patterns ending with `/` match that directory prefix/segment;
+///   plain words without globs or `/` perform an ergonomic ASCII case-insensitive substring match.
+pub fn matches_path_filter(rel_path: &str, filter_expr: &str) -> bool {
+    let trimmed = filter_expr.trim();
+    if trimmed.is_empty() {
+        return true;
+    }
+    let norm = rel_path.trim_start_matches("./").trim_start_matches('/');
+    let mut has_include = false;
+    let mut included = false;
+
+    for raw_tok in trimmed.split(',') {
+        let tok = raw_tok.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        let (neg, raw_pat) = match tok.strip_prefix('!') {
+            Some(rest) => (true, rest.trim()),
+            None => (false, tok),
+        };
+        if raw_pat.is_empty() {
+            continue;
+        }
+        let matched = match_filter_token(norm, raw_pat);
+        if neg {
+            if matched {
+                return false;
+            }
+        } else {
+            has_include = true;
+            if matched {
+                included = true;
+            }
+        }
+    }
+    !has_include || included
+}
+
+fn match_filter_token(rel_path: &str, raw_pat: &str) -> bool {
+    let pat = raw_pat.trim_start_matches("./").trim_start_matches('/');
+    if pat.is_empty() {
+        return true;
+    }
+    let has_glob = pat.bytes().any(|b| matches!(b, b'*' | b'?' | b'['));
+    if let Some(dir_pat) = pat.strip_suffix('/') {
+        if dir_pat.is_empty() {
+            return true;
+        }
+        if has_glob {
+            let full = format!("{dir_pat}/**");
+            return glob_match_path(&full, rel_path) || glob_match_suffix(&full, rel_path);
+        }
+        return rel_path.starts_with(pat)
+            || rel_path.contains(&format!("/{pat}"))
+            || rel_path == dir_pat;
+    }
+    if has_glob {
+        if pat.contains('/') {
+            glob_match_path(pat, rel_path) || glob_match_suffix(pat, rel_path)
+        } else {
+            let base = rel_path.rsplit('/').next().unwrap_or(rel_path);
+            glob_match_segment(pat, base) || glob_match_path(pat, rel_path)
+        }
+    } else if pat.contains('/') {
+        rel_path.starts_with(pat) || rel_path.contains(pat)
+    } else {
+        // Ergonomic ASCII case-insensitive substring match for plain terms like `palette` or `rs`.
+        contains_ascii_ci(rel_path.as_bytes(), pat.as_bytes())
+    }
+}
+
+fn contains_ascii_ci(hay: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    if needle.len() > hay.len() {
+        return false;
+    }
+    hay.windows(needle.len()).any(|w| {
+        w.iter()
+            .zip(needle.iter())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,5 +871,55 @@ mod tests {
         assert!(is_gitignored(&layers, "lib.o", "lib.o", false));
         assert!(is_gitignored(&layers, "a/b/c/d/deep.tmp", "deep.tmp", false));
         assert!(is_gitignored(&layers, "sub/local_tmp", "local_tmp", false));
+    }
+
+    #[test]
+    fn path_filter_supports_globs_dirs_negation_and_substrings() {
+        assert!(matches_path_filter("crates/editor-app/src/lib.rs", ""));
+        assert!(matches_path_filter("crates/editor-app/src/lib.rs", "*.rs"));
+        assert!(!matches_path_filter("README.md", "*.rs"));
+        assert!(matches_path_filter("crates/editor-app/src/lib.rs", "*.rs, !tests/"));
+        assert!(!matches_path_filter("crates/editor-app/tests/app_tests.rs", "*.rs, !tests/"));
+        assert!(matches_path_filter("crates/editor-render/src/palette.rs", "palette"));
+        assert!(matches_path_filter("crates/editor-render/src/palette.rs", "crates/editor-render/"));
+        assert!(!matches_path_filter("crates/editor-core/src/lib.rs", "crates/editor-render/"));
+        assert!(!matches_path_filter("target/debug/out.rs", "!target/"));
+        assert!(matches_path_filter("src/main.rs", "!target/"));
+    }
+
+    #[test]
+    fn ancestor_gitignores_apply_to_monorepo_subfolders_and_respect_anchoring() {
+        use crate::fs::MemoryFileSystem;
+
+        let fs = MemoryFileSystem::new();
+        fs.add_file("/mono/.git/HEAD", b"ref: refs/heads/main\n".to_vec());
+        fs.add_file(
+            "/mono/.gitignore",
+            b"*.log\n/top_only.txt\nservices/api/gen/\n!services/api/keep.log\n".to_vec(),
+        );
+        fs.add_file("/mono/services/.gitignore", b"local_tmp/\n".to_vec());
+        fs.add_file("/mono/services/api/src/main.rs", b"fn main() {}\n".to_vec());
+
+        // Opening the monorepo root has zero ancestor layers above it.
+        assert!(collect_ancestor_gitignores(&fs, Path::new("/mono")).is_empty());
+
+        // Opening `/mono/services/api` loads `/mono/.gitignore` + `/mono/services/.gitignore` in order.
+        let layers = collect_ancestor_gitignores(&fs, Path::new("/mono/services/api"));
+        assert_eq!(layers.len(), 2);
+
+        // Unanchored rule `*.log` from monorepo root applies, and negated path rule overrides it.
+        assert!(is_gitignored(&layers, "debug.log", "debug.log", false));
+        assert!(!is_gitignored(&layers, "keep.log", "keep.log", false));
+        // Anchored `/top_only.txt` at `/mono` must NOT ignore `/mono/services/api/top_only.txt`.
+        assert!(!is_gitignored(&layers, "top_only.txt", "top_only.txt", false));
+        // Path-anchored `services/api/gen/` from `/mono/.gitignore` matches `gen/` inside subfolder!
+        assert!(is_gitignored(&layers, "gen", "gen", true));
+        assert!(!is_gitignored(&layers, "gen", "gen", false));
+        // Intermediate ancestor `/mono/services/.gitignore` rule `local_tmp/` applies too.
+        assert!(is_gitignored(&layers, "local_tmp", "local_tmp", true));
+
+        // Submodule / worktree `.git` pointer file is skipped by `should_skip_file`.
+        let rules = IgnoreRules::macos(None);
+        assert!(rules.should_skip_file(".git"));
     }
 }

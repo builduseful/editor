@@ -169,6 +169,12 @@ enum PendingDiscardAction {
     MoveLargeFolder { src: PathBuf, dst_dir: PathBuf },
     ConfirmUpdate(editor_platform::UpdateInfo),
     RestartForUpdate(PathBuf),
+    ConfirmReplaceInFiles {
+        query: String,
+        replacement: String,
+        options: SearchOptions,
+        files: Vec<PathBuf>,
+    },
 }
 
 enum UpdateWorkerEvent {
@@ -262,6 +268,24 @@ pub struct EditorApp {
     last_update_check_secs: u64,
     available_update: Option<editor_platform::UpdateInfo>,
     update_worker_slot: Option<Arc<std::sync::Mutex<Option<UpdateWorkerEvent>>>>,
+
+    // Event-driven, zero-idle-CPU Git awareness (branch, multi-repo sidebar status, live gutter diff).
+    sidebar_git_repo: Option<editor_platform::GitRepo>,
+    active_git_repo: Option<editor_platform::GitRepo>,
+    pub git_branch: Option<String>,
+    pub git_status: editor_platform::GitStatusCache,
+    git_status_gen: Arc<std::sync::atomic::AtomicU64>,
+    git_status_slot: Option<
+        Arc<std::sync::Mutex<Option<(u64, Vec<(PathBuf, editor_platform::GitStatusMap)>, u64)>>>,
+    >,
+    git_status_in_flight: bool,
+    git_status_pending: bool,
+    git_status_cooldown_ms: u64,
+    last_git_status_ms: u64,
+    git_head_path: Option<PathBuf>,
+    git_head_hashes: Option<Vec<u64>>,
+    git_head_gen: Arc<std::sync::atomic::AtomicU64>,
+    git_head_slot: Option<Arc<std::sync::Mutex<Option<(u64, PathBuf, Option<Vec<u64>>)>>>>,
 
     pub atlas: GlyphAtlas,
     pub framebuffer: Framebuffer,
@@ -362,6 +386,20 @@ impl EditorApp {
             last_update_check_secs: 0,
             available_update: None,
             update_worker_slot: None,
+            sidebar_git_repo: None,
+            active_git_repo: None,
+            git_branch: None,
+            git_status: editor_platform::GitStatusCache::default(),
+            git_status_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            git_status_slot: None,
+            git_status_in_flight: false,
+            git_status_pending: false,
+            git_status_cooldown_ms: 500,
+            last_git_status_ms: 0,
+            git_head_path: None,
+            git_head_hashes: None,
+            git_head_gen: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            git_head_slot: None,
             atlas: GlyphAtlas::new(),
             framebuffer,
             layout: AppLayout::default(),
@@ -871,6 +909,21 @@ impl EditorApp {
 
     pub fn sync_fs_watch(&self, host: &mut dyn PlatformHost) {
         host.watch_directory(self.sidebar.root());
+        self.sync_git_dir_watch(host);
+    }
+
+    fn sync_git_dir_watch(&self, host: &mut dyn PlatformHost) {
+        let git_dir = self
+            .active_git_repo
+            .as_ref()
+            .or(self.sidebar_git_repo.as_ref())
+            .map(|r| r.git_dir.as_path());
+        let extra = match (git_dir, self.sidebar.root()) {
+            (Some(gd), Some(root)) if gd.starts_with(root) => None,
+            (Some(gd), _) => Some(gd),
+            (None, _) => None,
+        };
+        host.watch_extra_directory(extra);
     }
 
     fn persist_last_folder(&self, host: &mut dyn PlatformHost) {
@@ -878,6 +931,7 @@ impl EditorApp {
             host.save_pref("LastFolder", &root.to_string_lossy());
             host.watch_directory(Some(root));
         }
+        self.sync_git_dir_watch(host);
     }
 
     fn remember_view(&mut self, path: PathBuf, view: SavedViewState) {
@@ -1124,6 +1178,8 @@ impl EditorApp {
         self.save_session(host);
         self.save_preferences(host);
         self.sync_title(host);
+        self.refresh_git_workspace(host, true);
+        self.refresh_git_head_for_active_doc(host);
         self.recompute_layout();
         self.mark_dirty();
         host.request_redraw();
@@ -1131,6 +1187,7 @@ impl EditorApp {
 
     pub fn set_sidebar_root(&mut self, dir: &Path) {
         self.sidebar.set_root(self.fs.as_ref(), dir);
+        self.refresh_git_branch_sync();
         self.mark_dirty();
     }
 
@@ -1313,6 +1370,7 @@ impl EditorApp {
             }
         }
         self.sync_title(host);
+        self.on_active_doc_git_changed(host);
         self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
@@ -1420,6 +1478,7 @@ impl EditorApp {
             }
         }
         self.sync_title(host);
+        self.on_active_doc_git_changed(host);
         self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
@@ -1651,6 +1710,7 @@ impl EditorApp {
         }
         self.recompute_layout();
         self.sync_title(host);
+        self.on_active_doc_git_changed(host);
         self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
@@ -1941,6 +2001,7 @@ impl EditorApp {
         self.working_set.touch_mru(self.active_buf_id);
         self.recompute_layout();
         self.sync_title(host);
+        self.on_active_doc_git_changed(host);
         self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
@@ -2027,6 +2088,7 @@ impl EditorApp {
         self.working_set.touch_mru(self.active_buf_id);
         self.recompute_layout();
         self.sync_title(host);
+        self.on_active_doc_git_changed(host);
         // Only the two affected panes (headers + carets), the top tab strip, and the status bar change.
         if let Some(f) = prev_active {
             self.mark_dirty_rect(f);
@@ -2321,10 +2383,11 @@ impl EditorApp {
         let mut painter = Painter::from_surface(surf);
         painter.push_clip(effective_clip);
 
-        // 1. Sidebar (with quiet pinned `1..9` badges and `•` dirty dots!)
+        // 1. Sidebar (with quiet pinned `1..9` badges, `•` dirty dots, and Git status cues!)
         if !layout.sidebar.intersect(effective_clip).is_empty() {
             self.sidebar.set_prompt_caret_visible(self.caret_visible);
             let ws = &self.working_set;
+            let gs = &self.git_status;
             self.sidebar.draw_with_badges(
                 &mut painter,
                 layout.sidebar,
@@ -2334,6 +2397,8 @@ impl EditorApp {
                 |path| SidebarBadge {
                     pin_slot: ws.pin_slot_for_path(path),
                     dirty: ws.is_dirty_path(path),
+                    git_status: gs.file_status(path),
+                    git_dir_dirty: gs.dir_has_changes(path),
                 },
             );
         }
@@ -2496,6 +2561,7 @@ impl EditorApp {
                 theme_pref: self.theme_pref,
                 notice,
                 vim_badge: vim_badge_owned.as_deref(),
+                git_branch: self.git_branch.as_deref(),
             };
             draw_status_bar(
                 &mut painter,
@@ -2638,12 +2704,15 @@ impl EditorApp {
     ) {
         if matches!(event, InputEvent::Tick { .. }) {
             self.poll_update_worker(host);
+            self.poll_git_workers(host);
         }
         // Intercept keyboard & mouse when the custom in-app confirmation modal is open.
         if self.confirm_modal.visible {
             match event {
                 InputEvent::KeyDown { key, .. } => {
-                    let choice = if self.confirm_modal.is_update_confirm {
+                    let choice = if self.confirm_modal.is_update_confirm
+                        || self.confirm_modal.is_replace_all_confirm
+                    {
                         match key {
                             Key::Enter => Some(ConfirmChoice::Discard),
                             Key::Escape => Some(ConfirmChoice::Cancel),
@@ -3053,6 +3122,7 @@ impl EditorApp {
                         _ => {}
                     }
                     self.maybe_start_auto_update_check(host);
+                    self.refresh_git_workspace(host, false);
                 }
                 self.mark_dirty();
                 host.request_redraw();
@@ -3696,7 +3766,147 @@ impl EditorApp {
                     host.request_quit();
                 }
             }
+            PendingDiscardAction::ConfirmReplaceInFiles {
+                query,
+                replacement,
+                options,
+                files,
+            } => {
+                self.execute_replace_in_files(&query, &replacement, options, &files, host);
+            }
         }
+    }
+
+    fn execute_replace_in_files(
+        &mut self,
+        query: &str,
+        replacement: &str,
+        options: SearchOptions,
+        files: &[PathBuf],
+        host: &mut dyn PlatformHost,
+    ) {
+        let Ok(Some(compiled)) = editor_core::CompiledQuery::compile(query, options) else {
+            self.set_notice("Invalid search query", true);
+            self.mark_dirty();
+            host.request_redraw();
+            return;
+        };
+
+        let mut total_matches = 0usize;
+        let mut total_files = 0usize;
+        let mut failed_files = 0usize;
+
+        for path in files {
+            // 1. Active pane buffer (stays in-memory and undoable with Cmd+Z!).
+            if self.doc.path() == Some(path.as_path()) {
+                let n = self
+                    .doc
+                    .replace_all(query, replacement, options, self.now_ms);
+                if n > 0 {
+                    let len = self.doc.len_bytes();
+                    self.caret = self.caret.min(len);
+                    self.anchor = self.anchor.min(len);
+                    self.extra_cursors.clear();
+                    self.sync_active_buffer_meta();
+                    self.recompute_active_git_diff();
+                    if self.find_bar.visible {
+                        self.refresh_search();
+                    }
+                    total_matches += n;
+                    total_files += 1;
+                }
+                continue;
+            }
+            // 2. Visible secondary split panes (also stays in-memory and undoable!).
+            let mut handled_split = false;
+            for pane in &mut self.other_panes {
+                if pane.doc.path() == Some(path.as_path()) {
+                    let n = pane.doc.replace_all(
+                        query,
+                        replacement,
+                        options,
+                        self.now_ms,
+                    );
+                    if n > 0 {
+                        let len = pane.doc.len_bytes();
+                        pane.caret = pane.caret.min(len);
+                        pane.anchor = pane.anchor.min(len);
+                        pane.extra_cursors.clear();
+                        total_matches += n;
+                        total_files += 1;
+                    }
+                    handled_split = true;
+                    break;
+                }
+            }
+            if handled_split {
+                continue;
+            }
+            // 3. Parked open buffers in WorkingSet (stays in-memory and undoable!).
+            if let Some(n) = self.working_set.replace_all_in_parked_by_path(
+                path,
+                query,
+                replacement,
+                options,
+                self.now_ms,
+            ) {
+                if n > 0 {
+                    total_matches += n;
+                    total_files += 1;
+                }
+                continue;
+            }
+            // 4. Unopened file on disk -> read UTF-8, replace via CompiledQuery, write atomically.
+            let mut buf = Vec::new();
+            let Ok(Some(sz)) = self.fs.read_prefix_into(path, 8 * 1024 * 1024, &mut buf) else {
+                failed_files += 1;
+                continue;
+            };
+            if sz > 8 * 1024 * 1024 {
+                failed_files += 1;
+                continue;
+            }
+            let Ok(text) = std::str::from_utf8(&buf) else {
+                failed_files += 1;
+                continue;
+            };
+            let (replaced, count) = replace_all_in_str(text, &compiled, replacement);
+            if count > 0 {
+                let bytes = replaced.into_bytes();
+                let res = self
+                    .fs
+                    .write_atomic(path, &mut |w| std::io::Write::write_all(w, &bytes));
+                if res.is_ok() {
+                    total_matches += count;
+                    total_files += 1;
+                } else {
+                    failed_files += 1;
+                }
+            }
+        }
+
+        self.palette.invalidate_file_index();
+        self.sync_title(host);
+        self.refresh_git_workspace(host, true);
+        if failed_files > 0 {
+            self.set_notice(
+                format!(
+                    "Replaced {total_matches} in {total_files} files ({failed_files} skipped)"
+                ),
+                true,
+            );
+        } else {
+            self.set_notice(
+                format!(
+                    "Replaced {total_matches} match{} in {total_files} file{}",
+                    if total_matches == 1 { "" } else { "es" },
+                    if total_files == 1 { "" } else { "s" }
+                ),
+                false,
+            );
+        }
+        self.mark_dirty();
+        host.request_redraw();
     }
 
     /// Run a passive once-per-24h GitHub Releases check (zero background timers, zero idle CPU).
@@ -3939,13 +4149,312 @@ impl EditorApp {
         }
     }
 
+    /// Refresh pure-Rust `.git/HEAD` branch label immediately (`< 50 µs`, zero subprocesses).
+    ///
+    /// Always resolves the innermost repository enclosing the active document first (handling
+    /// submodules, nested repos, worktrees, and multi-repo parent folders accurately), falling
+    /// back to the sidebar root's repository when no file is open.
+    pub fn refresh_git_branch_sync(&mut self) {
+        let sidebar_repo = self
+            .sidebar
+            .root()
+            .and_then(editor_platform::git::discover_repo);
+        let doc_repo = self
+            .doc
+            .path()
+            .and_then(editor_platform::git::discover_repo);
+        let active_repo = doc_repo.or_else(|| sidebar_repo.clone());
+
+        if self.sidebar_git_repo != sidebar_repo {
+            self.git_status.clear();
+            self.git_status_gen
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+        self.sidebar_git_repo = sidebar_repo;
+
+        if let Some(ref repo) = active_repo {
+            self.git_branch = editor_platform::git::read_branch_label(&repo.git_dir);
+        } else {
+            self.git_branch = None;
+        }
+        self.active_git_repo = active_repo;
+    }
+
+    fn on_active_doc_git_changed(&mut self, host: &mut dyn PlatformHost) {
+        let prev_repo = self.active_git_repo.clone();
+        self.refresh_git_branch_sync();
+        self.sync_git_dir_watch(host);
+        self.refresh_git_head_for_active_doc(host);
+        if self.active_git_repo != prev_repo {
+            if let Some(ref repo) = self.active_git_repo {
+                if !self.git_status.contains_repo(&repo.workdir) {
+                    self.refresh_git_workspace(host, false);
+                }
+            }
+        }
+    }
+
+    /// Refresh branch synchronously + kick a single-flight, pathspec-scoped async
+    /// `git --no-optional-locks status` worker when running in a live GUI host.
+    ///
+    /// Coalesces bursts so at most ONE `git status` subprocess runs at a time, and adapts the
+    /// cooldown to observed repo speed (`500 ms`..`10 s`) so large monorepos stay quiet.
+    pub fn refresh_git_workspace(&mut self, host: &mut dyn PlatformHost, force_status: bool) {
+        let prev_branch = self.git_branch.clone();
+        let prev_active = self.active_git_repo.clone();
+        self.refresh_git_branch_sync();
+        self.sync_git_dir_watch(host);
+        if self.git_branch != prev_branch || self.active_git_repo != prev_active {
+            self.refresh_git_head_for_active_doc(host);
+            self.mark_dirty_rect(self.layout.status_bar);
+            host.request_redraw();
+        }
+        let sidebar_root = self.sidebar.root().map(Path::to_path_buf);
+        let mut targets: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
+        if let Some(ref sr) = self.sidebar_git_repo {
+            targets.push((sr.workdir.clone(), sidebar_root.clone()));
+        }
+        if let Some(ref ar) = self.active_git_repo {
+            let already_listed = targets.iter().any(|(w, _)| w == &ar.workdir);
+            let relevant_to_sidebar = match sidebar_root.as_deref() {
+                None => true,
+                Some(sr) => ar.workdir.starts_with(sr) || sr.starts_with(&ar.workdir),
+            };
+            if !already_listed && relevant_to_sidebar {
+                targets.push((ar.workdir.clone(), sidebar_root));
+            }
+        }
+        if targets.is_empty() {
+            return;
+        }
+        let Some(waker) = host.main_loop_waker() else {
+            return;
+        };
+        if self.git_status_in_flight {
+            self.git_status_pending = true;
+            return;
+        }
+        if !force_status
+            && self.now_ms.saturating_sub(self.last_git_status_ms) < self.git_status_cooldown_ms
+        {
+            return;
+        }
+        self.git_status_in_flight = true;
+        self.git_status_pending = false;
+        self.last_git_status_ms = self.now_ms;
+        let gen = self
+            .git_status_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let gen_ref = Arc::clone(&self.git_status_gen);
+        let slot: Arc<
+            std::sync::Mutex<Option<(u64, Vec<(PathBuf, editor_platform::GitStatusMap)>, u64)>>,
+        > = Arc::new(std::sync::Mutex::new(None));
+        let slot_bg = Arc::clone(&slot);
+        self.git_status_slot = Some(slot);
+        std::thread::spawn(move || {
+            let started = std::time::Instant::now();
+            let mut results = Vec::with_capacity(targets.len());
+            for (workdir, scope) in targets {
+                if gen_ref.load(std::sync::atomic::Ordering::Acquire) != gen {
+                    break;
+                }
+                if let Some(status) =
+                    editor_platform::git::query_status(&workdir, scope.as_deref())
+                {
+                    results.push((workdir, status));
+                }
+            }
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            // Always deliver completion (even on empty/stale) so `git_status_in_flight` never sticks.
+            if let Ok(mut g) = slot_bg.lock() {
+                *g = Some((gen, results, elapsed_ms));
+            }
+            waker();
+        });
+    }
+
+    /// Fetch `HEAD` line hashes for the active document off-main-thread and compute live gutter diff.
+    pub fn refresh_git_head_for_active_doc(&mut self, host: &mut dyn PlatformHost) {
+        let Some(path) = self.doc.path().map(Path::to_path_buf) else {
+            self.git_head_path = None;
+            self.git_head_hashes = None;
+            self.viewport.git_diff.clear();
+            return;
+        };
+        if self.doc.len_bytes() > editor_platform::git::MAX_GIT_HEAD_FILE_BYTES as u64 {
+            self.git_head_path = Some(path);
+            self.git_head_hashes = None;
+            self.viewport.git_diff.clear();
+            return;
+        }
+        // Always discover the innermost repository enclosing `path` so nested repos and submodules
+        // diff against their own `HEAD` instead of failing against an enclosing outer repository.
+        let Some(repo) = editor_platform::git::discover_repo(&path) else {
+            self.git_head_path = Some(path);
+            self.git_head_hashes = None;
+            self.viewport.git_diff.clear();
+            return;
+        };
+        let Some(waker) = host.main_loop_waker() else {
+            if self.git_head_path.as_deref() != Some(path.as_path()) {
+                self.viewport.git_diff.clear();
+            }
+            return;
+        };
+        self.git_head_path = Some(path.clone());
+        let gen = self
+            .git_head_gen
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        let gen_ref = Arc::clone(&self.git_head_gen);
+        let slot: Arc<std::sync::Mutex<Option<(u64, PathBuf, Option<Vec<u64>>)>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let slot_bg = Arc::clone(&slot);
+        self.git_head_slot = Some(slot);
+        let workdir = repo.workdir;
+        std::thread::spawn(move || {
+            let hashes = editor_platform::git::read_head_file(&workdir, &path)
+                .and_then(|bytes| editor_core::hash_lines_bytes(&bytes));
+            if gen_ref.load(std::sync::atomic::Ordering::Acquire) == gen {
+                if let Ok(mut g) = slot_bg.lock() {
+                    *g = Some((gen, path, hashes));
+                }
+                waker();
+            }
+        });
+    }
+
+    /// Recompute live in-memory Myers gutter diff ticks from cached `HEAD` line hashes (`< 0.1 ms`).
+    pub fn recompute_active_git_diff(&mut self) {
+        let Some(ref head_hashes) = self.git_head_hashes else {
+            if !self.viewport.git_diff.is_empty() {
+                self.viewport.git_diff.clear();
+            }
+            return;
+        };
+        if self.git_head_path.as_deref() != self.doc.path() {
+            self.viewport.git_diff.clear();
+            return;
+        }
+        if let Some(cur_hashes) = editor_core::hash_document_lines(&mut self.doc) {
+            self.viewport.git_diff = editor_core::compute_line_diff(head_hashes, &cur_hashes);
+        } else {
+            self.viewport.git_diff.clear();
+        }
+    }
+
+    /// Test/headless hook: attach a `HEAD` baseline for the current document and recompute gutter diff.
+    pub fn set_git_head_baseline(&mut self, baseline_bytes: &[u8]) {
+        self.git_head_path = self.doc.path().map(Path::to_path_buf);
+        self.git_head_hashes = editor_core::hash_lines_bytes(baseline_bytes);
+        self.recompute_active_git_diff();
+        self.mark_dirty();
+    }
+
+    /// Jump the caret to the start of the next or previous live Git diff hunk (wraps cleanly).
+    fn jump_git_change(
+        &mut self,
+        forward: bool,
+        rasterizer: &mut dyn GlyphRasterizer,
+        host: &mut dyn PlatformHost,
+    ) {
+        if self.viewport.git_diff.is_empty() {
+            self.set_notice("No Git changes in file", false);
+            self.mark_dirty_rect(self.layout.status_bar);
+            host.request_redraw();
+            return;
+        }
+        let mut hunks: Vec<usize> = Vec::new();
+        let mut prev_line: Option<usize> = None;
+        for m in &self.viewport.git_diff {
+            if prev_line.map_or(true, |p| m.line > p + 1) {
+                hunks.push(m.line);
+            }
+            prev_line = Some(m.line);
+        }
+        let (cur_line, _) = self.doc.byte_to_line_col(self.caret);
+        let target_line = if forward {
+            hunks
+                .iter()
+                .copied()
+                .find(|&l| l > cur_line)
+                .unwrap_or(hunks[0])
+        } else {
+            hunks
+                .iter()
+                .copied()
+                .rev()
+                .find(|&l| l < cur_line)
+                .unwrap_or(*hunks.last().unwrap())
+        };
+        if let Some((start, _, _)) = self.doc.line_byte_range(target_line) {
+            self.caret = start;
+            self.anchor = start;
+            self.extra_cursors.clear();
+            self.preferred_x_px = None;
+            self.sidebar.set_focused(false);
+            let m = self.doc_metrics(rasterizer);
+            self.viewport
+                .ensure_caret_visible(&mut self.doc, self.caret, m, self.framebuffer.scale);
+            self.mark_dirty();
+            host.request_redraw();
+        }
+    }
+
+    fn poll_git_workers(&mut self, host: &mut dyn PlatformHost) {
+        let status_res = self
+            .git_status_slot
+            .as_ref()
+            .and_then(|s| s.lock().ok())
+            .and_then(|mut g| g.take());
+        if let Some((gen, results, elapsed_ms)) = status_res {
+            self.git_status_slot = None;
+            self.git_status_in_flight = false;
+            self.git_status_cooldown_ms = elapsed_ms.saturating_mul(4).clamp(500, 10_000);
+            if gen == self.git_status_gen.load(std::sync::atomic::Ordering::Acquire)
+                && !results.is_empty()
+            {
+                for (workdir, map) in results {
+                    self.git_status.upsert(workdir, map);
+                }
+                self.mark_dirty_rect(self.layout.sidebar);
+                host.request_redraw();
+            }
+            if self.git_status_pending {
+                self.git_status_pending = false;
+                self.refresh_git_workspace(host, true);
+            }
+        }
+        let head_res = self
+            .git_head_slot
+            .as_ref()
+            .and_then(|s| s.lock().ok())
+            .and_then(|mut g| g.take());
+        if let Some((gen, path, hashes)) = head_res {
+            self.git_head_slot = None;
+            if gen == self.git_head_gen.load(std::sync::atomic::Ordering::Acquire)
+                && self.doc.path() == Some(path.as_path())
+            {
+                self.git_head_path = Some(path);
+                self.git_head_hashes = hashes;
+                self.recompute_active_git_diff();
+                self.mark_dirty();
+                host.request_redraw();
+            }
+        }
+    }
+
     /// Process coalesced OS filesystem change notifications lazily and with zero unnecessary work:
     /// - Only refreshes directories ALREADY loaded in `sidebar.dir_cache` (never scans collapsed dirs).
     /// - Silently reloads clean open/split/parked buffers whose on-disk identity changed.
     /// - Never overwrites dirty buffers (shows a quiet notice instead).
     fn handle_fs_changed(&mut self, raw_paths: &[PathBuf], host: &mut dyn PlatformHost) {
-        self.palette.invalidate_file_index();
         let mut any_changed = false;
+        let mut workspace_files_changed = raw_paths.is_empty();
+        let mut git_meta_changed = raw_paths.is_empty();
+        let active_git_dir = self.active_git_repo.as_ref().map(|r| r.git_dir.clone());
+        let sidebar_git_dir = self.sidebar_git_repo.as_ref().map(|r| r.git_dir.clone());
 
         // 1. Lazy sidebar refresh (strictly limited to already-loaded directories!).
         if raw_paths.is_empty() {
@@ -3955,8 +4464,26 @@ impl EditorApp {
             let mut dirs_to_check: Vec<PathBuf> = Vec::new();
             for p in raw_paths {
                 let s = p.to_string_lossy();
-                if s.contains("/.git/")
-                    || s.contains("/target/")
+                let in_git_dir = s.contains("/.git/")
+                    || active_git_dir.as_deref().is_some_and(|gd| p.starts_with(gd))
+                    || sidebar_git_dir.as_deref().is_some_and(|gd| p.starts_with(gd));
+                if in_git_dir {
+                    let is_ref_or_head = s.ends_with("/HEAD")
+                        || s.ends_with("/MERGE_HEAD")
+                        || s.ends_with("/CHERRY_PICK_HEAD")
+                        || s.ends_with("/packed-refs")
+                        || s.contains("/refs/heads/")
+                        || s.contains("/refs/remotes/");
+                    if is_ref_or_head || s.ends_with("/index") {
+                        git_meta_changed = true;
+                    }
+                    if is_ref_or_head {
+                        // A branch switch or commit may have added/removed tracked files.
+                        workspace_files_changed = true;
+                    }
+                    continue;
+                }
+                if s.contains("/target/")
                     || s.contains("/node_modules/")
                     || s.ends_with("/.DS_Store")
                     || s.ends_with(".editor.lock")
@@ -3964,6 +4491,7 @@ impl EditorApp {
                 {
                     continue;
                 }
+                workspace_files_changed = true;
                 if !dirs_to_check.contains(p) {
                     dirs_to_check.push(p.clone());
                 }
@@ -3979,6 +4507,9 @@ impl EditorApp {
                     any_changed = true;
                 }
             }
+        }
+        if workspace_files_changed {
+            self.palette.invalidate_file_index();
         }
 
         let path_matches = |doc_path: &Path| -> bool {
@@ -4036,7 +4567,14 @@ impl EditorApp {
             any_changed = true;
         }
 
+        if git_meta_changed || any_changed {
+            self.refresh_git_workspace(host, git_meta_changed);
+            if git_meta_changed {
+                self.refresh_git_head_for_active_doc(host);
+            }
+        }
         if any_changed {
+            self.recompute_active_git_diff();
             self.mark_dirty();
             host.request_redraw();
         }
@@ -4596,6 +5134,7 @@ impl EditorApp {
                 // Saving NEVER removes a Kept tab from `open` or `pinned`!
                 self.sync_active_buffer_meta();
                 self.sync_title(host);
+                self.refresh_git_workspace(host, true);
                 self.set_notice(format!("Saved ({})", report.method.as_str()), false);
                 host.request_redraw();
                 true
@@ -4623,6 +5162,8 @@ impl EditorApp {
                         self.sidebar.reveal(self.fs.as_ref(), &p);
                     }
                 }
+                self.refresh_git_workspace(host, true);
+                self.refresh_git_head_for_active_doc(host);
                 self.set_notice("Saved", false);
                 host.request_redraw();
                 true
@@ -4791,6 +5332,32 @@ impl EditorApp {
                         clipboard,
                         host,
                     );
+                }
+            }
+            PaletteAction::RequestReplaceAll {
+                query,
+                replacement,
+                options,
+                files,
+                match_count,
+            } => {
+                if match_count == 0 || files.is_empty() {
+                    self.set_notice("No matches to replace", false);
+                    self.mark_dirty();
+                    host.request_redraw();
+                } else {
+                    let file_count = files.len();
+                    self.palette.close();
+                    self.pending_discard = Some(PendingDiscardAction::ConfirmReplaceInFiles {
+                        query,
+                        replacement,
+                        options,
+                        files,
+                    });
+                    self.confirm_modal
+                        .open_confirm_replace_all(match_count, file_count);
+                    self.mark_dirty();
+                    host.request_redraw();
                 }
             }
         }
@@ -5114,6 +5681,12 @@ impl EditorApp {
                 self.recompute_layout();
                 self.mark_dirty();
                 host.request_redraw();
+            }
+            AppCommand::NextGitChange => {
+                self.jump_git_change(true, rasterizer, host);
+            }
+            AppCommand::PrevGitChange => {
+                self.jump_git_change(false, rasterizer, host);
             }
             AppCommand::QuickOpen => {
                 self.goto_line.close();
@@ -5607,6 +6180,7 @@ impl EditorApp {
                 SidebarAction::Changed => {
                     if self.sidebar.root() != root_before.as_deref() {
                         self.persist_last_folder(host);
+                        self.refresh_git_workspace(host, true);
                     }
                     self.mark_dirty();
                     host.request_redraw();
@@ -5641,6 +6215,43 @@ impl EditorApp {
         rasterizer: &mut dyn GlyphRasterizer,
         host: &mut dyn PlatformHost,
     ) {
+        if !self.extra_cursors.is_empty() {
+            let all = self.all_cursors_sorted();
+            let mut line_entries: Vec<(usize, usize, bool)> = Vec::with_capacity(all.len());
+            for (_, c, is_p) in all {
+                let (line, col) = self.doc.byte_to_line_col(c);
+                if let Some(last) = line_entries.last_mut() {
+                    if last.0 == line {
+                        last.2 |= is_p;
+                        continue;
+                    }
+                }
+                line_entries.push((line, col, is_p));
+            }
+            let mut edits: Vec<(u64, u64, String)> = Vec::with_capacity(line_entries.len());
+            for &(line, _, _) in &line_entries {
+                if let Some((_, content_end, _)) = self.doc.line_byte_range(line) {
+                    let content = self.doc.line_content(line).unwrap_or_default();
+                    edits.push((content_end, 0, format!("\n{content}")));
+                }
+            }
+            if let Ok(ends) = self.doc.edit_multi(&edits, self.now_ms) {
+                let mut next = Vec::with_capacity(ends.len());
+                for (i, end) in ends.into_iter().enumerate() {
+                    let (_, col, is_p) = line_entries[i];
+                    let (new_line, _) = self.doc.byte_to_line_col(end);
+                    let nc = self
+                        .doc
+                        .line_byte_range(new_line)
+                        .map(|(s, e, _)| s + (col as u64).min(e - s))
+                        .unwrap_or(end);
+                    next.push((nc, nc, is_p));
+                }
+                self.set_cursors_from_list(next);
+                self.after_document_mutated(rasterizer, host);
+            }
+            return;
+        }
         let (line, col) = self.doc.byte_to_line_col(self.caret);
         let Some((_, content_end, _)) = self.doc.line_byte_range(line) else {
             return;
@@ -5662,6 +6273,60 @@ impl EditorApp {
         rasterizer: &mut dyn GlyphRasterizer,
         host: &mut dyn PlatformHost,
     ) {
+        if !self.extra_cursors.is_empty() {
+            let all = self.all_cursors_sorted();
+            let mut lines: Vec<(usize, bool)> = Vec::with_capacity(all.len());
+            for (_, c, is_p) in all {
+                let (line, _) = self.doc.byte_to_line_col(c);
+                if let Some(last) = lines.last_mut() {
+                    if last.0 == line {
+                        last.1 |= is_p;
+                        continue;
+                    }
+                }
+                lines.push((line, is_p));
+            }
+            let mut edits: Vec<(u64, u64, String)> = Vec::with_capacity(lines.len());
+            let mut flags: Vec<bool> = Vec::with_capacity(lines.len());
+            for &(line, is_p) in &lines {
+                let Some((start, _, full_end)) = self.doc.line_byte_range(line) else {
+                    continue;
+                };
+                let (ds, dl) = if full_end > start {
+                    (start, full_end - start)
+                } else if line > 0 {
+                    let (_, prev_content_end, prev_full_end) =
+                        self.doc.line_byte_range(line - 1).unwrap_or((0, 0, 0));
+                    (prev_content_end, prev_full_end - prev_content_end)
+                } else {
+                    continue;
+                };
+                if let Some(last) = edits.last_mut() {
+                    if ds <= last.0 + last.1 {
+                        let end = (last.0 + last.1).max(ds + dl);
+                        last.1 = end - last.0;
+                        if let Some(lf) = flags.last_mut() {
+                            *lf |= is_p;
+                        }
+                        continue;
+                    }
+                }
+                edits.push((ds, dl, String::new()));
+                flags.push(is_p);
+            }
+            if !edits.is_empty() {
+                if let Ok(ends) = self.doc.edit_multi(&edits, self.now_ms) {
+                    let next: Vec<(u64, u64, bool)> = ends
+                        .into_iter()
+                        .zip(flags)
+                        .map(|(end, is_p)| (end, end, is_p))
+                        .collect();
+                    self.set_cursors_from_list(next);
+                    self.after_document_mutated(rasterizer, host);
+                }
+            }
+            return;
+        }
         let (line, _) = self.doc.byte_to_line_col(self.caret);
         let Some((start, _, full_end)) = self.doc.line_byte_range(line) else {
             return;
@@ -5728,6 +6393,77 @@ impl EditorApp {
         let prefix_trim = self.doc.language().line_comment().unwrap_or("//");
         let prefix_owned = format!("{prefix_trim} ");
         let prefix = prefix_owned.as_str();
+        if !self.extra_cursors.is_empty() {
+            let all = self.all_cursors_sorted();
+            let mut lines: Vec<(usize, bool)> = Vec::with_capacity(all.len());
+            for (a, c, is_p) in all {
+                let (la, _) = self.doc.byte_to_line_col(a.min(c));
+                let (mut lb, cb) = self.doc.byte_to_line_col(a.max(c));
+                if lb > la && cb == 0 {
+                    lb -= 1;
+                }
+                for l in la..=lb {
+                    if let Some(last) = lines.last_mut() {
+                        if last.0 == l {
+                            last.1 |= is_p;
+                            continue;
+                        }
+                    }
+                    lines.push((l, is_p));
+                }
+            }
+            lines.sort_by_key(|&(l, _)| l);
+            let mut deduped: Vec<(usize, bool)> = Vec::with_capacity(lines.len());
+            for (l, p) in lines {
+                if let Some(last) = deduped.last_mut() {
+                    if last.0 == l {
+                        last.1 |= p;
+                        continue;
+                    }
+                }
+                deduped.push((l, p));
+            }
+            let contents: Vec<String> = deduped
+                .iter()
+                .map(|&(l, _)| self.doc.line_content(l).unwrap_or_default())
+                .collect();
+            let all_commented = contents
+                .iter()
+                .filter(|l| !l.trim().is_empty())
+                .all(|l| l.trim_start().starts_with(prefix_trim));
+            let mut edits: Vec<(u64, u64, String)> = Vec::with_capacity(deduped.len());
+            let mut flags: Vec<bool> = Vec::with_capacity(deduped.len());
+            for (&(l, is_p), line) in deduped.iter().zip(&contents) {
+                let Some((s, e, _)) = self.doc.line_byte_range(l) else {
+                    continue;
+                };
+                let indent_len = line.len() - line.trim_start().len();
+                let rebuilt = if all_commented {
+                    let rest = &line[indent_len..];
+                    if let Some(stripped) = rest.strip_prefix(prefix) {
+                        format!("{}{}", &line[..indent_len], stripped)
+                    } else if let Some(stripped) = rest.strip_prefix(prefix_trim) {
+                        format!("{}{}", &line[..indent_len], stripped)
+                    } else {
+                        line.clone()
+                    }
+                } else {
+                    format!("{}{}{}", &line[..indent_len], prefix, &line[indent_len..])
+                };
+                edits.push((s, e - s, rebuilt));
+                flags.push(is_p);
+            }
+            if let Ok(ends) = self.doc.edit_multi(&edits, self.now_ms) {
+                let next: Vec<(u64, u64, bool)> = ends
+                    .into_iter()
+                    .zip(flags)
+                    .map(|(end, is_p)| (end, end, is_p))
+                    .collect();
+                self.set_cursors_from_list(next);
+                self.after_document_mutated(rasterizer, host);
+            }
+            return;
+        }
         let (start_line, end_line) = self.selected_line_span();
         let Some((span_start, _, _)) = self.doc.line_byte_range(start_line) else { return };
         let Some((_, span_end, _)) = self.doc.line_byte_range(end_line) else { return };
@@ -6596,7 +7332,19 @@ impl EditorApp {
                     let (ds, dl) = if e > s {
                         (s, e - s)
                     } else if s > 0 {
-                        let prev = if mods.alt {
+                        let prev = if mods.primary() {
+                            let (line, _) = self.doc.byte_to_line_col(s);
+                            let line_start = self
+                                .doc
+                                .line_byte_range(line)
+                                .map(|(ls, _, _)| ls)
+                                .unwrap_or(0);
+                            if line_start < s {
+                                line_start
+                            } else {
+                                self.move_grapheme_left(s)
+                            }
+                        } else if mods.alt {
                             self.move_word_left(s)
                         } else {
                             self.move_grapheme_left(s)
@@ -6680,8 +7428,52 @@ impl EditorApp {
             }
             Key::Tab => {
                 self.preferred_x_px = None;
-                let spaces = " ".repeat(self.viewport.tab_width);
-                self.multi_cursor_apply_text(&spaces, rasterizer, host);
+                if mods.shift {
+                    let all = self.all_cursors_sorted();
+                    let mut lines: Vec<(usize, bool)> = Vec::with_capacity(all.len());
+                    for (_, c, is_p) in all {
+                        let (line, _) = self.doc.byte_to_line_col(c);
+                        if let Some(last) = lines.last_mut() {
+                            if last.0 == line {
+                                last.1 |= is_p;
+                                continue;
+                            }
+                        }
+                        lines.push((line, is_p));
+                    }
+                    let tw = self.viewport.tab_width;
+                    let mut edits: Vec<(u64, u64, String)> = Vec::with_capacity(lines.len());
+                    let mut flags: Vec<bool> = Vec::with_capacity(lines.len());
+                    for &(line, is_p) in &lines {
+                        let Some((ls, _, _)) = self.doc.line_byte_range(line) else {
+                            continue;
+                        };
+                        let content = self.doc.line_content(line).unwrap_or_default();
+                        let strip = if content.starts_with('\t') {
+                            1
+                        } else {
+                            content
+                                .bytes()
+                                .take(tw)
+                                .take_while(|&b| b == b' ')
+                                .count()
+                        };
+                        edits.push((ls, strip as u64, String::new()));
+                        flags.push(is_p);
+                    }
+                    if let Ok(ends) = self.doc.edit_multi(&edits, self.now_ms) {
+                        let next: Vec<(u64, u64, bool)> = ends
+                            .into_iter()
+                            .zip(flags)
+                            .map(|(end, is_p)| (end, end, is_p))
+                            .collect();
+                        self.set_cursors_from_list(next);
+                        self.after_document_mutated(rasterizer, host);
+                    }
+                } else {
+                    let spaces = " ".repeat(self.viewport.tab_width);
+                    self.multi_cursor_apply_text(&spaces, rasterizer, host);
+                }
                 true
             }
             Key::Char(_) => {
@@ -6710,6 +7502,7 @@ impl EditorApp {
         host: &mut dyn PlatformHost,
     ) {
         self.sync_active_buffer_meta();
+        self.recompute_active_git_diff();
         let metrics = self.doc_metrics(rasterizer);
         self.viewport
             .ensure_caret_visible(&mut self.doc, self.caret, metrics, self.framebuffer.scale);
@@ -6943,6 +7736,7 @@ impl EditorApp {
                     SidebarAction::Changed => {
                         if self.sidebar.root() != root_before.as_deref() {
                             self.persist_last_folder(host);
+                            self.refresh_git_workspace(host, true);
                         }
                         self.mark_dirty();
                         host.request_redraw();
@@ -8846,6 +9640,34 @@ fn draw_drag_overlay(
             rasterizer,
         );
     }
+}
+
+fn replace_all_in_str(
+    text: &str,
+    compiled: &editor_core::CompiledQuery,
+    template: &str,
+) -> (String, usize) {
+    let mut scratch = editor_core::SearchScratch::new();
+    let mut hits: Vec<(usize, usize)> = Vec::new();
+    compiled.find_in_bytes(text.as_bytes(), usize::MAX, &mut scratch, &mut hits);
+    if hits.is_empty() {
+        return (String::new(), 0);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut last = 0usize;
+    let mut count = 0usize;
+    for (s, e) in hits {
+        if s < last || e > text.len() || !text.is_char_boundary(s) || !text.is_char_boundary(e) {
+            continue;
+        }
+        out.push_str(&text[last..s]);
+        let expanded = compiled.expand_replacement(&text[s..e], template, &mut scratch);
+        out.push_str(&expanded);
+        last = e;
+        count += 1;
+    }
+    out.push_str(&text[last..]);
+    (out, count)
 }
 
 fn draw_pane_header(
