@@ -105,6 +105,23 @@ reference, not a component library.
   - `./target/release/editor-gui --snapshot OUT.png --theme light|dark --size WxH --sidebar-root DIR [FILE]`
     — headless CoreText Retina PNG snapshot for visual verification.
 
+## Versioning & changelog
+
+- **Single source of truth:** `[workspace.package] version` in `Cargo.toml`
+  propagates automatically to `editor`, `editor-gui`, `Editor.app` (`Info.plist`),
+  and `.github/workflows/release.yml` (which verifies that pushed `vX.Y.Z` tags
+  match `Cargo.toml`).
+- **Bump SemVer on user-facing changes:**
+  - Bump **PATCH** (`X.Y.Z+1`) for bug fixes, performance/memory optimizations,
+    and UI polish.
+  - Bump **MINOR** (`X.Y+1.0`) for new user-facing features.
+  - Bump **MAJOR** (`X+1.0.0`) for breaking CLI/IPC schema changes or major
+    milestones.
+  - Do not bump on doc-only or CI-only commits.
+- **Update `CHANGELOG.md`** with concise entries under the matching version
+  whenever bumping `Cargo.toml`, and rebuild `Editor.app` (`./target/release/bundle-app`)
+  when packaging locally.
+
 ## Repo hygiene
 
 - **Never add or commit personal information.** No personal paths (`/Users/...`,
