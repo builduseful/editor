@@ -51,7 +51,7 @@ pub use panes::{
     Arrangement, Direction, Divider, DividerAxis, DropPlan, DropZone, GridLayout, PaneId,
     PaneRect, PaneSlot, MAX_PANES,
 };
-pub use session::{FolderSession, SessionStore, MAX_RECENT_FOLDERS};
+pub use session::{ratio_to_bp, FolderSession, SavedPane, SessionStore, MAX_RECENT_FOLDERS};
 pub use vim::{VimMode, VimState};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -462,7 +462,11 @@ impl EditorApp {
             }
         }
         if let Some(sz) = host.load_pref("FontSize").and_then(|s| s.parse::<f32>().ok()) {
-            self.viewport.font_size_pt = sz.clamp(8.0, 36.0);
+            let clamped = sz.clamp(8.0, 36.0);
+            self.viewport.font_size_pt = clamped;
+            for p in &mut self.other_panes {
+                p.viewport.font_size_pt = clamped;
+            }
         }
         if let Some(wrap) = host.load_pref("WordWrap") {
             self.default_word_wrap = wrap == "1" || wrap == "true";
@@ -985,7 +989,8 @@ impl EditorApp {
         host.request_redraw();
     }
 
-    /// Capture the active workspace folder's numbered pins, Kept open files, and active cursor.
+    /// Capture the active workspace folder's numbered pins, Kept open files, active cursor,
+    /// and visible split pane grid (slot positions, per-pane cursors, focused pane, ratios, zoom).
     pub fn capture_current_folder_session(&mut self) -> Option<FolderSession> {
         let folder = self.sidebar.root()?.to_path_buf();
         self.sync_active_buffer_meta();
@@ -1007,6 +1012,43 @@ impl EditorApp {
         } else {
             (0, 0)
         };
+
+        let mut panes = Vec::new();
+        let mut active_pane_idx = 0usize;
+        if self.is_split() {
+            let (ordered_ids, n) = self.arrangement.ordered();
+            for &pid in &ordered_ids[..n] {
+                let slot = self.arrangement.slot_of(pid).unwrap_or_default();
+                let pane_info: Option<(PathBuf, usize, usize)> = if pid == self.active_id {
+                    self.doc.path().map(Path::to_path_buf).map(|p| {
+                        let (l, c) = self.doc.byte_to_line_col(self.caret);
+                        (p, l, c)
+                    })
+                } else {
+                    self.other_panes
+                        .iter_mut()
+                        .find(|p| p.id == pid)
+                        .and_then(|p| {
+                            let path = p.doc.path()?.to_path_buf();
+                            let (l, c) = p.doc.byte_to_line_col(p.caret);
+                            Some((path, l, c))
+                        })
+                };
+                if let Some((path, line, col_offset)) = pane_info {
+                    if pid == self.active_id {
+                        active_pane_idx = panes.len();
+                    }
+                    panes.push(SavedPane {
+                        col: slot.col,
+                        row: slot.row,
+                        path,
+                        line,
+                        col_offset,
+                    });
+                }
+            }
+        }
+
         Some(FolderSession {
             folder,
             pins,
@@ -1014,6 +1056,14 @@ impl EditorApp {
             active,
             active_line,
             active_col,
+            panes,
+            active_pane_idx,
+            col_ratio_bp: ratio_to_bp(self.arrangement.col_ratio),
+            row_ratio_bp: [
+                ratio_to_bp(self.arrangement.row_ratio[0]),
+                ratio_to_bp(self.arrangement.row_ratio[1]),
+            ],
+            zoomed: self.zoomed && self.is_split(),
         })
     }
 
@@ -1125,28 +1175,104 @@ impl EditorApp {
             }
         }
 
-        if let Some(target_id) = active_target {
-            if target_id != self.active_buf_id {
+        // Restore saved multi-pane grid layout (slot positions, per-pane cursors, focused pane,
+        // split ratios, and fullscreen zoom), gracefully collapsing any deleted files.
+        let mut restored_panes: Vec<(PaneSlot, BufferId, usize, usize, bool)> = Vec::new();
+        for (idx, sp) in session.panes.iter().enumerate().take(MAX_PANES) {
+            if let Some(buf_id) = open_one(self, &sp.path, false) {
+                restored_any = true;
+                restored_panes.push((
+                    PaneSlot::new(sp.col.min(1), sp.row.min(1)),
+                    buf_id,
+                    sp.line,
+                    sp.col_offset,
+                    idx == session.active_pane_idx,
+                ));
+            }
+        }
+
+        if restored_panes.len() >= 2 {
+            let focused_idx = restored_panes
+                .iter()
+                .position(|(_, _, _, _, is_act)| *is_act)
+                .unwrap_or(0);
+            let (active_slot, active_buf, active_line, active_col, _) = restored_panes[focused_idx];
+            if active_buf != self.active_buf_id {
                 self.sync_active_buffer_meta();
                 self.park_active_into_pool(false);
-                let _ = self.install_buffer_in_active_pane(target_id);
+                let _ = self.install_buffer_in_active_pane(active_buf);
             }
-            self.working_set.touch_mru(target_id);
-            // Restore saved cursor line & col cleanly!
-            self.doc.tree_mut().ensure_indexed_for_line(session.active_line + 16);
-            let clamped_line = session
-                .active_line
-                .min(self.doc.editable_line_count().saturating_sub(1));
+            self.doc.tree_mut().ensure_indexed_for_line(active_line + 16);
+            let clamped_line = active_line.min(self.doc.editable_line_count().saturating_sub(1));
             if let Some((ls, le, _)) = self.doc.line_byte_range(clamped_line) {
-                let off = ls + (session.active_col as u64).min(le - ls);
+                let off = ls + (active_col as u64).min(le - ls);
                 self.caret = off;
                 self.anchor = off;
                 self.viewport.scroll_top_line = clamped_line.saturating_sub(6);
             }
-        } else if restored_any {
-            if let Some(p) = self.doc.path().map(Path::to_path_buf) {
-                if self.sidebar.is_under_root(&p) {
-                    self.sidebar.reveal(self.fs.as_ref(), &p);
+
+            let mut arr_entries: Vec<(PaneId, PaneSlot)> = Vec::with_capacity(restored_panes.len());
+            arr_entries.push((self.active_id, active_slot));
+
+            for (i, &(slot, buf_id, line, col, _)) in restored_panes.iter().enumerate() {
+                if i == focused_idx {
+                    continue;
+                }
+                let pane_id = self.alloc_pane_id();
+                if let Ok(mut pane) = self.make_pane_for_buffer(pane_id, buf_id) {
+                    pane.doc.tree_mut().ensure_indexed_for_line(line + 16);
+                    let cl = line.min(pane.doc.editable_line_count().saturating_sub(1));
+                    if let Some((ls, le, _)) = pane.doc.line_byte_range(cl) {
+                        let off = ls + (col as u64).min(le - ls);
+                        pane.caret = off;
+                        pane.anchor = off;
+                        pane.viewport.scroll_top_line = cl.saturating_sub(6);
+                    }
+                    arr_entries.push((pane_id, slot));
+                    self.other_panes.push(pane);
+                }
+            }
+
+            if let Some(arr) = Arrangement::from_saved(
+                &arr_entries,
+                session.col_ratio(),
+                session.row_ratios(),
+            ) {
+                self.arrangement = arr;
+                self.zoomed = session.zoomed && self.is_split();
+            }
+            self.working_set.touch_mru(self.active_buf_id);
+        } else {
+            if let Some(&(_, buf_id, _, _, _)) = restored_panes.first() {
+                if active_target.is_none() {
+                    active_target = Some(buf_id);
+                }
+            }
+            if let Some(target_id) = active_target {
+                if target_id != self.active_buf_id {
+                    self.sync_active_buffer_meta();
+                    self.park_active_into_pool(false);
+                    let _ = self.install_buffer_in_active_pane(target_id);
+                }
+                self.working_set.touch_mru(target_id);
+                // Restore saved cursor line & col cleanly!
+                self.doc
+                    .tree_mut()
+                    .ensure_indexed_for_line(session.active_line + 16);
+                let clamped_line = session
+                    .active_line
+                    .min(self.doc.editable_line_count().saturating_sub(1));
+                if let Some((ls, le, _)) = self.doc.line_byte_range(clamped_line) {
+                    let off = ls + (session.active_col as u64).min(le - ls);
+                    self.caret = off;
+                    self.anchor = off;
+                    self.viewport.scroll_top_line = clamped_line.saturating_sub(6);
+                }
+            } else if restored_any {
+                if let Some(p) = self.doc.path().map(Path::to_path_buf) {
+                    if self.sidebar.is_under_root(&p) {
+                        self.sidebar.reveal(self.fs.as_ref(), &p);
+                    }
                 }
             }
         }
@@ -1580,6 +1706,7 @@ impl EditorApp {
         }
         self.zoomed = !self.zoomed;
         self.recompute_layout();
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
     }
@@ -1609,6 +1736,7 @@ impl EditorApp {
         self.arrangement = Arrangement::new(self.active_id);
         self.zoomed = false;
         self.recompute_layout();
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
     }
@@ -1906,6 +2034,7 @@ impl EditorApp {
         self.focus_pane_id(id, host);
         self.working_set.touch_mru(buf_id);
         self.recompute_layout();
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
         true
@@ -1941,6 +2070,7 @@ impl EditorApp {
         self.focus_pane_id(pane_id, host);
         self.working_set.touch_mru(buf_id);
         self.recompute_layout();
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
         true
@@ -2025,6 +2155,7 @@ impl EditorApp {
         if let Some(b) = other {
             self.arrangement.swap(a, b);
             self.recompute_layout();
+            self.save_session(host);
             self.mark_dirty();
             host.request_redraw();
         }
@@ -2035,6 +2166,7 @@ impl EditorApp {
         let ok = self.arrangement.move_pane(src, target, zone);
         if ok {
             self.recompute_layout();
+            self.save_session(host);
             self.mark_dirty();
             host.request_redraw();
         }
@@ -2089,6 +2221,7 @@ impl EditorApp {
         self.recompute_layout();
         self.sync_title(host);
         self.on_active_doc_git_changed(host);
+        self.save_session(host);
         // Only the two affected panes (headers + carets), the top tab strip, and the status bar change.
         if let Some(f) = prev_active {
             self.mark_dirty_rect(f);
@@ -2192,6 +2325,7 @@ impl EditorApp {
     pub fn set_pane_col_ratio(&mut self, ratio: f32, host: &mut dyn PlatformHost) {
         self.arrangement.set_col_ratio(ratio);
         self.recompute_layout();
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
     }
@@ -2199,6 +2333,7 @@ impl EditorApp {
     pub fn set_pane_row_ratio(&mut self, col: usize, ratio: f32, host: &mut dyn PlatformHost) {
         self.arrangement.set_row_ratio(col, ratio);
         self.recompute_layout();
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
     }
@@ -2206,6 +2341,7 @@ impl EditorApp {
     pub fn reset_pane_ratios(&mut self, host: &mut dyn PlatformHost) {
         self.arrangement.reset_ratios();
         self.recompute_layout();
+        self.save_session(host);
         self.mark_dirty();
         host.request_redraw();
     }
@@ -3235,6 +3371,7 @@ impl EditorApp {
                         host.request_redraw();
                     }
                     if released_div {
+                        self.save_session(host);
                         self.mark_dirty();
                         host.request_redraw();
                     }
@@ -7877,6 +8014,7 @@ impl EditorApp {
                     self.hovered_divider = None;
                     self.arrangement.reset_divider(div.axis);
                     self.recompute_layout();
+                    self.save_session(host);
                     host.set_cursor(CursorShape::Arrow);
                     self.mark_dirty();
                     host.request_redraw();

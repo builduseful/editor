@@ -4922,3 +4922,111 @@ fn nested_repos_and_multi_repo_workspace_track_active_file_branch() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+
+#[test]
+fn split_pane_layout_ratios_and_cursors_persist_across_full_app_restart() {
+    use editor_platform::FileSystem;
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/ws/a.rs", b"a0\na1\na2\na3\n".to_vec());
+    fs.add_file("/ws/b.rs", b"b0\nb1\nb2\nb3\nb4\n".to_vec());
+    fs.add_file("/ws/c.rs", b"c0\nc1\nc2\n".to_vec());
+    fs.add_file("/other/x.rs", b"x0\n".to_vec());
+
+    let mut host = HeadlessHost::new();
+    host.prefs.insert("FontSize".to_string(), "15".to_string());
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+
+    // 1. Open `/ws`, arrange a 3-pane layout: a.rs (0,0), b.rs (1,0), c.rs (1,1),
+    // customize split ratios, position distinct cursors, focus b.rs, and Quit completely.
+    {
+        let mut app = EditorApp::new(fs.clone(), 1280, 800, 1.0);
+        app.load_preferences(&host);
+        app.open_folder(Path::new("/ws"), &mut host);
+        app.open_file(Path::new("/ws/a.rs"), &mut host).unwrap();
+        let a_off = app.doc.line_byte_range(2).unwrap().0 + 1;
+        app.caret = a_off;
+        app.anchor = a_off;
+
+        app.split_pane_with(Some(Path::new("/ws/b.rs")), &mut host);
+        let b_id = app.arrangement.id_at_index(app.active_pane_index()).unwrap();
+        let b_off = app.doc.line_byte_range(3).unwrap().0 + 2;
+        app.caret = b_off;
+        app.anchor = b_off;
+
+        app.split_pane_down(Some(Path::new("/ws/c.rs")), &mut host);
+        let c_off = app.doc.line_byte_range(1).unwrap().0 + 1;
+        app.caret = c_off;
+        app.anchor = c_off;
+
+        app.set_pane_col_ratio(0.65, &mut host);
+        app.set_pane_row_ratio(1, 0.35, &mut host);
+        app.focus_pane_id(b_id, &mut host);
+
+        app.handle_event(
+            InputEvent::Command(AppCommand::Quit),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(host.quit_requested);
+    }
+
+    // 2. Cold restart: brand-new EditorApp loads prefs -> exact 3-pane grid, ratios, focus & cursors!
+    {
+        host.quit_requested = false;
+        let mut app = EditorApp::new(fs.clone(), 1280, 800, 1.0);
+        app.load_preferences(&host);
+
+        assert_eq!(app.pane_count(), 3);
+        assert_eq!(app.doc.path(), Some(Path::new("/ws/b.rs")));
+        assert_eq!(app.doc.byte_to_line_col(app.caret), (3, 2));
+        assert!((app.arrangement.col_ratio - 0.65).abs() < 0.005);
+        assert!((app.arrangement.row_ratio[1] - 0.35).abs() < 0.005);
+        assert_eq!(app.viewport.font_size_pt, 15.0);
+
+        // Verify slot placement via reading order (row-major: (0,0)=a.rs, (1,0)=b.rs, (1,1)=c.rs).
+        let (ids, n) = app.arrangement.ordered();
+        assert_eq!(n, 3);
+        assert_eq!(app.arrangement.slot_of(ids[0]), Some(editor_app::PaneSlot::new(0, 0)));
+        assert_eq!(app.arrangement.slot_of(ids[1]), Some(editor_app::PaneSlot::new(1, 0)));
+        assert_eq!(app.arrangement.slot_of(ids[2]), Some(editor_app::PaneSlot::new(1, 1)));
+        assert_eq!(app.active_pane_index(), 1);
+
+        // Focus a.rs & c.rs panes and verify their restored cursors + font size.
+        app.focus_pane_id(ids[0], &mut host);
+        assert_eq!(app.doc.path(), Some(Path::new("/ws/a.rs")));
+        assert_eq!(app.doc.byte_to_line_col(app.caret), (2, 1));
+        assert_eq!(app.viewport.font_size_pt, 15.0);
+
+        app.focus_pane_id(ids[2], &mut host);
+        assert_eq!(app.doc.path(), Some(Path::new("/ws/c.rs")));
+        assert_eq!(app.doc.byte_to_line_col(app.caret), (1, 1));
+
+        // Switch away to `/other`, keep a single pane there, then switch back to `/ws` ->
+        // `/ws`'s 3-pane split layout is restored cleanly, and `/other` remembers its 1-pane layout!
+        app.open_folder(Path::new("/other"), &mut host);
+        app.only_active_pane(&mut host);
+        app.open_file(Path::new("/other/x.rs"), &mut host).unwrap();
+        assert_eq!(app.pane_count(), 1);
+        app.open_folder(Path::new("/ws"), &mut host);
+        assert_eq!(app.pane_count(), 3);
+        app.open_folder(Path::new("/other"), &mut host);
+        assert_eq!(app.pane_count(), 1);
+        app.open_folder(Path::new("/ws"), &mut host);
+        assert_eq!(app.pane_count(), 3);
+    }
+
+    // 3. If one saved pane's file is deleted before restart, remaining panes restore cleanly!
+    fs.remove_file(Path::new("/ws/c.rs")).unwrap();
+    {
+        let mut app = EditorApp::new(fs.clone(), 1280, 800, 1.0);
+        app.load_preferences(&host);
+        assert_eq!(app.pane_count(), 2);
+        assert_eq!(app.arrangement.cols(), 2);
+        assert_eq!(app.arrangement.rows_in(0), 1);
+        assert_eq!(app.arrangement.rows_in(1), 1);
+    }
+}

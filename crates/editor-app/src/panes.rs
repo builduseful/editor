@@ -171,6 +171,45 @@ impl Arrangement {
         }
     }
 
+    /// Reconstruct a normalized grid arrangement from saved `(PaneId, PaneSlot)` pairs and ratios.
+    /// Automatically collapses empty columns/rows (e.g. if a saved pane's file was deleted on disk).
+    pub fn from_saved(
+        entries: &[(PaneId, PaneSlot)],
+        col_ratio: f32,
+        row_ratio: [f32; 2],
+    ) -> Option<Self> {
+        if entries.is_empty() || entries.len() > MAX_PANES {
+            return None;
+        }
+        let mut slots = [(0, PaneSlot::default()); MAX_PANES];
+        let mut len = 0u8;
+        for &(id, raw_slot) in entries {
+            let slot = PaneSlot::new(raw_slot.col.min(1), raw_slot.row.min(1));
+            if slots[..len as usize]
+                .iter()
+                .any(|(eid, es)| *eid == id || *es == slot)
+            {
+                continue;
+            }
+            slots[len as usize] = (id, slot);
+            len += 1;
+        }
+        if len == 0 {
+            return None;
+        }
+        let mut arr = Self {
+            slots,
+            len,
+            col_ratio: col_ratio.clamp(0.15, 0.85),
+            row_ratio: [
+                row_ratio[0].clamp(0.15, 0.85),
+                row_ratio[1].clamp(0.15, 0.85),
+            ],
+        };
+        arr.normalize();
+        Some(arr)
+    }
+
     pub fn len(&self) -> usize {
         self.len as usize
     }
