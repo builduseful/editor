@@ -8,8 +8,8 @@ use crate::input::{ConfirmChoice, CursorShape};
 /// when a short-lived background worker finishes a batch.
 pub type MainLoopWaker = Arc<dyn Fn() + Send + Sync>;
 
-/// Thread-safe HTTPS GET callback `(url, max_bytes) -> Result<Vec<u8>, String>` backed by the
-/// host OS's native TLS/HTTP stack (`NSURLSession` on macOS, `WinHTTP` on Windows).
+/// Thread-safe HTTPS GET callback `(url, max_bytes) -> Result<Vec<u8>, String>` backed by a
+/// short-lived OS `curl` subprocess (keeping TLS/HTTP frameworks out of the GUI process).
 pub type HttpFetcher = Arc<dyn Fn(&str, usize) -> Result<Vec<u8>, String> + Send + Sync>;
 
 pub trait Clipboard {

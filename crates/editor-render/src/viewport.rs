@@ -121,7 +121,7 @@ impl Viewport {
             h_bar_dragging: false,
             drag_anchor_px: 0.0,
             drag_start_scroll: 0.0,
-            wrap_cache: HashMap::with_capacity(256),
+            wrap_cache: HashMap::new(),
             wrap_cache_doc_gen: 0,
             wrap_cache_width: 0,
             wrap_cache_font_q: 0,

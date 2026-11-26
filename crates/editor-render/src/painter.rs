@@ -7,6 +7,7 @@
 //! - In-place vertical scroll-blit for sub-millisecond scrolling
 
 use editor_core::grapheme_clusters;
+use editor_core::swar::is_all_ascii;
 use editor_platform::{FontStyle, Framebuffer, GlyphFormat, GlyphRasterizer, PixelRect, SurfaceMut};
 
 use crate::atlas::{AtlasGlyph, GlyphAtlas};
@@ -438,6 +439,20 @@ impl<'a> Painter<'a> {
     ) -> f32 {
         let mut pen = x;
         let clip_right = self.current_clip().right() as f32;
+        if is_all_ascii(text.as_bytes()) {
+            let mut buf = [0u8; 1];
+            for &b in text.as_bytes() {
+                if pen > clip_right {
+                    break;
+                }
+                buf[0] = b;
+                let s = std::str::from_utf8(&buf).unwrap_or(" ");
+                let glyph = atlas.get_or_rasterize(rasterizer, style, size_px, s);
+                self.draw_glyph(pen, baseline_y, glyph, color, atlas);
+                pen += glyph.advance;
+            }
+            return pen;
+        }
         for (_, cluster) in grapheme_clusters(text) {
             if pen > clip_right {
                 break;
@@ -458,6 +473,16 @@ impl<'a> Painter<'a> {
         rasterizer: &mut dyn GlyphRasterizer,
     ) -> f32 {
         let mut w = 0.0f32;
+        if is_all_ascii(text.as_bytes()) {
+            let mut buf = [0u8; 1];
+            for &b in text.as_bytes() {
+                buf[0] = b;
+                let s = std::str::from_utf8(&buf).unwrap_or(" ");
+                let glyph = atlas.get_or_rasterize(rasterizer, style, size_px, s);
+                w += glyph.advance;
+            }
+            return w;
+        }
         for (_, cluster) in grapheme_clusters(text) {
             let glyph = atlas.get_or_rasterize(rasterizer, style, size_px, cluster);
             w += glyph.advance;

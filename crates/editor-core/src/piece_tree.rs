@@ -1043,6 +1043,20 @@ impl PieceTree {
         self.dirty
     }
 
+    /// Release resident 64 KB base-file page-cache slots when parking an inactive tab.
+    /// Unsaved edits live in `AddBuffer` and remain untouched; visible pages refill lazily
+    /// from the OS filesystem cache on focus.
+    pub fn evict_page_cache(&self) {
+        if let BaseBacking::Paged { cache, .. } = &self.base {
+            if let Ok(mut guard) = cache.lock() {
+                for slot in &mut guard.slots {
+                    slot.valid = false;
+                    slot.data = Vec::new();
+                }
+            }
+        }
+    }
+
     pub fn set_clean(&mut self) {
         self.dirty = false;
     }

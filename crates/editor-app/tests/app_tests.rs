@@ -5030,3 +5030,76 @@ fn split_pane_layout_ratios_and_cursors_persist_across_full_app_restart() {
         assert_eq!(app.arrangement.rows_in(1), 1);
     }
 }
+
+#[test]
+fn idle_caret_settles_solid_pauses_timer_respects_notices_and_resumes_on_input() {
+    let fs = Arc::new(MemoryFileSystem::new());
+    let mut app = EditorApp::new(fs, 1000, 700, 1.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    // 1. Fresh focused app wants the periodic tick timer and blinks on 530 ms intervals.
+    assert!(app.wants_tick_timer());
+    assert!(app.is_caret_visible());
+    app.handle_event(InputEvent::Tick { now_ms: 1_000 }, &mut raster, &mut clip, &mut host);
+    assert!(!app.is_caret_visible(), "first tick >= 530ms toggles caret off");
+    assert!(app.wants_tick_timer());
+
+    // 2. After CARET_BLINK_IDLE_MS (10_000 ms) without user input, caret settles solidly VISIBLE
+    //    and wants_tick_timer() flips to false so the OS pauses its timer!
+    let settled_ms = 1_000 + editor_app::CARET_BLINK_IDLE_MS;
+    let redraws_before = host.redraw_requests;
+    app.handle_event(InputEvent::Tick { now_ms: settled_ms }, &mut raster, &mut clip, &mut host);
+    assert!(app.is_caret_visible(), "idle caret must settle visible, never invisible");
+    assert_eq!(host.redraw_requests, redraws_before + 1);
+    assert!(!app.wants_tick_timer(), "timer should pause once settled solid with no notice/toast");
+
+    // 3. Subsequent ticks while idle cause zero toggles and zero redraws.
+    let redraws_settled = host.redraw_requests;
+    app.handle_event(
+        InputEvent::Tick { now_ms: settled_ms + 2_000 },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.is_caret_visible());
+    assert_eq!(host.redraw_requests, redraws_settled);
+    assert!(!app.wants_tick_timer());
+
+    // 4. An active status notice keeps the timer alive until it expires, then pauses again.
+    app.set_notice("Saved", false);
+    assert!(app.wants_tick_timer(), "active notice must keep timer running so it can expire");
+    app.handle_event(
+        InputEvent::Tick { now_ms: settled_ms + 10_000 },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.wants_tick_timer(), "timer stops again once notice expires");
+
+    // 5. Any user input resumes blinking and re-enables wants_tick_timer().
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('a'),
+            mods: Modifiers::NONE,
+            text: Some("a".to_string()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.wants_tick_timer());
+    app.handle_event(
+        InputEvent::Tick { now_ms: settled_ms + 10_600 },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.is_caret_visible(), "blinking resumes cleanly after input");
+    assert!(app.wants_tick_timer());
+
+    // 6. Unfocusing immediately turns off wants_tick_timer().
+    app.handle_event(InputEvent::FocusChanged(false), &mut raster, &mut clip, &mut host);
+    assert!(!app.wants_tick_timer());
+}

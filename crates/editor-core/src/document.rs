@@ -261,6 +261,11 @@ impl Document {
         self.undo.is_dirty()
     }
 
+    /// Free cached base-file pages when parking this document in an inactive tab.
+    pub fn evict_page_cache(&self) {
+        self.tree.evict_page_cache();
+    }
+
     #[inline]
     pub fn generation(&self) -> u64 {
         self.generation

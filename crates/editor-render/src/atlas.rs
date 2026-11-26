@@ -8,6 +8,7 @@
 //!   backed by the same compact shelf-packed pixel atlases.
 
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use editor_platform::{FontMetrics, FontStyle, GlyphFormat, GlyphRasterizer};
 
@@ -23,11 +24,62 @@ pub struct AtlasGlyph {
     pub format: GlyphFormat,
 }
 
+const INLINE_CLUSTER_CAP: usize = 22;
+
+/// Compact 24-byte grapheme cluster key (same size as `String`, zero heap allocations for
+/// all clusters <= 22 UTF-8 bytes — covering ASCII, Latin, CJK, symbols, and almost all emoji).
+#[derive(Debug, Clone)]
+enum ClusterKey {
+    Inline { len: u8, bytes: [u8; INLINE_CLUSTER_CAP] },
+    Long(Box<str>),
+}
+
+impl ClusterKey {
+    #[inline]
+    fn from_str(s: &str) -> Self {
+        let b = s.as_bytes();
+        if b.len() <= INLINE_CLUSTER_CAP {
+            let mut bytes = [0u8; INLINE_CLUSTER_CAP];
+            bytes[..b.len()].copy_from_slice(b);
+            ClusterKey::Inline {
+                len: b.len() as u8,
+                bytes,
+            }
+        } else {
+            ClusterKey::Long(s.into())
+        }
+    }
+
+    #[inline]
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            ClusterKey::Inline { len, bytes } => &bytes[..*len as usize],
+            ClusterKey::Long(s) => s.as_bytes(),
+        }
+    }
+}
+
+impl PartialEq for ClusterKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+impl Eq for ClusterKey {}
+
+impl Hash for ClusterKey {
+    #[inline]
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.as_bytes().hash(state);
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct GlyphKey {
     style: FontStyle,
     size_q4: u32,
-    cluster: String,
+    cluster: ClusterKey,
 }
 
 struct ShelfPacker {
@@ -241,7 +293,7 @@ impl GlyphAtlas {
         let key = GlyphKey {
             style,
             size_q4: q,
-            cluster: cluster.to_string(),
+            cluster: ClusterKey::from_str(cluster),
         };
         if let Some(&g) = self.cache.get(&key) {
             return g;

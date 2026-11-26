@@ -125,12 +125,12 @@ enum PaletteFocus {
     Replace,
 }
 
-/// Precomputed per-file metadata for zero-allocation fuzzy Quick Open and fast grep filtering.
+/// Compact precomputed per-file metadata for zero-allocation fuzzy Quick Open and fast grep filtering.
+/// Stores only `rel: Box<str>` (1 heap alloc instead of 3); absolute paths are reconstructed on demand
+/// against `root` and ASCII case-folding happens in-register during scoring.
 #[derive(Debug, Clone)]
 struct IndexedFile {
-    abs: PathBuf,
-    rel: String,
-    rel_lower: String,
+    rel: Box<str>,
     basename_start: u32,
     /// 64-bit ASCII presence bitmask (`a-z`, `0-9`, `/`, `.`, `_`, `-`) for 1-instruction rejection.
     char_mask: u64,
@@ -139,27 +139,36 @@ struct IndexedFile {
 }
 
 impl IndexedFile {
-    fn new(abs: PathBuf, rel: String) -> Self {
-        let rel_lower = rel.to_ascii_lowercase();
+    fn new(rel: String) -> Self {
         let basename_start = rel.rfind('/').map(|i| (i + 1) as u32).unwrap_or(0);
-        let char_mask = ascii_char_mask(rel_lower.as_bytes());
-        let skip_grep = has_binary_extension(&rel_lower);
+        let char_mask = ascii_char_mask(rel.as_bytes());
+        let skip_grep = has_binary_extension(&rel);
         Self {
-            abs,
-            rel,
-            rel_lower,
+            rel: rel.into_boxed_str(),
             basename_start,
             char_mask,
             skip_grep,
         }
     }
+
+    #[inline]
+    fn abs_path(&self, root: &Path) -> PathBuf {
+        root.join(&*self.rel)
+    }
+
+    #[inline]
+    fn fill_abs_path(&self, root: &Path, dst: &mut PathBuf) {
+        dst.clear();
+        dst.push(root);
+        dst.push(&*self.rel);
+    }
 }
 
 #[inline]
-fn ascii_char_bit(b_lower: u8) -> u64 {
-    match b_lower {
-        b'a'..=b'z' => 1u64 << (b_lower - b'a'),
-        b'0'..=b'9' => 1u64 << (26 + (b_lower - b'0')),
+fn ascii_char_bit(b: u8) -> u64 {
+    match b.to_ascii_lowercase() {
+        b'a'..=b'z' => 1u64 << (b.to_ascii_lowercase() - b'a'),
+        b'0'..=b'9' => 1u64 << (26 + (b - b'0')),
         b'/' => 1u64 << 36,
         b'.' => 1u64 << 37,
         b'_' => 1u64 << 38,
@@ -169,22 +178,29 @@ fn ascii_char_bit(b_lower: u8) -> u64 {
 }
 
 #[inline]
-fn ascii_char_mask(lower_bytes: &[u8]) -> u64 {
+fn ascii_char_mask(bytes: &[u8]) -> u64 {
     let mut mask = 0u64;
-    for &b in lower_bytes {
+    for &b in bytes {
         mask |= ascii_char_bit(b);
     }
     mask
 }
 
-fn has_binary_extension(rel_lower: &str) -> bool {
-    let Some(dot) = rel_lower.rfind('.') else {
+fn has_binary_extension(rel: &str) -> bool {
+    let Some(dot) = rel.rfind('.') else {
         return false;
     };
-    let ext = &rel_lower[dot + 1..];
-    if ext.contains('/') {
+    let raw_ext = &rel[dot + 1..];
+    if raw_ext.is_empty() || raw_ext.len() > 8 || raw_ext.contains('/') {
         return false;
     }
+    let mut lower = [0u8; 8];
+    for (dst, &src) in lower.iter_mut().zip(raw_ext.as_bytes()) {
+        *dst = src.to_ascii_lowercase();
+    }
+    let Ok(ext) = std::str::from_utf8(&lower[..raw_ext.len()]) else {
+        return false;
+    };
     matches!(
         ext,
         "png"
@@ -938,10 +954,12 @@ impl CommandPalette {
         };
 
         self.reclaim_stashed_slab();
+        let root = self.file_cache_root.as_deref().unwrap_or_else(|| Path::new(""));
         let path_filter = self.active_path_filter().to_string();
         let mut files_with_hits: Vec<PathBuf> = Vec::new();
         let mut total_matches = 0usize;
         let mut read_buf = Vec::new();
+        let mut path_buf = PathBuf::new();
         let mut scratch = SearchScratch::new();
         let mut hits = Vec::new();
 
@@ -952,8 +970,9 @@ impl CommandPalette {
             if !path_filter.is_empty() && !matches_path_filter(&f.rel, &path_filter) {
                 continue;
             }
+            f.fill_abs_path(root, &mut path_buf);
             let bytes: Option<&[u8]> = if let Some((_, mem)) =
-                self.dirty_files.iter().find(|(p, _)| p == &f.abs)
+                self.dirty_files.iter().find(|(p, _)| p == &path_buf)
             {
                 Some(mem.as_slice())
             } else if let Some(SlabSlot::Cached { chunk, start, end }) =
@@ -965,7 +984,7 @@ impl CommandPalette {
                     .and_then(|c| c.get(start as usize..end as usize))
             } else {
                 const MAX_REPLACE_FILE_BYTES: usize = 8 * 1024 * 1024;
-                match fs.read_prefix_into(&f.abs, MAX_REPLACE_FILE_BYTES, &mut read_buf) {
+                match fs.read_prefix_into(&path_buf, MAX_REPLACE_FILE_BYTES, &mut read_buf) {
                     Ok(Some(sz)) if sz <= MAX_REPLACE_FILE_BYTES as u64 => {
                         let sample = &read_buf[..read_buf.len().min(4096)];
                         if find_byte(sample, 0).is_some() {
@@ -984,7 +1003,7 @@ impl CommandPalette {
             compiled.find_in_bytes(data, usize::MAX, &mut scratch, &mut hits);
             if !hits.is_empty() {
                 total_matches += hits.len();
-                files_with_hits.push(f.abs.clone());
+                files_with_hits.push(path_buf.clone());
             }
         }
 
@@ -1063,14 +1082,15 @@ impl CommandPalette {
         } else {
             ""
         };
+        let root = self.file_cache_root.as_deref().unwrap_or_else(|| Path::new(""));
         if query.is_empty() {
             for f in self.all_files.iter().take(MAX_QUICK_OPEN_ITEMS) {
                 let name = &f.rel[f.basename_start as usize..];
                 self.items.push(PaletteItem {
-                    path: f.abs.clone(),
+                    path: f.abs_path(root),
                     command_id: None,
                     primary: name.to_string(),
-                    secondary: f.rel.clone(),
+                    secondary: f.rel.to_string(),
                     shortcut: String::new(),
                     line_0based: None,
                     col_bytes: None,
@@ -1095,7 +1115,7 @@ impl CommandPalette {
                 }
                 if let Some(score) = fuzzy_score_prelowered(
                     &pat_lower,
-                    f.rel_lower.as_bytes(),
+                    f.rel.as_bytes(),
                     f.basename_start as usize,
                 ) {
                     scored.push((score, idx));
@@ -1114,10 +1134,10 @@ impl CommandPalette {
                 let f = &self.all_files[idx];
                 let name = &f.rel[f.basename_start as usize..];
                 self.items.push(PaletteItem {
-                    path: f.abs.clone(),
+                    path: f.abs_path(root),
                     command_id: None,
                     primary: name.to_string(),
-                    secondary: f.rel.clone(),
+                    secondary: f.rel.to_string(),
                     shortcut: String::new(),
                     line_0based: None,
                     col_bytes: None,
@@ -1223,9 +1243,11 @@ impl CommandPalette {
             .get_or_insert_with(|| SearchSlab::new(self.all_files.len()));
         slab.ensure_len(self.all_files.len());
 
+        let root = self.file_cache_root.clone().unwrap_or_default();
         let sync_budget = Duration::from_millis(SYNC_HEAD_START_MS);
         let (buckets, next_idx, finished_slice) = search_slice_sync_budgeted(
             fs,
+            &root,
             &self.all_files,
             start_idx,
             slab,
@@ -1266,6 +1288,7 @@ impl CommandPalette {
                 spawn_search_worker(
                     Arc::clone(&rt.fs),
                     Arc::clone(&rt.waker),
+                    root,
                     files_slice,
                     taken_slab,
                     Arc::clone(&self.slab_stash),
@@ -1352,10 +1375,12 @@ impl CommandPalette {
                             s.fully_loaded && s.slots.len() >= self.all_files.len()
                         });
                     if slab_warm {
+                        let root = self.file_cache_root.clone().unwrap_or_default();
                         let path_filter = self.active_path_filter().to_string();
                         let slab = self.search_slab.as_mut().unwrap();
                         let (buckets, timed_out) = search_project_parallel_buckets(
                             fs,
+                            &root,
                             &self.all_files,
                             slab,
                             &self.dirty_files,
@@ -1372,6 +1397,7 @@ impl CommandPalette {
                     self.update_project_search_status();
                 } else {
                     // Synchronous headless/test/benchmark path.
+                    let root = self.file_cache_root.clone().unwrap_or_default();
                     let path_filter = self.active_path_filter().to_string();
                     let slab = self
                         .search_slab
@@ -1379,6 +1405,7 @@ impl CommandPalette {
                     slab.ensure_len(self.all_files.len());
                     let (buckets, timed_out) = search_project_parallel_buckets(
                         fs,
+                        &root,
                         &self.all_files,
                         slab,
                         &self.dirty_files,
@@ -2589,6 +2616,7 @@ struct SlabWriter<'a> {
 #[allow(clippy::too_many_arguments)]
 fn search_slice_sync_budgeted(
     fs: &dyn FileSystem,
+    root: &Path,
     files: &[IndexedFile],
     start_idx: usize,
     slab: &mut SearchSlab,
@@ -2613,6 +2641,7 @@ fn search_slice_sync_budgeted(
         local_slots: Vec::new(),
     });
     let mut read_buf = Vec::new();
+    let mut path_buf = PathBuf::new();
     let mut scratch = SearchScratch::new();
     let mut file_hits = Vec::new();
     let mut buckets: Vec<(usize, Vec<PaletteItem>)> = Vec::new();
@@ -2632,6 +2661,7 @@ fn search_slice_sync_budgeted(
         let mut items = Vec::new();
         search_single_file(
             fs,
+            root,
             idx,
             &files[idx],
             slab,
@@ -2640,6 +2670,7 @@ fn search_slice_sync_budgeted(
             compiled,
             max_matches - total_found,
             &mut read_buf,
+            &mut path_buf,
             &mut scratch,
             &mut file_hits,
             &mut items,
@@ -2666,6 +2697,7 @@ fn search_slice_sync_budgeted(
 fn spawn_search_worker(
     fs: Arc<dyn FileSystem>,
     waker: MainLoopWaker,
+    root: PathBuf,
     files: Vec<(usize, IndexedFile)>,
     mut slab_opt: Option<SearchSlab>,
     slab_stash: Arc<Mutex<Option<SearchSlab>>>,
@@ -2705,6 +2737,7 @@ fn spawn_search_worker(
             let last_wake_ms = AtomicU64::new(0);
             let slab_ref: &SearchSlab = &slab;
             let fs_ref: &dyn FileSystem = fs.as_ref();
+            let root_ref: &Path = root.as_path();
 
             let slab_deltas: Vec<Option<(Vec<u8>, Vec<(usize, SlabSlot)>)>> =
                 std::thread::scope(|s| {
@@ -2725,6 +2758,7 @@ fn spawn_search_worker(
 
                         handles.push(s.spawn(move || {
                             let mut read_buf = Vec::new();
+                            let mut path_buf = PathBuf::new();
                             let mut scratch = SearchScratch::new();
                             let mut file_hits = Vec::new();
                             let mut pending_hits: Vec<(usize, Vec<PaletteItem>)> = Vec::new();
@@ -2769,6 +2803,7 @@ fn spawn_search_worker(
                                     let mut items = Vec::new();
                                     search_single_file(
                                         fs_ref,
+                                        root_ref,
                                         file_idx,
                                         file,
                                         slab_ref,
@@ -2777,6 +2812,7 @@ fn spawn_search_worker(
                                         compiled_ref,
                                         remaining,
                                         &mut read_buf,
+                                        &mut path_buf,
                                         &mut scratch,
                                         &mut file_hits,
                                         &mut items,
@@ -2843,6 +2879,7 @@ fn spawn_search_worker(
 
 fn search_project_parallel_buckets(
     fs: &dyn FileSystem,
+    root: &Path,
     files: &[IndexedFile],
     slab: &mut SearchSlab,
     dirty_files: &[(PathBuf, Vec<u8>)],
@@ -2873,6 +2910,7 @@ fn search_project_parallel_buckets(
 
     if worker_count <= 1 {
         let mut read_buf = Vec::new();
+        let mut path_buf = PathBuf::new();
         let mut scratch = SearchScratch::new();
         let mut file_hits = Vec::new();
         let mut buckets: Vec<(usize, Vec<PaletteItem>)> = Vec::new();
@@ -2899,6 +2937,7 @@ fn search_project_parallel_buckets(
             let mut items = Vec::new();
             search_single_file(
                 fs,
+                root,
                 i,
                 f,
                 slab,
@@ -2907,6 +2946,7 @@ fn search_project_parallel_buckets(
                 compiled,
                 MAX_SEARCH_RESULTS - total_found,
                 &mut read_buf,
+                &mut path_buf,
                 &mut scratch,
                 &mut file_hits,
                 &mut items,
@@ -2947,6 +2987,7 @@ fn search_project_parallel_buckets(
             handles.push(s.spawn(move || {
                 // Lazy `read_buf`: zero allocation on warm slab sweeps!
                 let mut read_buf = Vec::new();
+                let mut path_buf = PathBuf::new();
                 let mut scratch = SearchScratch::new();
                 let mut file_hits = Vec::new();
                 let mut local_by_file: Vec<(usize, Vec<PaletteItem>)> = Vec::new();
@@ -2989,6 +3030,7 @@ fn search_project_parallel_buckets(
                         let mut items = Vec::new();
                         search_single_file(
                             fs,
+                            root,
                             idx,
                             &files[idx],
                             slab_ref,
@@ -2997,6 +3039,7 @@ fn search_project_parallel_buckets(
                             compiled,
                             remaining,
                             &mut read_buf,
+                            &mut path_buf,
                             &mut scratch,
                             &mut file_hits,
                             &mut items,
@@ -3040,6 +3083,7 @@ fn search_project_parallel_buckets(
 #[allow(clippy::too_many_arguments)]
 fn search_single_file(
     fs: &dyn FileSystem,
+    root: &Path,
     file_idx: usize,
     file: &IndexedFile,
     slab: &SearchSlab,
@@ -3048,6 +3092,7 @@ fn search_single_file(
     compiled: &CompiledQuery,
     max_matches: usize,
     read_buf: &mut Vec<u8>,
+    path_buf: &mut PathBuf,
     scratch: &mut SearchScratch,
     file_hits: &mut Vec<(usize, usize)>,
     out: &mut Vec<PaletteItem>,
@@ -3058,7 +3103,8 @@ fn search_single_file(
 
     // 1. Prefer in-memory dirty buffer if open and modified!
     if !dirty_files.is_empty() {
-        if let Some((_, dirty_bytes)) = dirty_files.iter().find(|(p, _)| p == &file.abs) {
+        file.fill_abs_path(root, path_buf);
+        if let Some((_, dirty_bytes)) = dirty_files.iter().find(|(p, _)| p == path_buf) {
             if dirty_bytes.is_empty()
                 || find_byte(&dirty_bytes[..dirty_bytes.len().min(8192)], 0).is_some()
             {
@@ -3066,7 +3112,7 @@ fn search_single_file(
             }
             file_hits.clear();
             compiled.find_in_bytes(dirty_bytes, max_matches, scratch, file_hits);
-            push_chunk_hits(file, dirty_bytes, 0, 0, file_hits, max_matches, out);
+            push_chunk_hits(root, file, dirty_bytes, 0, 0, file_hits, max_matches, out);
             return;
         }
     }
@@ -3079,7 +3125,7 @@ fn search_single_file(
             let slice = &slab.chunks[chunk as usize][start as usize..end as usize];
             file_hits.clear();
             compiled.find_in_bytes(slice, max_matches, scratch, file_hits);
-            push_chunk_hits(file, slice, 0, 0, file_hits, max_matches, out);
+            push_chunk_hits(root, file, slice, 0, 0, file_hits, max_matches, out);
             return;
         }
         SlabSlot::Unloaded => {
@@ -3091,7 +3137,8 @@ fn search_single_file(
             }
             if let Some(w) = writer {
                 if w.can_cache && w.bytes_used.load(Ordering::Relaxed) < MAX_SLAB_BYTES {
-                    match fs.read_prefix_into(&file.abs, MAX_SLAB_FILE_BYTES, read_buf) {
+                    file.fill_abs_path(root, path_buf);
+                    match fs.read_prefix_into(path_buf, MAX_SLAB_FILE_BYTES, read_buf) {
                         Ok(Some(total_len)) => {
                             if total_len == 0
                                 || total_len > MAX_STREAM_FILE_BYTES
@@ -3120,7 +3167,7 @@ fn search_single_file(
                                 }
                                 file_hits.clear();
                                 compiled.find_in_bytes(read_buf, max_matches, scratch, file_hits);
-                                push_chunk_hits(file, read_buf, 0, 0, file_hits, max_matches, out);
+                                push_chunk_hits(root, file, read_buf, 0, 0, file_hits, max_matches, out);
                                 return;
                             }
                             // Multi-MB file (> 256 KB, <= 16 MB): mark StreamFromDisk and reuse
@@ -3142,6 +3189,7 @@ fn search_single_file(
                                 file_hits,
                             );
                             let pushed = push_chunk_hits(
+                                root,
                                 file,
                                 &read_buf[..usable],
                                 0,
@@ -3159,12 +3207,14 @@ fn search_single_file(
                                 let base_line = count_byte(&read_buf[..step], b'\n');
                                 stream_search_file(
                                     fs,
+                                    root,
                                     file,
                                     compiled,
                                     step as u64,
                                     base_line,
                                     max_matches - pushed,
                                     read_buf,
+                                    path_buf,
                                     scratch,
                                     file_hits,
                                     out,
@@ -3192,12 +3242,14 @@ fn search_single_file(
 
     stream_search_file(
         fs,
+        root,
         file,
         compiled,
         0,
         0,
         max_matches,
         read_buf,
+        path_buf,
         scratch,
         file_hits,
         out,
@@ -3207,12 +3259,14 @@ fn search_single_file(
 #[allow(clippy::too_many_arguments)]
 fn stream_search_file(
     fs: &dyn FileSystem,
+    root: &Path,
     file: &IndexedFile,
     compiled: &CompiledQuery,
     start_offset: u64,
     start_line: usize,
     max_matches: usize,
     read_buf: &mut Vec<u8>,
+    path_buf: &mut PathBuf,
     scratch: &mut SearchScratch,
     file_hits: &mut Vec<(usize, usize)>,
     out: &mut Vec<PaletteItem>,
@@ -3220,7 +3274,8 @@ fn stream_search_file(
     if max_matches == 0 {
         return;
     }
-    let Ok(handle) = fs.open_read(&file.abs) else {
+    file.fill_abs_path(root, path_buf);
+    let Ok(handle) = fs.open_read(path_buf) else {
         return;
     };
     let total_len = handle.len();
@@ -3269,6 +3324,7 @@ fn stream_search_file(
         file_hits.clear();
         compiled.find_in_bytes(&chunk[..usable], max_matches - added, scratch, file_hits);
         let pushed = push_chunk_hits(
+            root,
             file,
             &chunk[..usable],
             offset,
@@ -3292,7 +3348,9 @@ fn stream_search_file(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_chunk_hits(
+    root: &Path,
     file: &IndexedFile,
     bytes: &[u8],
     base_offset: u64,
@@ -3352,7 +3410,7 @@ fn push_chunk_hits(
         };
 
         out.push(PaletteItem {
-            path: file.abs.clone(),
+            path: file.abs_path(root),
             command_id: None,
             primary: format!("{}:{}", file.rel, cur_line + 1),
             secondary: snippet,
@@ -3572,7 +3630,7 @@ fn visit_walk_dir(
                 if !ignore.should_skip_file(&entry.name)
                     && !is_gitignored(&active_layers, &rel, &entry.name, false)
                 {
-                    out.push(IndexedFile::new(entry.path, rel));
+                    out.push(IndexedFile::new(rel));
                     added += 1;
                 }
             }
@@ -3825,7 +3883,7 @@ fn fuzzy_score_prelowered(pat: &[u8], cand: &[u8], basename_start: usize) -> Opt
     let mut prev_matched = false;
 
     for (ci, &cb) in cand.iter().enumerate() {
-        if cb == pat[pi] {
+        if cb.to_ascii_lowercase() == pat[pi] {
             score += 10;
             if prev_matched {
                 score += 8;

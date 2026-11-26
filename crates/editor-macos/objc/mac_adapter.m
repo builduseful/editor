@@ -335,10 +335,10 @@ typedef struct {
     void (*on_fs_changed)(void* ud, const char* const* paths, size_t count);
     void (*on_drag)(void* ud, uint32_t phase, float x, float y, const char* path);
     void (*on_command)(void* ud, uint32_t cmd_id);
-    void (*on_tick)(void* ud, uint64_t now_ms);
+    int (*on_tick)(void* ud, uint64_t now_ms);
     // Zero-copy swapchain render: Rust paints directly into a free back-buffer IOSurface
     // with buffer-age damage tracking (zero duplicate CPU framebuffer, zero tearing/flicker).
-    int (*on_needs_render)(void* ud, uint32_t* out_w, uint32_t* out_h, float* out_scale);
+    int (*on_needs_render)(void* ud, int force, uint32_t* out_w, uint32_t* out_h, float* out_scale);
     int (*on_render_into)(void* ud, uint32_t* dst_pixels, uint32_t w, uint32_t h,
                           size_t stride_u32, float scale, int force_full,
                           int32_t extra_x, int32_t extra_y, int32_t extra_w, int32_t extra_h,
@@ -402,6 +402,14 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
     *dh = y1 - y0;
 }
 
+static void purge_and_release_surface(IOSurfaceRef surf) {
+    if (!surf) return;
+    // Immediately reclaim physical pages from macOS `phys_footprint` ledger even if
+    // WindowServer still transiently holds a Mach port reference.
+    IOSurfaceSetPurgeable(surf, kIOSurfacePurgeableEmpty, NULL);
+    CFRelease(surf);
+}
+
 @interface EditorSurfaceView : NSView {
     SwapSlot _slots[MAX_SWAP_SLOTS];
     int _frontIdx;
@@ -413,7 +421,7 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
 - (void)scheduleRedraw;
 - (void)presentFramebuffer;
 - (void)reclaimSpareSurfaces;
-- (void)releaseAllSlots;
+- (void)releaseAllSlotsAndClearLayer;
 - (void)notifyResize;
 @end
 
@@ -433,10 +441,22 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
     return self;
 }
 
-- (void)releaseAllSlots {
+- (void)releaseAllSlotsAndClearLayer {
+    [NSObject cancelPreviousPerformRequestsWithTarget:self
+                                             selector:@selector(reclaimSpareSurfaces)
+                                               object:nil];
+    // Detach layer.contents and flush CoreAnimation BEFORE marking surfaces Empty so
+    // an onscreen layer never references a purged IOSurface and WindowServer drops its retain.
+    if (self.layer) {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        self.layer.contents = nil;
+        [CATransaction commit];
+        [CATransaction flush];
+    }
     for (int i = 0; i < MAX_SWAP_SLOTS; i++) {
         if (_slots[i].surface) {
-            CFRelease(_slots[i].surface);
+            purge_and_release_surface(_slots[i].surface);
             _slots[i].surface = NULL;
         }
         _slots[i].needs_full = YES;
@@ -453,7 +473,7 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
 
 - (void)dealloc {
     [NSObject cancelPreviousPerformRequestsWithTarget:self];
-    [self releaseAllSlots];
+    [self releaseAllSlotsAndClearLayer];
 }
 
 - (BOOL)isFlipped { return YES; }
@@ -590,9 +610,28 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
     return surf;
 }
 
-- (int)acquireBackSlotWidth:(uint32_t)w height:(uint32_t)h {
+- (int)acquireBackSlotWidth:(uint32_t)w height:(uint32_t)h deferredOldFront:(IOSurfaceRef*)outOldFront {
+    if (outOldFront) *outOldFront = NULL;
     if (_surfW != w || _surfH != h) {
-        [self releaseAllSlots];
+        // Zero-flicker resize: purge all non-front old surfaces immediately, but defer purging
+        // the currently displayed front surface until the freshly painted surface replaces it.
+        for (int i = 0; i < MAX_SWAP_SLOTS; i++) {
+            if (_slots[i].surface) {
+                if (i == _frontIdx && outOldFront) {
+                    *outOldFront = _slots[i].surface;
+                } else {
+                    purge_and_release_surface(_slots[i].surface);
+                }
+                _slots[i].surface = NULL;
+            }
+            _slots[i].needs_full = YES;
+            _slots[i].is_volatile = NO;
+            _slots[i].dmg_x = 0;
+            _slots[i].dmg_y = 0;
+            _slots[i].dmg_w = 0;
+            _slots[i].dmg_h = 0;
+        }
+        _frontIdx = -1;
         _surfW = w;
         _surfH = h;
     }
@@ -640,7 +679,7 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
             }
         } else {
             // Release any extra burst slot beyond double-buffering.
-            CFRelease(_slots[i].surface);
+            purge_and_release_surface(_slots[i].surface);
             _slots[i].surface = NULL;
             _slots[i].needs_full = YES;
             _slots[i].is_volatile = NO;
@@ -654,15 +693,18 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
 
 - (void)presentFramebuffer {
     if (_inPresent || !self.cb.on_needs_render || !self.cb.on_render_into) return;
+    int needFreshSurface = (_frontIdx < 0 || !_slots[_frontIdx].surface) ? 1 : 0;
     uint32_t w = 0, h = 0;
     float scale = 1.0f;
-    if (!self.cb.on_needs_render(self.cb.userdata, &w, &h, &scale) || w == 0 || h == 0) {
+    if (!self.cb.on_needs_render(self.cb.userdata, needFreshSurface, &w, &h, &scale) || w == 0 || h == 0) {
         return;
     }
 
     _inPresent = YES;
-    int slotIdx = [self acquireBackSlotWidth:w height:h];
+    IOSurfaceRef oldFront = NULL;
+    int slotIdx = [self acquireBackSlotWidth:w height:h deferredOldFront:&oldFront];
     if (slotIdx < 0 || !_slots[slotIdx].surface) {
+        if (oldFront) CFRelease(oldFront);
         _inPresent = NO;
         return;
     }
@@ -716,11 +758,20 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
         [CATransaction commit];
         _frontIdx = slotIdx;
 
+        // Now that layer.contents points to the new resized surface, purge the old front surface.
+        if (oldFront) {
+            [CATransaction flush];
+            purge_and_release_surface(oldFront);
+        }
+
         // Schedule idle reclamation 200ms after activity stops (>12 vsyncs, <530ms caret blink).
         [NSObject cancelPreviousPerformRequestsWithTarget:self
                                                  selector:@selector(reclaimSpareSurfaces)
                                                    object:nil];
         [self performSelector:@selector(reclaimSpareSurfaces) withObject:nil afterDelay:0.2];
+    } else if (oldFront) {
+        // Layer may still reference oldFront; drop our ref without marking Empty.
+        CFRelease(oldFront);
     }
     _inPresent = NO;
 }
@@ -731,8 +782,11 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
     return NSMakePoint(pt.x * scale, pt.y * scale);
 }
 
+static void mac_ensure_blink_timer(void);
+
 - (void)keyDown:(NSEvent*)event {
     if (!self.cb.on_key) return;
+    mac_ensure_blink_timer();
     NSString* rawKey = event.charactersIgnoringModifiers;
     const char* key_utf8 = rawKey ? [rawKey UTF8String] : "";
     size_t key_len = key_utf8 ? strlen(key_utf8) : 0;
@@ -748,6 +802,7 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
 
 - (void)mouseDown:(NSEvent*)event {
     [self.window makeFirstResponder:self];
+    mac_ensure_blink_timer();
     NSPoint p = [self pixelPointFromEvent:event];
     self.cb.on_mouse(self.cb.userdata, 0, (float)p.x, (float)p.y, 0,
                      (uint8_t)MIN(event.clickCount, 3), encode_mods(event.modifierFlags));
@@ -755,6 +810,7 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
 
 - (void)rightMouseDown:(NSEvent*)event {
     [self.window makeFirstResponder:self];
+    mac_ensure_blink_timer();
     NSPoint p = [self pixelPointFromEvent:event];
     self.cb.on_mouse(self.cb.userdata, 0, (float)p.x, (float)p.y, 1,
                      (uint8_t)MIN(event.clickCount, 3), encode_mods(event.modifierFlags));
@@ -785,6 +841,7 @@ static void rect_union_into(int32_t* dx, int32_t* dy, int32_t* dw, int32_t* dh,
 }
 
 - (void)scrollWheel:(NSEvent*)event {
+    mac_ensure_blink_timer();
     NSPoint p = [self pixelPointFromEvent:event];
     CGFloat scale = self.window.backingScaleFactor > 0 ? self.window.backingScaleFactor : 1.0;
     CGFloat mult = event.hasPreciseScrollingDeltas ? scale : 18.0 * scale;
@@ -987,6 +1044,12 @@ void mac_watch_extra_directory(const char* dir_path) {
     }
 }
 
+static void mac_ensure_blink_timer(void) {
+    if (g_delegate && g_window && g_window.visible && g_window.isKeyWindow) {
+        [g_delegate startBlinkTimer];
+    }
+}
+
 void mac_close_window(void) {
     // macOS document-app convention: close/hide window while staying alive in Dock (white dot)
     // with 0.00% idle CPU, zero kernel FS wakeups, and zero retained IOSurface GPU buffers.
@@ -994,11 +1057,11 @@ void mac_close_window(void) {
     if (g_delegate) {
         [g_delegate stopBlinkTimer];
     }
-    if (g_view) {
-        [g_view releaseAllSlots];
-    }
     if (g_window) {
         [g_window orderOut:nil];
+    }
+    if (g_view) {
+        [g_view releaseAllSlotsAndClearLayer];
     }
 }
 
@@ -1077,7 +1140,12 @@ void mac_activate_app(void) {
 - (void)onTick:(NSTimer*)t {
     (void)t;
     if (self.cb.on_tick) {
-        self.cb.on_tick(self.cb.userdata, monotonic_ms());
+        int keep = self.cb.on_tick(self.cb.userdata, monotonic_ms());
+        if (keep) {
+            [self startBlinkTimer];
+        } else {
+            [self stopBlinkTimer];
+        }
     }
 }
 
@@ -1157,12 +1225,38 @@ void mac_activate_app(void) {
     return YES;
 }
 
+- (void)applicationDidHide:(NSNotification*)note {
+    (void)note;
+    [self stopBlinkTimer];
+    stop_fs_watcher_stream();
+    if (g_view) {
+        [g_view releaseAllSlotsAndClearLayer];
+    }
+}
+
+- (void)applicationDidUnhide:(NSNotification*)note {
+    (void)note;
+    if (g_window && g_window.visible) {
+        if (g_view) {
+            [g_view notifyResize];
+            [g_view scheduleRedraw];
+            [g_view displayIfNeeded];
+        }
+        [self startBlinkTimer];
+        start_fs_watcher_stream_if_needed();
+        if (self.cb.on_fs_changed) {
+            self.cb.on_fs_changed(self.cb.userdata, NULL, 0);
+        }
+    }
+}
+
 - (void)dispatchMenuCommand:(NSMenuItem*)item {
     NSInteger tag = item.tag;
     // If the window was hidden in the Dock and the user triggers New / Open from the menu bar, show it!
     if (g_window && !g_window.visible && (tag == 0 || tag == 1 || tag == 2 || tag == 37)) {
         [self showWindow];
     }
+    mac_ensure_blink_timer();
     if (self.cb.on_command) {
         self.cb.on_command(self.cb.userdata, (uint32_t)tag);
     }
@@ -1317,89 +1411,6 @@ void mac_activate_app(void) {
 }
 
 @end
-
-int mac_http_get(const char* url_cstr, size_t max_bytes, uint8_t** out_buf, size_t* out_len,
-                 char** out_err) {
-    if (out_buf) *out_buf = NULL;
-    if (out_len) *out_len = 0;
-    if (out_err) *out_err = NULL;
-    if (!url_cstr || !out_buf || !out_len) return -1;
-
-    @autoreleasepool {
-        NSString* urlStr = [NSString stringWithUTF8String:url_cstr];
-        NSURL* url = urlStr ? [NSURL URLWithString:urlStr] : nil;
-        if (!url || ![url.scheme.lowercaseString isEqualToString:@"https"]) {
-            if (out_err) *out_err = strdup("only https:// URLs are permitted");
-            return -1;
-        }
-
-        NSURLSessionConfiguration* cfg = [NSURLSessionConfiguration ephemeralSessionConfiguration];
-        cfg.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
-        cfg.timeoutIntervalForRequest = 15.0;
-        cfg.timeoutIntervalForResource = 60.0;
-        NSURLSession* session = [NSURLSession sessionWithConfiguration:cfg];
-
-        NSMutableURLRequest* req = [NSMutableURLRequest requestWithURL:url];
-        req.HTTPMethod = @"GET";
-        [req setValue:@"editor-updater/1" forHTTPHeaderField:@"User-Agent"];
-
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        __block NSData* respData = nil;
-        __block NSHTTPURLResponse* httpResp = nil;
-        __block NSError* reqErr = nil;
-
-        NSURLSessionDataTask* task =
-            [session dataTaskWithRequest:req
-                       completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
-                           respData = data;
-                           if ([response isKindOfClass:[NSHTTPURLResponse class]]) {
-                               httpResp = (NSHTTPURLResponse*)response;
-                           }
-                           reqErr = error;
-                           dispatch_semaphore_signal(sem);
-                       }];
-        [task resume];
-        dispatch_semaphore_wait(sem, DISPATCH_TIME_FOREVER);
-        [session finishTasksAndInvalidate];
-
-        if (reqErr) {
-            if (out_err) {
-                const char* msg = [[reqErr localizedDescription] UTF8String];
-                *out_err = strdup(msg ? msg : "network request failed");
-            }
-            return -1;
-        }
-        if (!httpResp || httpResp.statusCode != 200) {
-            NSInteger code = httpResp ? httpResp.statusCode : 0;
-            if (out_err) {
-                char tmp[64];
-                snprintf(tmp, sizeof(tmp), "HTTP %ld", (long)code);
-                *out_err = strdup(tmp);
-            }
-            return -1;
-        }
-        NSUInteger len = respData.length;
-        if (len > max_bytes) {
-            if (out_err) *out_err = strdup("response exceeded maximum allowed size");
-            return -1;
-        }
-        uint8_t* copy = (uint8_t*)malloc(len > 0 ? len : 1);
-        if (!copy) {
-            if (out_err) *out_err = strdup("out of memory");
-            return -1;
-        }
-        if (len > 0) {
-            memcpy(copy, respData.bytes, len);
-        }
-        *out_buf = copy;
-        *out_len = (size_t)len;
-        return 0;
-    }
-}
-
-void mac_free_bytes(uint8_t* ptr) {
-    if (ptr) free(ptr);
-}
 
 void mac_wake_main_loop(void) {
     dispatch_async(dispatch_get_main_queue(), ^{

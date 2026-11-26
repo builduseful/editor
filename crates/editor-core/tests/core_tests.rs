@@ -919,3 +919,34 @@ fn swar_unrolled_rare_pair_and_regex_span_parity() {
     assert_eq!(&sample[hits[0].0..hits[0].1], "FIXME");
     assert_eq!(&sample[hits[1].0..hits[1].1], "TODO");
 }
+
+#[test]
+fn evict_page_cache_preserves_unsaved_edits_and_refills_paged_reads() {
+    let fs = MemoryFileSystem::new();
+    let p = PathBuf::from("/large_paged.txt");
+    // > 256 KB so PieceTree uses BaseBacking::Paged with its 8 x 64 KB PageCache.
+    let mut content = String::with_capacity(420_000);
+    for i in 0..8000usize {
+        content.push_str(&format!("line_{i:05}_payload_0123456789_abcdef_xyz\n"));
+    }
+    assert!(content.len() > 300_000);
+    fs.add_file(&p, content.as_bytes().to_vec());
+
+    let mut doc = Document::open(&fs, &p).unwrap();
+    assert_eq!(doc.line_content(0).unwrap(), "line_00000_payload_0123456789_abcdef_xyz");
+    assert_eq!(doc.line_content(5000).unwrap(), "line_05000_payload_0123456789_abcdef_xyz");
+
+    // Apply an unsaved edit into AddBuffer, then evict the base PageCache (simulating tab park).
+    let (l10_s, _, _) = doc.line_byte_range(10).unwrap();
+    doc.edit(l10_s, 0, "// EDITED ", 1, false).unwrap();
+    doc.evict_page_cache();
+
+    // Base lines refill seamlessly after eviction AND unsaved edits stay intact!
+    assert!(doc.is_dirty());
+    assert_eq!(doc.line_content(0).unwrap(), "line_00000_payload_0123456789_abcdef_xyz");
+    assert_eq!(
+        doc.line_content(10).unwrap(),
+        "// EDITED line_00010_payload_0123456789_abcdef_xyz"
+    );
+    assert_eq!(doc.line_content(7999).unwrap(), "line_07999_payload_0123456789_abcdef_xyz");
+}

@@ -51,8 +51,8 @@ struct MacCallbacks {
     on_fs_changed: extern "C" fn(*mut c_void, *const *const c_char, usize),
     on_drag: extern "C" fn(*mut c_void, u32, f32, f32, *const c_char),
     on_command: extern "C" fn(*mut c_void, u32),
-    on_tick: extern "C" fn(*mut c_void, u64),
-    on_needs_render: extern "C" fn(*mut c_void, *mut u32, *mut u32, *mut f32) -> c_int,
+    on_tick: extern "C" fn(*mut c_void, u64) -> c_int,
+    on_needs_render: extern "C" fn(*mut c_void, c_int, *mut u32, *mut u32, *mut f32) -> c_int,
     on_render_into: extern "C" fn(
         *mut c_void,
         *mut u32,
@@ -100,14 +100,6 @@ extern "C" {
     fn mac_watch_extra_directory(dir_path: *const c_char);
     fn mac_activate_app();
     fn mac_wake_main_loop();
-    fn mac_http_get(
-        url: *const c_char,
-        max_bytes: usize,
-        out_buf: *mut *mut u8,
-        out_len: *mut usize,
-        out_err: *mut *mut c_char,
-    ) -> c_int;
-    fn mac_free_bytes(ptr: *mut u8);
     fn mac_run_app(cb: MacCallbacks);
 }
 
@@ -404,33 +396,7 @@ impl PlatformHost for MacHost {
     }
 
     fn http_fetcher(&self) -> Option<editor_platform::HttpFetcher> {
-        Some(Arc::new(|url: &str, max_bytes: usize| {
-            let c_url = CString::new(url).map_err(|_| "invalid URL".to_string())?;
-            let mut buf: *mut u8 = std::ptr::null_mut();
-            let mut len: usize = 0;
-            let mut err: *mut c_char = std::ptr::null_mut();
-            let rc = unsafe { mac_http_get(c_url.as_ptr(), max_bytes, &mut buf, &mut len, &mut err) };
-            if rc == 0 {
-                let bytes = if !buf.is_null() && len > 0 {
-                    unsafe { std::slice::from_raw_parts(buf, len) }.to_vec()
-                } else {
-                    Vec::new()
-                };
-                if !buf.is_null() {
-                    unsafe { mac_free_bytes(buf) };
-                }
-                Ok(bytes)
-            } else {
-                let msg = if !err.is_null() {
-                    let s = unsafe { CStr::from_ptr(err) }.to_string_lossy().into_owned();
-                    unsafe { mac_free_cstr(err) };
-                    s
-                } else {
-                    "network error".to_string()
-                };
-                Err(msg)
-            }
-        }))
+        Some(Arc::new(editor_platform::update::https_get_via_curl))
     }
 
     fn relaunch_after_update(&mut self, app_bundle: &Path) {
@@ -784,7 +750,7 @@ extern "C" fn cb_command(ud: *mut c_void, cmd_id: u32) {
     }
 }
 
-extern "C" fn cb_tick(ud: *mut c_void, now_ms: u64) {
+extern "C" fn cb_tick(ud: *mut c_void, now_ms: u64) -> c_int {
     let b = unsafe { &mut *(ud as *mut Bridge) };
     // Drain any incoming CLI/agent IPC commands (`status`, `open`, `goto`, `select`,
     // `insert`, `find`, `save`, `undo`, `redo`, `action`, `close`/`quit`).
@@ -802,7 +768,7 @@ extern "C" fn cb_tick(ud: *mut c_void, now_ms: u64) {
         if should_quit {
             b.ipc = None;
             b.host.request_quit();
-            return;
+            return 0;
         }
     }
     b.app.handle_event(
@@ -811,16 +777,22 @@ extern "C" fn cb_tick(ud: *mut c_void, now_ms: u64) {
         &mut b.clipboard,
         &mut b.host,
     );
+    if b.app.wants_tick_timer() {
+        1
+    } else {
+        0
+    }
 }
 
 extern "C" fn cb_needs_render(
     ud: *mut c_void,
+    force: c_int,
     out_w: *mut u32,
     out_h: *mut u32,
     out_scale: *mut f32,
 ) -> c_int {
     let b = unsafe { &mut *(ud as *mut Bridge) };
-    if !b.app.is_dirty_frame() {
+    if force == 0 && !b.app.is_dirty_frame() {
         return 0;
     }
     unsafe {

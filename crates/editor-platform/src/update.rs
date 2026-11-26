@@ -10,7 +10,9 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::version::{compare_semver, SemVer, APP_VERSION};
@@ -194,6 +196,115 @@ pub fn check_manifest_bytes(bytes: &[u8]) -> Result<UpdateCheckOutcome, String> 
     let text = std::str::from_utf8(bytes).map_err(|_| "release manifest is not valid UTF-8")?;
     let manifest = parse_release_manifest(text)?;
     evaluate_manifest(&manifest, APP_VERSION, platform_asset_keys())
+}
+
+/// Resolve the OS-bundled `curl` executable using an absolute system path when available
+/// to avoid `PATH` hijacking.
+fn resolve_curl_binary() -> &'static str {
+    #[cfg(target_os = "windows")]
+    {
+        const SYS_CURL: &str = r"C:\Windows\System32\curl.exe";
+        if Path::new(SYS_CURL).exists() {
+            SYS_CURL
+        } else {
+            "curl.exe"
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        if Path::new("/usr/bin/curl").exists() {
+            "/usr/bin/curl"
+        } else {
+            "curl"
+        }
+    }
+}
+
+/// Hardened, cross-platform one-shot HTTPS GET via the OS-bundled `curl` subprocess.
+///
+/// Running HTTPS fetches out-of-process keeps TLS/HTTP frameworks (`CFNetwork`, `Security`,
+/// `libboringssl`, `WinHTTP`, `OpenSSL`) out of the long-lived GUI process (~4–10 MB saved
+/// permanently) while sharing one audited implementation across GUI and CLI:
+/// - Strict host/scheme allowlist (`validate_release_url`)
+/// - `-q` (`--disable`) first to ignore user `~/.curlrc`
+/// - `--proto =https --proto-redir =https --max-redirs 5` (never downgrades off HTTPS)
+/// - Bounded stdout read (`max_bytes + 1`) even on chunked transfers without `Content-Length`
+pub fn https_get_via_curl(url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
+    validate_release_url(url)?;
+    let curl = resolve_curl_binary();
+    let max_size_str = max_bytes.to_string();
+
+    let mut cmd = Command::new(curl);
+    cmd.args([
+        "-q",
+        "-fsSL",
+        "--proto",
+        "=https",
+        "--proto-redir",
+        "=https",
+        "--max-redirs",
+        "5",
+        "--connect-timeout",
+        "15",
+        "--max-time",
+        "60",
+        "--user-agent",
+        "editor-updater/1",
+        "--max-filesize",
+        &max_size_str,
+        "--",
+        url,
+    ])
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("failed to execute {curl}: {e}"))?;
+
+    let mut body = Vec::new();
+    let limit = (max_bytes as u64).saturating_add(1);
+    if let Some(stdout) = child.stdout.take() {
+        stdout
+            .take(limit)
+            .read_to_end(&mut body)
+            .map_err(|e| format!("failed to read download stream: {e}"))?;
+    }
+
+    if body.len() > max_bytes {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err("downloaded payload exceeded size limit".to_string());
+    }
+
+    let mut err_buf = Vec::new();
+    if let Some(stderr) = child.stderr.take() {
+        let _ = stderr.take(4096).read_to_end(&mut err_buf);
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("failed waiting for {curl}: {e}"))?;
+
+    if !status.success() {
+        let stderr_str = String::from_utf8_lossy(&err_buf);
+        let msg = stderr_str.trim();
+        return Err(if msg.is_empty() {
+            format!("download failed with status {status}")
+        } else {
+            msg.to_string()
+        });
+    }
+
+    Ok(body)
 }
 
 // ============================================================================
@@ -969,5 +1080,14 @@ mod tests {
         assert_eq!(fs::read_to_string(cur.join("ver.txt")).unwrap(), "0.3.0");
         assert!(!staged.exists());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn https_get_via_curl_enforces_url_allowlist_before_spawning() {
+        assert!(!resolve_curl_binary().is_empty());
+        assert!(https_get_via_curl("http://github.com/builduseful/editor", 1024).is_err());
+        assert!(https_get_via_curl("file:///etc/passwd", 1024).is_err());
+        assert!(https_get_via_curl("https://evil.example/release.json", 1024).is_err());
+        assert!(https_get_via_curl("--config=/tmp/evil", 1024).is_err());
     }
 }

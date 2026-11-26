@@ -189,6 +189,10 @@ enum UpdateWorkerEvent {
     },
 }
 
+/// After 10 seconds without user input, settle the caret calmly solid (like GTK/Emacs/WCAG)
+/// so the host can pause the 530 ms blink timer -> 0.00% idle CPU & single-surface RAM.
+pub const CARET_BLINK_IDLE_MS: u64 = 10_000;
+
 pub struct EditorApp {
     fs: Arc<dyn FileSystem>,
     pub doc: Document,
@@ -296,6 +300,7 @@ pub struct EditorApp {
     window_focused: bool,
     caret_visible: bool,
     last_blink_ms: u64,
+    last_activity_ms: Option<u64>,
     now_ms: u64,
     notice: Option<(String, bool, u64)>,
 
@@ -407,6 +412,7 @@ impl EditorApp {
             window_focused: true,
             caret_visible: true,
             last_blink_ms: 0,
+            last_activity_ms: None,
             now_ms: 0,
             notice: None,
             dragging_selection: false,
@@ -1394,6 +1400,9 @@ impl EditorApp {
         }
         // Only park if no other pane currently holds a live copy (or ours is dirty).
         if !self.is_buf_in_other_pane(old_id) || old_doc.is_dirty() {
+            // Release up to 512 KB of base-file page cache per parked large tab;
+            // unsaved edits stay in AddBuffer and visible pages refill from OS cache on focus.
+            old_doc.evict_page_cache();
             self.working_set.park(
                 old_id,
                 ParkedBuffer {
@@ -2830,6 +2839,54 @@ impl EditorApp {
         nodes
     }
 
+    /// Whether the host should keep its periodic 530 ms UI tick timer active.
+    ///
+    /// Returns `false` when unfocused or once the caret has settled solid after
+    /// `CARET_BLINK_IDLE_MS` with no expiring toast/notice — enabling 0.00% idle CPU
+    /// and single-surface steady memory even while the window stays focused for reading.
+    pub fn wants_tick_timer(&self) -> bool {
+        if !self.window_focused {
+            return false;
+        }
+        if self.toast.visible || self.notice.is_some() {
+            return true;
+        }
+        match self.last_activity_ms {
+            None => true,
+            Some(t0) => {
+                self.now_ms.saturating_sub(t0) < CARET_BLINK_IDLE_MS || !self.caret_visible
+            }
+        }
+    }
+
+    /// Current caret visibility (useful for deterministic tests and host introspection).
+    pub fn is_caret_visible(&self) -> bool {
+        self.caret_visible
+    }
+
+    /// Advance caret blink state on `Tick { now_ms }`, settling solid after `CARET_BLINK_IDLE_MS`.
+    /// Returns `true` if `caret_visible` changed and needs a redraw.
+    fn advance_caret_blink(&mut self, now_ms: u64) -> bool {
+        if !self.window_focused {
+            return false;
+        }
+        let anchor = *self.last_activity_ms.get_or_insert(now_ms);
+        if now_ms.saturating_sub(anchor) >= CARET_BLINK_IDLE_MS {
+            if !self.caret_visible {
+                self.caret_visible = true;
+                self.last_blink_ms = now_ms;
+                return true;
+            }
+            return false;
+        }
+        if now_ms.saturating_sub(self.last_blink_ms) >= 530 {
+            self.caret_visible = !self.caret_visible;
+            self.last_blink_ms = now_ms;
+            return true;
+        }
+        false
+    }
+
     /// Process a single platform-neutral `InputEvent`.
     pub fn handle_event(
         &mut self,
@@ -2838,6 +2895,17 @@ impl EditorApp {
         clipboard: &mut dyn Clipboard,
         host: &mut dyn PlatformHost,
     ) {
+        if matches!(
+            event,
+            InputEvent::KeyDown { .. }
+                | InputEvent::MouseDown { .. }
+                | InputEvent::Scroll { .. }
+                | InputEvent::Command(_)
+                | InputEvent::OpenPath(_)
+                | InputEvent::FocusChanged(true)
+        ) {
+            self.last_activity_ms = None;
+        }
         if matches!(event, InputEvent::Tick { .. }) {
             self.poll_update_worker(host);
             self.poll_git_workers(host);
@@ -3010,9 +3078,7 @@ impl EditorApp {
                 }
                 InputEvent::Tick { now_ms } => {
                     self.now_ms = now_ms;
-                    if self.window_focused && now_ms.saturating_sub(self.last_blink_ms) >= 530 {
-                        self.caret_visible = !self.caret_visible;
-                        self.last_blink_ms = now_ms;
+                    if self.advance_caret_blink(now_ms) {
                         self.mark_dirty();
                         host.request_redraw();
                     }
@@ -3102,9 +3168,7 @@ impl EditorApp {
                 InputEvent::Tick { now_ms } => {
                     self.now_ms = now_ms;
                     let mut need_redraw = self.palette.poll_background(self.fs.as_ref());
-                    if self.window_focused && now_ms.saturating_sub(self.last_blink_ms) >= 530 {
-                        self.caret_visible = !self.caret_visible;
-                        self.last_blink_ms = now_ms;
+                    if self.advance_caret_blink(now_ms) {
                         need_redraw = true;
                     }
                     if need_redraw {
@@ -3286,9 +3350,7 @@ impl EditorApp {
                         host.request_redraw();
                     }
                 }
-                if self.window_focused && now_ms.saturating_sub(self.last_blink_ms) >= 530 {
-                    self.caret_visible = !self.caret_visible;
-                    self.last_blink_ms = now_ms;
+                if self.advance_caret_blink(now_ms) {
                     if self.find_bar.is_focused() {
                         self.mark_dirty_rect(self.layout.find_bar);
                     } else if self.goto_line.visible {

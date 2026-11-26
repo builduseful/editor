@@ -545,3 +545,45 @@ fn palette_respects_os_home_ignore_rules_gitignore_and_async_streaming() {
     palette.close();
     assert!(!palette.is_streaming());
 }
+
+#[test]
+fn glyph_atlas_inline_and_long_cluster_keys_and_compact_palette_index() {
+    let mut atlas = GlyphAtlas::new();
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut fb = Framebuffer::new(320, 80, 2.0);
+    let theme = Theme::light();
+
+    // 1. Inline ASCII / UTF-8 / short emoji AND >22-byte ZWJ family emoji cluster keys!
+    let long_zwj = "👨\u{200D}👩\u{200D}👧\u{200D}👦";
+    assert!(long_zwj.len() > 22, "ZWJ family emoji exercises ClusterKey::Long");
+    let g1 = atlas.get_or_rasterize(&mut raster, FontStyle::Ui, 24.0, "A");
+    let g2 = atlas.get_or_rasterize(&mut raster, FontStyle::Ui, 24.0, "A");
+    assert_eq!((g1.atlas_x, g1.atlas_y), (g2.atlas_x, g2.atlas_y));
+    let e1 = atlas.get_or_rasterize(&mut raster, FontStyle::Ui, 24.0, long_zwj);
+    let e2 = atlas.get_or_rasterize(&mut raster, FontStyle::Ui, 24.0, long_zwj);
+    assert_eq!((e1.atlas_x, e1.atlas_y), (e2.atlas_x, e2.atlas_y));
+
+    // ASCII UI draw & measure match cleanly across mixed font sizes without thrashing.
+    let w_ascii = Painter::measure_text_ui("Hello World", FontStyle::Ui, 24.0, &mut atlas, &mut raster);
+    let w_mixed = Painter::measure_text_ui("Hello 🚀", FontStyle::Ui, 22.0, &mut atlas, &mut raster);
+    assert!(w_ascii > 0.0 && w_mixed > 0.0);
+    let mut p = Painter::new(&mut fb);
+    let end_x = p.draw_text_ui(4.0, 30.0, "Hello World", FontStyle::Ui, 24.0, theme.text, &mut atlas, &mut raster);
+    assert!((end_x - (4.0 + w_ascii)).abs() < 0.01);
+
+    // 2. Compact IndexedFile: mixed-case Quick Open fuzzy match, uppercase binary ext skip, and grep!
+    let fs = MemoryFileSystem::new();
+    let root = PathBuf::from("/proj");
+    fs.add_file(root.join("Src/MyComponent.rs"), b"pub fn MixedNeedle() {}\n".to_vec());
+    fs.add_file(root.join("Assets/LOGO.PNG"), b"MixedNeedle inside fake PNG\n".to_vec());
+    let mut pal = editor_render::CommandPalette::new();
+    pal.open_quick_open(&fs, Some(&root));
+    pal.input.set_text("mycomp");
+    pal.refresh_results(&fs);
+    assert_eq!(pal.items.len(), 1);
+    assert_eq!(pal.items[0].path, root.join("Src/MyComponent.rs"));
+
+    pal.open_project_search(&fs, Some(&root), Some("MixedNeedle"));
+    assert_eq!(pal.items.len(), 1, "uppercase .PNG binary extension must be skipped");
+    assert_eq!(pal.items[0].path, root.join("Src/MyComponent.rs"));
+}

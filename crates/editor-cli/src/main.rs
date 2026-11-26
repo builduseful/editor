@@ -2535,40 +2535,7 @@ fn cmd_action(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start:
 }
 
 fn cli_https_get(url: &str, max_bytes: usize) -> Result<Vec<u8>, String> {
-    editor_platform::update::validate_release_url(url)?;
-    let curl = if cfg!(target_os = "windows") {
-        "curl.exe"
-    } else if Path::new("/usr/bin/curl").exists() {
-        "/usr/bin/curl"
-    } else {
-        "curl"
-    };
-    let out = std::process::Command::new(curl)
-        .args([
-            "-fsSL",
-            "--proto",
-            "=https",
-            "--max-time",
-            "60",
-            "--max-filesize",
-            &max_bytes.to_string(),
-            url,
-        ])
-        .output()
-        .map_err(|e| format!("failed to execute {curl}: {e}"))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let msg = stderr.trim();
-        return Err(if msg.is_empty() {
-            format!("download failed with status {}", out.status)
-        } else {
-            msg.to_string()
-        });
-    }
-    if out.stdout.len() > max_bytes {
-        return Err("downloaded payload exceeded size limit".to_string());
-    }
-    Ok(out.stdout)
+    editor_platform::update::https_get_via_curl(url, max_bytes)
 }
 
 fn cmd_update(args: &[String], start: Instant) -> u8 {
