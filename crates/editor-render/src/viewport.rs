@@ -19,6 +19,7 @@ pub const H_SCROLLBAR_STRIP_PT: f32 = 9.0;
 pub const V_SCROLLBAR_WIDTH_PT: f32 = 9.0;
 const MAX_WRAP_CACHE_ENTRIES: usize = 1024;
 const MAX_CACHED_VISUAL_LINES: usize = 512;
+const MAX_EXACT_WRAP_METRICS_LINES: usize = 4096;
 const HUGE_LINE_WINDOW_THRESHOLD: u64 = 16 * 1024;
 const HUGE_LINE_WINDOW_BYTES: usize = 4096;
 
@@ -80,6 +81,14 @@ pub struct Viewport {
     wrap_cache_doc_gen: u64,
     wrap_cache_width: i32,
     wrap_cache_font_q: u32,
+    /// Prefix sums of visual wrapped line counts (`len == total_logical + 1` for files <= 4096 lines).
+    /// Enables exact O(1) vertical scrollbar thumb sizing and O(log N) thumb dragging in wrap mode.
+    wrapped_prefix: Vec<usize>,
+    wrapped_total_visual_lines: usize,
+    wrapped_metrics_doc_gen: u64,
+    wrapped_metrics_width: i32,
+    wrapped_metrics_font_q: u32,
+    wrapped_metrics_line_count: usize,
     pub layout: ViewportLayout,
     pub last_caret_rect: PixelRect,
     /// Render a cell-wide block cursor (used in Vim Normal / Visual modes) instead of a thin bar.
@@ -116,6 +125,12 @@ impl Viewport {
             wrap_cache_doc_gen: 0,
             wrap_cache_width: 0,
             wrap_cache_font_q: 0,
+            wrapped_prefix: Vec::new(),
+            wrapped_total_visual_lines: 0,
+            wrapped_metrics_doc_gen: 0,
+            wrapped_metrics_width: 0,
+            wrapped_metrics_font_q: 0,
+            wrapped_metrics_line_count: 0,
             layout: ViewportLayout::default(),
             last_caret_rect: PixelRect::ZERO,
             block_caret: false,
@@ -124,12 +139,20 @@ impl Viewport {
         }
     }
 
+    fn clear_wrap_caches(&mut self) {
+        self.wrap_cache.clear();
+        self.wrapped_prefix.clear();
+        self.wrapped_total_visual_lines = 0;
+        self.wrapped_metrics_width = 0;
+        self.wrapped_metrics_line_count = 0;
+    }
+
     pub fn reset_for_document(&mut self) {
         self.scroll_top_line = 0;
         self.scroll_sub_y_px = 0.0;
         self.scroll_x_px = 0.0;
         self.max_line_width_px = 0.0;
-        self.wrap_cache.clear();
+        self.clear_wrap_caches();
     }
 
     pub fn font_px(&self, scale: f32) -> f32 {
@@ -138,17 +161,17 @@ impl Viewport {
 
     pub fn zoom_in(&mut self) {
         self.font_size_pt = (self.font_size_pt + 1.5).min(36.0);
-        self.wrap_cache.clear();
+        self.clear_wrap_caches();
     }
 
     pub fn zoom_out(&mut self) {
         self.font_size_pt = (self.font_size_pt - 1.5).max(8.0);
-        self.wrap_cache.clear();
+        self.clear_wrap_caches();
     }
 
     pub fn zoom_reset(&mut self) {
         self.font_size_pt = 13.5;
-        self.wrap_cache.clear();
+        self.clear_wrap_caches();
     }
 
     pub fn toggle_wrap(&mut self) {
@@ -156,7 +179,7 @@ impl Viewport {
         if self.word_wrap {
             self.scroll_x_px = 0.0;
         }
-        self.wrap_cache.clear();
+        self.clear_wrap_caches();
     }
 
     fn sync_wrap_cache(&mut self, doc_gen: u64, text_w: i32, font_px: f32) {
@@ -172,6 +195,146 @@ impl Viewport {
         }
         if self.wrap_cache.len() > MAX_WRAP_CACHE_ENTRIES {
             self.wrap_cache.clear();
+        }
+    }
+
+    /// Zero-allocation exact count of visual rows `text` wraps into (matches `layout_line` 1:1).
+    fn count_wrapped_visual_lines(&self, text: &str, cell_w: f32, max_w: f32) -> usize {
+        if !self.word_wrap || max_w <= cell_w * 2.0 {
+            return 1;
+        }
+        let max_cells = (max_w / cell_w).floor().max(4.0) as usize;
+        // Fast path: tab-free ASCII line shorter than viewport width never wraps.
+        if text.len() <= max_cells
+            && is_all_ascii(text.as_bytes())
+            && find_byte(text.as_bytes(), b'\t').is_none()
+        {
+            return 1;
+        }
+        let mut segs = 0usize;
+        let mut seg_start = 0usize;
+        let mut col_cells = 0usize;
+        let mut last_break_byte: Option<usize> = None;
+
+        for (off, cluster) in grapheme_clusters(text) {
+            let cw = if cluster == "\t" {
+                self.tab_width - (col_cells % self.tab_width)
+            } else {
+                cluster_cell_width(cluster) as usize
+            };
+            if col_cells > 0 && col_cells + cw > max_cells {
+                if let Some(brk) = last_break_byte {
+                    if brk > seg_start {
+                        segs += 1;
+                        seg_start = brk;
+                        col_cells = self
+                            .measure_prefix_px(&text[seg_start..off], off - seg_start, 1.0)
+                            .round() as usize;
+                        last_break_byte = None;
+                    } else {
+                        segs += 1;
+                        seg_start = off;
+                        col_cells = 0;
+                        last_break_byte = None;
+                    }
+                } else {
+                    segs += 1;
+                    seg_start = off;
+                    col_cells = 0;
+                }
+            }
+            col_cells += cw;
+            if cluster == " " || cluster == "\t" {
+                last_break_byte = Some(off + cluster.len());
+            }
+        }
+        segs + 1
+    }
+
+    /// Keep cached visual wrapped line counts in sync with `(doc_gen, text_w, font_px, lines)`.
+    /// O(1) when unchanged; exact prefix sums for <= 4096 lines; bounded 128-line sample for huge files.
+    fn sync_wrapped_metrics(
+        &mut self,
+        doc: &mut Document,
+        text_w: i32,
+        metrics: FontMetrics,
+        scale: f32,
+    ) {
+        if !self.word_wrap || text_w <= 0 {
+            if !self.wrapped_prefix.is_empty() || self.wrapped_total_visual_lines != 0 {
+                self.wrapped_prefix.clear();
+                self.wrapped_total_visual_lines = 0;
+                self.wrapped_metrics_width = 0;
+                self.wrapped_metrics_line_count = 0;
+            }
+            return;
+        }
+        let font_px = self.font_px(scale);
+        let fq = (font_px * 4.0).round() as u32;
+        let doc_gen = doc.generation();
+        let total_logical = doc.editable_line_count().max(1);
+        if self.wrapped_metrics_doc_gen == doc_gen
+            && self.wrapped_metrics_width == text_w
+            && self.wrapped_metrics_font_q == fq
+            && self.wrapped_metrics_line_count == total_logical
+            && self.wrapped_total_visual_lines > 0
+        {
+            return;
+        }
+        self.wrapped_metrics_doc_gen = doc_gen;
+        self.wrapped_metrics_width = text_w;
+        self.wrapped_metrics_font_q = fq;
+        self.wrapped_metrics_line_count = total_logical;
+
+        let text_pad_x = px(12.0, scale) as f32;
+        let max_wrap_w = (text_w as f32 - text_pad_x * 2.0).max(metrics.cell_width * 4.0);
+
+        if doc.is_fully_indexed() && total_logical <= MAX_EXACT_WRAP_METRICS_LINES {
+            self.wrapped_prefix.clear();
+            self.wrapped_prefix.reserve(total_logical + 1);
+            let mut acc = 0usize;
+            self.wrapped_prefix.push(0);
+            for line in 0..total_logical {
+                let content = doc.line_content(line).unwrap_or_default();
+                acc += self.count_wrapped_visual_lines(&content, metrics.cell_width, max_wrap_w);
+                self.wrapped_prefix.push(acc);
+            }
+            self.wrapped_total_visual_lines = acc.max(1);
+        } else {
+            self.wrapped_prefix.clear();
+            let sample_start = self
+                .scroll_top_line
+                .min(total_logical.saturating_sub(1));
+            let sample_end = (sample_start + 128).min(total_logical);
+            let mut sampled_vis = 0usize;
+            let mut sampled_log = 0usize;
+            for line in sample_start..sample_end {
+                let content = doc.line_content(line).unwrap_or_default();
+                sampled_vis +=
+                    self.count_wrapped_visual_lines(&content, metrics.cell_width, max_wrap_w);
+                sampled_log += 1;
+            }
+            let avg = (sampled_vis.max(1) as f64 / sampled_log.max(1) as f64).max(1.0);
+            let est_logical = doc.estimated_editable_line_count().max(total_logical);
+            self.wrapped_total_visual_lines =
+                ((est_logical as f64) * avg).ceil().max(est_logical as f64) as usize;
+        }
+    }
+
+    fn current_visual_scroll_y(&self, line_h: f32) -> f32 {
+        if self.word_wrap && !self.wrapped_prefix.is_empty() {
+            let max_idx = self.wrapped_prefix.len().saturating_sub(1);
+            let vis_before = self.wrapped_prefix[self.scroll_top_line.min(max_idx)];
+            vis_before as f32 * line_h + self.scroll_sub_y_px
+        } else if self.word_wrap
+            && self.wrapped_total_visual_lines > 0
+            && self.wrapped_metrics_line_count > 0
+        {
+            let ratio =
+                self.wrapped_total_visual_lines as f32 / self.wrapped_metrics_line_count as f32;
+            self.scroll_top_line as f32 * line_h * ratio + self.scroll_sub_y_px
+        } else {
+            self.scroll_top_line as f32 * line_h + self.scroll_sub_y_px
         }
     }
 
@@ -207,12 +370,17 @@ impl Viewport {
         let v_bar = PixelRect::new(rect.right() - v_bar_w, rect.y, v_bar_w, text_h);
         let h_bar = PixelRect::new(rect.x + gutter_w, rect.bottom() - h_strip, text_w, h_strip);
 
-        // Compute vertical thumb.
-        let total_lines = doc.estimated_editable_line_count().max(1);
+        // Compute vertical thumb (visual wrapped height when `word_wrap` is on).
+        let est_logical = doc.estimated_editable_line_count().max(1);
+        let total_visual_lines = if self.word_wrap && self.wrapped_total_visual_lines > 0 {
+            self.wrapped_total_visual_lines.max(est_logical)
+        } else {
+            est_logical
+        };
         let line_h = metrics.line_height.max(1) as f32;
-        let total_h = total_lines as f32 * line_h;
+        let total_h = total_visual_lines as f32 * line_h;
         let v_thumb = if total_h > text_h as f32 && text_h > 0 {
-            let cur_y = self.scroll_top_line as f32 * line_h + self.scroll_sub_y_px;
+            let cur_y = self.current_visual_scroll_y(line_h);
             let max_y = (total_h - text_h as f32).max(1.0);
             let frac = (cur_y / max_y).clamp(0.0, 1.0);
             let thumb_h = ((text_h as f32 * text_h as f32) / total_h)
@@ -288,8 +456,7 @@ impl Viewport {
             ScrollbarHit::VerticalThumb => {
                 self.v_bar_dragging = true;
                 self.drag_anchor_px = y_px;
-                self.drag_start_scroll =
-                    self.scroll_top_line as f32 * line_h + self.scroll_sub_y_px;
+                self.drag_start_scroll = self.current_visual_scroll_y(line_h);
             }
             ScrollbarHit::HorizontalThumb => {
                 self.h_bar_dragging = true;
@@ -310,8 +477,16 @@ impl Viewport {
     ) -> bool {
         let line_h = metrics.line_height.max(1) as f32;
         if self.v_bar_dragging {
-            let total_lines = doc.estimated_editable_line_count().max(1);
-            let total_h = total_lines as f32 * line_h;
+            if self.word_wrap {
+                self.sync_wrapped_metrics(doc, self.layout.text.w, metrics, scale);
+            }
+            let est_logical = doc.estimated_editable_line_count().max(1);
+            let total_visual = if self.word_wrap && self.wrapped_total_visual_lines > 0 {
+                self.wrapped_total_visual_lines.max(est_logical)
+            } else {
+                est_logical
+            };
+            let total_h = total_visual as f32 * line_h;
             let text_h = self.layout.text.h.max(1) as f32;
             let travel = (self.layout.v_bar.h - self.layout.v_thumb.h).max(1) as f32;
             let max_y = (total_h - text_h).max(0.0);
@@ -347,14 +522,70 @@ impl Viewport {
     ) {
         let line_h = metrics.line_height.max(1) as f32;
         if dy_px.abs() > 0.01 {
-            let cur = self.scroll_top_line as f32 * line_h + self.scroll_sub_y_px;
-            let target = (cur + dy_px).max(0.0);
-            self.set_vertical_scroll_px(target, doc, metrics, scale);
+            if self.word_wrap {
+                self.scroll_wrapped_by(dy_px, doc, metrics, scale);
+            } else {
+                let cur = self.scroll_top_line as f32 * line_h + self.scroll_sub_y_px;
+                let target = (cur + dy_px).max(0.0);
+                self.set_vertical_scroll_px(target, doc, metrics, scale);
+            }
         }
         if !self.word_wrap && dx_px.abs() > 0.01 {
             let max_x = (self.max_line_width_px + 32.0 * scale - self.layout.text.w as f32).max(0.0);
             self.scroll_x_px = (self.scroll_x_px + dx_px).clamp(0.0, max_x);
         }
+    }
+
+    /// Pixel-smooth vertical stepping in word-wrap mode (walks actual wrapped visual line heights).
+    fn scroll_wrapped_by(
+        &mut self,
+        dy_px: f32,
+        doc: &mut Document,
+        metrics: FontMetrics,
+        scale: f32,
+    ) {
+        let line_h = metrics.line_height.max(1) as f32;
+        let text_pad_x = px(12.0, scale) as f32;
+        let max_wrap_w =
+            (self.layout.text.w as f32 - text_pad_x * 2.0).max(metrics.cell_width * 4.0);
+        let visible_lines = ((self.layout.text.h.max(1) as f32) / line_h).ceil().max(1.0) as usize;
+        let extra_step = ((dy_px.abs() / line_h).ceil() as usize).min(4096);
+        if dy_px > 0.0 {
+            doc.tree_mut()
+                .ensure_indexed_for_line(self.scroll_top_line + visible_lines + extra_step + 16);
+        }
+        let total_lines = doc.editable_line_count().max(1);
+        if self.scroll_top_line >= total_lines {
+            self.scroll_top_line = total_lines - 1;
+            self.scroll_sub_y_px = 0.0;
+        }
+
+        self.scroll_sub_y_px += dy_px;
+        if dy_px > 0.0 {
+            while self.scroll_top_line + 1 < total_lines {
+                let content = doc.line_content(self.scroll_top_line).unwrap_or_default();
+                let vis = self.count_wrapped_visual_lines(&content, metrics.cell_width, max_wrap_w);
+                let block_h = vis as f32 * line_h;
+                if self.scroll_sub_y_px >= block_h {
+                    self.scroll_sub_y_px -= block_h;
+                    self.scroll_top_line += 1;
+                } else {
+                    break;
+                }
+            }
+        } else {
+            while self.scroll_sub_y_px < 0.0 && self.scroll_top_line > 0 {
+                self.scroll_top_line -= 1;
+                let content = doc.line_content(self.scroll_top_line).unwrap_or_default();
+                let vis = self.count_wrapped_visual_lines(&content, metrics.cell_width, max_wrap_w);
+                self.scroll_sub_y_px += vis as f32 * line_h;
+            }
+            if self.scroll_sub_y_px < 0.0 {
+                self.scroll_sub_y_px = 0.0;
+            }
+        }
+        self.sync_wrapped_metrics(doc, self.layout.text.w, metrics, scale);
+        self.clamp_vertical_scroll(doc, metrics, scale);
     }
 
     /// Compute the exact maximum top position `(max_line, max_sub_y_px)` so the last line
@@ -427,6 +658,41 @@ impl Viewport {
     ) {
         let line_h = metrics.line_height.max(1) as f32;
         let text_h = self.layout.text.h.max(0) as f32;
+
+        if self.word_wrap {
+            self.sync_wrapped_metrics(doc, self.layout.text.w, metrics, scale);
+            if !self.wrapped_prefix.is_empty() {
+                let total_vis = *self.wrapped_prefix.last().unwrap_or(&1).max(&1);
+                let max_y = (total_vis as f32 * line_h - text_h).max(0.0);
+                let clamped = target_px.clamp(0.0, max_y);
+                let target_vis_line = (clamped / line_h).floor().max(0.0) as usize;
+                // Find the logical line containing `target_vis_line` via O(log N) binary search.
+                let idx = self
+                    .wrapped_prefix
+                    .partition_point(|&v| v <= target_vis_line)
+                    .saturating_sub(1);
+                let logical_max = doc.editable_line_count().saturating_sub(1);
+                self.scroll_top_line = idx.min(logical_max);
+                let base_px = self.wrapped_prefix[self.scroll_top_line] as f32 * line_h;
+                self.scroll_sub_y_px = (clamped - base_px).max(0.0);
+                self.clamp_vertical_scroll(doc, metrics, scale);
+                return;
+            }
+            let est_logical = doc.estimated_editable_line_count().max(1);
+            let total_vis = self.wrapped_total_visual_lines.max(est_logical);
+            let max_y = (total_vis as f32 * line_h - text_h).max(0.0);
+            let clamped = target_px.clamp(0.0, max_y);
+            let frac = if max_y > 0.0 { clamped / max_y } else { 0.0 };
+            let target_line = ((frac * est_logical.saturating_sub(1) as f32).floor().max(0.0)) as usize;
+            let visible_lines = (text_h / line_h).ceil().max(1.0) as usize;
+            doc.tree_mut()
+                .ensure_indexed_for_line(target_line + visible_lines + 16);
+            self.scroll_top_line = target_line;
+            self.scroll_sub_y_px = 0.0;
+            self.clamp_vertical_scroll(doc, metrics, scale);
+            return;
+        }
+
         let est_total_h = doc.estimated_editable_line_count().max(1) as f32 * line_h;
         let est_max_y = (est_total_h - text_h).max(0.0);
         let clamped_est = target_px.clamp(0.0, est_max_y);
@@ -451,8 +717,99 @@ impl Viewport {
     ) {
         let (line, col_bytes) = doc.byte_to_line_col(caret_byte);
         let line_h = metrics.line_height.max(1) as f32;
-        let visible_lines = ((self.layout.text.h as f32) / line_h).floor().max(1.0) as usize;
+        let text_h = self.layout.text.h as f32;
+        if text_h <= 0.0 {
+            return;
+        }
 
+        if self.word_wrap {
+            self.sync_wrapped_metrics(doc, self.layout.text.w, metrics, scale);
+            let text_pad_x = px(12.0, scale) as f32;
+            let max_wrap_w =
+                (self.layout.text.w as f32 - text_pad_x * 2.0).max(metrics.cell_width * 4.0);
+            let line_content = doc.line_content(line).unwrap_or_default();
+            let segs = self.layout_line(line, &line_content, metrics.cell_width, max_wrap_w);
+            let caret_seg_idx = segs
+                .iter()
+                .enumerate()
+                .find(|&(idx, seg)| {
+                    col_bytes >= seg.byte_start
+                        && (col_bytes < seg.byte_end || idx + 1 == segs.len())
+                })
+                .map(|(idx, _)| idx)
+                .unwrap_or(0);
+            let caret_in_line_top = caret_seg_idx as f32 * line_h;
+            let caret_in_line_bottom = caret_in_line_top + line_h;
+
+            // Above current scroll top -> snap top cleanly to the caret's visual row.
+            if line < self.scroll_top_line
+                || (line == self.scroll_top_line && caret_in_line_top < self.scroll_sub_y_px)
+            {
+                self.scroll_top_line = line;
+                self.scroll_sub_y_px = caret_in_line_top;
+                self.clamp_vertical_scroll(doc, metrics, scale);
+                return;
+            }
+
+            // Compute caret's visual bottom relative to the top of the viewport.
+            let needs_scroll_down = if !self.wrapped_prefix.is_empty()
+                && line < self.wrapped_prefix.len()
+                && self.scroll_top_line < self.wrapped_prefix.len()
+            {
+                let vis_before_caret = self.wrapped_prefix[line];
+                let vis_before_top = self.wrapped_prefix[self.scroll_top_line];
+                let rel_bottom = (vis_before_caret.saturating_sub(vis_before_top) as f32) * line_h
+                    - self.scroll_sub_y_px
+                    + caret_in_line_bottom;
+                rel_bottom > text_h
+            } else if line - self.scroll_top_line > 512 {
+                true
+            } else {
+                let mut acc_y = -self.scroll_sub_y_px;
+                let mut overflow = false;
+                for l in self.scroll_top_line..line {
+                    let c = doc.line_content(l).unwrap_or_default();
+                    let vis = self.count_wrapped_visual_lines(&c, metrics.cell_width, max_wrap_w);
+                    acc_y += vis as f32 * line_h;
+                    if acc_y >= text_h {
+                        overflow = true;
+                        break;
+                    }
+                }
+                overflow || (acc_y + caret_in_line_bottom > text_h)
+            };
+
+            if needs_scroll_down {
+                // Walk backward at most one viewport height from the caret's visual bottom so the
+                // caret's visual row lands cleanly at the bottom edge of the viewport (O(visible_lines)).
+                let mut rem_h = text_h - caret_in_line_bottom;
+                if rem_h <= 0.0 {
+                    self.scroll_top_line = line;
+                    self.scroll_sub_y_px = (caret_in_line_bottom - text_h).max(0.0);
+                } else {
+                    let mut top_line = line;
+                    let mut top_sub = 0.0f32;
+                    while top_line > 0 {
+                        top_line -= 1;
+                        let c = doc.line_content(top_line).unwrap_or_default();
+                        let vis =
+                            self.count_wrapped_visual_lines(&c, metrics.cell_width, max_wrap_w);
+                        let bh = vis as f32 * line_h;
+                        if bh >= rem_h {
+                            top_sub = (bh - rem_h).max(0.0);
+                            break;
+                        }
+                        rem_h -= bh;
+                    }
+                    self.scroll_top_line = top_line;
+                    self.scroll_sub_y_px = top_sub;
+                }
+                self.clamp_vertical_scroll(doc, metrics, scale);
+            }
+            return;
+        }
+
+        let visible_lines = (text_h / line_h).floor().max(1.0) as usize;
         if line < self.scroll_top_line {
             self.scroll_top_line = line;
             self.scroll_sub_y_px = 0.0;
@@ -461,16 +818,14 @@ impl Viewport {
             self.scroll_sub_y_px = 0.0;
         }
 
-        if !self.word_wrap {
-            if let Some(text) = doc.line_content(line) {
-                let cx = self.measure_prefix_px(&text, col_bytes, metrics.cell_width);
-                let text_w = self.layout.text.w as f32;
-                let pad = 24.0 * scale;
-                if cx < self.scroll_x_px + pad {
-                    self.scroll_x_px = (cx - pad).max(0.0);
-                } else if cx > self.scroll_x_px + text_w - pad {
-                    self.scroll_x_px = (cx - text_w + pad).max(0.0);
-                }
+        if let Some(text) = doc.line_content(line) {
+            let cx = self.measure_prefix_px(&text, col_bytes, metrics.cell_width);
+            let text_w = self.layout.text.w as f32;
+            let pad = 24.0 * scale;
+            if cx < self.scroll_x_px + pad {
+                self.scroll_x_px = (cx - pad).max(0.0);
+            } else if cx > self.scroll_x_px + text_w - pad {
+                self.scroll_x_px = (cx - text_w + pad).max(0.0);
             }
         }
     }
@@ -699,14 +1054,21 @@ impl Viewport {
         let scale = painter.scale();
         let font_px = self.font_px(scale);
         let metrics = atlas.metrics(rasterizer, FontStyle::Mono, font_px);
-        let layout = self.compute_layout(rect, doc, metrics, scale);
-        self.sync_wrap_cache(doc.generation(), layout.text.w, font_px);
+        let line_h = metrics.line_height.max(1) as f32;
+        // Guarantee lazy PieceTree indexing covers at least the visible viewport + lookahead,
+        // even for >16 KB files that start with long single lines.
+        let est_vis_lines = ((rect.h.max(1) as f32) / line_h).ceil().max(1.0) as usize;
+        doc.tree_mut()
+            .ensure_indexed_for_line(self.scroll_top_line + est_vis_lines + 8);
+        let pre_layout = self.compute_layout(rect, doc, metrics, scale);
+        self.sync_wrap_cache(doc.generation(), pre_layout.text.w, font_px);
+        self.sync_wrapped_metrics(doc, pre_layout.text.w, metrics, scale);
         self.clamp_vertical_scroll(doc, metrics, scale);
+        let layout = self.compute_layout(rect, doc, metrics, scale);
 
         let clip = painter.current_clip();
         let hairline = (1.0 * scale).round().max(1.0) as i32;
         let text_pad_x = px(12.0, scale) as f32;
-        let line_h = metrics.line_height.max(1) as f32;
         let cell_w = metrics.cell_width;
         let max_wrap_w = (layout.text.w as f32 - text_pad_x * 2.0).max(cell_w * 4.0);
 

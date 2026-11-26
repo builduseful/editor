@@ -169,6 +169,63 @@ fn viewport_vertical_scroll_clamps_flush_to_bottom_with_no_excess_whitespace() {
         (cur_scroll - expected_max).abs() <= 1.0,
         "scroll={cur_scroll} expected={expected_max} (should leave zero bottom void)"
     );
+
+    // 3. Word-wrapped document with FEWER logical lines than viewport height, but MORE visual
+    // wrapped lines than viewport height: MUST show a vertical scrollbar, scroll via wheel,
+    // and auto-scroll when the caret moves down to the bottom wrapped rows!
+    let mut wrapped_text = String::new();
+    for i in 0..12 {
+        wrapped_text.push_str(&format!(
+            "Paragraph {i}: the quick brown fox jumps over the lazy dog repeatedly to force multiple wrapped visual lines inside a narrow pane.\n"
+        ));
+    }
+    let mut wrapped_doc = Document::from_str(&wrapped_text, None);
+    let narrow = PixelRect::new(0, 0, 320, 260);
+    let mut wvp = Viewport::new();
+    wvp.word_wrap = true;
+    let mut fb = Framebuffer::new(320, 260, 1.0);
+    let mut atlas = GlyphAtlas::new();
+    let theme = Theme::light();
+    {
+        let mut p = Painter::new(&mut fb);
+        wvp.draw(
+            &mut p,
+            narrow,
+            &mut wrapped_doc,
+            0,
+            None,
+            &[],
+            None,
+            None,
+            &editor_render::ImeComposition::default(),
+            true,
+            true,
+            &theme,
+            &mut atlas,
+            &mut raster,
+        );
+    }
+    assert!(
+        !wvp.layout.v_thumb.is_empty(),
+        "wrapped document overflowing viewport visually must display vertical scrollbar thumb"
+    );
+
+    // Moving caret to the last logical line (11 < visible logical lines) MUST scroll down!
+    let last_byte = wrapped_doc.len_bytes();
+    wvp.ensure_caret_visible(&mut wrapped_doc, last_byte, metrics, 1.0);
+    assert!(
+        wvp.scroll_top_line > 0 || wvp.scroll_sub_y_px > 0.0,
+        "ensure_caret_visible must scroll down when wrapped lines push caret past viewport bottom"
+    );
+
+    // Wheel scrolling down from top must advance smoothly through wrapped visual rows.
+    wvp.scroll_top_line = 0;
+    wvp.scroll_sub_y_px = 0.0;
+    wvp.scroll_by(0.0, 200.0, &mut wrapped_doc, metrics, 1.0);
+    assert!(
+        wvp.scroll_top_line > 0 || wvp.scroll_sub_y_px > 0.0,
+        "scroll_by must scroll wrapped content even when logical lines < viewport height"
+    );
 }
 
 #[test]
