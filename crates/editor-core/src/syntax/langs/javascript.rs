@@ -263,7 +263,8 @@ fn scan_template_segment(cur: &mut ByteCursor<'_>, out: &mut Vec<TokenSpan>) -> 
         if b == b'\\' && cur.pos + 1 < len {
             push_span(out, seg_start, cur.pos, TokenKind::String);
             let es = cur.pos;
-            cur.advance(2);
+            cur.advance(1);
+            cur.bump_char();
             push_span(out, es, cur.pos, TokenKind::Escape);
             seg_start = cur.pos;
         } else if b == b'$' && cur.peek_at(1) == Some(b'{') {
@@ -317,7 +318,8 @@ fn scan_regex_literal(cur: &mut ByteCursor<'_>, out: &mut Vec<TokenSpan>) {
     while !cur.is_eof() {
         let b = cur.bytes[cur.pos];
         if b == b'\\' && cur.pos + 1 < cur.len() {
-            cur.advance(2);
+            cur.advance(1);
+            cur.bump_char();
         } else if b == b'[' {
             in_class = true;
             cur.advance(1);

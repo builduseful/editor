@@ -392,24 +392,34 @@ impl<'a> Painter<'a> {
             GlyphFormat::Bgra32 => {
                 let (color_buf, color_stride_u32) = atlas.color_pixels();
                 let color_stride = (color_stride_u32 as usize) * 4;
+                let fg_a = fg.a as u32;
                 for row in 0..draw_h {
                     let src_row = ((glyph.atlas_y as usize) + sy0 + row) * color_stride
                         + ((glyph.atlas_x as usize) + sx0) * 4;
                     let dst_row = ((clipped.y as usize) + row) * fb_stride + (clipped.x as usize);
                     for col in 0..draw_w {
                         let si = src_row + col * 4;
-                        let sb = color_buf[si] as u32;
-                        let sg = color_buf[si + 1] as u32;
-                        let sr = color_buf[si + 2] as u32;
-                        let sa = color_buf[si + 3] as u32;
+                        let mut sb = color_buf[si] as u32;
+                        let mut sg = color_buf[si + 1] as u32;
+                        let mut sr = color_buf[si + 2] as u32;
+                        let mut sa = color_buf[si + 3] as u32;
                         if sa == 0 {
                             continue;
+                        }
+                        if fg_a < 255 {
+                            sr = (sr * fg_a + 127) / 255;
+                            sg = (sg * fg_a + 127) / 255;
+                            sb = (sb * fg_a + 127) / 255;
+                            sa = (sa * fg_a + 127) / 255;
+                            if sa == 0 {
+                                continue;
+                            }
                         }
                         let dst = &mut self.surf.pixels[dst_row + col];
                         if sa == 255 {
                             *dst = (0xFFu32 << 24) | (sr << 16) | (sg << 8) | sb;
                         } else {
-                            // Source is already premultiplied BGRA8.
+                            // Source is premultiplied BGRA8.
                             let inv = 255 - sa;
                             let dr = (*dst >> 16) & 0xFF;
                             let dg = (*dst >> 8) & 0xFF;
@@ -493,8 +503,8 @@ impl<'a> Painter<'a> {
     /// Shift a sub-rectangle of the framebuffer vertically by `dy` pixels (positive = move down).
     /// Enables sub-millisecond scrolling by reusing 95% of already-rasterized pixels!
     pub fn scroll_rect_vertical(&mut self, rect: PixelRect, dy: i32) {
-        let r = rect.intersect(self.surf.bounds());
-        if r.is_empty() || dy == 0 || dy.abs() >= r.h {
+        let r = rect.intersect(self.current_clip());
+        if r.is_empty() || dy == 0 || dy.unsigned_abs() >= r.h as u32 {
             return;
         }
         let stride = self.surf.stride;

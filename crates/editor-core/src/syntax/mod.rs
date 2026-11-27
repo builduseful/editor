@@ -470,11 +470,22 @@ impl SyntaxCache {
         }
     }
 
-    /// Mark lines starting at `line` as potentially stale WITHOUT discarding prior end states,
-    /// so subsequent lexing can converge and stop early as soon as `new_state == old_state`.
+    /// Invalidate cached end states from `line` onward (truncating potentially shifted states
+    /// after line-count-changing operations such as undo, redo, multi-cursor edits, or replace-all).
     pub fn invalidate_from(&mut self, line: usize) {
-        self.dirty_from = self.dirty_from.min(line);
-        self.dirty_through = self.dirty_through.max(line);
+        if line < self.cache_offset {
+            self.cache_offset = 0;
+            self.end_states.clear();
+            self.dirty_from = 0;
+            self.dirty_through = line;
+        } else {
+            let rel = line - self.cache_offset;
+            if rel < self.end_states.len() {
+                self.end_states.truncate(rel);
+            }
+            self.dirty_from = self.dirty_from.min(line);
+            self.dirty_through = self.dirty_through.max(line);
+        }
     }
 
     /// Adjust cached end-states when an edit at `line` changes the line count by `delta_lines`.
@@ -490,15 +501,21 @@ impl SyntaxCache {
         }
         let rel = start_line - self.cache_offset;
         if delta_lines > 0 && rel < self.end_states.len() {
-            let add = (delta_lines as usize).min(4096);
-            let fill = self
-                .end_states
-                .get(rel)
-                .copied()
-                .unwrap_or(LexState::NORMAL);
-            self.end_states
-                .splice(rel..rel, std::iter::repeat_n(fill, add));
-            self.dirty_through = self.dirty_through.max(start_line + add);
+            let add = delta_lines as usize;
+            if add > 4096 {
+                // Large paste: truncate tail so shifted states cannot cause premature convergence.
+                self.end_states.truncate(rel);
+                self.dirty_through = self.dirty_through.max(start_line);
+            } else {
+                let fill = self
+                    .end_states
+                    .get(rel)
+                    .copied()
+                    .unwrap_or(LexState::NORMAL);
+                self.end_states
+                    .splice(rel..rel, std::iter::repeat_n(fill, add));
+                self.dirty_through = self.dirty_through.max(start_line + add);
+            }
         } else if delta_lines < 0 && rel < self.end_states.len() {
             let rem = (-delta_lines) as usize;
             let end = (rel + rem).min(self.end_states.len());
@@ -608,7 +625,7 @@ impl SyntaxCache {
         };
         if line_text.is_empty() || line_text.len() > MAX_LEX_LINE_BYTES {
             self.set_end_state(line_idx, start_state);
-            if line_idx >= self.dirty_from {
+            if line_idx == self.dirty_from {
                 self.dirty_from = line_idx + 1;
             }
             return start_state;
@@ -619,7 +636,7 @@ impl SyntaxCache {
             .lex_line(line_text, start_state, registry, out);
 
         self.set_end_state(line_idx, end_state);
-        if line_idx >= self.dirty_from {
+        if line_idx == self.dirty_from {
             self.dirty_from = line_idx + 1;
         }
         end_state

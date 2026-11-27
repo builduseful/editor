@@ -180,7 +180,8 @@ fn scan_ps_double_string(cur: &mut ByteCursor<'_>, out: &mut Vec<TokenSpan>) {
         if b == b'`' && cur.pos + 1 < cur.len() {
             push_span(out, seg_start, cur.pos, TokenKind::String);
             let es = cur.pos;
-            cur.advance(2);
+            cur.advance(1);
+            cur.bump_char();
             push_span(out, es, cur.pos, TokenKind::Escape);
             seg_start = cur.pos;
         } else if b == b'"' {

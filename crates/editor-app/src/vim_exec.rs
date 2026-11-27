@@ -60,6 +60,7 @@ impl EditorApp {
                 host.request_redraw();
             }
             VimAction::OperatorMotion { op, motion, count } => {
+                self.extra_cursors.clear();
                 let start = self.caret;
                 let end = self.resolve_vim_motion(motion, count, true, rasterizer);
                 let (a, b) = if start <= end {
@@ -74,24 +75,42 @@ impl EditorApp {
                 } else if b > a {
                     self.vim.last_yank_linewise = false;
                     self.apply_vim_byte_range(op, a, b, rasterizer, clipboard, host);
+                } else {
+                    self.mark_dirty_rect(self.layout.status_bar);
+                    host.request_redraw();
                 }
             }
             VimAction::OperatorLines { op, count } => {
+                self.extra_cursors.clear();
                 let (line, _) = self.doc.byte_to_line_col(self.caret);
                 let max_line = self.doc.editable_line_count().saturating_sub(1);
                 let end_line = (line + count.saturating_sub(1)).min(max_line);
                 self.apply_vim_line_range(op, line, end_line, rasterizer, clipboard, host);
             }
             VimAction::OperatorTextObject { op, obj } => {
+                self.extra_cursors.clear();
                 if let Some((a, b)) = self.resolve_text_object(obj) {
                     self.vim.last_yank_linewise = false;
                     self.apply_vim_byte_range(op, a, b, rasterizer, clipboard, host);
+                } else {
+                    self.mark_dirty_rect(self.layout.status_bar);
+                    host.request_redraw();
                 }
             }
-            VimAction::VisualApply(op) => {
-                if let Some((a, b)) = self.selection() {
-                    let linewise = self.vim.mode == VimMode::VisualLine;
-                    self.vim.last_yank_linewise = linewise;
+            VimAction::VisualApply { op, linewise } => {
+                self.extra_cursors.clear();
+                self.vim.last_yank_linewise = linewise;
+                if linewise {
+                    let (la, lb) = if let Some((a, b)) = self.selection() {
+                        let (la, _) = self.doc.byte_to_line_col(a);
+                        let (lb, _) = self.doc.byte_to_line_col(b.saturating_sub(1).max(a));
+                        (la, lb)
+                    } else {
+                        let (line, _) = self.doc.byte_to_line_col(self.caret);
+                        (line, line)
+                    };
+                    self.apply_vim_line_range(op, la, lb, rasterizer, clipboard, host);
+                } else if let Some((a, b)) = self.selection() {
                     if matches!(op, VimOperator::Indent | VimOperator::Outdent) {
                         let (la, _) = self.doc.byte_to_line_col(a);
                         let (lb, _) = self.doc.byte_to_line_col(b.saturating_sub(1).max(a));
@@ -99,9 +118,28 @@ impl EditorApp {
                     } else {
                         self.apply_vim_byte_range(op, a, b, rasterizer, clipboard, host);
                     }
+                } else {
+                    // Immediate charwise visual operator (`vd`, `vy`, `vc`, `v>`, `v<`) with no
+                    // motion yet: operate on the single grapheme under the caret (or current line
+                    // for indent/outdent).
+                    let (line, col) = self.doc.byte_to_line_col(self.caret);
+                    if matches!(op, VimOperator::Indent | VimOperator::Outdent) {
+                        self.apply_vim_line_range(op, line, line, rasterizer, clipboard, host);
+                    } else if let Some((ls, content_end, _)) = self.doc.line_byte_range(line) {
+                        let content = self.doc.line_content(line).unwrap_or_default();
+                        let next = next_grapheme_boundary(&content, col.min(content.len()));
+                        let end = (ls + next as u64).min(content_end);
+                        if end > self.caret || op == VimOperator::Change {
+                            self.apply_vim_byte_range(op, self.caret, end, rasterizer, clipboard, host);
+                        } else {
+                            self.mark_dirty();
+                            host.request_redraw();
+                        }
+                    }
                 }
             }
             VimAction::EnterInsert { kind } => {
+                self.extra_cursors.clear();
                 self.anchor = self.caret;
                 let (line, col) = self.doc.byte_to_line_col(self.caret);
                 match kind {
@@ -195,6 +233,7 @@ impl EditorApp {
                 host.request_redraw();
             }
             VimAction::DeleteChar { before, count } => {
+                self.extra_cursors.clear();
                 let (line, col) = self.doc.byte_to_line_col(self.caret);
                 let Some((ls, content_end, _)) = self.doc.line_byte_range(line) else {
                     return;
@@ -227,6 +266,7 @@ impl EditorApp {
                 }
             }
             VimAction::ReplaceChar(ch) => {
+                self.extra_cursors.clear();
                 let (line, col) = self.doc.byte_to_line_col(self.caret);
                 let Some((ls, content_end, _)) = self.doc.line_byte_range(line) else {
                     return;
@@ -244,6 +284,7 @@ impl EditorApp {
                 }
             }
             VimAction::JoinLines(count) => {
+                self.extra_cursors.clear();
                 let (line, _) = self.doc.byte_to_line_col(self.caret);
                 let mut joined = false;
                 for _ in 0..count {
@@ -268,6 +309,7 @@ impl EditorApp {
                 }
             }
             VimAction::Paste { before, linewise } => {
+                self.extra_cursors.clear();
                 let Some(text) = clipboard.get_text() else {
                     return;
                 };
@@ -315,7 +357,11 @@ impl EditorApp {
                         self.caret
                     };
                     if let Ok(pos) = self.doc.edit(ins_at, 0, &text, self.now_ms, false) {
-                        self.caret = pos.saturating_sub(1).max(ins_at);
+                        self.caret = if pos > ins_at {
+                            self.move_grapheme_left(pos).max(ins_at)
+                        } else {
+                            ins_at
+                        };
                         self.anchor = self.caret;
                         self.after_document_mutated(rasterizer, host);
                     }
@@ -629,7 +675,11 @@ impl EditorApp {
                         }
                         if let Some(idx) = found {
                             let final_col = if matches!(kind, FindCharKind::TillForward) {
-                                prev_grapheme_boundary(&content, idx)
+                                if inclusive_op {
+                                    idx
+                                } else {
+                                    prev_grapheme_boundary(&content, idx)
+                                }
                             } else if inclusive_op {
                                 idx + ch.len_utf8()
                             } else {
@@ -643,7 +693,11 @@ impl EditorApp {
                     FindCharKind::Backward | FindCharKind::TillBackward => {
                         let mut found = None;
                         let mut rem = count;
-                        for (idx, c) in content[..cur].char_indices().rev() {
+                        let mut safe_cur = cur.min(content.len());
+                        while safe_cur > 0 && !content.is_char_boundary(safe_cur) {
+                            safe_cur -= 1;
+                        }
+                        for (idx, c) in content[..safe_cur].char_indices().rev() {
                             if c == ch {
                                 rem -= 1;
                                 if rem == 0 {
@@ -693,14 +747,23 @@ impl EditorApp {
                     }
                     None
                 } else {
-                    // Enclosing bracket pair on current line.
+                    if content.is_empty() {
+                        return None;
+                    }
+                    // Enclosing bracket pair on current line (UTF-8 char-boundary safe).
+                    let mut safe_cur = cur.min(content.len());
+                    while safe_cur > 0 && !content.is_char_boundary(safe_cur) {
+                        safe_cur -= 1;
+                    }
+                    let scan_end = if safe_cur < content.len() {
+                        next_grapheme_boundary(&content, safe_cur)
+                    } else {
+                        content.len()
+                    };
                     let mut depth = 0i32;
                     let mut open_idx = None;
-                    for (i, c) in content[..=cur.min(content.len().saturating_sub(1))]
-                        .char_indices()
-                        .rev()
-                    {
-                        if c == close && i != cur {
+                    for (i, c) in content[..scan_end].char_indices().rev() {
+                        if c == close && i != safe_cur {
                             depth += 1;
                         } else if c == open {
                             if depth == 0 {
@@ -741,8 +804,10 @@ impl EditorApp {
         host: &mut dyn PlatformHost,
     ) {
         let len = (b - a) as usize;
-        let text = String::from_utf8_lossy(&self.doc.read_range(a, len)).into_owned();
-        clipboard.set_text(&text);
+        if !matches!(op, VimOperator::Indent | VimOperator::Outdent) {
+            let text = String::from_utf8_lossy(&self.doc.read_range(a, len)).into_owned();
+            clipboard.set_text(&text);
+        }
         match op {
             VimOperator::Yank => {
                 self.caret = a;
@@ -752,7 +817,15 @@ impl EditorApp {
                 host.request_redraw();
             }
             VimOperator::Delete | VimOperator::Change => {
-                if let Ok(pos) = self.doc.edit(a, len as u64, "", self.now_ms, false) {
+                if op == VimOperator::Change {
+                    self.vim.mode = VimMode::Insert;
+                }
+                if len == 0 {
+                    self.caret = a;
+                    self.anchor = a;
+                    self.mark_dirty();
+                    host.request_redraw();
+                } else if let Ok(pos) = self.doc.edit(a, len as u64, "", self.now_ms, false) {
                     self.caret = pos;
                     self.anchor = pos;
                     self.after_document_mutated(rasterizer, host);
@@ -819,6 +892,7 @@ impl EditorApp {
                 }
             }
             VimOperator::Change => {
+                self.vim.mode = VimMode::Insert;
                 self.vim.last_yank_linewise = true;
                 let content = self.doc.line_content(start_line).unwrap_or_default();
                 let indent: String = content

@@ -529,10 +529,16 @@ impl Arrangement {
     }
 
     pub fn set_col_ratio(&mut self, ratio: f32) {
+        if !ratio.is_finite() {
+            return;
+        }
         self.col_ratio = ratio.clamp(0.15, 0.85);
     }
 
     pub fn set_row_ratio(&mut self, col: usize, ratio: f32) {
+        if !ratio.is_finite() {
+            return;
+        }
         self.row_ratio[col.min(1)] = ratio.clamp(0.15, 0.85);
     }
 

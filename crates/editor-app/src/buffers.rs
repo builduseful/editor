@@ -26,15 +26,6 @@ pub const MAX_PINS: usize = 9;
 /// Pinned (`1..9`), dirty (unsaved), and split-visible tabs are never evicted.
 pub const DEFAULT_MAX_OPEN_TABS: usize = 8;
 
-/// Compact cursor + scroll memory retained when a clean unpinned buffer is LRU-evicted.
-#[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct SavedViewState {
-    pub caret: u64,
-    pub scroll_top_line: usize,
-    pub scroll_sub_y_px: f32,
-    pub scroll_x_px: f32,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenMode {
     /// Transient single-click browse slot (replaced in place on next single-click).
@@ -61,6 +52,13 @@ pub struct BufferMeta {
     pub path: Option<PathBuf>,
     pub file_name: String,
     pub dirty: bool,
+    /// Stable Hot Exit draft ID once backed up (cleared when saved/discarded).
+    pub draft_id: Option<u64>,
+    /// `Document::generation()` at the time this buffer's current `.buf` snapshot was committed.
+    pub last_backed_up_gen: u64,
+    /// `(undo_rev, is_draft, binding_rev)` of the last persisted `.undo` snapshot so no-op blurs
+    /// and quits do zero `.undo` writes.
+    pub last_persisted_undo_sig: (u64, bool, u64),
 }
 
 pub struct WorkingSet {
@@ -87,6 +85,9 @@ impl WorkingSet {
                 path: None,
                 file_name: "Untitled".to_string(),
                 dirty: false,
+                draft_id: None,
+                last_backed_up_gen: 0,
+                last_persisted_undo_sig: (0, false, 0),
             },
         );
         Self {
@@ -110,6 +111,9 @@ impl WorkingSet {
                 path,
                 file_name,
                 dirty,
+                draft_id: None,
+                last_backed_up_gen: 0,
+                last_persisted_undo_sig: (0, false, 0),
             },
         );
         id
@@ -117,6 +121,42 @@ impl WorkingSet {
 
     pub fn get_meta(&self, id: BufferId) -> Option<&BufferMeta> {
         self.meta.get(&id)
+    }
+
+    pub fn get_meta_mut(&mut self, id: BufferId) -> Option<&mut BufferMeta> {
+        self.meta.get_mut(&id)
+    }
+
+    pub fn set_draft_state(&mut self, id: BufferId, draft_id: Option<u64>, backed_up_gen: u64) {
+        if let Some(m) = self.meta.get_mut(&id) {
+            m.draft_id = draft_id;
+            m.last_backed_up_gen = backed_up_gen;
+        }
+    }
+
+    pub fn set_undo_sig(&mut self, id: BufferId, sig: (u64, bool, u64)) {
+        if let Some(m) = self.meta.get_mut(&id) {
+            m.last_persisted_undo_sig = sig;
+        }
+    }
+
+    pub fn find_by_draft_id(&self, draft_id: u64) -> Option<BufferId> {
+        self.meta
+            .values()
+            .find(|m| m.draft_id == Some(draft_id))
+            .map(|m| m.id)
+    }
+
+    pub fn parked_ids(&self) -> Vec<BufferId> {
+        self.parked.keys().copied().collect()
+    }
+
+    pub fn parked_mut(&mut self, id: BufferId) -> Option<&mut ParkedBuffer> {
+        self.parked.get_mut(&id)
+    }
+
+    pub fn parked_ref(&self, id: BufferId) -> Option<&ParkedBuffer> {
+        self.parked.get(&id)
     }
 
     pub fn update_meta(&mut self, id: BufferId, path: Option<PathBuf>, file_name: String, dirty: bool) {
@@ -132,6 +172,9 @@ impl WorkingSet {
                     path,
                     file_name,
                     dirty,
+                    draft_id: None,
+                    last_backed_up_gen: 0,
+                    last_persisted_undo_sig: (0, false, 0),
                 },
             );
         }
@@ -163,35 +206,6 @@ impl WorkingSet {
 
     /// Check clean parked buffers matching `changed` (or all clean parked buffers if `changed` is empty)
     /// and silently reload any whose on-disk identity changed. Never overwrites dirty buffers.
-    pub fn reload_clean_parked(
-        &mut self,
-        fs: &dyn editor_platform::FileSystem,
-        changed: &[PathBuf],
-    ) -> bool {
-        let mut any = false;
-        for parked in self.parked.values_mut() {
-            if parked.doc.is_dirty() {
-                continue;
-            }
-            let Some(p) = parked.doc.path() else {
-                continue;
-            };
-            let matches = changed.is_empty()
-                || changed
-                    .iter()
-                    .any(|c| c == p || p.parent() == Some(c.as_path()));
-            if matches
-                && parked.doc.check_identity(fs) == editor_core::IdentityCheck::ReloadedClean
-            {
-                let len = parked.doc.len_bytes();
-                parked.caret = parked.caret.min(len);
-                parked.anchor = parked.anchor.min(len);
-                any = true;
-            }
-        }
-        any
-    }
-
     /// Apply `replace_all_with_options` to a parked buffer matching `path` (keeps edits undoable!).
     /// Returns `Some(replaced_count)` if `path` was parked in the working set.
     pub fn replace_all_in_parked_by_path(
@@ -252,6 +266,7 @@ impl WorkingSet {
 
     pub fn remap_paths(
         &mut self,
+        fs: &dyn editor_platform::FileSystem,
         from: &Path,
         to: &Path,
         is_dir: bool,
@@ -273,12 +288,28 @@ impl WorkingSet {
         };
         for parked in self.parked.values_mut() {
             if let Some(new_p) = parked.doc.path().and_then(remap) {
-                parked.doc.set_path(new_p);
-                let lang = editor_core::Language::from_path_with_overrides(
+                let old_default = editor_core::Language::from_path_with_overrides(
                     parked.doc.path(),
                     syntax_ext_map,
                 );
-                parked.doc.set_language(lang);
+                let cur_rev = parked.doc.rev();
+                parked.doc.set_path(new_p.clone());
+                if let Ok(st) = fs.stat(&new_p) {
+                    if st.rev.dev == cur_rev.dev
+                        && st.rev.ino == cur_rev.ino
+                        && st.rev.size == cur_rev.size
+                        && st.rev.mtime_ns == cur_rev.mtime_ns
+                    {
+                        parked.doc.set_rev(st.rev);
+                    }
+                }
+                let new_default = editor_core::Language::from_path_with_overrides(
+                    parked.doc.path(),
+                    syntax_ext_map,
+                );
+                if old_default != new_default {
+                    parked.doc.set_language(new_default);
+                }
             }
         }
         for meta in self.meta.values_mut() {
@@ -289,6 +320,7 @@ impl WorkingSet {
                     .unwrap_or("Untitled")
                     .to_string();
                 meta.path = Some(new_p);
+                meta.last_persisted_undo_sig = (0, false, 0);
             }
         }
     }
@@ -533,13 +565,13 @@ impl WorkingSet {
     ///
     /// Evicts least-recently-used clean tabs that are NOT in `protected_ids` (active or visible
     /// split panes), NEVER evicting pinned (`1..9`) or dirty (unsaved) buffers.
-    /// Returns each evicted buffer's `(id, path, saved_view_state)` so the app can retain
-    /// lightweight cursor/scroll memory if the file is re-opened later.
+    /// Returns each evicted buffer's `(id, path, parked_buffer)` so the app can retain
+    /// RAM-only cursor/scroll recall for the current session.
     pub fn evict_lru_open(
         &mut self,
         max_open: usize,
         protected_ids: &[BufferId],
-    ) -> Vec<(BufferId, Option<PathBuf>, Option<SavedViewState>)> {
+    ) -> Vec<(BufferId, Option<PathBuf>, Option<ParkedBuffer>)> {
         let mut evicted = Vec::new();
         if max_open == 0 || self.open.len() <= max_open {
             return evicted;
@@ -564,14 +596,9 @@ impl WorkingSet {
                 break;
             };
             let path = self.meta.get(&victim).and_then(|m| m.path.clone());
-            let view = self.parked.get(&victim).map(|p| SavedViewState {
-                caret: p.caret,
-                scroll_top_line: p.scroll_top_line,
-                scroll_sub_y_px: p.scroll_sub_y_px,
-                scroll_x_px: p.scroll_x_px,
-            });
+            let parked = self.parked.remove(&victim);
             self.remove_buffer(victim);
-            evicted.push((victim, path, view));
+            evicted.push((victim, path, parked));
         }
         evicted
     }

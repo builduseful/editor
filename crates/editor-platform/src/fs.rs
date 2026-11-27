@@ -206,6 +206,58 @@ pub trait FileSystem: Send + Sync {
 // Portable std::fs implementation (Unix + Windows)
 // ============================================================================
 
+/// Recursively ensure `dir` exists through `fs` (works on both `StdFileSystem` and
+/// `MemoryFileSystem`) and tighten directory permissions to `0o700` on Unix.
+pub fn ensure_private_dir(fs: &dyn FileSystem, dir: &Path) -> FsResult<()> {
+    if fs.stat(dir).map(|s| s.is_dir).unwrap_or(false) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+        }
+        return Ok(());
+    }
+    let mut missing: Vec<PathBuf> = Vec::new();
+    let mut cur = Some(dir.to_path_buf());
+    while let Some(p) = cur {
+        if fs.stat(&p).map(|s| s.is_dir).unwrap_or(false) {
+            break;
+        }
+        let parent = p.parent().map(Path::to_path_buf);
+        if parent.as_deref() == Some(p.as_path()) {
+            break;
+        }
+        missing.push(p);
+        cur = parent;
+    }
+    for p in missing.into_iter().rev() {
+        match fs.create_dir(&p) {
+            Ok(()) => {}
+            Err(FsError::AlreadyExists(_)) if fs.stat(&p).map(|s| s.is_dir).unwrap_or(false) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    Ok(())
+}
+
+/// Best-effort tighten a private app-state file to `0o600` on Unix (no-op on Windows / memory FS).
+pub fn set_private_file_permissions(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct StdFileSystem;
 
@@ -292,9 +344,13 @@ impl FileHandle for StdFileHandle {
         #[cfg(unix)]
         {
             use std::os::unix::fs::FileExt;
-            self.file
-                .read_at(buf, offset)
-                .map_err(|e| map_io_err(&self.path, e))
+            loop {
+                match self.file.read_at(buf, offset) {
+                    Ok(n) => return Ok(n),
+                    Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e) => return Err(map_io_err(&self.path, e)),
+                }
+            }
         }
         #[cfg(windows)]
         {
@@ -307,17 +363,27 @@ impl FileHandle for StdFileHandle {
 }
 
 fn unique_temp_path(target: &Path) -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static TEMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
     let parent = target.parent().unwrap_or_else(|| Path::new("."));
-    let base = target
+    let raw_base = target
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("file");
+    // Cap base prefix at <= 80 UTF-8 bytes so `.{base}.editor-tmp-{pid}-{nanos}-{seq}` stays well under NAME_MAX (255).
+    let mut base_end = raw_base.len().min(80);
+    while base_end > 0 && !raw_base.is_char_boundary(base_end) {
+        base_end -= 1;
+    }
+    let base = if base_end == 0 { "file" } else { &raw_base[..base_end] };
     let pid = std::process::id();
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    parent.join(format!(".{base}.editor-tmp-{pid}-{nanos}"))
+    let seq = TEMP_SEQ.fetch_add(1, Ordering::Relaxed);
+    parent.join(format!(".{base}.editor-tmp-{pid}-{nanos}-{seq}"))
 }
 
 impl FileSystem for StdFileSystem {
@@ -379,7 +445,8 @@ impl FileSystem for StdFileSystem {
             std::fs::canonicalize(path).map_err(|e| map_io_err(path, e))
         } else if let (Some(parent), Some(name)) = (path.parent(), path.file_name()) {
             let resolved_parent = if parent.as_os_str().is_empty() {
-                std::env::current_dir().map_err(|e| map_io_err(path, e))?
+                let cwd = std::env::current_dir().map_err(|e| map_io_err(path, e))?;
+                std::fs::canonicalize(&cwd).unwrap_or(cwd)
             } else {
                 std::fs::canonicalize(parent).map_err(|e| map_io_err(parent, e))?
             };
@@ -442,11 +509,12 @@ impl FileSystem for StdFileSystem {
     ) -> FsResult<FileStat> {
         let existing_perms = std::fs::metadata(path).ok().map(|m| m.permissions());
         let tmp_path = unique_temp_path(path);
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+            .map_err(|e| map_io_err(path, e))?;
         let write_result = (|| -> io::Result<()> {
-            let mut f = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp_path)?;
             {
                 let mut writer = io::BufWriter::with_capacity(64 * 1024, &mut f);
                 write_fn(&mut writer)?;
@@ -458,13 +526,31 @@ impl FileSystem for StdFileSystem {
             f.sync_data()?;
             Ok(())
         })();
+        drop(f);
 
         if let Err(err) = write_result {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(map_io_err(path, err));
         }
 
-        if let Err(err) = std::fs::rename(&tmp_path, path) {
+        #[cfg(target_os = "windows")]
+        let rename_res = {
+            let mut last = std::fs::rename(&tmp_path, path);
+            for delay_ms in [5u64, 15, 30] {
+                match &last {
+                    Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                        std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+                        last = std::fs::rename(&tmp_path, path);
+                    }
+                    _ => break,
+                }
+            }
+            last
+        };
+        #[cfg(not(target_os = "windows"))]
+        let rename_res = std::fs::rename(&tmp_path, path);
+
+        if let Err(err) = rename_res {
             let _ = std::fs::remove_file(&tmp_path);
             return Err(map_io_err(path, err));
         }
@@ -496,9 +582,11 @@ impl FileSystem for StdFileSystem {
             for (offset, data) in ranges {
                 let mut written = 0;
                 while written < data.len() {
-                    let n = file
-                        .write_at(&data[written..], offset + written as u64)
-                        .map_err(|e| map_io_err(path, e))?;
+                    let n = match file.write_at(&data[written..], offset + written as u64) {
+                        Ok(n) => n,
+                        Err(ref e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(map_io_err(path, e)),
+                    };
                     if n == 0 {
                         return Err(FsError::Io("short write_at".into()));
                     }

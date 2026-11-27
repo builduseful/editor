@@ -400,9 +400,12 @@ pub struct CommandPalette {
     last_search_selected: usize,
     // Modal-lifetime-only bounded text slab (<= 20 MB while Search in Files is open; 0 B closed).
     search_slab: Option<SearchSlab>,
+    /// Epoch counter incremented on `close()` / `invalidate_file_index()` / root switch so
+    /// cancelled background workers never leak or stash slabs across sessions or folders.
+    slab_epoch: Arc<AtomicU64>,
     /// Reclaim slot so cancelled background search workers return partial slabs instead of
-    /// discarding disk reads when the user types rapidly.
-    slab_stash: Arc<Mutex<Option<SearchSlab>>>,
+    /// discarding disk reads when the user types rapidly within the same search session.
+    slab_stash: Arc<Mutex<Option<(u64, SearchSlab)>>>,
     // Generation-stamped short-lived background workers (0.00% idle CPU when closed!).
     index_gen: Arc<AtomicU64>,
     index_task: Option<IndexTask>,
@@ -469,6 +472,7 @@ impl CommandPalette {
             last_search_query: String::new(),
             last_search_selected: 0,
             search_slab: None,
+            slab_epoch: Arc::new(AtomicU64::new(1)),
             slab_stash: Arc::new(Mutex::new(None)),
             index_gen: Arc::new(AtomicU64::new(0)),
             index_task: None,
@@ -538,17 +542,21 @@ impl CommandPalette {
 
     fn reclaim_stashed_slab(&mut self) {
         if self.search_slab.is_none() {
-            if let Ok(mut guard) = self.slab_stash.try_lock() {
-                if let Some(s) = guard.take() {
-                    self.search_slab = Some(s);
+            let cur_epoch = self.slab_epoch.load(Ordering::Relaxed);
+            if let Ok(mut guard) = self.slab_stash.lock() {
+                if let Some((ep, s)) = guard.take() {
+                    if ep == cur_epoch {
+                        self.search_slab = Some(s);
+                    }
                 }
             }
         }
     }
 
     fn clear_slab(&mut self) {
+        self.slab_epoch.fetch_add(1, Ordering::Relaxed);
         self.search_slab = None;
-        if let Ok(mut guard) = self.slab_stash.try_lock() {
+        if let Ok(mut guard) = self.slab_stash.lock() {
             *guard = None;
         }
     }
@@ -1285,12 +1293,15 @@ impl CommandPalette {
                     progress: Arc::clone(&progress),
                 });
                 let taken_slab = self.search_slab.take();
+                let cur_slab_epoch = self.slab_epoch.load(Ordering::Relaxed);
                 spawn_search_worker(
                     Arc::clone(&rt.fs),
                     Arc::clone(&rt.waker),
                     root,
                     files_slice,
                     taken_slab,
+                    Arc::clone(&self.slab_epoch),
+                    cur_slab_epoch,
                     Arc::clone(&self.slab_stash),
                     self.dirty_files.clone(),
                     compiled.clone(),
@@ -1623,11 +1634,11 @@ impl CommandPalette {
         }
         let xi = x_px.round() as i32;
         let yi = y_px.round() as i32;
-        let lines = (-dy_px / 18.0).round() as isize;
+        let lines = (dy_px / 18.0).round() as isize;
         let step = if lines == 0 {
-            if dy_px < 0.0 {
+            if dy_px > 0.0 {
                 1
-            } else if dy_px > 0.0 {
+            } else if dy_px < 0.0 {
                 -1
             } else {
                 0
@@ -2700,7 +2711,9 @@ fn spawn_search_worker(
     root: PathBuf,
     files: Vec<(usize, IndexedFile)>,
     mut slab_opt: Option<SearchSlab>,
-    slab_stash: Arc<Mutex<Option<SearchSlab>>>,
+    slab_epoch: Arc<AtomicU64>,
+    my_slab_epoch: u64,
+    slab_stash: Arc<Mutex<Option<(u64, SearchSlab)>>>,
     dirty_files: Vec<(PathBuf, Vec<u8>)>,
     compiled: CompiledQuery,
     max_matches: usize,
@@ -2858,20 +2871,27 @@ fn spawn_search_worker(
             slab.bytes_used = bytes_used.load(Ordering::Relaxed);
             slab.refresh_fully_loaded();
 
-            if gen_atomic.load(Ordering::Relaxed) == my_gen {
+            if gen_atomic.load(Ordering::Relaxed) == my_gen
+                && slab_epoch.load(Ordering::Relaxed) == my_slab_epoch
+            {
                 if let Ok(mut g) = progress.lock() {
                     g.done = true;
                     g.timed_out = timed_out_flag.load(Ordering::Relaxed);
                     g.returned_slab = Some(slab);
                 }
                 waker();
-            } else if let Ok(mut stash) = slab_stash.lock() {
-                // Keep the richer partially-filled slab available for the next keystroke!
-                let replace = stash
-                    .as_ref()
-                    .is_none_or(|prev| slab.bytes_used > prev.bytes_used);
-                if replace {
-                    *stash = Some(slab);
+            } else if slab_epoch.load(Ordering::Relaxed) == my_slab_epoch {
+                if let Ok(mut stash) = slab_stash.lock() {
+                    // Keep the richer partially-filled slab available for the next keystroke
+                    // strictly within the same modal session & root epoch!
+                    if slab_epoch.load(Ordering::Relaxed) == my_slab_epoch {
+                        let replace = stash
+                            .as_ref()
+                            .is_none_or(|(ep, prev)| *ep != my_slab_epoch || slab.bytes_used > prev.bytes_used);
+                        if replace {
+                            *stash = Some((my_slab_epoch, slab));
+                        }
+                    }
                 }
             }
         });

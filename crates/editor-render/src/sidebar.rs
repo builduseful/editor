@@ -114,20 +114,11 @@ pub enum SidebarPromptAction {
 pub enum SidebarContextAction {
     NewFile,
     NewFolder,
+    RevealInFileManager,
     CopyPath,
     CopyRelativePath,
     Rename,
     Delete,
-}
-
-#[derive(Debug, Clone)]
-struct SidebarContextMenu {
-    anchor_x: i32,
-    anchor_y: i32,
-    has_target: bool,
-    hovered: Option<usize>,
-    card_rect: PixelRect,
-    item_rects: Vec<(SidebarContextAction, PixelRect)>,
 }
 
 #[derive(Debug, Clone)]
@@ -196,8 +187,6 @@ pub struct Sidebar {
     inline_edit: Option<InlineEdit>,
     /// Caret blink visibility forwarded from `EditorApp` for the inline editor.
     prompt_caret_visible: bool,
-    /// Active custom-drawn right-click context menu.
-    context_menu: Option<SidebarContextMenu>,
     /// Highlighted destination directory while dragging a file or folder inside the sidebar.
     drop_target_dir: Option<PathBuf>,
     header_height_px: i32,
@@ -234,7 +223,6 @@ impl Sidebar {
             minimize_rect: PixelRect::ZERO,
             inline_edit: None,
             prompt_caret_visible: true,
-            context_menu: None,
             drop_target_dir: None,
             header_height_px: 30,
             last_viewport_h_px: 400,
@@ -268,7 +256,6 @@ impl Sidebar {
             self.edge_hovered = false;
             self.edge_active = false;
             self.inline_edit = None;
-            self.context_menu = None;
         }
     }
 
@@ -563,7 +550,6 @@ impl Sidebar {
             input_rect: PixelRect::ZERO,
         });
         self.ensure_row_visible(slot_idx, self.last_viewport_h_px);
-        self.context_menu = None;
         self.focused = true;
         true
     }
@@ -588,7 +574,6 @@ impl Sidebar {
             input_rect: PixelRect::ZERO,
         });
         self.ensure_row_visible(slot_idx, self.last_viewport_h_px);
-        self.context_menu = None;
         self.focused = true;
         true
     }
@@ -631,7 +616,6 @@ impl Sidebar {
             input_rect: PixelRect::ZERO,
         });
         self.ensure_row_visible(slot_idx, self.last_viewport_h_px);
-        self.context_menu = None;
         self.focused = true;
         true
     }
@@ -670,14 +654,6 @@ impl Sidebar {
             }
         }
         (SidebarPromptAction::Changed, None)
-    }
-
-    pub fn is_context_menu_open(&self) -> bool {
-        self.context_menu.is_some()
-    }
-
-    pub fn close_context_menu(&mut self) {
-        self.context_menu = None;
     }
 
     pub fn set_drop_target(&mut self, dir: Option<PathBuf>) -> bool {
@@ -725,158 +701,45 @@ impl Sidebar {
         Some(candidate)
     }
 
-    pub fn open_context_menu(&mut self, rect: PixelRect, x_px: f32, y_px: f32, scale: f32) -> bool {
+    /// Hit-test a right-click inside the sidebar.
+    ///
+    /// Returns:
+    /// - `None` if hidden or outside the interactive tree area (or on header controls / resize edge).
+    /// - `Some(Some(path))` if a file or directory row was hit (selects the row and focuses the sidebar).
+    /// - `Some(None)` if empty space inside the sidebar body was hit (focuses the sidebar).
+    pub fn select_at_for_context_menu(
+        &mut self,
+        rect: PixelRect,
+        x_px: f32,
+        y_px: f32,
+        scale: f32,
+    ) -> Option<Option<PathBuf>> {
         if !self.visible || !rect.contains(x_px.round() as i32, y_px.round() as i32) {
-            return false;
+            return None;
         }
         self.cancel_prompt();
         let hit = self.hit_test(rect, x_px, y_px, scale);
-        let has_target = match hit {
+        match hit {
             SidebarHit::RowBody(i) | SidebarHit::RowDisclosure(i) | SidebarHit::RowEnter(i) => {
                 if let Some(row) = self.rows.get(i) {
-                    self.selected = Some(row.path.clone());
-                    true
+                    let path = row.path.clone();
+                    self.selected = Some(path.clone());
+                    self.focused = true;
+                    Some(Some(path))
                 } else {
-                    false
+                    self.focused = true;
+                    Some(None)
                 }
             }
-            _ => false,
-        };
-        self.focused = true;
-        self.context_menu = Some(SidebarContextMenu {
-            anchor_x: x_px.round() as i32,
-            anchor_y: y_px.round() as i32,
-            has_target,
-            hovered: None,
-            card_rect: PixelRect::ZERO,
-            item_rects: Vec::new(),
-        });
-        true
-    }
-
-    pub fn hover_context_menu(&mut self, x_px: f32, y_px: f32) -> (bool, bool) {
-        let Some(ref mut menu) = self.context_menu else {
-            return (false, false);
-        };
-        let xi = x_px.round() as i32;
-        let yi = y_px.round() as i32;
-        let next = menu
-            .item_rects
-            .iter()
-            .position(|(_, r)| r.contains(xi, yi));
-        let changed = menu.hovered != next;
-        menu.hovered = next;
-        (changed, next.is_some())
-    }
-
-    pub fn click_context_menu(&mut self, x_px: f32, y_px: f32) -> Option<SidebarContextAction> {
-        let menu = self.context_menu.take()?;
-        let xi = x_px.round() as i32;
-        let yi = y_px.round() as i32;
-        for (act, r) in menu.item_rects {
-            if r.contains(xi, yi) {
-                return Some(act);
+            SidebarHit::None => {
+                self.selected = None;
+                self.focused = true;
+                Some(None)
             }
-        }
-        None
-    }
-
-    pub fn draw_context_menu(
-        &mut self,
-        painter: &mut Painter,
-        bounds: PixelRect,
-        theme: &Theme,
-        atlas: &mut GlyphAtlas,
-        rasterizer: &mut dyn GlyphRasterizer,
-    ) {
-        let Some(ref mut menu) = self.context_menu else {
-            return;
-        };
-        let scale = painter.scale();
-        // `None` entries render a quiet hairline separator between logical groups.
-        let entries: Vec<Option<(SidebarContextAction, &str, bool)>> = if menu.has_target {
-            vec![
-                Some((SidebarContextAction::NewFile, "New File…", false)),
-                Some((SidebarContextAction::NewFolder, "New Folder…", false)),
-                None,
-                Some((SidebarContextAction::CopyPath, "Copy Path", false)),
-                Some((
-                    SidebarContextAction::CopyRelativePath,
-                    "Copy Relative Path",
-                    false,
-                )),
-                None,
-                Some((SidebarContextAction::Rename, "Rename…", false)),
-                Some((SidebarContextAction::Delete, "Delete…", true)),
-            ]
-        } else {
-            vec![
-                Some((SidebarContextAction::NewFile, "New File…", false)),
-                Some((SidebarContextAction::NewFolder, "New Folder…", false)),
-            ]
-        };
-        let pad = px(4.0, scale);
-        let row_h = px(24.0, scale);
-        let sep_h = px(7.0, scale);
-        let hairline = (1.0 * scale).round().max(1.0) as i32;
-        let card_w = px(164.0, scale);
-        let content_h: i32 = entries
-            .iter()
-            .map(|e| if e.is_some() { row_h } else { sep_h })
-            .sum();
-        let card_h = pad * 2 + content_h;
-        let x = menu
-            .anchor_x
-            .min(bounds.right() - card_w - px(6.0, scale))
-            .max(bounds.x + px(4.0, scale));
-        let y = menu
-            .anchor_y
-            .min(bounds.bottom() - card_h - px(6.0, scale))
-            .max(bounds.y + px(4.0, scale));
-        let card = PixelRect::new(x, y, card_w, card_h);
-        menu.card_rect = card;
-        menu.item_rects.clear();
-
-        painter.fill_rounded_rect(card, 6.0 * scale, theme.surface);
-        painter.stroke_rounded_rect(card, 6.0 * scale, (1.0 * scale).max(1.0), theme.border_control);
-
-        let font_px = 12.0 * scale;
-        let m = atlas.metrics(rasterizer, FontStyle::Ui, font_px);
-        let mut cy = card.y + pad;
-        let mut item_idx = 0usize;
-        for entry in entries {
-            let Some((act, label, is_danger)) = entry else {
-                let sy = cy + (sep_h - hairline) / 2;
-                painter.fill_rect(
-                    PixelRect::new(card.x + pad + px(4.0, scale), sy, card.w - (pad + px(4.0, scale)) * 2, hairline),
-                    theme.border_subtle,
-                );
-                cy += sep_h;
-                continue;
-            };
-            let r = PixelRect::new(card.x + pad, cy, card.w - pad * 2, row_h);
-            menu.item_rects.push((act, r));
-            if menu.hovered == Some(item_idx) {
-                painter.fill_rounded_rect(r, 4.0 * scale, theme.selection);
-            }
-            let baseline = r.y as f32 + (r.h as f32 + m.ascent - m.descent) * 0.5;
-            let col = if is_danger {
-                theme.state_danger
-            } else {
-                theme.text
-            };
-            painter.draw_text_ui(
-                (r.x + px(8.0, scale)) as f32,
-                baseline,
-                label,
-                FontStyle::Ui,
-                font_px,
-                col,
-                atlas,
-                rasterizer,
-            );
-            cy += row_h;
-            item_idx += 1;
+            SidebarHit::Breadcrumb(_)
+            | SidebarHit::Minimize
+            | SidebarHit::ResizeEdge
+            | SidebarHit::InlineInput => None,
         }
     }
 
@@ -1436,12 +1299,27 @@ impl Sidebar {
         let badge_px = 10.0 * scale;
         let metrics = atlas.metrics(rasterizer, FontStyle::Ui, font_px);
         let bmetrics = atlas.metrics(rasterizer, FontStyle::UiBold, badge_px);
+        // Cancel any inline prompt whose target slot is now out of bounds after a tree shrink.
+        if let Some(ref edit) = self.inline_edit {
+            let max_slot = if edit.is_virtual_insert() {
+                self.rows.len()
+            } else {
+                self.rows.len().saturating_sub(1)
+            };
+            if edit.slot_idx > max_slot || (!edit.is_virtual_insert() && self.rows.is_empty()) {
+                self.inline_edit = None;
+            }
+        }
         let virtual_insert = self
             .inline_edit
             .as_ref()
             .is_some_and(|e| e.is_virtual_insert());
         let inline_slot = self.inline_edit.as_ref().map(|e| e.slot_idx);
         let total_display_rows = self.rows.len() + usize::from(virtual_insert);
+        // Clamp `scroll_y_px` whenever rows shrink (e.g. collapsing an expanded folder).
+        let max_scroll =
+            ((total_display_rows as i32 * self.row_height_px) - list_rect.h).max(0) as f32;
+        self.scroll_y_px = self.scroll_y_px.clamp(0.0, max_scroll);
         let first_row = (self.scroll_y_px / self.row_height_px as f32).floor().max(0.0) as usize;
         let visible_rows = (list_rect.h / self.row_height_px) as usize + 2;
         let end_row = (first_row + visible_rows).min(total_display_rows);

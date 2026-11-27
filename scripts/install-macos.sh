@@ -49,7 +49,7 @@ Options:
   --no-cli            Do not create or remove the `editor` CLI symlink
   --force             Replace an existing non-editor file at the CLI symlink path
   --uninstall         Remove Editor.app and its `editor` symlink
-  --purge             With --uninstall, also remove saved macOS preferences and IPC socket
+  --purge             With --uninstall, also remove saved preferences, backups, and IPC socket
   -h, --help          Show this help message
 EOF
 }
@@ -179,9 +179,10 @@ do_uninstall() {
 
     if [ "$PURGE" -eq 1 ]; then
         defaults delete "$BUNDLE_ID" >/dev/null 2>&1 || true
+        rm -rf "$HOME/Library/Application Support/$BUNDLE_ID" 2>/dev/null || true
         uid=$(id -u)
         rm -f "${TMPDIR:-/tmp}/editor-ipc-${uid}.sock" "/tmp/editor-ipc-${uid}.sock" 2>/dev/null || true
-        echo "Cleared preferences ($BUNDLE_ID) and IPC socket"
+        echo "Cleared preferences ($BUNDLE_ID), app state, and IPC socket"
         removed_any=1
     fi
 
@@ -194,6 +195,9 @@ STAGING_APP=""
 PREV_APP=""
 DL_TMP=""
 cleanup() {
+    if [ -n "$PREV_APP" ] && [ -d "$PREV_APP" ] && [ ! -d "$DEST_APP" ]; then
+        run_priv "$APP_DIR" mv "$PREV_APP" "$DEST_APP" 2>/dev/null || true
+    fi
     if [ -n "$STAGING_APP" ] && [ -d "$STAGING_APP" ]; then
         run_priv "$APP_DIR" rm -rf "$STAGING_APP" 2>/dev/null || true
     fi
@@ -217,12 +221,15 @@ download_release_app() {
     /usr/bin/curl -fsSL --proto =https --max-time 20 "$MANIFEST_URL" -o "$MANIFEST_FILE"
 
     # Extract macos-universal URL and SHA-256 using macOS's built-in Python 3 or plutil/awk.
-    PARSED=$(/usr/bin/python3 - "$MANIFEST_FILE" <<'PY'
+    ARCH=$(uname -m)
+    PARSED=$(/usr/bin/python3 - "$MANIFEST_FILE" "$ARCH" <<'PY'
 import json, sys
 with open(sys.argv[1], "r", encoding="utf-8") as f:
     m = json.load(f)
+arch = sys.argv[2]
 assets = m.get("assets", {})
-a = assets.get("macos-universal") or assets.get("macos-arm64") or assets.get("macos-x86_64")
+arch_key = "macos-arm64" if arch == "arm64" else "macos-x86_64"
+a = assets.get("macos-universal") or assets.get(arch_key)
 if not a or "url" not in a or "sha256" not in a:
     sys.exit("release manifest missing macOS asset")
 url = a["url"]
@@ -280,6 +287,9 @@ do_install() {
     fi
 
     run_priv "$APP_DIR" mkdir -p "$APP_DIR"
+    APP_DIR=$(cd "$APP_DIR" && pwd)
+    DEST_APP="$APP_DIR/$APP_NAME"
+    CLI_INSIDE_APP="$DEST_APP/Contents/MacOS/$BIN_NAME"
 
     # Stage inside the same filesystem as $APP_DIR so the swap is atomic.
     STAGING_APP="$APP_DIR/.${APP_NAME}.staging.$$"

@@ -67,6 +67,7 @@ struct RenderedTab {
 
 pub struct TabStrip {
     pub scroll_x_px: f32,
+    last_active_id: Option<u32>,
     hovered_tab: Option<u32>,
     hovered_close: Option<u32>,
     hovered_sidebar_btn: bool,
@@ -92,6 +93,7 @@ impl TabStrip {
     pub fn new() -> Self {
         Self {
             scroll_x_px: 0.0,
+            last_active_id: None,
             hovered_tab: None,
             hovered_close: None,
             hovered_sidebar_btn: false,
@@ -451,31 +453,36 @@ impl TabStrip {
         let max_scroll = (total_w - self.tabs_clip_rect.w).max(0) as f32;
         self.scroll_x_px = self.scroll_x_px.clamp(0.0, max_scroll);
 
-        // Ensure the active tab is inside the visible horizontal window.
-        let mut cur_rel_x = 0i32;
-        for (i, it) in items.iter().enumerate() {
-            if i > 0 {
-                cur_rel_x += pill_gap;
-                if has_pinned
-                    && has_unpinned
-                    && items[i - 1].pin_slot.is_some()
-                    && it.pin_slot.is_none()
-                {
-                    cur_rel_x += divider_gap;
+        // Auto-scroll the active tab into view ONLY when the active tab changes (preserving manual wheel/trackpad scrolling).
+        let active_id = items.iter().find(|it| it.is_active).map(|it| it.id);
+        if active_id != self.last_active_id {
+            self.last_active_id = active_id;
+            let mut cur_rel_x = 0i32;
+            for (i, it) in items.iter().enumerate() {
+                if i > 0 {
+                    cur_rel_x += pill_gap;
+                    if has_pinned
+                        && has_unpinned
+                        && items[i - 1].pin_slot.is_some()
+                        && it.pin_slot.is_none()
+                    {
+                        cur_rel_x += divider_gap;
+                    }
                 }
-            }
-            let w = widths[i];
-            if it.is_active {
-                let left = cur_rel_x as f32;
-                let right = (cur_rel_x + w) as f32;
-                if left < self.scroll_x_px {
-                    self.scroll_x_px = left;
-                } else if right > self.scroll_x_px + self.tabs_clip_rect.w as f32 {
-                    self.scroll_x_px = (right - self.tabs_clip_rect.w as f32).clamp(0.0, max_scroll);
+                let w = widths[i];
+                if it.is_active {
+                    let left = cur_rel_x as f32;
+                    let right = (cur_rel_x + w) as f32;
+                    if left < self.scroll_x_px {
+                        self.scroll_x_px = left;
+                    } else if right > self.scroll_x_px + self.tabs_clip_rect.w as f32 {
+                        self.scroll_x_px =
+                            (right - self.tabs_clip_rect.w as f32).clamp(0.0, max_scroll);
+                    }
+                    break;
                 }
-                break;
+                cur_rel_x += w;
             }
-            cur_rel_x += w;
         }
 
         painter.push_clip(self.tabs_clip_rect);

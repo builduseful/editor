@@ -266,10 +266,10 @@ impl IgnoreRules {
         }
 
         if !self.dir_suffixes.is_empty() {
+            let nb = name.as_bytes();
             for &suf in self.dir_suffixes {
-                if name.len() > suf.len()
-                    && name[name.len() - suf.len()..].eq_ignore_ascii_case(suf)
-                {
+                let sb = suf.as_bytes();
+                if nb.len() > sb.len() && nb[nb.len() - sb.len()..].eq_ignore_ascii_case(sb) {
                     return true;
                 }
             }
@@ -407,7 +407,7 @@ impl GitIgnoreLayer {
                 continue;
             }
             let has_slash = rest.contains('/');
-            let anchored = leading_slash || (has_slash && !has_leading_dstar);
+            let anchored = (leading_slash || has_slash) && !has_leading_dstar;
             if anchored || has_slash {
                 has_path_rule = true;
             }
@@ -486,8 +486,21 @@ pub fn collect_ancestor_gitignores(fs: &dyn FileSystem, root: &Path) -> Vec<Arc<
 
     let canonical = fs.canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     // If `root` itself has a `.git` entry (dir or submodule/worktree file), it is already a repo
-    // root — outer `.gitignore` files outside this repo must NOT bleed in.
-    if fs.stat(&canonical.join(".git")).is_ok() {
+    // root — outer `.gitignore` files outside this repo must NOT bleed in, but this repo's own
+    // `.git/info/exclude` still applies.
+    if let Ok(st) = fs.stat(&canonical.join(".git")) {
+        if st.is_dir {
+            let exclude = canonical.join(".git").join("info").join("exclude");
+            let mut buf = Vec::new();
+            if let Ok(Some(len)) = fs.read_prefix_into(&exclude, MAX_GITIGNORE_BYTES, &mut buf) {
+                if len > 0 {
+                    let text = String::from_utf8_lossy(&buf);
+                    if let Some(layer) = GitIgnoreLayer::parse(String::new(), &text) {
+                        return vec![Arc::new(layer)];
+                    }
+                }
+            }
+        }
         return Vec::new();
     }
 
@@ -642,12 +655,17 @@ fn glob_match_segment(pat: &str, text: &str) -> bool {
             } else {
                 return false;
             }
-        } else if pi < p.len() && (p[pi] == b'?' || p[pi] == t[ti]) {
+        } else if pi < p.len() && p[pi] == b'?' {
+            let ch_len = text[ti..].chars().next().map_or(1, char::len_utf8);
+            pi += 1;
+            ti += ch_len;
+        } else if pi < p.len() && p[pi] == t[ti] {
             pi += 1;
             ti += 1;
         } else if let Some(sp) = star_pi {
             pi = sp + 1;
-            star_ti += 1;
+            let ch_len = text[star_ti..].chars().next().map_or(1, char::len_utf8);
+            star_ti += ch_len;
             ti = star_ti;
         } else {
             return false;
@@ -661,6 +679,7 @@ fn glob_match_segment(pat: &str, text: &str) -> bool {
 
 /// Iterative linear-time multi-segment path matcher supporting `**`, `*`, `?`, and `[...]`.
 /// Zero recursion — immune to pathological `**/**/**/**` patterns.
+/// Per `gitignore(5)`, a trailing `/**` matches entries inside the directory, not the directory itself.
 fn glob_match_path(pat: &str, path: &str) -> bool {
     let p: Vec<&str> = pat.split('/').collect();
     let t: Vec<&str> = path.split('/').collect();
@@ -683,9 +702,6 @@ fn glob_match_path(pat: &str, path: &str) -> bool {
         } else {
             return false;
         }
-    }
-    while pi < p.len() && p[pi] == "**" {
-        pi += 1;
     }
     pi == p.len()
 }
@@ -921,5 +937,33 @@ mod tests {
         // Submodule / worktree `.git` pointer file is skipped by `should_skip_file`.
         let rules = IgnoreRules::macos(None);
         assert!(rules.should_skip_file(".git"));
+    }
+
+    #[test]
+    fn audit_regressions_non_ascii_dirs_double_star_and_char_globs() {
+        // Non-ASCII directory names whose byte length >= `.app`/`.bundle` must never panic.
+        let mac = IgnoreRules::macos(None);
+        let proj = Path::new("/proj");
+        for name in ["über", "日本語", "📁docs", "café", "a.app"] {
+            let skipped = mac.should_skip_dir(proj, name);
+            assert_eq!(skipped, name == "a.app");
+        }
+
+        // `foo/**` ignores contents under `foo/`, NOT directory `foo` itself.
+        let layer = Arc::new(
+            GitIgnoreLayer::parse(String::new(), "foo/**\n/**/deep.log\na?c.txt\n").unwrap(),
+        );
+        let layers = vec![layer];
+        assert!(!is_gitignored(&layers, "foo", "foo", true));
+        assert!(is_gitignored(&layers, "foo/bar.txt", "bar.txt", false));
+        assert!(is_gitignored(&layers, "foo/sub/bar.txt", "bar.txt", false));
+
+        // `/**/deep.log` matches at any depth.
+        assert!(is_gitignored(&layers, "deep.log", "deep.log", false));
+        assert!(is_gitignored(&layers, "x/y/deep.log", "deep.log", false));
+
+        // `?` matches a single Unicode scalar (multi-byte UTF-8).
+        assert!(is_gitignored(&layers, "aéc.txt", "aéc.txt", false));
+        assert!(!is_gitignored(&layers, "aéé.txt", "aéé.txt", false));
     }
 }

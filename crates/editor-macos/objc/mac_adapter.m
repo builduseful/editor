@@ -28,7 +28,8 @@ int mac_clone_file(const char* src, const char* dst) {
 // ============================================================================
 
 // FontStyle enum matches Rust: 0=Mono, 1=MonoBold, 2=MonoItalic, 3=Ui, 4=UiBold
-static CTFontRef resolve_ct_font(uint32_t style, float size_px) {
+// Returns a +1 retained CTFontRef; caller MUST CFRelease it!
+static CTFontRef resolve_ct_font(uint32_t style, float size_px) CF_RETURNS_RETAINED {
     NSFont* ns_font = nil;
     CGFloat sz = (CGFloat)(size_px > 4.0f ? size_px : 12.0f);
     switch (style) {
@@ -56,7 +57,7 @@ static CTFontRef resolve_ct_font(uint32_t style, float size_px) {
     if (!ns_font) {
         ns_font = [NSFont userFixedPitchFontOfSize:sz];
     }
-    return (__bridge CTFontRef)ns_font;
+    return (__bridge_retained CTFontRef)ns_font;
 }
 
 typedef struct {
@@ -70,6 +71,7 @@ typedef struct {
 void mac_font_metrics(uint32_t style, float size_px, MacFontMetrics* out) {
     @autoreleasepool {
         CTFontRef font = resolve_ct_font(style, size_px);
+        if (!font) return;
         CGFloat asc = CTFontGetAscent(font);
         CGFloat desc = CTFontGetDescent(font);
         CGFloat lead = CTFontGetLeading(font);
@@ -84,6 +86,7 @@ void mac_font_metrics(uint32_t style, float size_px, MacFontMetrics* out) {
         } else {
             adv.width = size_px * 0.6;
         }
+        CFRelease(font);
         out->ascent = (float)asc;
         out->descent = (float)desc;
         out->leading = (float)lead;
@@ -119,12 +122,14 @@ void mac_rasterize_cluster(uint32_t style, float size_px, const uint8_t* utf8, s
             return;
         }
         CTFontRef font = resolve_ct_font(style, size_px);
+        if (!font) return;
         NSDictionary* attrs = @{
             (id)kCTFontAttributeName: (__bridge id)font,
             (id)kCTForegroundColorAttributeName: (__bridge id)[NSColor whiteColor].CGColor,
         };
         NSAttributedString* attrStr = [[NSAttributedString alloc] initWithString:str attributes:attrs];
         CTLineRef line = CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)attrStr);
+        CFRelease(font);
         if (!line) return;
 
         CGFloat asc = 0, desc = 0, lead = 0;
@@ -181,6 +186,12 @@ void mac_rasterize_cluster(uint32_t style, float size_px, const uint8_t* utf8, s
         if (is_color) {
             size_t len = (size_t)w * (size_t)h * 4;
             uint8_t* buf = (uint8_t*)calloc(1, len);
+            if (!buf) {
+                out->width = 0;
+                out->height = 0;
+                CFRelease(line);
+                return;
+            }
             CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
             CGContextRef ctx = CGBitmapContextCreate(
                 buf, w, h, 8, w * 4, cs,
@@ -198,6 +209,12 @@ void mac_rasterize_cluster(uint32_t style, float size_px, const uint8_t* utf8, s
         } else {
             size_t len = (size_t)w * (size_t)h;
             uint8_t* buf = (uint8_t*)calloc(1, len);
+            if (!buf) {
+                out->width = 0;
+                out->height = 0;
+                CFRelease(line);
+                return;
+            }
             CGColorSpaceRef cs = CGColorSpaceCreateDeviceGray();
             CGContextRef ctx = CGBitmapContextCreate(buf, w, h, 8, w, cs, (CGBitmapInfo)kCGImageAlphaNone);
             CGColorSpaceRelease(cs);
@@ -276,7 +293,8 @@ char* mac_open_file_dialog(int choose_dir) {
         if ([panel runModal] == NSModalResponseOK) {
             NSURL* url = panel.URL;
             if (url && url.path) {
-                return strdup([url.path UTF8String]);
+                const char* utf8 = [url.path UTF8String];
+                if (utf8) return strdup(utf8);
             }
         }
         return NULL;
@@ -287,12 +305,14 @@ char* mac_save_file_dialog(const char* default_name) {
     @autoreleasepool {
         NSSavePanel* panel = [NSSavePanel savePanel];
         if (default_name && default_name[0]) {
-            panel.nameFieldStringValue = [NSString stringWithUTF8String:default_name];
+            NSString* defName = [NSString stringWithUTF8String:default_name];
+            if (defName) panel.nameFieldStringValue = defName;
         }
         if ([panel runModal] == NSModalResponseOK) {
             NSURL* url = panel.URL;
             if (url && url.path) {
-                return strdup([url.path UTF8String]);
+                const char* utf8 = [url.path UTF8String];
+                if (utf8) return strdup(utf8);
             }
         }
         return NULL;
@@ -317,6 +337,23 @@ int mac_confirm_discard(const char* file_name) {
     }
 }
 
+// Reveal a file or directory in Finder, selecting the item. Returns 1 on success, 0 on error.
+int mac_reveal_in_finder(const char* path) {
+    if (!path || !*path) return 0;
+    @autoreleasepool {
+        NSString* s = [NSString stringWithUTF8String:path];
+        if (!s) return 0;
+        NSFileManager* fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:s] && [fm attributesOfItemAtPath:s error:nil] == nil) {
+            return 0;
+        }
+        NSURL* url = [NSURL fileURLWithPath:s];
+        if (!url) return 0;
+        [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[url]];
+        return 1;
+    }
+}
+
 // ============================================================================
 // 4. Minimal NSWindow + CALayer BGRA8 Framebuffer Presenter
 // ============================================================================
@@ -335,6 +372,7 @@ typedef struct {
     void (*on_fs_changed)(void* ud, const char* const* paths, size_t count);
     void (*on_drag)(void* ud, uint32_t phase, float x, float y, const char* path);
     void (*on_command)(void* ud, uint32_t cmd_id);
+    void (*on_will_terminate)(void* ud);
     int (*on_tick)(void* ud, uint64_t now_ms);
     // Zero-copy swapchain render: Rust paints directly into a free back-buffer IOSurface
     // with buffer-age damage tracking (zero duplicate CPU framebuffer, zero tearing/flicker).
@@ -582,6 +620,12 @@ static void purge_and_release_surface(IOSurfaceRef surf) {
     [self scheduleRedraw];
 }
 
+- (void)viewDidChangeBackingProperties {
+    [super viewDidChangeBackingProperties];
+    [self notifyResize];
+    [self scheduleRedraw];
+}
+
 - (void)notifyResize {
     CGFloat scale = self.window.backingScaleFactor;
     if (scale < 1.0) scale = 1.0;
@@ -804,8 +848,14 @@ static void mac_ensure_blink_timer(void);
     [self.window makeFirstResponder:self];
     mac_ensure_blink_timer();
     NSPoint p = [self pixelPointFromEvent:event];
-    self.cb.on_mouse(self.cb.userdata, 0, (float)p.x, (float)p.y, 0,
-                     (uint8_t)MIN(event.clickCount, 3), encode_mods(event.modifierFlags));
+    NSEventModifierFlags flags = event.modifierFlags;
+    BOOL ctrlSecondary = (flags & NSEventModifierFlagControl) &&
+                         !(flags & (NSEventModifierFlagCommand | NSEventModifierFlagOption |
+                                    NSEventModifierFlagShift)) &&
+                         event.clickCount == 1;
+    uint8_t button = ctrlSecondary ? 1 : 0;
+    self.cb.on_mouse(self.cb.userdata, 0, (float)p.x, (float)p.y, button,
+                     (uint8_t)MIN(event.clickCount, 3), encode_mods(flags));
 }
 
 - (void)rightMouseDown:(NSEvent*)event {
@@ -885,7 +935,8 @@ static BOOL is_noisy_fs_path(const char* p) {
     }
     if (strstr(p, "/target/") != NULL ||
         strstr(p, "/node_modules/") != NULL || strstr(p, "/.DS_Store") != NULL ||
-        strstr(p, ".editor.lock") != NULL || strstr(p, ".editor.tmp") != NULL) {
+        strstr(p, ".editor.lock") != NULL || strstr(p, ".editor-tmp-") != NULL ||
+        strstr(p, ".editor-cow-") != NULL || strstr(p, ".editor-tail-") != NULL) {
         return YES;
     }
     return NO;
@@ -1204,7 +1255,12 @@ void mac_activate_app(void) {
     (void)sender;
     if (filenames.count > 0 && self.cb.on_open_path) {
         [self showWindow];
-        self.cb.on_open_path(self.cb.userdata, [filenames.firstObject UTF8String]);
+        for (NSString* filename in filenames) {
+            const char* utf8 = [filename UTF8String];
+            if (utf8) {
+                self.cb.on_open_path(self.cb.userdata, utf8);
+            }
+        }
         [NSApp replyToOpenOrPrint:NSApplicationDelegateReplySuccess];
         return;
     }
@@ -1215,6 +1271,13 @@ void mac_activate_app(void) {
     (void)sender;
     // Standard macOS document-app behavior: keep running in Dock (white dot) until Cmd+Q.
     return NO;
+}
+
+- (void)applicationWillTerminate:(NSNotification*)note {
+    (void)note;
+    if (self.cb.on_will_terminate) {
+        self.cb.on_will_terminate(self.cb.userdata);
+    }
 }
 
 - (BOOL)applicationShouldHandleReopen:(NSApplication*)sender hasVisibleWindows:(BOOL)flag {

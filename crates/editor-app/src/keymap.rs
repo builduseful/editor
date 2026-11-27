@@ -71,12 +71,22 @@ impl KeyChord {
     }
 
     pub fn matches(self, key: Key, mods: Modifiers) -> bool {
-        if self.primary != mods.primary() || self.shift != mods.shift || self.alt != mods.alt {
+        if self.shift != mods.shift || self.alt != mods.alt {
             return false;
         }
         #[cfg(target_os = "macos")]
-        if self.ctrl != mods.ctrl {
-            return false;
+        {
+            if self.primary != mods.primary() || self.ctrl != mods.ctrl {
+                return false;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            // On Windows/Linux, `primary` and `ctrl` both map to the physical Ctrl modifier.
+            let want_ctrl = self.primary || self.ctrl;
+            if want_ctrl != mods.ctrl || mods.meta {
+                return false;
+            }
         }
         match (self.key, key) {
             (Key::Char(a), Key::Char(b)) => a.eq_ignore_ascii_case(&b),

@@ -51,6 +51,7 @@ struct MacCallbacks {
     on_fs_changed: extern "C" fn(*mut c_void, *const *const c_char, usize),
     on_drag: extern "C" fn(*mut c_void, u32, f32, f32, *const c_char),
     on_command: extern "C" fn(*mut c_void, u32),
+    on_will_terminate: extern "C" fn(*mut c_void),
     on_tick: extern "C" fn(*mut c_void, u64) -> c_int,
     on_needs_render: extern "C" fn(*mut c_void, c_int, *mut u32, *mut u32, *mut f32) -> c_int,
     on_render_into: extern "C" fn(
@@ -91,6 +92,7 @@ extern "C" {
     fn mac_open_file_dialog(choose_dir: c_int) -> *mut c_char;
     fn mac_save_file_dialog(default_name: *const c_char) -> *mut c_char;
     fn mac_confirm_discard(file_name: *const c_char) -> c_int;
+    fn mac_reveal_in_finder(path: *const c_char) -> c_int;
     fn mac_set_title(title: *const c_char);
     fn mac_set_cursor(cursor_id: u32);
     fn mac_request_redraw();
@@ -377,6 +379,10 @@ impl PlatformHost for MacHost {
         }
     }
 
+    fn state_dir(&self) -> Option<PathBuf> {
+        editor_platform::default_app_state_dir()
+    }
+
     fn watch_directory(&mut self, dir: Option<&Path>) {
         match dir.and_then(|p| p.to_str()).and_then(|s| CString::new(s).ok()) {
             Some(cs) => unsafe { mac_watch_directory(cs.as_ptr()) },
@@ -402,6 +408,21 @@ impl PlatformHost for MacHost {
     fn relaunch_after_update(&mut self, app_bundle: &Path) {
         let _ = editor_platform::update::schedule_macos_relaunch(app_bundle);
     }
+
+    fn reveal_in_file_manager(&mut self, path: &Path) -> Result<(), String> {
+        let Some(s) = path.to_str() else {
+            return Err("Path is not valid UTF-8".to_string());
+        };
+        let Ok(cs) = CString::new(s) else {
+            return Err("Path contains an interior NUL byte".to_string());
+        };
+        let ok = unsafe { mac_reveal_in_finder(cs.as_ptr()) };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err("Could not reveal item in Finder".to_string())
+        }
+    }
 }
 
 // ============================================================================
@@ -413,7 +434,27 @@ struct Bridge {
     rasterizer: MacGlyphRasterizer,
     clipboard: MacClipboard,
     host: MacHost,
-    ipc: Option<editor_platform::ipc::IpcServer>,
+}
+
+/// Re-entrancy-safe wrapper passed as Objective-C `userdata`.
+/// Prevents simultaneous `&mut Bridge` aliasing when AppKit runs nested modal loops
+/// (`NSOpenPanel`, `NSSavePanel`, `NSAlert`) or synchronously dispatches `windowDidResignKey:`
+/// / `applicationWillTerminate:` while another callback is already active on the stack.
+struct BridgeCell {
+    inner: std::cell::RefCell<Bridge>,
+    ipc: std::cell::RefCell<Option<editor_platform::ipc::IpcServer>>,
+}
+
+#[inline]
+fn with_bridge<R>(ud: *mut c_void, default: R, f: impl FnOnce(&mut Bridge) -> R) -> R {
+    if ud.is_null() {
+        return default;
+    }
+    let bc = unsafe { &*(ud as *const BridgeCell) };
+    match bc.inner.try_borrow_mut() {
+        Ok(mut guard) => f(&mut guard),
+        Err(_) => default,
+    }
 }
 
 fn decode_mods(bits: u32) -> Modifiers {
@@ -453,14 +494,32 @@ fn decode_key(keycode: u16, text: &str) -> Option<Key> {
         109 => Some(Key::F(10)),
         103 => Some(Key::F(11)),
         111 => Some(Key::F(12)),
-        // Normalize physical macOS punctuation keys so shifted chords (⇧⌘/, ⇧⌘\, ⇧⌘=, ⇧⌘[, ⇧⌘]) always match!
-        44 => Some(Key::Char('/')),
-        42 => Some(Key::Char('\\')),
-        24 => Some(Key::Char('=')),
-        27 => Some(Key::Char('-')),
-        33 => Some(Key::Char('[')),
-        30 => Some(Key::Char(']')),
-        _ => text.chars().next().map(Key::Char),
+        _ => {
+            if let Some(ch) = text.chars().next() {
+                // Normalize shifted US punctuation only when the OS reports the shifted symbol
+                // for physical US keycodes, without overriding non-US layouts (Dvorak/QWERTZ/AZERTY).
+                let norm = match (keycode, ch) {
+                    (44, '?') => '/',
+                    (42, '|') => '\\',
+                    (24, '+') => '=',
+                    (27, '_') => '-',
+                    (33, '{') => '[',
+                    (30, '}') => ']',
+                    _ => ch,
+                };
+                Some(Key::Char(norm))
+            } else {
+                match keycode {
+                    44 => Some(Key::Char('/')),
+                    42 => Some(Key::Char('\\')),
+                    24 => Some(Key::Char('=')),
+                    27 => Some(Key::Char('-')),
+                    33 => Some(Key::Char('[')),
+                    30 => Some(Key::Char(']')),
+                    _ => None,
+                }
+            }
+        }
     }
 }
 
@@ -525,17 +584,18 @@ fn decode_menu_cmd(tag: u32) -> Option<AppCommand> {
 }
 
 extern "C" fn cb_resize(ud: *mut c_void, w: u32, h: u32, scale: f32) {
-    let b = unsafe { &mut *(ud as *mut Bridge) };
-    b.app.handle_event(
-        InputEvent::Resize {
-            width_px: w,
-            height_px: h,
-            scale,
-        },
-        &mut b.rasterizer,
-        &mut b.clipboard,
-        &mut b.host,
-    );
+    with_bridge(ud, (), |b| {
+        b.app.handle_event(
+            InputEvent::Resize {
+                width_px: w,
+                height_px: h,
+                scale,
+            },
+            &mut b.rasterizer,
+            &mut b.clipboard,
+            &mut b.host,
+        );
+    });
 }
 
 extern "C" fn cb_key(
@@ -547,7 +607,6 @@ extern "C" fn cb_key(
     text_ptr: *const u8,
     text_len: usize,
 ) {
-    let b = unsafe { &mut *(ud as *mut Bridge) };
     let key_str = if !key_ptr.is_null() && key_len > 0 {
         let slice = unsafe { std::slice::from_raw_parts(key_ptr, key_len) };
         std::str::from_utf8(slice).unwrap_or("")
@@ -563,27 +622,33 @@ extern "C" fn cb_key(
     let Some(key) = decode_key(keycode, if key_str.is_empty() { text_str } else { key_str }) else {
         return;
     };
+    let decoded_mods = decode_mods(mods);
     // AppKit sets `NSEvent.characters` to Private Use Area codepoints (`U+F700..=U+F8FF`) for
-    // arrows, Home/End, PageUp/PageDown, and function keys. Non-character keys must NEVER emit
-    // printable `text`!
+    // arrows/function keys and ASCII control bytes (`0x00..0x20`, `0x7F`) for `Ctrl+<letter>`.
     let text_opt = if matches!(key, Key::Char(_))
         && !text_str.is_empty()
-        && !text_str.chars().any(|c| matches!(c, '\u{F700}'..='\u{F8FF}'))
+        && !text_str.chars().any(|c| {
+            matches!(c, '\u{F700}'..='\u{F8FF}')
+                || (decoded_mods.ctrl && (c as u32) < 0x20)
+                || c == '\x7F'
+        })
     {
         Some(text_str.to_string())
     } else {
         None
     };
-    b.app.handle_event(
-        InputEvent::KeyDown {
-            key,
-            mods: decode_mods(mods),
-            text: text_opt,
-        },
-        &mut b.rasterizer,
-        &mut b.clipboard,
-        &mut b.host,
-    );
+    with_bridge(ud, (), |b| {
+        b.app.handle_event(
+            InputEvent::KeyDown {
+                key,
+                mods: decoded_mods,
+                text: text_opt,
+            },
+            &mut b.rasterizer,
+            &mut b.clipboard,
+            &mut b.host,
+        );
+    });
 }
 
 extern "C" fn cb_mouse(
@@ -595,7 +660,6 @@ extern "C" fn cb_mouse(
     clicks: u8,
     mods: u32,
 ) {
-    let b = unsafe { &mut *(ud as *mut Bridge) };
     let btn = match button {
         1 => MouseButton::Right,
         2 => MouseButton::Middle,
@@ -621,63 +685,69 @@ extern "C" fn cb_mouse(
             mods: decode_mods(mods),
         },
     };
-    b.app
-        .handle_event(ev, &mut b.rasterizer, &mut b.clipboard, &mut b.host);
+    with_bridge(ud, (), |b| {
+        b.app
+            .handle_event(ev, &mut b.rasterizer, &mut b.clipboard, &mut b.host);
+    });
 }
 
 extern "C" fn cb_scroll(ud: *mut c_void, dx: f32, dy: f32, x: f32, y: f32, mods: u32) {
-    let b = unsafe { &mut *(ud as *mut Bridge) };
-    b.app.handle_event(
-        InputEvent::Scroll {
-            dx_px: dx,
-            dy_px: dy,
-            x_px: x,
-            y_px: y,
-            mods: decode_mods(mods),
-        },
-        &mut b.rasterizer,
-        &mut b.clipboard,
-        &mut b.host,
-    );
+    with_bridge(ud, (), |b| {
+        b.app.handle_event(
+            InputEvent::Scroll {
+                dx_px: dx,
+                dy_px: dy,
+                x_px: x,
+                y_px: y,
+                mods: decode_mods(mods),
+            },
+            &mut b.rasterizer,
+            &mut b.clipboard,
+            &mut b.host,
+        );
+    });
 }
 
 extern "C" fn cb_focus(ud: *mut c_void, focused: u32) {
-    let b = unsafe { &mut *(ud as *mut Bridge) };
-    b.app.handle_event(
-        InputEvent::FocusChanged(focused != 0),
-        &mut b.rasterizer,
-        &mut b.clipboard,
-        &mut b.host,
-    );
+    with_bridge(ud, (), |b| {
+        b.app.handle_event(
+            InputEvent::FocusChanged(focused != 0),
+            &mut b.rasterizer,
+            &mut b.clipboard,
+            &mut b.host,
+        );
+    });
 }
 
 extern "C" fn cb_theme(ud: *mut c_void, is_dark: u32) {
-    let b = unsafe { &mut *(ud as *mut Bridge) };
     let st = if is_dark != 0 {
         SystemTheme::Dark
     } else {
         SystemTheme::Light
     };
-    b.app.handle_event(
-        InputEvent::SystemThemeChanged(st),
-        &mut b.rasterizer,
-        &mut b.clipboard,
-        &mut b.host,
-    );
+    with_bridge(ud, (), |b| {
+        b.app.handle_event(
+            InputEvent::SystemThemeChanged(st),
+            &mut b.rasterizer,
+            &mut b.clipboard,
+            &mut b.host,
+        );
+    });
 }
 
 extern "C" fn cb_open_path(ud: *mut c_void, path_ptr: *const c_char) {
     if path_ptr.is_null() {
         return;
     }
-    let b = unsafe { &mut *(ud as *mut Bridge) };
     let p = PathBuf::from(unsafe { CStr::from_ptr(path_ptr) }.to_string_lossy().into_owned());
-    b.app.handle_event(
-        InputEvent::OpenPath(p),
-        &mut b.rasterizer,
-        &mut b.clipboard,
-        &mut b.host,
-    );
+    with_bridge(ud, (), |b| {
+        b.app.handle_event(
+            InputEvent::OpenPath(p),
+            &mut b.rasterizer,
+            &mut b.clipboard,
+            &mut b.host,
+        );
+    });
 }
 
 extern "C" fn cb_drag(
@@ -687,7 +757,6 @@ extern "C" fn cb_drag(
     y: f32,
     path_ptr: *const c_char,
 ) {
-    let b = unsafe { &mut *(ud as *mut Bridge) };
     let ph = match phase {
         0 => editor_platform::DragPhase::Enter,
         1 => editor_platform::DragPhase::Move,
@@ -703,21 +772,22 @@ extern "C" fn cb_drag(
                 .into_owned(),
         ))
     };
-    b.app.handle_event(
-        InputEvent::ExternalDrag {
-            phase: ph,
-            x_px: x,
-            y_px: y,
-            path,
-        },
-        &mut b.rasterizer,
-        &mut b.clipboard,
-        &mut b.host,
-    );
+    with_bridge(ud, (), |b| {
+        b.app.handle_event(
+            InputEvent::ExternalDrag {
+                phase: ph,
+                x_px: x,
+                y_px: y,
+                path,
+            },
+            &mut b.rasterizer,
+            &mut b.clipboard,
+            &mut b.host,
+        );
+    });
 }
 
 extern "C" fn cb_fs_changed(ud: *mut c_void, paths_ptr: *const *const c_char, count: usize) {
-    let b = unsafe { &mut *(ud as *mut Bridge) };
     let mut paths = Vec::with_capacity(count.min(256));
     if !paths_ptr.is_null() && count > 0 {
         let slice = unsafe { std::slice::from_raw_parts(paths_ptr, count) };
@@ -730,31 +800,64 @@ extern "C" fn cb_fs_changed(ud: *mut c_void, paths_ptr: *const *const c_char, co
             }
         }
     }
-    b.app.handle_event(
-        InputEvent::FsChanged(paths),
-        &mut b.rasterizer,
-        &mut b.clipboard,
-        &mut b.host,
-    );
-}
-
-extern "C" fn cb_command(ud: *mut c_void, cmd_id: u32) {
-    let b = unsafe { &mut *(ud as *mut Bridge) };
-    if let Some(cmd) = decode_menu_cmd(cmd_id) {
+    with_bridge(ud, (), |b| {
         b.app.handle_event(
-            InputEvent::Command(cmd),
+            InputEvent::FsChanged(paths),
             &mut b.rasterizer,
             &mut b.clipboard,
             &mut b.host,
         );
+    });
+}
+
+extern "C" fn cb_command(ud: *mut c_void, cmd_id: u32) {
+    if let Some(cmd) = decode_menu_cmd(cmd_id) {
+        with_bridge(ud, (), |b| {
+            b.app.handle_event(
+                InputEvent::Command(cmd),
+                &mut b.rasterizer,
+                &mut b.clipboard,
+                &mut b.host,
+            );
+        });
+    }
+}
+
+extern "C" fn cb_will_terminate(ud: *mut c_void) {
+    if ud.is_null() {
+        return;
+    }
+    let bc = unsafe { &*(ud as *const BridgeCell) };
+    // Always drop the IPC server so `/tmp/editor-ipc-<uid>.sock` is removed on every exit path.
+    if let Ok(mut ipc_guard) = bc.ipc.try_borrow_mut() {
+        *ipc_guard = None;
+    }
+    if let Ok(mut b_guard) = bc.inner.try_borrow_mut() {
+        let b = &mut *b_guard;
+        b.app.handle_will_terminate(&mut b.host);
     }
 }
 
 extern "C" fn cb_tick(ud: *mut c_void, now_ms: u64) -> c_int {
-    let b = unsafe { &mut *(ud as *mut Bridge) };
+    if ud.is_null() {
+        return 0;
+    }
+    let bc = unsafe { &*(ud as *const BridgeCell) };
+    let Ok(mut b_guard) = bc.inner.try_borrow_mut() else {
+        return 1;
+    };
+    let b = &mut *b_guard;
     // Drain any incoming CLI/agent IPC commands (`status`, `open`, `goto`, `select`,
     // `insert`, `find`, `save`, `undo`, `redo`, `action`, `close`/`quit`).
-    while let Some(pending) = b.ipc.as_ref().and_then(|s| s.try_recv()) {
+    loop {
+        let pending = bc
+            .ipc
+            .try_borrow()
+            .ok()
+            .and_then(|g| g.as_ref().and_then(|s| s.try_recv()));
+        let Some(pending) = pending else {
+            break;
+        };
         let (reply, activate, should_quit) = b.app.execute_ipc(
             &pending.cmd,
             &mut b.rasterizer,
@@ -766,7 +869,9 @@ extern "C" fn cb_tick(ud: *mut c_void, now_ms: u64) -> c_int {
         }
         pending.respond(reply);
         if should_quit {
-            b.ipc = None;
+            if let Ok(mut ipc_guard) = bc.ipc.try_borrow_mut() {
+                *ipc_guard = None;
+            }
             b.host.request_quit();
             return 0;
         }
@@ -791,16 +896,17 @@ extern "C" fn cb_needs_render(
     out_h: *mut u32,
     out_scale: *mut f32,
 ) -> c_int {
-    let b = unsafe { &mut *(ud as *mut Bridge) };
-    if force == 0 && !b.app.is_dirty_frame() {
-        return 0;
-    }
-    unsafe {
-        *out_w = b.app.framebuffer.width;
-        *out_h = b.app.framebuffer.height;
-        *out_scale = b.app.framebuffer.scale;
-    }
-    1
+    with_bridge(ud, 0, |b| {
+        if force == 0 && !b.app.is_dirty_frame() {
+            return 0;
+        }
+        unsafe {
+            *out_w = b.app.framebuffer.width;
+            *out_h = b.app.framebuffer.height;
+            *out_scale = b.app.framebuffer.scale;
+        }
+        1
+    })
 }
 
 extern "C" fn cb_render_into(
@@ -820,41 +926,45 @@ extern "C" fn cb_render_into(
     out_w: *mut i32,
     out_h: *mut i32,
 ) -> c_int {
-    let b = unsafe { &mut *(ud as *mut Bridge) };
     if dst_pixels.is_null() || w == 0 || h == 0 || stride_u32 < w as usize {
         return 0;
     }
-    let slice = unsafe { std::slice::from_raw_parts_mut(dst_pixels, stride_u32 * (h as usize)) };
-    let surf = editor_platform::SurfaceMut {
-        width: w,
-        height: h,
-        stride: stride_u32,
-        scale,
-        pixels: slice,
-    };
-    let extra_dirty = editor_platform::PixelRect::new(extra_x, extra_y, extra_w, extra_h);
-    if let Some(painted) =
-        b.app
-            .render_into_with_damage(surf, &mut b.rasterizer, extra_dirty, force_full != 0)
-    {
-        unsafe {
-            if !out_x.is_null() {
-                *out_x = painted.x;
+    with_bridge(ud, 0, |b| {
+        let slice =
+            unsafe { std::slice::from_raw_parts_mut(dst_pixels, stride_u32 * (h as usize)) };
+        let surf = editor_platform::SurfaceMut {
+            width: w,
+            height: h,
+            stride: stride_u32,
+            scale,
+            pixels: slice,
+        };
+        let extra_dirty = editor_platform::PixelRect::new(extra_x, extra_y, extra_w, extra_h);
+        if let Some(painted) = b.app.render_into_with_damage(
+            surf,
+            &mut b.rasterizer,
+            extra_dirty,
+            force_full != 0,
+        ) {
+            unsafe {
+                if !out_x.is_null() {
+                    *out_x = painted.x;
+                }
+                if !out_y.is_null() {
+                    *out_y = painted.y;
+                }
+                if !out_w.is_null() {
+                    *out_w = painted.w;
+                }
+                if !out_h.is_null() {
+                    *out_h = painted.h;
+                }
             }
-            if !out_y.is_null() {
-                *out_y = painted.y;
-            }
-            if !out_w.is_null() {
-                *out_w = painted.w;
-            }
-            if !out_h.is_null() {
-                *out_h = painted.h;
-            }
+            1
+        } else {
+            0
         }
-        1
-    } else {
-        0
-    }
+    })
 }
 
 // ============================================================================
@@ -1183,13 +1293,12 @@ fn main() {
     .ok();
 
     // Live native macOS GUI launch (0-byte virtual CPU framebuffer: paints directly into IOSurface!).
-    let mut bridge = Box::new(Bridge {
+    let mut bridge = Bridge {
         app: EditorApp::new_zero_copy(fs, size.0 * 2, size.1 * 2, 2.0),
         rasterizer: MacGlyphRasterizer,
         clipboard: MacClipboard,
         host: MacHost,
-        ipc,
-    });
+    };
     // Use our 100% custom-drawn Build Useful confirmation modal instead of native NSAlert.
     bridge.app.use_in_app_modal = true;
     bridge.app.load_preferences(&bridge.host);
@@ -1214,7 +1323,11 @@ fn main() {
     bridge.app.refresh_git_head_for_active_doc(&mut bridge.host);
     bridge.app.maybe_start_auto_update_check(&mut bridge.host);
 
-    let ud = (&mut *bridge as *mut Bridge) as *mut c_void;
+    let bridge_cell = Box::new(BridgeCell {
+        inner: std::cell::RefCell::new(bridge),
+        ipc: std::cell::RefCell::new(ipc),
+    });
+    let ud = (&*bridge_cell as *const BridgeCell) as *mut c_void;
     let cbs = MacCallbacks {
         userdata: ud,
         on_resize: cb_resize,
@@ -1227,6 +1340,7 @@ fn main() {
         on_fs_changed: cb_fs_changed,
         on_drag: cb_drag,
         on_command: cb_command,
+        on_will_terminate: cb_will_terminate,
         on_tick: cb_tick,
         on_needs_render: cb_needs_render,
         on_render_into: cb_render_into,

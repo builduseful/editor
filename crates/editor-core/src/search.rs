@@ -187,10 +187,28 @@ impl CompiledQuery {
         template: &str,
         scratch: &mut SearchScratch,
     ) -> String {
+        self.expand_replacement_with_context(matched_text, None, None, template, scratch)
+    }
+
+    /// Expand a replacement template while preserving adjacent character context for `\b` / `\B` / `^` / `$`.
+    pub fn expand_replacement_with_context(
+        &self,
+        matched_text: &str,
+        prev_before_slice: Option<char>,
+        next_after_slice: Option<char>,
+        template: &str,
+        scratch: &mut SearchScratch,
+    ) -> String {
         match &self.kind {
             QueryKind::Literal(_) => template.to_string(),
             QueryKind::Regex(re) => {
-                if let Some(caps) = re.find_captures(matched_text, 0, &mut scratch.pike) {
+                if let Some(caps) = re.find_captures_with_context(
+                    matched_text,
+                    0,
+                    prev_before_slice,
+                    next_after_slice,
+                    &mut scratch.pike,
+                ) {
                     caps.expand(matched_text, template)
                 } else {
                     template.to_string()
@@ -491,7 +509,19 @@ fn find_literal_in_tree(
         if got < lit.needle.len() {
             break;
         }
-        let win = &window[..got];
+        let raw_win_end = offset + got as u64;
+        let is_eof = raw_win_end >= total_len;
+        let usable = if lit.whole_word && !is_eof {
+            let floored = utf8_floor(&window[..got]);
+            if floored >= lit.needle.len() {
+                floored
+            } else {
+                got
+            }
+        } else {
+            got
+        };
+        let win = &window[..usable];
 
         let prev_ch = if lit.whole_word && offset > 0 {
             let back = offset.min(4) as usize;
@@ -500,7 +530,7 @@ fn find_literal_in_tree(
         } else {
             None
         };
-        let win_end = offset + got as u64;
+        let win_end = offset + usable as u64;
         let next_ch = if lit.whole_word && win_end < total_len {
             let fwd = (total_len - win_end).min(4) as usize;
             let n = tree.read_into_slice(win_end, &mut ctx_buf[..fwd]);
@@ -531,23 +561,35 @@ fn find_literal_in_tree(
         if win_end >= total_len {
             break;
         }
-        let safe_step = got.saturating_sub(overlap).max(last_match_end).max(1);
+        let mut safe_step = usable.saturating_sub(overlap).max(last_match_end).max(1);
+        if lit.whole_word && safe_step < usable {
+            let snapped = utf8_floor(&win[..safe_step]);
+            if snapped > 0 {
+                safe_step = snapped;
+            }
+        }
         offset += safe_step as u64;
     }
 
     matches
 }
 
-/// Find the longest valid UTF-8 prefix length of `bytes` (trimming any split trailing char).
+/// Find the longest valid UTF-8 prefix length of `bytes` (trimming only an incomplete trailing char).
 #[inline]
 pub fn utf8_floor(bytes: &[u8]) -> usize {
-    if bytes.is_empty() {
+    let len = bytes.len();
+    if len == 0 {
         return 0;
     }
-    let check_start = bytes.len().saturating_sub(4);
-    match std::str::from_utf8(&bytes[check_start..]) {
-        Ok(_) => bytes.len(),
-        Err(e) => check_start + e.valid_up_to(),
+    // Walk back at most 3 continuation bytes to locate the start byte of the final UTF-8 scalar.
+    let mut start = len - 1;
+    let limit = len.saturating_sub(4);
+    while start > limit && (bytes[start] & 0xC0) == 0x80 {
+        start -= 1;
+    }
+    match std::str::from_utf8(&bytes[start..]) {
+        Ok(_) => len,
+        Err(_) => start,
     }
 }
 

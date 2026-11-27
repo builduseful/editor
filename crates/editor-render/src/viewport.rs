@@ -161,16 +161,19 @@ impl Viewport {
 
     pub fn zoom_in(&mut self) {
         self.font_size_pt = (self.font_size_pt + 1.5).min(36.0);
+        self.max_line_width_px = 0.0;
         self.clear_wrap_caches();
     }
 
     pub fn zoom_out(&mut self) {
         self.font_size_pt = (self.font_size_pt - 1.5).max(8.0);
+        self.max_line_width_px = 0.0;
         self.clear_wrap_caches();
     }
 
     pub fn zoom_reset(&mut self) {
         self.font_size_pt = 13.5;
+        self.max_line_width_px = 0.0;
         self.clear_wrap_caches();
     }
 
@@ -217,7 +220,7 @@ impl Viewport {
         let mut last_break_byte: Option<usize> = None;
 
         for (off, cluster) in grapheme_clusters(text) {
-            let cw = if cluster == "\t" {
+            let mut cw = if cluster == "\t" {
                 self.tab_width - (col_cells % self.tab_width)
             } else {
                 cluster_cell_width(cluster) as usize
@@ -241,6 +244,17 @@ impl Viewport {
                     segs += 1;
                     seg_start = off;
                     col_cells = 0;
+                }
+                if cluster == "\t" {
+                    cw = self.tab_width - (col_cells % self.tab_width);
+                }
+                if col_cells > 0 && col_cells + cw > max_cells {
+                    segs += 1;
+                    seg_start = off;
+                    col_cells = 0;
+                    if cluster == "\t" {
+                        cw = self.tab_width;
+                    }
                 }
             }
             col_cells += cw;
@@ -316,6 +330,7 @@ impl Viewport {
             }
             let avg = (sampled_vis.max(1) as f64 / sampled_log.max(1) as f64).max(1.0);
             let est_logical = doc.estimated_editable_line_count().max(total_logical);
+            self.wrapped_metrics_line_count = est_logical;
             self.wrapped_total_visual_lines =
                 ((est_logical as f64) * avg).ceil().max(est_logical as f64) as usize;
         }
@@ -660,6 +675,8 @@ impl Viewport {
         let text_h = self.layout.text.h.max(0) as f32;
 
         if self.word_wrap {
+            let font_px = self.font_px(scale);
+            self.sync_wrap_cache(doc.generation(), self.layout.text.w, font_px);
             self.sync_wrapped_metrics(doc, self.layout.text.w, metrics, scale);
             if !self.wrapped_prefix.is_empty() {
                 let total_vis = *self.wrapped_prefix.last().unwrap_or(&1).max(&1);
@@ -723,6 +740,8 @@ impl Viewport {
         }
 
         if self.word_wrap {
+            let font_px = self.font_px(scale);
+            self.sync_wrap_cache(doc.generation(), self.layout.text.w, font_px);
             self.sync_wrapped_metrics(doc, self.layout.text.w, metrics, scale);
             let text_pad_x = px(12.0, scale) as f32;
             let max_wrap_w =
@@ -810,7 +829,9 @@ impl Viewport {
         }
 
         let visible_lines = (text_h / line_h).floor().max(1.0) as usize;
-        if line < self.scroll_top_line {
+        if line < self.scroll_top_line
+            || (line == self.scroll_top_line && self.scroll_sub_y_px > 0.0)
+        {
             self.scroll_top_line = line;
             self.scroll_sub_y_px = 0.0;
         } else if line >= self.scroll_top_line + visible_lines {
@@ -892,7 +913,7 @@ impl Viewport {
         let max_cells = (max_w / cell_w).floor().max(4.0) as usize;
 
         for (off, cluster) in grapheme_clusters(text) {
-            let cw = if cluster == "\t" {
+            let mut cw = if cluster == "\t" {
                 self.tab_width - (col_cells % self.tab_width)
             } else {
                 cluster_cell_width(cluster) as usize
@@ -930,6 +951,21 @@ impl Viewport {
                     seg_start = off;
                     col_cells = 0;
                 }
+                if cluster == "\t" {
+                    cw = self.tab_width - (col_cells % self.tab_width);
+                }
+                if col_cells > 0 && col_cells + cw > max_cells {
+                    segs.push(WrappedSegment {
+                        byte_start: seg_start,
+                        byte_end: off,
+                        width_px: col_cells as f32 * cell_w,
+                    });
+                    seg_start = off;
+                    col_cells = 0;
+                    if cluster == "\t" {
+                        cw = self.tab_width;
+                    }
+                }
             }
             col_cells += cw;
             if cluster == " " || cluster == "\t" {
@@ -959,6 +995,8 @@ impl Viewport {
         scale: f32,
     ) -> DocHit {
         let line_h = metrics.line_height.max(1) as f32;
+        let font_px = self.font_px(scale);
+        self.sync_wrap_cache(doc.generation(), self.layout.text.w, font_px);
         let text_pad_x = px(12.0, scale) as f32;
         let text_origin_x = self.layout.text.x as f32 + text_pad_x - self.scroll_x_px;
         let max_wrap_w = (self.layout.text.w as f32 - text_pad_x * 2.0).max(metrics.cell_width * 4.0);
@@ -982,8 +1020,10 @@ impl Viewport {
         while line < total_lines {
             let content = doc.line_content(line).unwrap_or_default();
             let segs = self.layout_line(line, &content, metrics.cell_width, max_wrap_w);
-            for seg in &segs {
-                if target_y < cur_y + line_h || line + 1 == total_lines {
+            for (seg_idx, seg) in segs.iter().enumerate() {
+                if target_y < cur_y + line_h
+                    || (line + 1 == total_lines && seg_idx + 1 == segs.len())
+                {
                     let seg_str = &content[seg.byte_start..seg.byte_end];
                     let rel_x = (x_px - text_origin_x).max(0.0);
                     let col_in_seg = self.x_to_col_bytes(seg_str, rel_x, metrics.cell_width);
@@ -1051,6 +1091,8 @@ impl Viewport {
         if rect.is_empty() {
             return;
         }
+        // Reset per-frame caret bounding rect so partial dirty-rect redraws stay tight!
+        self.last_caret_rect = PixelRect::ZERO;
         let scale = painter.scale();
         let font_px = self.font_px(scale);
         let metrics = atlas.metrics(rasterizer, FontStyle::Mono, font_px);

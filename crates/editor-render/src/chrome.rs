@@ -546,7 +546,7 @@ pub fn draw_status_bar(
         } else {
             theme.state_success
         };
-        painter.draw_text_ui(
+        lx = painter.draw_text_ui(
             lx,
             baseline,
             msg,
@@ -613,6 +613,7 @@ pub struct ConfirmModal {
     pub is_move_confirm: bool,
     pub is_update_confirm: bool,
     pub is_replace_all_confirm: bool,
+    pub is_save_conflict: bool,
     pub move_body: String,
     pub btn_save: PixelRect,
     pub btn_discard: PixelRect,
@@ -627,6 +628,7 @@ impl ConfirmModal {
         self.is_move_confirm = false;
         self.is_update_confirm = false;
         self.is_replace_all_confirm = false;
+        self.is_save_conflict = false;
         self.move_body.clear();
         self.file_name = file_name.to_string();
     }
@@ -638,6 +640,7 @@ impl ConfirmModal {
         self.is_move_confirm = false;
         self.is_update_confirm = false;
         self.is_replace_all_confirm = false;
+        self.is_save_conflict = false;
         self.move_body.clear();
         self.file_name = name.to_string();
     }
@@ -649,6 +652,7 @@ impl ConfirmModal {
         self.is_move_confirm = true;
         self.is_update_confirm = false;
         self.is_replace_all_confirm = false;
+        self.is_save_conflict = false;
         self.file_name = name.to_string();
         self.move_body = format!("Move \"{name}\" ({summary}) into \"{dest_name}\"?");
     }
@@ -660,6 +664,7 @@ impl ConfirmModal {
         self.is_move_confirm = false;
         self.is_update_confirm = true;
         self.is_replace_all_confirm = false;
+        self.is_save_conflict = false;
         self.file_name = new_version.to_string();
         self.move_body = format!(
             "Version {new_version} is available (installed: {current_version})."
@@ -673,6 +678,7 @@ impl ConfirmModal {
         self.is_move_confirm = false;
         self.is_update_confirm = false;
         self.is_replace_all_confirm = true;
+        self.is_save_conflict = false;
         self.file_name = format!(
             "{match_count} match{} in {file_count} file{}",
             if match_count == 1 { "" } else { "es" },
@@ -682,12 +688,27 @@ impl ConfirmModal {
             .to_string();
     }
 
+    pub fn open_save_conflict(&mut self, file_name: &str) {
+        self.visible = true;
+        self.is_delete = false;
+        self.delete_is_dir = false;
+        self.is_move_confirm = false;
+        self.is_update_confirm = false;
+        self.is_replace_all_confirm = false;
+        self.is_save_conflict = true;
+        self.file_name = file_name.to_string();
+        self.move_body =
+            "This file changed on disk since you opened it. Overwrite with your changes?"
+                .to_string();
+    }
+
     pub fn close(&mut self) {
         self.visible = false;
         self.is_delete = false;
         self.is_move_confirm = false;
         self.is_update_confirm = false;
         self.is_replace_all_confirm = false;
+        self.is_save_conflict = false;
     }
 
     pub fn hit_test(&self, x_px: f32, y_px: f32) -> Option<ConfirmChoice> {
@@ -764,6 +785,11 @@ impl ConfirmModal {
         } else if self.is_replace_all_confirm {
             (
                 format!("Replace {}?", self.file_name),
+                self.move_body.as_str(),
+            )
+        } else if self.is_save_conflict {
+            (
+                format!("{} Changed on Disk", self.file_name),
                 self.move_body.as_str(),
             )
         } else {
@@ -859,6 +885,15 @@ impl ConfirmModal {
             self.btn_cancel = PixelRect::new(card.x + pad, btn_y, cancel_w, btn_h);
             draw_button(painter, self.btn_cancel, "Cancel", false, theme, atlas, rasterizer);
             draw_button(painter, self.btn_discard, "Replace All", true, theme, atlas, rasterizer);
+        } else if self.is_save_conflict {
+            let ov_w = px(90.0, scale);
+            let rel_w = px(76.0, scale);
+            self.btn_save = PixelRect::new(card.right() - pad - ov_w, btn_y, ov_w, btn_h);
+            self.btn_discard = PixelRect::new(self.btn_save.x - gap - rel_w, btn_y, rel_w, btn_h);
+            self.btn_cancel = PixelRect::new(card.x + pad, btn_y, cancel_w, btn_h);
+            draw_button(painter, self.btn_cancel, "Cancel", false, theme, atlas, rasterizer);
+            draw_button(painter, self.btn_discard, "Reload", false, theme, atlas, rasterizer);
+            draw_button(painter, self.btn_save, "Overwrite", true, theme, atlas, rasterizer);
         } else {
             let save_w = px(72.0, scale);
             let discard_w = px(92.0, scale);

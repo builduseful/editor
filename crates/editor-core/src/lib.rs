@@ -34,8 +34,8 @@ pub use grapheme::{
 pub use piece_tree::{PieceTree, Summary};
 pub use regex::{is_word_char, Captures, PikeVmScratch, Regex, RegexError};
 pub use search::{
-    find_all_matches, find_all_matches_checked, find_next_match, CompiledQuery, SearchMatch,
-    SearchOptions, SearchScratch,
+    find_all_matches, find_all_matches_checked, find_next_match, utf8_floor, CompiledQuery,
+    SearchMatch, SearchOptions, SearchScratch,
 };
 pub use syntax::{
     Language, LanguageMeta, LanguageRegistry, LexState, LineState, SyntaxCache, SyntaxPlugin,

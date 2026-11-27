@@ -157,9 +157,11 @@ impl<'a> ByteCursor<'a> {
             if allow_escape && b == b'\\' && self.pos + 1 < len {
                 push_span(out, seg_start, self.pos, TokenKind::String);
                 let esc_start = self.pos;
-                self.pos += 2;
+                self.pos += 1;
+                let esc_b = self.bytes[self.pos];
+                self.bump_char();
                 // Handle `\xNN`, `\uNNNN`, `\u{...}` neatly.
-                match self.bytes[esc_start + 1] {
+                match esc_b {
                     b'x' => {
                         let mut k = 0;
                         while k < 2
@@ -226,7 +228,8 @@ impl<'a> ByteCursor<'a> {
             if allow_escape && b == b'\\' && self.pos + 1 < len {
                 push_span(out, seg_start, self.pos, TokenKind::String);
                 let esc_start = self.pos;
-                self.pos += 2;
+                self.pos += 1;
+                self.bump_char();
                 push_span(out, esc_start, self.pos, TokenKind::Escape);
                 seg_start = self.pos;
             } else if b == quote

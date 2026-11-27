@@ -123,12 +123,15 @@ impl ShelfPacker {
             self.pixels = vec![0u8; 256 * 256 * self.bytes_per_pixel];
         }
         let pad = 1u32;
+        if w + pad * 2 > self.width {
+            return None;
+        }
         if self.cursor_x + w + pad > self.width {
             self.cursor_x = 1;
             self.cursor_y += self.row_height + pad;
             self.row_height = 0;
         }
-        if self.cursor_y + h + pad > self.height {
+        while self.cursor_y + h + pad > self.height {
             if self.height >= 4096 {
                 return None;
             }
@@ -136,9 +139,6 @@ impl ShelfPacker {
             self.pixels
                 .resize((self.width as usize) * (new_h as usize) * self.bytes_per_pixel, 0);
             self.height = new_h;
-            if self.cursor_y + h + pad > self.height {
-                return None;
-            }
         }
         let ax = self.cursor_x;
         let ay = self.cursor_y;
@@ -304,33 +304,41 @@ impl GlyphAtlas {
             GlyphFormat::Alpha8 => self.alpha.allocate(r.width, r.height, &r.pixels),
             GlyphFormat::Bgra32 => self.color.allocate(r.width, r.height, &r.pixels),
         };
-        let (ax, ay) = match alloc {
-            Some(pos) => pos,
+        let packed = match alloc {
+            Some(pos) => Some(pos),
             None => {
                 // Atlas full: reset cleanly and re-pack this glyph.
                 self.clear();
                 match r.format {
-                    GlyphFormat::Alpha8 => self
-                        .alpha
-                        .allocate(r.width, r.height, &r.pixels)
-                        .unwrap_or((0, 0)),
-                    GlyphFormat::Bgra32 => self
-                        .color
-                        .allocate(r.width, r.height, &r.pixels)
-                        .unwrap_or((0, 0)),
+                    GlyphFormat::Alpha8 => self.alpha.allocate(r.width, r.height, &r.pixels),
+                    GlyphFormat::Bgra32 => self.color.allocate(r.width, r.height, &r.pixels),
                 }
             }
         };
 
-        let entry = AtlasGlyph {
-            atlas_x: ax,
-            atlas_y: ay,
-            width: r.width,
-            height: r.height,
-            bearing_x: r.bearing_x,
-            bearing_y: r.bearing_y,
-            advance: r.advance,
-            format: r.format,
+        let entry = if let Some((ax, ay)) = packed {
+            AtlasGlyph {
+                atlas_x: ax,
+                atlas_y: ay,
+                width: r.width,
+                height: r.height,
+                bearing_x: r.bearing_x,
+                bearing_y: r.bearing_y,
+                advance: r.advance,
+                format: r.format,
+            }
+        } else {
+            // Oversized glyph could not fit in atlas: store zero-size placeholder so draw_glyph never panics OOB.
+            AtlasGlyph {
+                atlas_x: 0,
+                atlas_y: 0,
+                width: 0,
+                height: 0,
+                bearing_x: r.bearing_x,
+                bearing_y: r.bearing_y,
+                advance: r.advance,
+                format: r.format,
+            }
         };
         self.cache.insert(key, entry);
         entry

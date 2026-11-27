@@ -219,11 +219,15 @@ fn main() {
         }
     }
 
-    // Best-effort ad-hoc signing so macOS LaunchServices accepts the bundle cleanly.
-    let _ = Command::new("/usr/bin/codesign")
+    // Ad-hoc sign so macOS LaunchServices and `codesign --verify --deep --strict` accept the bundle.
+    let status = Command::new("/usr/bin/codesign")
         .args(["--force", "--deep", "--sign", "-"])
         .arg(&app_dir)
-        .status();
+        .status()
+        .expect("invoke /usr/bin/codesign");
+    if !status.success() {
+        panic!("codesign failed with status {status}");
+    }
 
     println!(
         "Packaged {} (v{} / build {})",

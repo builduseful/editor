@@ -183,9 +183,10 @@ pub fn prev_grapheme_boundary(s: &str, byte_offset: usize) -> usize {
         return 0;
     }
 
-    // Fast ASCII path when both current and previous bytes are plain ASCII.
+    // Fast ASCII path when the previous byte is plain ASCII and NOT preceded by ZWJ (U+200D).
     let prev_b = bytes[target - 1];
-    if prev_b < 0x80 {
+    let after_zwj = target >= 4 && bytes[target - 4..target - 1] == [0xE2, 0x80, 0x8D];
+    if prev_b < 0x80 && !after_zwj {
         if prev_b == b'\n' && target >= 2 && bytes[target - 2] == b'\r' {
             return target - 2;
         }
@@ -199,14 +200,14 @@ pub fn prev_grapheme_boundary(s: &str, byte_offset: usize) -> usize {
     while anchor > 0 && !s.is_char_boundary(anchor) {
         anchor -= 1;
     }
-    // Walk back further if we landed in the middle of a regional indicator run or ZWJ chain.
+    // Walk back further if we landed in the middle of a regional indicator run, combining run, or ZWJ chain.
     while anchor > 0 {
         let prev_start = snap_down_char_boundary(s, anchor - 1);
         let ch = s[prev_start..].chars().next().unwrap();
+        anchor = prev_start;
         if ch.is_ascii() && ch != '\r' {
             break;
         }
-        anchor = prev_start;
     }
 
     let mut cur = anchor;

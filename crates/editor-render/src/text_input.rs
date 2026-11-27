@@ -36,6 +36,7 @@ impl TextInput {
         self.text = value.into();
         self.caret = self.text.len();
         self.anchor = 0;
+        self.scroll_x = 0.0;
     }
 
     pub fn select_all(&mut self) {
@@ -332,9 +333,12 @@ impl TextInput {
             atlas,
             rasterizer,
         );
+        let total_w = Painter::measure_text_ui(&self.text, FontStyle::Ui, font_px, atlas, rasterizer);
         let inner_w = inner.w as f32;
+        let max_scroll = (total_w - inner_w + 8.0 * scale).max(0.0);
+        self.scroll_x = self.scroll_x.clamp(0.0, max_scroll);
         if caret_x_rel - self.scroll_x > inner_w - 4.0 * scale {
-            self.scroll_x = (caret_x_rel - inner_w + 8.0 * scale).max(0.0);
+            self.scroll_x = (caret_x_rel - inner_w + 8.0 * scale).clamp(0.0, max_scroll);
         } else if caret_x_rel < self.scroll_x {
             self.scroll_x = (caret_x_rel - 4.0 * scale).max(0.0);
         }

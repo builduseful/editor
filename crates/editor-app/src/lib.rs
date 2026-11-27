@@ -23,19 +23,20 @@ use editor_core::{
     TokenKind,
 };
 use editor_platform::{
-    AppCommand, Clipboard, ConfirmChoice, CursorShape, DragPhase, FileSystem, FontStyle,
-    Framebuffer, GlyphRasterizer, InputEvent, Key, Modifiers, MouseButton, PixelRect, PlatformHost,
-    SurfaceMut, SystemTheme, ThemePreference,
+    display_path_string, AppCommand, Clipboard, ConfirmChoice, CursorShape, DragPhase, FileSystem,
+    FontStyle, Framebuffer, GlyphRasterizer, InputEvent, Key, Modifiers, MouseButton, PixelRect,
+    PlatformHost, SurfaceMut, SystemTheme, ThemePreference,
 };
 use editor_render::{
     chrome::{draw_status_bar, status_bar_height_px},
     parse_mono_style, tab_strip_height_px, A11yNode, A11yRole, ActionToast, Color, CommandPalette,
-    ConfirmModal, FindBarAction, FindBarState, GlyphAtlas, GotoLineState, ImeComposition, Painter,
-    PaletteAction, PaletteOpenTarget, PinsAction, PinsOverlay, ScrollbarHit, ShortcutsAction,
-    ShortcutsOverlay, Sidebar, SidebarAction, SidebarBadge, SidebarContextAction, SidebarHit,
-    SidebarPromptAction, SidebarPromptKind, SidebarSide, StatusBarData, StripDropTarget,
-    SyntaxPalette, SyntaxStylePreference, SyntaxThemeConfig, SyntaxThemePreset, TabStrip,
-    TabStripHit, Theme, ToastHit, TokenOverride, Viewport, SIDEBAR_AUTO_MINIMIZE_WIDTH_PT,
+    ConfirmModal, ContextMenu, ContextMenuEntry, FindBarAction, FindBarState, GlyphAtlas,
+    GotoLineState, ImeComposition, Painter, PaletteAction, PaletteOpenTarget, PinsAction,
+    PinsOverlay, ScrollbarHit, ShortcutsAction, ShortcutsOverlay, Sidebar, SidebarAction,
+    SidebarBadge, SidebarContextAction, SidebarHit, SidebarPromptAction, SidebarPromptKind,
+    SidebarSide, StatusBarData, StripDropTarget, SyntaxPalette, SyntaxStylePreference,
+    SyntaxThemeConfig, SyntaxThemePreset, TabStrip, TabStripHit, Theme, ToastHit, TokenOverride,
+    Viewport, SIDEBAR_AUTO_MINIMIZE_WIDTH_PT,
 };
 
 use fs_undo::{
@@ -44,14 +45,18 @@ use fs_undo::{
 };
 
 pub use buffers::{
-    BufferId, OpenMode, ParkedBuffer, SavedViewState, WorkingSet, DEFAULT_MAX_OPEN_TABS, MAX_PINS,
+    BufferId, OpenMode, ParkedBuffer, WorkingSet, DEFAULT_MAX_OPEN_TABS, MAX_PINS,
 };
 pub use keymap::{KeyChord, KeyScope, Keymap, ShortcutEntry};
 pub use panes::{
     Arrangement, Direction, Divider, DividerAxis, DropPlan, DropZone, GridLayout, PaneId,
     PaneRect, PaneSlot, MAX_PANES,
 };
-pub use session::{ratio_to_bp, FolderSession, SavedPane, SessionStore, MAX_RECENT_FOLDERS};
+pub use session::{
+    ratio_to_bp, DraftRecord, DraftStore, FolderSession, SavedBufferRef, SavedPane, SavedTab,
+    SavedViewPos, SessionStore, UndoBinding, UndoStore, MAX_BACKUP_BYTES, MAX_RECENT_FOLDERS,
+    MAX_TOTAL_BACKUP_BYTES, MAX_TOTAL_UNDO_BYTES, MAX_UNDO_PERSIST_BYTES, MAX_UNDO_PERSIST_STEPS,
+};
 pub use vim::{VimMode, VimState};
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -175,6 +180,14 @@ enum PendingDiscardAction {
         options: SearchOptions,
         files: Vec<PathBuf>,
     },
+    ConfirmSaveConflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackupSyncOutcome {
+    AllBackedUp,
+    HasOversizedDirty,
+    Unavailable,
 }
 
 enum UpdateWorkerEvent {
@@ -189,9 +202,31 @@ enum UpdateWorkerEvent {
     },
 }
 
+/// RAM-only MRU cap for clean unpinned tabs trimmed in the background by `max_open_tabs`
+/// (never written to disk; cleared on explicit `⌘W`, sidebar delete, folder switch, and quit).
+const MAX_EVICTED_VIEWS_RAM: usize = 32;
+
 /// After 10 seconds without user input, settle the caret calmly solid (like GTK/Emacs/WCAG)
 /// so the host can pause the 530 ms blink timer -> 0.00% idle CPU & single-surface RAM.
 pub const CARET_BLINK_IDLE_MS: u64 = 10_000;
+
+#[derive(Debug, Clone)]
+enum ContextMenuAction {
+    SidebarNewFile,
+    SidebarNewFolder,
+    SidebarRename,
+    SidebarDelete,
+    RevealPath(PathBuf),
+    CopyPath(PathBuf),
+    CopyRelativePath(PathBuf),
+    TogglePin(BufferId),
+    SplitBuffer {
+        target_pane: PaneId,
+        zone: DropZone,
+        buf_id: BufferId,
+    },
+    CloseBuffer(BufferId),
+}
 
 pub struct EditorApp {
     fs: Arc<dyn FileSystem>,
@@ -208,10 +243,20 @@ pub struct EditorApp {
     pub working_set: WorkingSet,
     /// LRU cap on clean unpinned Kept open tabs (`0` = unlimited; default = 8).
     pub max_open_tabs: usize,
-    /// Per-folder persisted session store (pins, open files, active file & cursor for last 12 folders).
+    /// Per-folder persisted session store (open tabs, split panes & views for last 12 folders).
     pub session_store: SessionStore,
-    /// Lightweight in-memory cursor/scroll recall (last 64 paths) when clean tabs are LRU-evicted.
-    view_memory: Vec<(PathBuf, SavedViewState)>,
+    /// Last encoded `FolderSessions` written to host prefs (for zero-write blur checks).
+    last_saved_sessions: Option<String>,
+    /// RAM-only view recall (max 32) strictly for clean tabs auto-evicted by `max_open_tabs`.
+    evicted_views: Vec<(PathBuf, SavedViewPos)>,
+    /// Crash-safe Hot Exit backup store for unsaved Untitled and modified file buffers.
+    pub draft_store: DraftStore,
+    /// Cached host state directory (`PlatformHost::state_dir()`), if persistent state is enabled.
+    state_dir: Option<PathBuf>,
+    /// Draft IDs explicitly discarded via `Don't Save` / `Reload` awaiting the next backup sync.
+    discarded_draft_ids: Vec<u64>,
+    /// File paths explicitly discarded via `Don't Save` awaiting backup cleanup.
+    discarded_draft_paths: Vec<PathBuf>,
     /// Custom-drawn top Working-Set Strip.
     pub tab_strip: TabStrip,
     /// Custom-drawn Pinned & Open Files quick overlay (`⌘E` / `<Space>e`).
@@ -239,6 +284,9 @@ pub struct EditorApp {
     pub palette: CommandPalette,
     pub shortcuts: ShortcutsOverlay,
     pub confirm_modal: ConfirmModal,
+    /// Shared custom-drawn right-click context menu (sidebar rows/empty space, tabs, pane headers).
+    pub context_menu: ContextMenu,
+    context_menu_actions: Vec<ContextMenuAction>,
     /// Gmail-style floating action toast with optional inline `Undo` button.
     pub toast: ActionToast,
     /// Bounded in-memory undo/redo history for sidebar filesystem ops (independent of document undo).
@@ -351,7 +399,12 @@ impl EditorApp {
             working_set: WorkingSet::new(1),
             max_open_tabs: DEFAULT_MAX_OPEN_TABS,
             session_store: SessionStore::default(),
-            view_memory: Vec::new(),
+            last_saved_sessions: None,
+            evicted_views: Vec::new(),
+            draft_store: DraftStore::default(),
+            state_dir: None,
+            discarded_draft_ids: Vec::new(),
+            discarded_draft_paths: Vec::new(),
             tab_strip: TabStrip::new(),
             pins_overlay: PinsOverlay::new(),
             sidebar: Sidebar::new(),
@@ -369,6 +422,8 @@ impl EditorApp {
             palette: CommandPalette::new(),
             shortcuts: ShortcutsOverlay::new(),
             confirm_modal: ConfirmModal::default(),
+            context_menu: ContextMenu::new(),
+            context_menu_actions: Vec::new(),
             toast: ActionToast::default(),
             fs_undo: FsUndoStack::new(),
             keymap: Keymap::new(),
@@ -450,20 +505,45 @@ impl EditorApp {
         {
             self.max_open_tabs = max_tabs;
         }
+        if let Some(ext_map) = host.load_pref("SyntaxExtMap") {
+            self.syntax_ext_map = parse_str_map(&ext_map);
+        }
+        self.state_dir = host.state_dir();
+        if let Some(ref sd) = self.state_dir {
+            self.draft_store = DraftStore::load(self.fs.as_ref(), sd);
+        }
         if let Some(raw_sessions) = host.load_pref("FolderSessions") {
             self.session_store = SessionStore::decode(&raw_sessions);
+            self.last_saved_sessions = Some(raw_sessions);
         }
         if self.sidebar.root().is_none() {
+            let mut restored_folder = false;
             if let Some(raw_dir) = host.load_pref("LastFolder") {
                 let dir = PathBuf::from(raw_dir.trim());
-                if !dir.as_os_str().is_empty()
-                    && self.fs.stat(&dir).map(|s| s.is_dir).unwrap_or(false)
-                {
-                    let canonical = self.fs.canonicalize(&dir).unwrap_or(dir);
-                    self.sidebar.set_root(self.fs.as_ref(), &canonical);
-                    if self.is_initial_empty_untitled() {
-                        self.restore_folder_session_internal(&canonical);
+                if !dir.as_os_str().is_empty() {
+                    if self.fs.stat(&dir).map(|s| s.is_dir).unwrap_or(false) {
+                        let canonical = self.fs.canonicalize(&dir).unwrap_or(dir);
+                        self.sidebar.set_root(self.fs.as_ref(), &canonical);
+                        if self.is_initial_empty_untitled() {
+                            self.restore_folder_session_internal(&canonical);
+                        }
+                        restored_folder = true;
+                    } else if self.is_initial_empty_untitled() {
+                        // Even if `LastFolder` was deleted while closed, recover any drafts from it!
+                        let fallback = self.fs.canonicalize(&dir).unwrap_or(dir);
+                        self.restore_folder_session_internal(&fallback);
+                        restored_folder = !self.is_initial_empty_untitled();
                     }
+                }
+            }
+            if !restored_folder && self.is_initial_empty_untitled() {
+                // Restore standalone (no-folder) session & unsaved Untitled drafts if present.
+                let standalone = PathBuf::new();
+                if self.session_store.get(&standalone).is_some()
+                    || !self.draft_store.untitled_for_scope(&standalone).is_empty()
+                    || !self.draft_store.file_drafts_for_scope(&standalone).is_empty()
+                {
+                    self.restore_folder_session_internal(&standalone);
                 }
             }
         }
@@ -501,9 +581,6 @@ impl EditorApp {
             self.syntax_theme.dark_overrides = SyntaxThemeConfig::decode_overrides(&ov);
         }
         self.rebuild_syntax_palettes();
-        if let Some(ext_map) = host.load_pref("SyntaxExtMap") {
-            self.syntax_ext_map = parse_str_map(&ext_map);
-        }
         if let Some(vim) = host.load_pref("VimMode") {
             self.vim.set_enabled(vim == "1" || vim == "true");
         }
@@ -520,7 +597,9 @@ impl EditorApp {
             self.last_update_check_secs = ts;
         }
         self.sync_wrap_for_panes();
-        self.sync_languages_for_panes();
+        if !self.syntax_ext_map.is_empty() {
+            self.sync_languages_for_panes();
+        }
         self.recompute_layout();
         self.mark_dirty();
     }
@@ -944,17 +1023,806 @@ impl EditorApp {
         self.sync_git_dir_watch(host);
     }
 
-    fn remember_view(&mut self, path: PathBuf, view: SavedViewState) {
-        self.view_memory.retain(|(p, _)| p != &path);
-        self.view_memory.insert(0, (path, view));
-        if self.view_memory.len() > 64 {
-            self.view_memory.truncate(64);
+    fn remember_evicted_view(&mut self, path: PathBuf, view: SavedViewPos) {
+        if view.is_default() {
+            return;
+        }
+        self.evicted_views.retain(|(p, _)| p != &path);
+        self.evicted_views.insert(0, (path, view));
+        if self.evicted_views.len() > MAX_EVICTED_VIEWS_RAM {
+            self.evicted_views.truncate(MAX_EVICTED_VIEWS_RAM);
         }
     }
 
-    fn take_remembered_view(&mut self, path: &Path) -> Option<SavedViewState> {
-        let pos = self.view_memory.iter().position(|(p, _)| p == path)?;
-        Some(self.view_memory.remove(pos).1)
+    fn take_evicted_view(&mut self, path: &Path) -> Option<SavedViewPos> {
+        let pos = self.evicted_views.iter().position(|(p, _)| p == path)?;
+        Some(self.evicted_views.remove(pos).1)
+    }
+
+    fn forget_evicted_view(&mut self, path: &Path) {
+        self.evicted_views.retain(|(p, _)| p != path);
+    }
+
+    fn forget_evicted_views_under(&mut self, path: &Path, is_dir: bool) {
+        self.evicted_views.retain(|(p, _)| {
+            if is_dir {
+                !p.starts_with(path)
+            } else {
+                p != path
+            }
+        });
+    }
+
+    fn capture_view_pos(
+        doc: &mut Document,
+        caret: u64,
+        anchor: u64,
+        scroll_top_line: usize,
+        scroll_sub_y_px: f32,
+        scroll_x_px: f32,
+    ) -> SavedViewPos {
+        let (line, col) = doc.byte_to_line_col(caret);
+        let (anchor_line, anchor_col) = doc.byte_to_line_col(anchor);
+        SavedViewPos::from_pixels(
+            line,
+            col,
+            anchor_line,
+            anchor_col,
+            scroll_top_line,
+            scroll_sub_y_px,
+            scroll_x_px,
+        )
+    }
+
+    fn apply_view_pos(
+        doc: &mut Document,
+        caret: &mut u64,
+        anchor: &mut u64,
+        scroll_top_line: &mut usize,
+        scroll_sub_y_px: &mut f32,
+        scroll_x_px: &mut f32,
+        pos: SavedViewPos,
+    ) {
+        let max_needed = pos.line.max(pos.anchor_line).max(pos.scroll_top_line);
+        doc.tree_mut().ensure_indexed_for_line(max_needed + 32);
+        let last_line = doc.editable_line_count().saturating_sub(1);
+
+        let resolve_lc = |d: &mut Document, raw_line: usize, raw_col: usize| -> u64 {
+            let l = raw_line.min(last_line);
+            let Some((ls, le, _)) = d.line_byte_range(l) else {
+                return 0;
+            };
+            let line_len = (le - ls) as usize;
+            let clamped = raw_col.min(line_len);
+            if clamped == 0 || clamped == line_len {
+                return ls + clamped as u64;
+            }
+            let content = d.line_content(l).unwrap_or_default();
+            let mut safe = clamped.min(content.len());
+            while safe > 0 && !content.is_char_boundary(safe) {
+                safe -= 1;
+            }
+            ls + safe as u64
+        };
+
+        *caret = resolve_lc(doc, pos.line, pos.col);
+        *anchor = resolve_lc(doc, pos.anchor_line, pos.anchor_col);
+        *scroll_top_line = pos.scroll_top_line.min(last_line);
+        *scroll_sub_y_px = pos.scroll_sub_y_px();
+        *scroll_x_px = pos.scroll_x_px();
+    }
+
+    fn capture_view_for_buf_id(&mut self, id: BufferId) -> SavedViewPos {
+        if id == self.active_buf_id {
+            Self::capture_view_pos(
+                &mut self.doc,
+                self.caret,
+                self.anchor,
+                self.viewport.scroll_top_line,
+                self.viewport.scroll_sub_y_px,
+                self.viewport.scroll_x_px,
+            )
+        } else if let Some(pane) = self.other_panes.iter_mut().find(|p| p.buf_id == id) {
+            Self::capture_view_pos(
+                &mut pane.doc,
+                pane.caret,
+                pane.anchor,
+                pane.viewport.scroll_top_line,
+                pane.viewport.scroll_sub_y_px,
+                pane.viewport.scroll_x_px,
+            )
+        } else if let Some(parked) = self.working_set.parked_mut(id) {
+            Self::capture_view_pos(
+                &mut parked.doc,
+                parked.caret,
+                parked.anchor,
+                parked.scroll_top_line,
+                parked.scroll_sub_y_px,
+                parked.scroll_x_px,
+            )
+        } else {
+            SavedViewPos::default()
+        }
+    }
+
+    fn saved_tab_for_id(&mut self, id: BufferId) -> Option<SavedTab> {
+        let target = self.buffer_ref_for_id(id)?;
+        let view = self.capture_view_for_buf_id(id);
+        Some(SavedTab { target, view })
+    }
+
+    fn current_scope_folder(&self) -> PathBuf {
+        self.sidebar.root().map(Path::to_path_buf).unwrap_or_default()
+    }
+
+    fn buffer_ref_for_id(&self, id: BufferId) -> Option<SavedBufferRef> {
+        let meta = self.working_set.get_meta(id)?;
+        if let Some(ref p) = meta.path {
+            Some(SavedBufferRef::File(p.clone()))
+        } else {
+            meta.draft_id.map(SavedBufferRef::Draft)
+        }
+    }
+
+    /// Declarative, idempotent Hot Exit backup sync:
+    /// Makes `state_dir/backups/` match the current truth of `is_dirty()` for the active scope
+    /// (writing immutable `d<id>_r<rev>.buf` files only when `doc.generation()` changed, committing
+    /// `index.tsv` atomically, and orphan-GCing superseded `.buf` files).
+    fn sync_backups_now(&mut self, host: &mut dyn PlatformHost) -> Result<BackupSyncOutcome, String> {
+        if let Some(sd) = host.state_dir() {
+            if self.state_dir.as_deref() != Some(sd.as_path()) {
+                self.state_dir = Some(sd.clone());
+                self.draft_store = DraftStore::load(self.fs.as_ref(), &sd);
+            }
+        }
+        let Some(state_dir) = self.state_dir.clone() else {
+            return Ok(if self.any_buffer_dirty() {
+                BackupSyncOutcome::Unavailable
+            } else {
+                BackupSyncOutcome::AllBackedUp
+            });
+        };
+
+        if !self.draft_store.loaded_ok {
+            return Ok(if self.any_buffer_dirty() {
+                BackupSyncOutcome::Unavailable
+            } else {
+                BackupSyncOutcome::AllBackedUp
+            });
+        }
+
+        self.sync_active_buffer_meta();
+        let scope = self.current_scope_folder();
+
+        // Collect all live buffers across active pane, secondary panes, and parked pool
+        // (deduplicated by `BufferId`, preferring active pane / highest generation).
+        struct LiveBufInfo {
+            buf_id: BufferId,
+            path: Option<PathBuf>,
+            dirty: bool,
+            len_bytes: u64,
+            generation: u64,
+            base_rev: editor_platform::FileRev,
+            bom: bool,
+            eol: editor_core::Eol,
+            lang_override: Option<String>,
+            view: SavedViewPos,
+        }
+
+        let mut seen: Vec<BufferId> = Vec::new();
+        let mut live: Vec<LiveBufInfo> = Vec::new();
+
+        {
+            let v = Self::capture_view_pos(
+                &mut self.doc,
+                self.caret,
+                self.anchor,
+                self.viewport.scroll_top_line,
+                self.viewport.scroll_sub_y_px,
+                self.viewport.scroll_x_px,
+            );
+            let path = self.doc.path().map(Path::to_path_buf);
+            let default_lang = Language::from_path_with_overrides(path.as_deref(), &self.syntax_ext_map);
+            let lang_ov = (self.doc.language() != default_lang)
+                .then(|| self.doc.language().id().to_string());
+            seen.push(self.active_buf_id);
+            live.push(LiveBufInfo {
+                buf_id: self.active_buf_id,
+                path,
+                dirty: self.doc.is_dirty(),
+                len_bytes: self.doc.len_bytes(),
+                generation: self.doc.generation(),
+                base_rev: self.doc.rev(),
+                bom: self.doc.has_bom(),
+                eol: self.doc.eol(),
+                lang_override: lang_ov,
+                view: v,
+            });
+        }
+        for pane in &mut self.other_panes {
+            if seen.contains(&pane.buf_id) {
+                continue;
+            }
+            let v = Self::capture_view_pos(
+                &mut pane.doc,
+                pane.caret,
+                pane.anchor,
+                pane.viewport.scroll_top_line,
+                pane.viewport.scroll_sub_y_px,
+                pane.viewport.scroll_x_px,
+            );
+            let path = pane.doc.path().map(Path::to_path_buf);
+            let default_lang = Language::from_path_with_overrides(path.as_deref(), &self.syntax_ext_map);
+            let lang_ov = (pane.doc.language() != default_lang)
+                .then(|| pane.doc.language().id().to_string());
+            seen.push(pane.buf_id);
+            live.push(LiveBufInfo {
+                buf_id: pane.buf_id,
+                path,
+                dirty: pane.doc.is_dirty(),
+                len_bytes: pane.doc.len_bytes(),
+                generation: pane.doc.generation(),
+                base_rev: pane.doc.rev(),
+                bom: pane.doc.has_bom(),
+                eol: pane.doc.eol(),
+                lang_override: lang_ov,
+                view: v,
+            });
+        }
+        let parked_ids = self.working_set.parked_ids();
+        for pid in parked_ids {
+            if seen.contains(&pid) {
+                continue;
+            }
+            if let Some(parked) = self.working_set.parked_mut(pid) {
+                let v = Self::capture_view_pos(
+                    &mut parked.doc,
+                    parked.caret,
+                    parked.anchor,
+                    parked.scroll_top_line,
+                    parked.scroll_sub_y_px,
+                    parked.scroll_x_px,
+                );
+                let path = parked.doc.path().map(Path::to_path_buf);
+                let default_lang =
+                    Language::from_path_with_overrides(path.as_deref(), &self.syntax_ext_map);
+                let lang_ov = (parked.doc.language() != default_lang)
+                    .then(|| parked.doc.language().id().to_string());
+                seen.push(pid);
+                live.push(LiveBufInfo {
+                    buf_id: pid,
+                    path,
+                    dirty: parked.doc.is_dirty(),
+                    len_bytes: parked.doc.len_bytes(),
+                    generation: parked.doc.generation(),
+                    base_rev: parked.doc.rev(),
+                    bom: parked.doc.has_bom(),
+                    eol: parked.doc.eol(),
+                    lang_override: lang_ov,
+                    view: v,
+                });
+            }
+        }
+
+        let mut clean_paths: Vec<PathBuf> = Vec::new();
+        let mut live_dirty_ids: Vec<u64> = Vec::new();
+        let mut has_oversized = false;
+        let mut manifest_changed = false;
+
+        // Track existing total backup bytes from other folders so we respect MAX_TOTAL_BACKUP_BYTES.
+        let mut total_bytes: u64 = self
+            .draft_store
+            .records
+            .iter()
+            .filter(|r| {
+                r.scope_folder != scope
+                    && !live.iter().any(|l| l.path.is_some() && l.path == r.original_path)
+            })
+            .map(|r| r.byte_len as u64)
+            .sum();
+
+        for info in &live {
+            // Never back up clean buffers or empty 0-byte Untitled buffers.
+            let is_backup_dirty = info.dirty && (info.path.is_some() || info.len_bytes > 0);
+            if !is_backup_dirty {
+                if let Some(ref p) = info.path {
+                    clean_paths.push(p.clone());
+                }
+                if let Some(old_id) = self.working_set.get_meta(info.buf_id).and_then(|m| m.draft_id) {
+                    self.working_set.set_draft_state(info.buf_id, None, 0);
+                    let before = self.draft_store.records.len();
+                    self.draft_store.records.retain(|r| r.id != old_id);
+                    if self.draft_store.records.len() != before {
+                        manifest_changed = true;
+                    }
+                }
+                continue;
+            }
+
+            if info.len_bytes > MAX_BACKUP_BYTES
+                || total_bytes.saturating_add(info.len_bytes) > MAX_TOTAL_BACKUP_BYTES
+            {
+                has_oversized = true;
+                continue;
+            }
+            total_bytes = total_bytes.saturating_add(info.len_bytes);
+
+            let meta_snap = self.working_set.get_meta(info.buf_id).cloned();
+            let existing_id = meta_snap
+                .as_ref()
+                .and_then(|m| m.draft_id)
+                .or_else(|| {
+                    info.path
+                        .as_deref()
+                        .and_then(|p| self.draft_store.find_by_path(p).map(|r| r.id))
+                });
+            let draft_id = match existing_id {
+                Some(id) => id,
+                None => self.draft_store.alloc_id(),
+            };
+            live_dirty_ids.push(draft_id);
+
+            let prev_rec = self.draft_store.find_by_id(draft_id).cloned();
+            let last_backed_gen = meta_snap.as_ref().map_or(0, |m| m.last_backed_up_gen);
+            let needs_content_write = prev_rec.is_none() || info.generation != last_backed_gen;
+
+            let (rev, byte_len, sha256) = if needs_content_write {
+                let next_rev = prev_rec.as_ref().map_or(1, |r| r.rev + 1);
+                let mut bytes = Vec::with_capacity(info.len_bytes as usize);
+                if info.buf_id == self.active_buf_id {
+                    self.doc
+                        .tree_mut()
+                        .read_range(0, info.len_bytes as usize, &mut bytes);
+                } else if let Some(pane) =
+                    self.other_panes.iter_mut().find(|p| p.buf_id == info.buf_id)
+                {
+                    pane.doc
+                        .tree_mut()
+                        .read_range(0, info.len_bytes as usize, &mut bytes);
+                } else if let Some(parked) = self.working_set.parked_mut(info.buf_id) {
+                    parked
+                        .doc
+                        .tree_mut()
+                        .read_range(0, info.len_bytes as usize, &mut bytes);
+                }
+                let (blen, hash) = DraftStore::write_draft_bytes(
+                    self.fs.as_ref(),
+                    &state_dir,
+                    draft_id,
+                    next_rev,
+                    &bytes,
+                )?;
+                self.working_set
+                    .set_draft_state(info.buf_id, Some(draft_id), info.generation);
+                manifest_changed = true;
+                (next_rev, blen, hash)
+            } else {
+                let r = prev_rec.as_ref().unwrap();
+                self.working_set
+                    .set_draft_state(info.buf_id, Some(draft_id), info.generation);
+                (r.rev, r.byte_len, r.sha256.clone())
+            };
+
+            let new_rec = DraftRecord {
+                id: draft_id,
+                rev,
+                scope_folder: scope.clone(),
+                original_path: info.path.clone(),
+                base_rev: info.base_rev,
+                bom: info.bom,
+                eol: info.eol,
+                lang_override: info.lang_override.clone(),
+                view: info.view,
+                byte_len,
+                sha256,
+            };
+            if prev_rec.as_ref() != Some(&new_rec) {
+                self.draft_store.records.retain(|r| {
+                    r.id != draft_id
+                        && !(info.path.is_some() && r.original_path == info.path)
+                });
+                self.draft_store.records.push(new_rec);
+                manifest_changed = true;
+            }
+        }
+
+        // Remove drafts for files that are now clean, explicitly discarded drafts, or Untitled
+        // drafts in the current scope that are no longer open.
+        let before_len = self.draft_store.records.len();
+        self.draft_store.records.retain(|r| {
+            if self.discarded_draft_ids.contains(&r.id) {
+                return false;
+            }
+            if let Some(ref p) = r.original_path {
+                if clean_paths.contains(p) || self.discarded_draft_paths.contains(p) {
+                    return false;
+                }
+                true
+            } else {
+                r.scope_folder != scope || live_dirty_ids.contains(&r.id)
+            }
+        });
+        self.discarded_draft_ids.clear();
+        self.discarded_draft_paths.clear();
+        if self.draft_store.records.len() != before_len {
+            manifest_changed = true;
+        }
+
+        if manifest_changed {
+            self.draft_store
+                .commit_and_gc(self.fs.as_ref(), &state_dir)?;
+        }
+
+        // Persist changed bounded `.undo` snapshots for open edited buffers (clean & dirty).
+        self.sync_live_undo_files(&state_dir);
+
+        Ok(if has_oversized {
+            BackupSyncOutcome::HasOversizedDirty
+        } else {
+            BackupSyncOutcome::AllBackedUp
+        })
+    }
+
+    fn undo_sig_for_doc(doc: &Document, draft_rec: Option<&DraftRecord>) -> (u64, bool, u64) {
+        if doc.undo_stack().is_empty() {
+            return (0, false, 0);
+        }
+        let urev = doc.undo_stack().current_rev();
+        if let Some(rec) = draft_rec {
+            (urev, true, rec.rev)
+        } else {
+            let r = doc.rev();
+            (urev, false, r.mtime_ns ^ r.size.rotate_left(17) ^ doc.len_bytes())
+        }
+    }
+
+    fn sync_live_undo_files(&mut self, state_dir: &Path) {
+        let mut seen: Vec<BufferId> = Vec::new();
+        let mut ids: Vec<BufferId> = Vec::with_capacity(1 + self.other_panes.len());
+        ids.push(self.active_buf_id);
+        seen.push(self.active_buf_id);
+        for p in &self.other_panes {
+            if !seen.contains(&p.buf_id) {
+                seen.push(p.buf_id);
+                ids.push(p.buf_id);
+            }
+        }
+        for pid in self.working_set.parked_ids() {
+            if !seen.contains(&pid) {
+                seen.push(pid);
+                ids.push(pid);
+            }
+        }
+
+        for buf_id in ids {
+            let meta_snap = self.working_set.get_meta(buf_id).cloned();
+            let prev_sig = meta_snap
+                .as_ref()
+                .map_or((0, false, 0), |m| m.last_persisted_undo_sig);
+            let draft_rec = meta_snap
+                .as_ref()
+                .and_then(|m| m.draft_id)
+                .and_then(|did| self.draft_store.find_by_id(did))
+                .cloned();
+
+            let (doc_empty_undo, cur_sig, path_opt, is_valid_disk, doc_rev, doc_len) =
+                if buf_id == self.active_buf_id {
+                    let sig = Self::undo_sig_for_doc(&self.doc, draft_rec.as_ref());
+                    (
+                        self.doc.undo_stack().is_empty(),
+                        sig,
+                        self.doc.path().map(Path::to_path_buf),
+                        self.doc.rev() != editor_platform::FileRev::default(),
+                        self.doc.rev(),
+                        self.doc.len_bytes(),
+                    )
+                } else if let Some(pane) = self.other_panes.iter().find(|p| p.buf_id == buf_id) {
+                    let sig = Self::undo_sig_for_doc(&pane.doc, draft_rec.as_ref());
+                    (
+                        pane.doc.undo_stack().is_empty(),
+                        sig,
+                        pane.doc.path().map(Path::to_path_buf),
+                        pane.doc.rev() != editor_platform::FileRev::default(),
+                        pane.doc.rev(),
+                        pane.doc.len_bytes(),
+                    )
+                } else if let Some(parked) = self.working_set.parked_ref(buf_id) {
+                    let sig = Self::undo_sig_for_doc(&parked.doc, draft_rec.as_ref());
+                    (
+                        parked.doc.undo_stack().is_empty(),
+                        sig,
+                        parked.doc.path().map(Path::to_path_buf),
+                        parked.doc.rev() != editor_platform::FileRev::default(),
+                        parked.doc.rev(),
+                        parked.doc.len_bytes(),
+                    )
+                } else {
+                    continue;
+                };
+
+            if doc_empty_undo {
+                if prev_sig != (0, false, 0) {
+                    self.working_set.set_undo_sig(buf_id, (0, false, 0));
+                }
+                continue;
+            }
+            if cur_sig == prev_sig {
+                continue;
+            }
+
+            let key = if let Some(ref p) = path_opt {
+                UndoStore::key_for_path(p)
+            } else if let Some(ref rec) = draft_rec {
+                UndoStore::key_for_draft(rec.id)
+            } else {
+                continue;
+            };
+
+            let binding = if let Some(ref rec) = draft_rec {
+                UndoBinding::Draft {
+                    id: rec.id,
+                    rev: rec.rev,
+                    len: doc_len,
+                }
+            } else if path_opt.is_some() && is_valid_disk {
+                let fp = if buf_id == self.active_buf_id {
+                    self.doc.content_fingerprint()
+                } else if let Some(pane) = self.other_panes.iter_mut().find(|p| p.buf_id == buf_id)
+                {
+                    pane.doc.content_fingerprint()
+                } else if let Some(parked) = self.working_set.parked_mut(buf_id) {
+                    parked.doc.content_fingerprint()
+                } else {
+                    continue;
+                };
+                UndoBinding::OnDisk {
+                    rev: doc_rev,
+                    len: doc_len,
+                    fingerprint: fp,
+                }
+            } else {
+                continue;
+            };
+
+            let wrote = if buf_id == self.active_buf_id {
+                UndoStore::write_undo(
+                    self.fs.as_ref(),
+                    state_dir,
+                    &key,
+                    binding,
+                    self.doc.undo_stack(),
+                )
+            } else if let Some(pane) = self.other_panes.iter().find(|p| p.buf_id == buf_id) {
+                UndoStore::write_undo(
+                    self.fs.as_ref(),
+                    state_dir,
+                    &key,
+                    binding,
+                    pane.doc.undo_stack(),
+                )
+            } else if let Some(parked) = self.working_set.parked_ref(buf_id) {
+                UndoStore::write_undo(
+                    self.fs.as_ref(),
+                    state_dir,
+                    &key,
+                    binding,
+                    parked.doc.undo_stack(),
+                )
+            } else {
+                Ok(false)
+            };
+
+            match wrote {
+                Ok(true) => self.working_set.set_undo_sig(buf_id, cur_sig),
+                Ok(false) => self.working_set.set_undo_sig(buf_id, (0, false, 0)),
+                Err(_) => {}
+            }
+        }
+    }
+
+    /// Declarative GC for `state_dir/undo/`: keeps only `.undo` files belonging to open tabs in
+    /// saved `FolderSessions` or live `DraftStore` records (skipping live buffers with empty undo).
+    fn gc_undo_now(&self) {
+        let Some(ref state_dir) = self.state_dir else {
+            return;
+        };
+        let mut live_empty_keys: Vec<String> = Vec::new();
+        let mut active_keys: Vec<String> = Vec::new();
+        let mut note_live = |doc: &Document, draft_id: Option<u64>| {
+            let key = if let Some(p) = doc.path() {
+                UndoStore::key_for_path(p)
+            } else if let Some(did) = draft_id {
+                UndoStore::key_for_draft(did)
+            } else {
+                return;
+            };
+            if doc.undo_stack().is_empty() {
+                live_empty_keys.push(key);
+            } else if !active_keys.contains(&key) {
+                active_keys.push(key);
+            }
+        };
+        let act_did = self
+            .working_set
+            .get_meta(self.active_buf_id)
+            .and_then(|m| m.draft_id);
+        note_live(&self.doc, act_did);
+        for p in &self.other_panes {
+            let did = self.working_set.get_meta(p.buf_id).and_then(|m| m.draft_id);
+            note_live(&p.doc, did);
+        }
+        for pid in self.working_set.parked_ids() {
+            if let Some(parked) = self.working_set.parked_ref(pid) {
+                let did = self.working_set.get_meta(pid).and_then(|m| m.draft_id);
+                note_live(&parked.doc, did);
+            }
+        }
+
+        let mut keep_keys: Vec<String> = active_keys.clone();
+        let mut push_ref = |r: &SavedBufferRef| {
+            let key = match r {
+                SavedBufferRef::File(p) => UndoStore::key_for_path(p),
+                SavedBufferRef::Draft(did) => UndoStore::key_for_draft(*did),
+            };
+            if !live_empty_keys.contains(&key) && !keep_keys.contains(&key) {
+                keep_keys.push(key);
+            }
+        };
+        for fs in &self.session_store.folders {
+            for t in &fs.pins {
+                push_ref(&t.target);
+            }
+            for t in &fs.open {
+                push_ref(&t.target);
+            }
+            for sp in &fs.panes {
+                push_ref(&sp.tab.target);
+            }
+        }
+        for rec in &self.draft_store.records {
+            let key = if let Some(ref p) = rec.original_path {
+                UndoStore::key_for_path(p)
+            } else {
+                UndoStore::key_for_draft(rec.id)
+            };
+            if !live_empty_keys.contains(&key) && !keep_keys.contains(&key) {
+                keep_keys.push(key);
+            }
+        }
+        UndoStore::gc_undo(self.fs.as_ref(), state_dir, &keep_keys, &active_keys);
+    }
+
+    /// Synchronous shutdown hook (called from macOS `applicationWillTerminate:` for Dock Quit / logout).
+    pub fn handle_will_terminate(&mut self, host: &mut dyn PlatformHost) {
+        let _ = self.sync_backups_now(host);
+        self.save_session(host);
+        self.gc_undo_now();
+    }
+
+    /// Unified open helper: if a verified Hot Exit draft exists for `canonical`, restores it dirty
+    /// (with original `base_rev`, BOM, EOL, language, and verified undo history); otherwise opens
+    /// cleanly from disk and attaches any verified `.undo` history for that exact file revision.
+    fn open_doc_or_draft(
+        &mut self,
+        canonical: &Path,
+    ) -> Result<(Document, Option<u64>, Option<SavedViewPos>, Option<String>, (u64, bool, u64)), String> {
+        let rec_opt = self.draft_store.find_by_path(canonical).cloned();
+        if let (Some(rec), Some(sd)) = (rec_opt, self.state_dir.clone()) {
+            match DraftStore::read_verified_text(self.fs.as_ref(), &sd, &rec) {
+                Ok(text) => {
+                    let mut doc = Document::from_unsaved_draft(
+                        &text,
+                        Some(canonical.to_path_buf()),
+                        rec.base_rev,
+                        rec.bom,
+                        rec.eol,
+                    );
+                    if let Some(ref lang_id) = rec.lang_override {
+                        if let Some(lang) = Language::from_id(lang_id) {
+                            doc.set_language(lang);
+                        } else {
+                            self.apply_language_override(&mut doc);
+                        }
+                    } else {
+                        self.apply_language_override(&mut doc);
+                    }
+                    let disk_changed_or_missing = match self.fs.stat(canonical) {
+                        Ok(st) => {
+                            rec.base_rev != editor_platform::FileRev::default()
+                                && st.rev != rec.base_rev
+                        }
+                        Err(_) => true,
+                    };
+                    let notice = match self.fs.stat(canonical) {
+                        Ok(st) if rec.base_rev != editor_platform::FileRev::default() && st.rev != rec.base_rev => {
+                            Some("File changed on disk — restored unsaved changes".to_string())
+                        }
+                        Err(_) => Some("Original file removed on disk — restored unsaved changes".to_string()),
+                        _ => None,
+                    };
+                    let key = UndoStore::key_for_path(canonical);
+                    let binding = UndoBinding::Draft {
+                        id: rec.id,
+                        rev: rec.rev,
+                        len: doc.len_bytes(),
+                    };
+                    let mut undo_sig = (0, false, 0);
+                    if let Some(mut undo) =
+                        UndoStore::read_verified_undo(self.fs.as_ref(), &sd, &key, binding)
+                    {
+                        if disk_changed_or_missing {
+                            undo.clear_saved_rev();
+                        }
+                        doc.set_undo_stack(undo);
+                        undo_sig = Self::undo_sig_for_doc(&doc, Some(&rec));
+                    }
+                    return Ok((doc, Some(rec.id), Some(rec.view), notice, undo_sig));
+                }
+                Err(e) => {
+                    // Quarantine corrupt `.buf` so orphan GC never deletes it; warn and open disk file.
+                    self.draft_store.quarantine_file(rec.file_name());
+                    let mut doc =
+                        Document::open(self.fs.as_ref(), canonical).map_err(|err| err.to_string())?;
+                    self.apply_language_override(&mut doc);
+                    return Ok((doc, None, None, Some(format!("Draft recovery failed: {e}")), (0, false, 0)));
+                }
+            }
+        }
+        let mut doc = Document::open(self.fs.as_ref(), canonical).map_err(|e| e.to_string())?;
+        self.apply_language_override(&mut doc);
+        let mut undo_sig = (0, false, 0);
+        if let Some(ref sd) = self.state_dir {
+            let key = UndoStore::key_for_path(canonical);
+            // O(1) stat guard: zero content hashing when opening normal unedited files.
+            if self.fs.stat(&UndoStore::undo_dir(sd).join(&key)).is_ok() {
+                let fp = doc.content_fingerprint();
+                let binding = UndoBinding::OnDisk {
+                    rev: doc.rev(),
+                    len: doc.len_bytes(),
+                    fingerprint: fp,
+                };
+                if let Some(undo) =
+                    UndoStore::read_verified_undo(self.fs.as_ref(), sd, &key, binding)
+                {
+                    doc.set_undo_stack(undo);
+                    undo_sig = Self::undo_sig_for_doc(&doc, None);
+                }
+            }
+        }
+        Ok((doc, None, None, None, undo_sig))
+    }
+
+    fn open_untitled_draft(&mut self, draft_id: u64) -> Option<(Document, SavedViewPos, (u64, bool, u64))> {
+        let sd = self.state_dir.clone()?;
+        let rec = self.draft_store.find_by_id(draft_id)?.clone();
+        if rec.original_path.is_some() {
+            return None;
+        }
+        let text = match DraftStore::read_verified_text(self.fs.as_ref(), &sd, &rec) {
+            Ok(t) => t,
+            Err(_) => {
+                self.draft_store.quarantine_file(rec.file_name());
+                return None;
+            }
+        };
+        let mut doc = Document::from_unsaved_draft(&text, None, rec.base_rev, rec.bom, rec.eol);
+        if let Some(ref lang_id) = rec.lang_override {
+            if let Some(lang) = Language::from_id(lang_id) {
+                doc.set_language(lang);
+            }
+        }
+        let key = UndoStore::key_for_draft(draft_id);
+        let binding = UndoBinding::Draft {
+            id: rec.id,
+            rev: rec.rev,
+            len: doc.len_bytes(),
+        };
+        let mut undo_sig = (0, false, 0);
+        if let Some(undo) = UndoStore::read_verified_undo(self.fs.as_ref(), &sd, &key, binding) {
+            doc.set_undo_stack(undo);
+            undo_sig = Self::undo_sig_for_doc(&doc, Some(&rec));
+        }
+        Some((doc, rec.view, undo_sig))
     }
 
     fn protected_buffer_ids(&self) -> Vec<BufferId> {
@@ -967,15 +1835,23 @@ impl EditorApp {
     }
 
     /// Enforce `self.max_open_tabs` by LRU-evicting oldest clean unpinned non-visible tabs,
-    /// retaining lightweight cursor/scroll memory for seamless re-open.
+    /// retaining RAM-only cursor/scroll recall for the current session.
     fn enforce_open_tab_limit(&mut self) {
         let protected = self.protected_buffer_ids();
         let evicted = self
             .working_set
             .evict_lru_open(self.max_open_tabs, &protected);
-        for (_, path_opt, view_opt) in evicted {
-            if let (Some(p), Some(v)) = (path_opt, view_opt) {
-                self.remember_view(p, v);
+        for (_, path_opt, parked_opt) in evicted {
+            if let (Some(p), Some(mut parked)) = (path_opt, parked_opt) {
+                let v = Self::capture_view_pos(
+                    &mut parked.doc,
+                    parked.caret,
+                    parked.anchor,
+                    parked.scroll_top_line,
+                    parked.scroll_sub_y_px,
+                    parked.scroll_x_px,
+                );
+                self.remember_evicted_view(p, v);
             }
         }
     }
@@ -984,6 +1860,7 @@ impl EditorApp {
         self.max_open_tabs = max_tabs;
         self.enforce_open_tab_limit();
         self.save_session(host);
+        self.gc_undo_now();
         self.save_preferences(host);
         let msg = if max_tabs == 0 {
             "Open tab limit: unlimited".to_string()
@@ -995,73 +1872,80 @@ impl EditorApp {
         host.request_redraw();
     }
 
-    /// Capture the active workspace folder's numbered pins, Kept open files, active cursor,
-    /// and visible split pane grid (slot positions, per-pane cursors, focused pane, ratios, zoom).
+    /// Capture the active workspace folder's (or standalone session's) pinned/open tabs and
+    /// visible panes (1 for single-pane, 2..=4 for split), each with its exact cursor/scroll view.
     pub fn capture_current_folder_session(&mut self) -> Option<FolderSession> {
-        let folder = self.sidebar.root()?.to_path_buf();
+        let folder = self.current_scope_folder();
         self.sync_active_buffer_meta();
-        let pins: Vec<PathBuf> = self
-            .working_set
-            .pinned
-            .iter()
-            .filter_map(|id| self.working_set.get_meta(*id).and_then(|m| m.path.clone()))
+        let pin_ids = self.working_set.pinned.clone();
+        let open_ids = self.working_set.open.clone();
+        let pins: Vec<SavedTab> = pin_ids
+            .into_iter()
+            .filter_map(|id| self.saved_tab_for_id(id))
             .collect();
-        let open: Vec<PathBuf> = self
-            .working_set
-            .open
-            .iter()
-            .filter_map(|id| self.working_set.get_meta(*id).and_then(|m| m.path.clone()))
+        let open: Vec<SavedTab> = open_ids
+            .into_iter()
+            .filter_map(|id| self.saved_tab_for_id(id))
             .collect();
-        let active = self.doc.path().map(Path::to_path_buf);
-        let (active_line, active_col) = if active.is_some() {
-            self.doc.byte_to_line_col(self.caret)
-        } else {
-            (0, 0)
-        };
 
         let mut panes = Vec::new();
         let mut active_pane_idx = 0usize;
-        if self.is_split() {
-            let (ordered_ids, n) = self.arrangement.ordered();
-            for &pid in &ordered_ids[..n] {
-                let slot = self.arrangement.slot_of(pid).unwrap_or_default();
-                let pane_info: Option<(PathBuf, usize, usize)> = if pid == self.active_id {
-                    self.doc.path().map(Path::to_path_buf).map(|p| {
-                        let (l, c) = self.doc.byte_to_line_col(self.caret);
-                        (p, l, c)
-                    })
-                } else {
-                    self.other_panes
-                        .iter_mut()
-                        .find(|p| p.id == pid)
-                        .and_then(|p| {
-                            let path = p.doc.path()?.to_path_buf();
-                            let (l, c) = p.doc.byte_to_line_col(p.caret);
-                            Some((path, l, c))
-                        })
-                };
-                if let Some((path, line, col_offset)) = pane_info {
-                    if pid == self.active_id {
-                        active_pane_idx = panes.len();
-                    }
-                    panes.push(SavedPane {
-                        col: slot.col,
-                        row: slot.row,
-                        path,
-                        line,
-                        col_offset,
-                    });
+        let (ordered_ids, n) = self.arrangement.ordered();
+        for &pid in &ordered_ids[..n] {
+            let slot = self.arrangement.slot_of(pid).unwrap_or_default();
+            let tab_opt: Option<SavedTab> = if pid == self.active_id {
+                self.buffer_ref_for_id(self.active_buf_id).map(|target| {
+                    let view = Self::capture_view_pos(
+                        &mut self.doc,
+                        self.caret,
+                        self.anchor,
+                        self.viewport.scroll_top_line,
+                        self.viewport.scroll_sub_y_px,
+                        self.viewport.scroll_x_px,
+                    );
+                    SavedTab { target, view }
+                })
+            } else {
+                let buf_id_opt = self
+                    .other_panes
+                    .iter()
+                    .find(|p| p.id == pid)
+                    .map(|p| p.buf_id);
+                let target_opt = buf_id_opt.and_then(|bid| self.buffer_ref_for_id(bid));
+                target_opt.and_then(|target| {
+                    let pane = self.other_panes.iter_mut().find(|p| p.id == pid)?;
+                    let view = Self::capture_view_pos(
+                        &mut pane.doc,
+                        pane.caret,
+                        pane.anchor,
+                        pane.viewport.scroll_top_line,
+                        pane.viewport.scroll_sub_y_px,
+                        pane.viewport.scroll_x_px,
+                    );
+                    Some(SavedTab { target, view })
+                })
+            };
+            if let Some(tab) = tab_opt {
+                if pid == self.active_id {
+                    active_pane_idx = panes.len();
                 }
+                panes.push(SavedPane {
+                    col: slot.col,
+                    row: slot.row,
+                    tab,
+                });
             }
+        }
+
+        // For standalone (no-folder) sessions, omit when no file or draft is open.
+        if folder.as_os_str().is_empty() && pins.is_empty() && open.is_empty() && panes.is_empty() {
+            return None;
         }
 
         Some(FolderSession {
             folder,
             pins,
             open,
-            active,
-            active_line,
-            active_col,
             panes,
             active_pane_idx,
             col_ratio_bp: ratio_to_bp(self.arrangement.col_ratio),
@@ -1073,23 +1957,36 @@ impl EditorApp {
         })
     }
 
-    /// Persist the current workspace folder's session (pins, open tabs, active file & cursor).
-    pub fn save_session(&mut self, host: &mut dyn PlatformHost) {
+    fn update_session_store_from_live(&mut self) -> String {
         if let Some(session) = self.capture_current_folder_session() {
             self.session_store.upsert(session);
+        } else if self.current_scope_folder().as_os_str().is_empty() {
+            // Standalone with zero open tabs/panes: remove any stale `@standalone` entry!
+            self.session_store.remove(Path::new(""));
         }
-        self.persist_last_folder(host);
-        host.save_pref("FolderSessions", &self.session_store.encode());
+        self.session_store.encode()
     }
 
-    /// Restore saved pins, open tabs, and active file + cursor for `folder` cleanly.
-    /// Gracefully skips any files that were deleted or moved since the last session.
-    fn restore_folder_session_internal(&mut self, folder: &Path) {
-        let Some(session) = self.session_store.get(folder).cloned() else {
-            return;
-        };
+    /// Persist `FolderSessions` only if its encoded state changed (zero writes & zero FS watcher
+    /// churn on focus loss when nothing moved or scrolled).
+    fn save_session_if_changed(&mut self, host: &mut dyn PlatformHost) {
+        let encoded = self.update_session_store_from_live();
+        if self.last_saved_sessions.as_deref() != Some(encoded.as_str()) {
+            host.save_pref("FolderSessions", &encoded);
+            self.last_saved_sessions = Some(encoded);
+        }
+    }
 
-        // Reset working set to a fresh empty Untitled before populating saved files.
+    /// Persist the current workspace folder's session and active folder preference.
+    pub fn save_session(&mut self, host: &mut dyn PlatformHost) {
+        let encoded = self.update_session_store_from_live();
+        self.persist_last_folder(host);
+        host.save_pref("FolderSessions", &encoded);
+        self.last_saved_sessions = Some(encoded);
+    }
+
+    /// Reset all panes and working set cleanly to a fresh empty `Untitled` buffer.
+    fn reset_working_set_to_empty_untitled(&mut self) {
         self.other_panes.clear();
         self.arrangement = Arrangement::new(self.active_id);
         self.zoomed = false;
@@ -1098,69 +1995,201 @@ impl EditorApp {
         self.doc = Document::new_untitled();
         self.caret = 0;
         self.anchor = 0;
+        self.extra_cursors.clear();
         self.preferred_x_px = None;
         self.viewport.reset_for_document();
+        self.viewport.word_wrap = self.effective_word_wrap(None);
         self.search_matches.clear();
         self.active_match = None;
+    }
 
-        let mut restored_any = false;
-        let mut active_target: Option<BufferId> = None;
+    /// Restore saved pins, open tabs, visible panes (1..=4), unsaved Hot Exit drafts, and exact
+    /// cursor/selection/scroll positions for `folder` (or standalone `""` scope) cleanly.
+    fn restore_folder_session_internal(&mut self, folder: &Path) {
+        let session_opt = self.session_store.get(folder).cloned();
+        let scope_untitled_ids: Vec<u64> = self
+            .draft_store
+            .untitled_for_scope(folder)
+            .into_iter()
+            .map(|r| r.id)
+            .collect();
+        let scope_file_draft_paths: Vec<PathBuf> = self
+            .draft_store
+            .file_drafts_for_scope(folder)
+            .into_iter()
+            .filter_map(|r| r.original_path.clone())
+            .collect();
+        if session_opt.is_none()
+            && scope_untitled_ids.is_empty()
+            && scope_file_draft_paths.is_empty()
+        {
+            return;
+        }
+        let session = session_opt.unwrap_or(FolderSession {
+            folder: folder.to_path_buf(),
+            pins: Vec::new(),
+            open: Vec::new(),
+            panes: Vec::new(),
+            active_pane_idx: 0,
+            col_ratio_bp: session::DEFAULT_RATIO_BP,
+            row_ratio_bp: [session::DEFAULT_RATIO_BP, session::DEFAULT_RATIO_BP],
+            zoomed: false,
+        });
 
-        let open_one = |app: &mut Self, p: &Path, pin: bool| -> Option<BufferId> {
-            let canonical = app.fs.canonicalize(p).ok()?;
-            if app.fs.stat(&canonical).map(|s| s.is_dir).unwrap_or(true) {
-                return None;
-            }
-            if let Some(existing) = app.working_set.find_by_path(&canonical) {
-                if pin && !app.working_set.is_pinned(existing) {
-                    let _ = app.working_set.toggle_pin(existing);
+        self.reset_working_set_to_empty_untitled();
+
+        let mut pending_notice: Option<String> = None;
+
+        let open_tab = |app: &mut Self,
+                        buf_ref: &SavedBufferRef,
+                        saved_view: Option<SavedViewPos>,
+                        pin: bool,
+                        notice_out: &mut Option<String>|
+         -> Option<BufferId> {
+            match buf_ref {
+                SavedBufferRef::Draft(draft_id) => {
+                    if let Some(existing) = app.working_set.find_by_draft_id(*draft_id) {
+                        if pin && !app.working_set.is_pinned(existing) {
+                            let _ = app.working_set.toggle_pin(existing);
+                        }
+                        return Some(existing);
+                    }
+                    let (mut doc, draft_view, undo_sig) = app.open_untitled_draft(*draft_id)?;
+                    let view_pos = saved_view
+                        .filter(|v| !v.is_default())
+                        .unwrap_or(draft_view);
+                    let gen = doc.generation();
+                    let fname = doc.file_name().to_string();
+                    let mut c = 0u64;
+                    let mut a = 0u64;
+                    let mut stop = 0usize;
+                    let mut suby = 0.0f32;
+                    let mut sx = 0.0f32;
+                    Self::apply_view_pos(
+                        &mut doc, &mut c, &mut a, &mut stop, &mut suby, &mut sx, view_pos,
+                    );
+                    let id = if app.is_initial_empty_untitled() {
+                        let id = app.active_buf_id;
+                        app.doc = doc;
+                        app.caret = c;
+                        app.anchor = a;
+                        app.viewport.reset_for_document();
+                        app.viewport.scroll_top_line = stop;
+                        app.viewport.scroll_sub_y_px = suby;
+                        app.viewport.scroll_x_px = sx;
+                        app.viewport.word_wrap = app.effective_word_wrap(None);
+                        app.working_set.update_meta(id, None, fname, true);
+                        app.working_set.set_draft_state(id, Some(*draft_id), gen);
+                        app.working_set.set_undo_sig(id, undo_sig);
+                        id
+                    } else {
+                        let id = app.working_set.alloc_buffer(None, fname, true);
+                        app.working_set.set_draft_state(id, Some(*draft_id), gen);
+                        app.working_set.set_undo_sig(id, undo_sig);
+                        app.working_set.register_buffer(id, OpenMode::Keep);
+                        app.working_set.park(
+                            id,
+                            ParkedBuffer {
+                                doc,
+                                caret: c,
+                                anchor: a,
+                                preferred_x_px: None,
+                                scroll_top_line: stop,
+                                scroll_sub_y_px: suby,
+                                scroll_x_px: sx,
+                            },
+                        );
+                        id
+                    };
+                    if pin {
+                        let _ = app.working_set.toggle_pin(id);
+                    }
+                    app.working_set.touch_mru(id);
+                    Some(id)
                 }
-                return Some(existing);
+                SavedBufferRef::File(p) => {
+                    let canonical = app.fs.canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                    let has_draft = app.draft_store.find_by_path(&canonical).is_some();
+                    if !has_draft && app.fs.stat(&canonical).map(|s| s.is_dir).unwrap_or(true) {
+                        return None;
+                    }
+                    if let Some(existing) = app.working_set.find_by_path(&canonical) {
+                        if pin && !app.working_set.is_pinned(existing) {
+                            let _ = app.working_set.toggle_pin(existing);
+                        }
+                        return Some(existing);
+                    }
+                    let (mut doc, draft_id_opt, draft_view, notice, undo_sig) =
+                        app.open_doc_or_draft(&canonical).ok()?;
+                    if notice_out.is_none() {
+                        *notice_out = notice;
+                    }
+                    let dirty = doc.is_dirty();
+                    let gen = doc.generation();
+                    let doc_path = doc.path().map(Path::to_path_buf).or(Some(canonical.clone()));
+                    let fname = doc.file_name().to_string();
+                    let view_pos = saved_view
+                        .filter(|v| !v.is_default())
+                        .or(draft_view)
+                        .unwrap_or_default();
+                    let mut c = 0u64;
+                    let mut a = 0u64;
+                    let mut stop = 0usize;
+                    let mut suby = 0.0f32;
+                    let mut sx = 0.0f32;
+                    if !view_pos.is_default() {
+                        Self::apply_view_pos(
+                            &mut doc, &mut c, &mut a, &mut stop, &mut suby, &mut sx, view_pos,
+                        );
+                    }
+                    let id = if app.is_initial_empty_untitled() {
+                        let id = app.active_buf_id;
+                        app.doc = doc;
+                        app.caret = c;
+                        app.anchor = a;
+                        app.viewport.reset_for_document();
+                        app.viewport.scroll_top_line = stop;
+                        app.viewport.scroll_sub_y_px = suby;
+                        app.viewport.scroll_x_px = sx;
+                        app.viewport.word_wrap = app.effective_word_wrap(doc_path.as_deref());
+                        app.working_set.update_meta(id, doc_path, fname, dirty);
+                        if let Some(did) = draft_id_opt {
+                            app.working_set.set_draft_state(id, Some(did), gen);
+                        }
+                        app.working_set.set_undo_sig(id, undo_sig);
+                        id
+                    } else {
+                        let id = app.working_set.alloc_buffer(doc_path, fname, dirty);
+                        if let Some(did) = draft_id_opt {
+                            app.working_set.set_draft_state(id, Some(did), gen);
+                        }
+                        app.working_set.set_undo_sig(id, undo_sig);
+                        app.working_set.register_buffer(id, OpenMode::Keep);
+                        app.working_set.park(
+                            id,
+                            ParkedBuffer {
+                                doc,
+                                caret: c,
+                                anchor: a,
+                                preferred_x_px: None,
+                                scroll_top_line: stop,
+                                scroll_sub_y_px: suby,
+                                scroll_x_px: sx,
+                            },
+                        );
+                        id
+                    };
+                    if pin {
+                        let _ = app.working_set.toggle_pin(id);
+                    }
+                    app.working_set.touch_mru(id);
+                    Some(id)
+                }
             }
-            let mut doc = Document::open(app.fs.as_ref(), &canonical).ok()?;
-            app.apply_language_override(&mut doc);
-            let doc_path = doc.path().map(Path::to_path_buf).or(Some(canonical));
-            let fname = doc.file_name().to_string();
-            let id = if app.is_initial_empty_untitled() {
-                let id = app.active_buf_id;
-                app.doc = doc;
-                app.caret = 0;
-                app.anchor = 0;
-                app.viewport.reset_for_document();
-                app.viewport.word_wrap = app.effective_word_wrap(doc_path.as_deref());
-                app.working_set.update_meta(id, doc_path, fname, false);
-                id
-            } else {
-                let id = app.working_set.alloc_buffer(doc_path, fname, false);
-                app.working_set.register_buffer(id, OpenMode::Keep);
-                app.working_set.park(
-                    id,
-                    ParkedBuffer {
-                        doc,
-                        caret: 0,
-                        anchor: 0,
-                        preferred_x_px: None,
-                        scroll_top_line: 0,
-                        scroll_sub_y_px: 0.0,
-                        scroll_x_px: 0.0,
-                    },
-                );
-                id
-            };
-            if pin {
-                let _ = app.working_set.toggle_pin(id);
-            }
-            app.working_set.touch_mru(id);
-            Some(id)
         };
 
-        for p in &session.pins {
-            if let Some(id) = open_one(self, p, true) {
-                restored_any = true;
-                if session.active.as_deref() == Some(p.as_path()) {
-                    active_target = Some(id);
-                }
-            }
+        for tab in &session.pins {
+            let _ = open_tab(self, &tab.target, Some(tab.view), true, &mut pending_notice);
         }
         let open_cap = if self.max_open_tabs == 0 {
             usize::MAX
@@ -1168,119 +2197,103 @@ impl EditorApp {
             self.max_open_tabs
         };
         let mut restored_open = 0usize;
-        for p in &session.open {
-            if restored_open >= open_cap {
-                break;
+        for tab in &session.open {
+            let is_draft_or_dirty = matches!(tab.target, SavedBufferRef::Draft(_))
+                || tab
+                    .target
+                    .as_file()
+                    .is_some_and(|p| self.draft_store.find_by_path(p).is_some());
+            if !is_draft_or_dirty && restored_open >= open_cap {
+                continue;
             }
-            if let Some(id) = open_one(self, p, false) {
-                restored_any = true;
+            if open_tab(self, &tab.target, Some(tab.view), false, &mut pending_notice).is_some()
+                && !is_draft_or_dirty
+            {
                 restored_open += 1;
-                if session.active.as_deref() == Some(p.as_path()) {
-                    active_target = Some(id);
-                }
             }
         }
+        // Self-healing: reopen any drafts for this scope even if missing from `FolderSessions`.
+        for did in scope_untitled_ids {
+            let r = SavedBufferRef::Draft(did);
+            let _ = open_tab(self, &r, None, false, &mut pending_notice);
+        }
+        for fp in scope_file_draft_paths {
+            let r = SavedBufferRef::File(fp);
+            let _ = open_tab(self, &r, None, false, &mut pending_notice);
+        }
 
-        // Restore saved multi-pane grid layout (slot positions, per-pane cursors, focused pane,
-        // split ratios, and fullscreen zoom), gracefully collapsing any deleted files.
-        let mut restored_panes: Vec<(PaneSlot, BufferId, usize, usize, bool)> = Vec::new();
+        // Unified pane restore (1 pane = single-pane; 2..=4 panes = split grid), gracefully
+        // collapsing any externally deleted files.
+        let mut restored_panes: Vec<(PaneSlot, BufferId, SavedViewPos, bool)> = Vec::new();
         for (idx, sp) in session.panes.iter().enumerate().take(MAX_PANES) {
-            if let Some(buf_id) = open_one(self, &sp.path, false) {
-                restored_any = true;
+            if let Some(buf_id) =
+                open_tab(self, &sp.tab.target, Some(sp.tab.view), false, &mut pending_notice)
+            {
                 restored_panes.push((
                     PaneSlot::new(sp.col.min(1), sp.row.min(1)),
                     buf_id,
-                    sp.line,
-                    sp.col_offset,
+                    sp.tab.view,
                     idx == session.active_pane_idx,
                 ));
             }
         }
 
-        if restored_panes.len() >= 2 {
+        if !restored_panes.is_empty() {
             let focused_idx = restored_panes
                 .iter()
-                .position(|(_, _, _, _, is_act)| *is_act)
+                .position(|(_, _, _, is_act)| *is_act)
                 .unwrap_or(0);
-            let (active_slot, active_buf, active_line, active_col, _) = restored_panes[focused_idx];
+            let (active_slot, active_buf, active_view, _) = restored_panes[focused_idx];
             if active_buf != self.active_buf_id {
                 self.sync_active_buffer_meta();
                 self.park_active_into_pool(false);
                 let _ = self.install_buffer_in_active_pane(active_buf);
             }
-            self.doc.tree_mut().ensure_indexed_for_line(active_line + 16);
-            let clamped_line = active_line.min(self.doc.editable_line_count().saturating_sub(1));
-            if let Some((ls, le, _)) = self.doc.line_byte_range(clamped_line) {
-                let off = ls + (active_col as u64).min(le - ls);
-                self.caret = off;
-                self.anchor = off;
-                self.viewport.scroll_top_line = clamped_line.saturating_sub(6);
-            }
+            Self::apply_view_pos(
+                &mut self.doc,
+                &mut self.caret,
+                &mut self.anchor,
+                &mut self.viewport.scroll_top_line,
+                &mut self.viewport.scroll_sub_y_px,
+                &mut self.viewport.scroll_x_px,
+                active_view,
+            );
 
-            let mut arr_entries: Vec<(PaneId, PaneSlot)> = Vec::with_capacity(restored_panes.len());
-            arr_entries.push((self.active_id, active_slot));
+            if restored_panes.len() >= 2 {
+                let mut arr_entries: Vec<(PaneId, PaneSlot)> =
+                    Vec::with_capacity(restored_panes.len());
+                arr_entries.push((self.active_id, active_slot));
 
-            for (i, &(slot, buf_id, line, col, _)) in restored_panes.iter().enumerate() {
-                if i == focused_idx {
-                    continue;
-                }
-                let pane_id = self.alloc_pane_id();
-                if let Ok(mut pane) = self.make_pane_for_buffer(pane_id, buf_id) {
-                    pane.doc.tree_mut().ensure_indexed_for_line(line + 16);
-                    let cl = line.min(pane.doc.editable_line_count().saturating_sub(1));
-                    if let Some((ls, le, _)) = pane.doc.line_byte_range(cl) {
-                        let off = ls + (col as u64).min(le - ls);
-                        pane.caret = off;
-                        pane.anchor = off;
-                        pane.viewport.scroll_top_line = cl.saturating_sub(6);
+                for (i, &(slot, buf_id, view_pos, _)) in restored_panes.iter().enumerate() {
+                    if i == focused_idx {
+                        continue;
                     }
-                    arr_entries.push((pane_id, slot));
-                    self.other_panes.push(pane);
+                    let pane_id = self.alloc_pane_id();
+                    if let Ok(mut pane) = self.make_pane_for_buffer(pane_id, buf_id) {
+                        Self::apply_view_pos(
+                            &mut pane.doc,
+                            &mut pane.caret,
+                            &mut pane.anchor,
+                            &mut pane.viewport.scroll_top_line,
+                            &mut pane.viewport.scroll_sub_y_px,
+                            &mut pane.viewport.scroll_x_px,
+                            view_pos,
+                        );
+                        arr_entries.push((pane_id, slot));
+                        self.other_panes.push(pane);
+                    }
                 }
-            }
 
-            if let Some(arr) = Arrangement::from_saved(
-                &arr_entries,
-                session.col_ratio(),
-                session.row_ratios(),
-            ) {
-                self.arrangement = arr;
-                self.zoomed = session.zoomed && self.is_split();
+                if let Some(arr) = Arrangement::from_saved(
+                    &arr_entries,
+                    session.col_ratio(),
+                    session.row_ratios(),
+                ) {
+                    self.arrangement = arr;
+                    self.zoomed = session.zoomed && self.is_split();
+                }
             }
             self.working_set.touch_mru(self.active_buf_id);
-        } else {
-            if let Some(&(_, buf_id, _, _, _)) = restored_panes.first() {
-                if active_target.is_none() {
-                    active_target = Some(buf_id);
-                }
-            }
-            if let Some(target_id) = active_target {
-                if target_id != self.active_buf_id {
-                    self.sync_active_buffer_meta();
-                    self.park_active_into_pool(false);
-                    let _ = self.install_buffer_in_active_pane(target_id);
-                }
-                self.working_set.touch_mru(target_id);
-                // Restore saved cursor line & col cleanly!
-                self.doc
-                    .tree_mut()
-                    .ensure_indexed_for_line(session.active_line + 16);
-                let clamped_line = session
-                    .active_line
-                    .min(self.doc.editable_line_count().saturating_sub(1));
-                if let Some((ls, le, _)) = self.doc.line_byte_range(clamped_line) {
-                    let off = ls + (session.active_col as u64).min(le - ls);
-                    self.caret = off;
-                    self.anchor = off;
-                    self.viewport.scroll_top_line = clamped_line.saturating_sub(6);
-                }
-            } else if restored_any {
-                if let Some(p) = self.doc.path().map(Path::to_path_buf) {
-                    if self.sidebar.is_under_root(&p) {
-                        self.sidebar.reveal(self.fs.as_ref(), &p);
-                    }
-                }
-            }
         }
 
         if let Some(p) = self.doc.path().map(Path::to_path_buf) {
@@ -1288,26 +2301,47 @@ impl EditorApp {
                 self.sidebar.reveal(self.fs.as_ref(), &p);
             }
         }
+        if let Some(msg) = pending_notice {
+            self.set_notice(msg, true);
+        }
     }
 
-    /// Open a workspace folder, saving the outgoing folder's session and restoring the new folder's
-    /// saved pins/open files cleanly (when no unsaved dirty buffers would be disturbed).
+    /// Open a workspace folder, flushing the outgoing folder's Hot Exit drafts & session and
+    /// restoring the incoming folder's saved pins, tabs, splits, cursors, and drafts cleanly.
     pub fn open_folder(&mut self, dir: &Path, host: &mut dyn PlatformHost) {
         let canonical = self
             .fs
             .canonicalize(dir)
             .unwrap_or_else(|_| dir.to_path_buf());
+        let had_previous_folder = self.sidebar.root().is_some();
         let same_folder = self.sidebar.root() == Some(canonical.as_path());
+        let mut outgoing_backed_up = !self.any_buffer_dirty();
         if !same_folder {
+            if matches!(
+                self.sync_backups_now(host),
+                Ok(BackupSyncOutcome::AllBackedUp)
+            ) {
+                outgoing_backed_up = true;
+            }
             self.save_session(host);
         }
         self.sidebar_user_visible = true;
         self.sidebar.set_visible(true);
         self.sidebar.set_root(self.fs.as_ref(), &canonical);
-        if !same_folder && !self.any_buffer_dirty() && self.session_store.get(&canonical).is_some() {
-            self.restore_folder_session_internal(&canonical);
+        let has_saved_state = self.session_store.get(&canonical).is_some()
+            || !self.draft_store.untitled_for_scope(&canonical).is_empty()
+            || !self.draft_store.file_drafts_for_scope(&canonical).is_empty();
+        if !same_folder && outgoing_backed_up {
+            self.evicted_views.clear();
+            if has_saved_state {
+                self.restore_folder_session_internal(&canonical);
+            } else if had_previous_folder {
+                // Switching to a brand-new folder: isolate outgoing folder's tabs and drafts.
+                self.reset_working_set_to_empty_untitled();
+            }
         }
         self.save_session(host);
+        self.gc_undo_now();
         self.save_preferences(host);
         self.sync_title(host);
         self.refresh_git_workspace(host, true);
@@ -1422,8 +2456,9 @@ impl EditorApp {
         if let Some(parked) = self.working_set.take_parked(target_id) {
             self.active_buf_id = target_id;
             self.doc = parked.doc;
-            self.caret = parked.caret.min(self.doc.len_bytes());
-            self.anchor = parked.anchor.min(self.doc.len_bytes());
+            self.caret = Self::snap_doc_offset(&mut self.doc, parked.caret);
+            self.anchor = Self::snap_doc_offset(&mut self.doc, parked.anchor);
+            self.extra_cursors.clear();
             self.preferred_x_px = parked.preferred_x_px;
             self.viewport.reset_for_document();
             self.viewport.scroll_top_line = parked.scroll_top_line;
@@ -1451,6 +2486,7 @@ impl EditorApp {
         self.doc = doc;
         self.caret = 0;
         self.anchor = 0;
+        self.extra_cursors.clear();
         self.preferred_x_px = None;
         self.viewport.reset_for_document();
         self.viewport.word_wrap = self.effective_word_wrap(self.doc.path());
@@ -1542,13 +2578,17 @@ impl EditorApp {
             return Ok(existing_id);
         }
 
-        let mut doc = Document::open(self.fs.as_ref(), &canonical).map_err(|e| e.to_string())?;
-        self.apply_language_override(&mut doc);
+        let (doc, draft_id_opt, draft_view, draft_notice, undo_sig) =
+            self.open_doc_or_draft(&canonical)?;
+        let is_dirty = doc.is_dirty();
+        let doc_gen = doc.generation();
         let doc_path = doc.path().map(Path::to_path_buf).or(Some(canonical.clone()));
         let fname = doc.file_name().to_string();
-        let remembered = doc_path
-            .as_deref()
-            .and_then(|p| self.take_remembered_view(p));
+        let remembered = draft_view.or_else(|| {
+            doc_path
+                .as_deref()
+                .and_then(|p| self.take_evicted_view(p))
+        });
 
         let target_id = if self.is_initial_empty_untitled() {
             // Replace the untouched startup Untitled placeholder cleanly.
@@ -1561,20 +2601,37 @@ impl EditorApp {
             self.viewport.word_wrap = self.effective_word_wrap(doc_path.as_deref());
             self.search_matches.clear();
             self.active_match = None;
-            self.working_set.update_meta(id, doc_path.clone(), fname, false);
-            if mode == OpenMode::Preview {
+            self.working_set
+                .update_meta(id, doc_path.clone(), fname, is_dirty);
+            if let Some(did) = draft_id_opt {
+                self.working_set.set_draft_state(id, Some(did), doc_gen);
+            }
+            self.working_set.set_undo_sig(id, undo_sig);
+            if mode == OpenMode::Preview && !is_dirty {
                 self.working_set.open.retain(|&b| b != id);
                 self.working_set.preview = Some(id);
             }
             id
         } else {
             self.sync_active_buffer_meta();
-            let new_id = self.working_set.alloc_buffer(doc_path.clone(), fname, false);
-            let evicted = self.working_set.register_buffer(new_id, mode);
+            let new_id = self
+                .working_set
+                .alloc_buffer(doc_path.clone(), fname, is_dirty);
+            if let Some(did) = draft_id_opt {
+                self.working_set.set_draft_state(new_id, Some(did), doc_gen);
+            }
+            self.working_set.set_undo_sig(new_id, undo_sig);
+            let effective_mode = if is_dirty { OpenMode::Keep } else { mode };
+            let evicted = self.working_set.register_buffer(new_id, effective_mode);
             let drop_current = evicted == Some(self.active_buf_id);
             if let Some(old_prev) = evicted {
-                if old_prev != self.active_buf_id && !self.is_buf_in_other_pane(old_prev) {
-                    self.working_set.remove_buffer(old_prev);
+                if old_prev != self.active_buf_id {
+                    if self.is_buf_in_other_pane(old_prev) {
+                        // Graduate preview buffer displayed in a split pane so it never becomes an orphan.
+                        self.working_set.register_buffer(old_prev, OpenMode::Keep);
+                    } else {
+                        self.working_set.remove_buffer(old_prev);
+                    }
                 }
             }
             self.park_active_into_pool(drop_current);
@@ -1591,12 +2648,18 @@ impl EditorApp {
         };
 
         if let Some(view) = remembered {
-            let clamped = view.caret.min(self.doc.len_bytes());
-            self.caret = clamped;
-            self.anchor = clamped;
-            self.viewport.scroll_top_line = view.scroll_top_line;
-            self.viewport.scroll_sub_y_px = view.scroll_sub_y_px;
-            self.viewport.scroll_x_px = view.scroll_x_px;
+            Self::apply_view_pos(
+                &mut self.doc,
+                &mut self.caret,
+                &mut self.anchor,
+                &mut self.viewport.scroll_top_line,
+                &mut self.viewport.scroll_sub_y_px,
+                &mut self.viewport.scroll_x_px,
+                view,
+            );
+        }
+        if let Some(msg) = draft_notice {
+            self.set_notice(msg, true);
         }
 
         self.working_set.touch_mru(target_id);
@@ -1641,11 +2704,15 @@ impl EditorApp {
         self.doc = Document::new_untitled();
         self.caret = 0;
         self.anchor = 0;
+        self.extra_cursors.clear();
         self.preferred_x_px = None;
         self.viewport.reset_for_document();
         self.viewport.word_wrap = self.effective_word_wrap(None);
         self.search_matches.clear();
         self.active_match = None;
+        if self.find_bar.visible {
+            self.refresh_search();
+        }
         self.working_set.touch_mru(id);
         self.enforce_open_tab_limit();
         self.sync_title(host);
@@ -1768,6 +2835,25 @@ impl EditorApp {
         if !self.working_set.contains(id) {
             return;
         }
+        // Explicit close (`⌘W`): forget any RAM-only evicted view and track any discarded draft.
+        let closing_meta = self.working_set.get_meta(id).cloned();
+        let had_draft = closing_meta.as_ref().is_some_and(|m| m.draft_id.is_some() || m.dirty);
+        let had_persisted_undo = closing_meta
+            .as_ref()
+            .is_some_and(|m| m.last_persisted_undo_sig != (0, false, 0));
+        if let Some(ref meta) = closing_meta {
+            if let Some(ref p) = meta.path {
+                self.forget_evicted_view(p);
+            }
+            if let Some(did) = meta.draft_id {
+                self.discarded_draft_ids.push(did);
+            }
+            if meta.dirty {
+                if let Some(ref p) = meta.path {
+                    self.discarded_draft_paths.push(p.clone());
+                }
+            }
+        }
         let replacement = self
             .working_set
             .previous_mru(id)
@@ -1813,6 +2899,7 @@ impl EditorApp {
                         self.doc = next.doc;
                         self.caret = next.caret;
                         self.anchor = next.anchor;
+                        self.extra_cursors = next.extra_cursors;
                         self.preferred_x_px = next.preferred_x_px;
                         self.viewport = next.viewport;
                         self.search_matches = next.search_matches;
@@ -1837,6 +2924,7 @@ impl EditorApp {
                 self.doc = Document::new_untitled();
                 self.caret = 0;
                 self.anchor = 0;
+                self.extra_cursors.clear();
                 self.preferred_x_px = None;
                 self.viewport.reset_for_document();
                 self.viewport.word_wrap = self.effective_word_wrap(None);
@@ -1848,7 +2936,13 @@ impl EditorApp {
         self.recompute_layout();
         self.sync_title(host);
         self.on_active_doc_git_changed(host);
+        if had_draft {
+            let _ = self.sync_backups_now(host);
+        }
         self.save_session(host);
+        if had_draft || had_persisted_undo {
+            self.gc_undo_now();
+        }
         self.mark_dirty();
         host.request_redraw();
     }
@@ -1960,11 +3054,16 @@ impl EditorApp {
                 self.working_set.graduate_preview(existing_id);
                 return self.make_pane_for_buffer(id, existing_id);
             }
-            let mut doc = Document::open(self.fs.as_ref(), &canonical).map_err(|e| e.to_string())?;
-            self.apply_language_override(&mut doc);
+            let (doc, draft_id_opt, view_opt, _, undo_sig) = self.open_doc_or_draft(&canonical)?;
+            let is_dirty = doc.is_dirty();
+            let doc_gen = doc.generation();
             let doc_path = doc.path().map(Path::to_path_buf).or(Some(canonical));
             let fname = doc.file_name().to_string();
-            let buf_id = self.working_set.alloc_buffer(doc_path, fname, false);
+            let buf_id = self.working_set.alloc_buffer(doc_path, fname, is_dirty);
+            if let Some(did) = draft_id_opt {
+                self.working_set.set_draft_state(buf_id, Some(did), doc_gen);
+            }
+            self.working_set.set_undo_sig(buf_id, undo_sig);
             self.working_set.register_buffer(buf_id, OpenMode::Keep);
             let mut pane = PaneState::new_from_font(
                 id,
@@ -1973,6 +3072,17 @@ impl EditorApp {
                 self.effective_word_wrap(doc.path()),
             );
             pane.doc = doc;
+            if let Some(view) = view_opt {
+                Self::apply_view_pos(
+                    &mut pane.doc,
+                    &mut pane.caret,
+                    &mut pane.anchor,
+                    &mut pane.viewport.scroll_top_line,
+                    &mut pane.viewport.scroll_sub_y_px,
+                    &mut pane.viewport.scroll_x_px,
+                    view,
+                );
+            }
             return Ok(pane);
         }
         // Splitting without an explicit path opens a view of the active buffer.
@@ -2005,9 +3115,43 @@ impl EditorApp {
             self.viewport.font_size_pt,
             self.effective_word_wrap(path_opt.as_deref()),
         );
-        if let Some(p) = path_opt {
-            pane.doc = Document::open(self.fs.as_ref(), &p).map_err(|e| e.to_string())?;
-            self.apply_language_override(&mut pane.doc);
+        if buf_id == self.active_buf_id && self.doc.is_dirty() {
+            let text = self.doc.to_string_lossy();
+            let mut doc = Document::from_unsaved_draft(
+                &text,
+                self.doc.path().map(Path::to_path_buf),
+                self.doc.rev(),
+                self.doc.has_bom(),
+                self.doc.eol(),
+            );
+            doc.set_language(self.doc.language());
+            pane.doc = doc;
+        } else if let Some(sec_dirty) = self
+            .other_panes
+            .iter_mut()
+            .find(|p| p.buf_id == buf_id && p.doc.is_dirty())
+            .map(|p| {
+                (
+                    p.doc.to_string_lossy(),
+                    p.doc.path().map(Path::to_path_buf),
+                    p.doc.rev(),
+                    p.doc.has_bom(),
+                    p.doc.eol(),
+                    p.doc.language(),
+                )
+            })
+        {
+            let (text, p_opt, rev, bom, eol, lang) = sec_dirty;
+            let mut doc = Document::from_unsaved_draft(&text, p_opt, rev, bom, eol);
+            doc.set_language(lang);
+            pane.doc = doc;
+        } else if let Some(p) = path_opt {
+            let (doc, _, _, _, _) = self.open_doc_or_draft(&p)?;
+            pane.doc = doc;
+        } else if let Some(did) = self.working_set.get_meta(buf_id).and_then(|m| m.draft_id) {
+            if let Some((doc, _, _)) = self.open_untitled_draft(did) {
+                pane.doc = doc;
+            }
         }
         pane.viewport.word_wrap = self.effective_word_wrap(pane.doc.path());
         Ok(pane)
@@ -2133,11 +3277,15 @@ impl EditorApp {
         self.doc = next.doc;
         self.caret = next.caret;
         self.anchor = next.anchor;
+        self.extra_cursors = next.extra_cursors;
         self.preferred_x_px = next.preferred_x_px;
         self.viewport = next.viewport;
         self.search_matches = next.search_matches;
         self.active_match = next.active_match;
         self.working_set.touch_mru(self.active_buf_id);
+        if self.find_bar.visible {
+            self.refresh_search();
+        }
         self.recompute_layout();
         self.sync_title(host);
         self.on_active_doc_git_changed(host);
@@ -2227,6 +3375,9 @@ impl EditorApp {
         std::mem::swap(&mut self.active_id, &mut other.id);
         std::mem::swap(&mut self.active_buf_id, &mut other.buf_id);
         self.working_set.touch_mru(self.active_buf_id);
+        if self.find_bar.visible {
+            self.refresh_search();
+        }
         self.recompute_layout();
         self.sync_title(host);
         self.on_active_doc_git_changed(host);
@@ -2324,6 +3475,9 @@ impl EditorApp {
     }
 
     pub fn set_sidebar_width_pt(&mut self, width_pt: f32, host: &mut dyn PlatformHost) {
+        if !width_pt.is_finite() {
+            return;
+        }
         self.sidebar.set_width_pt(width_pt);
         self.save_preferences(host);
         self.recompute_layout();
@@ -2473,7 +3627,7 @@ impl EditorApp {
             || self.palette.is_open()
             || self.shortcuts.visible
             || self.pins_overlay.visible
-            || self.sidebar.is_context_menu_open()
+            || self.context_menu.is_open()
             || self.toast.visible
         {
             full_bounds
@@ -2503,6 +3657,7 @@ impl EditorApp {
             && !self.palette.is_open()
             && !self.shortcuts.visible
             && !self.pins_overlay.visible
+            && !self.context_menu.is_open()
             && !self.sidebar.is_focused()
             && !self.find_bar.is_focused()
             && !self.goto_line.visible;
@@ -2750,9 +3905,9 @@ impl EditorApp {
             );
         }
 
-        // 5c. Optional custom-drawn sidebar context menu.
-        if self.sidebar.is_context_menu_open() {
-            self.sidebar.draw_context_menu(
+        // 5c. Optional custom-drawn context menu (sidebar, tab strip, or split-pane header).
+        if self.context_menu.is_open() {
+            self.context_menu.draw(
                 &mut painter,
                 full_bounds,
                 &theme,
@@ -2919,6 +4074,15 @@ impl EditorApp {
                     {
                         match key {
                             Key::Enter => Some(ConfirmChoice::Discard),
+                            Key::Escape => Some(ConfirmChoice::Cancel),
+                            _ => None,
+                        }
+                    } else if self.confirm_modal.is_save_conflict {
+                        match key {
+                            Key::Enter | Key::Char('o') | Key::Char('O') => {
+                                Some(ConfirmChoice::Save)
+                            }
+                            Key::Char('r') | Key::Char('R') => Some(ConfirmChoice::Discard),
                             Key::Escape => Some(ConfirmChoice::Cancel),
                             _ => None,
                         }
@@ -3181,11 +4345,11 @@ impl EditorApp {
             }
         }
 
-        // Intercept pointer & Escape when the sidebar right-click context menu is open.
-        if self.sidebar.is_context_menu_open() {
+        // Intercept pointer & keyboard navigation when the right-click context menu is open.
+        if self.context_menu.is_open() {
             match event {
                 InputEvent::MouseMove { x_px, y_px, .. } => {
-                    let (changed, over_item) = self.sidebar.hover_context_menu(x_px, y_px);
+                    let (changed, over_item) = self.context_menu.hover(x_px, y_px);
                     host.set_cursor(if over_item {
                         CursorShape::Pointer
                     } else {
@@ -3202,8 +4366,19 @@ impl EditorApp {
                     return;
                 }
                 InputEvent::Tick { now_ms } => {
-                    // Keep the menu open across periodic blink ticks!
+                    // Keep the menu open across periodic ticks while still expiring notices/toasts.
                     self.now_ms = now_ms;
+                    if self.toast.expire_if_needed(now_ms) {
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    if let Some((_, _, exp)) = &self.notice {
+                        if now_ms >= *exp {
+                            self.notice = None;
+                            self.mark_dirty_rect(self.layout.status_bar);
+                            host.request_redraw();
+                        }
+                    }
                     return;
                 }
                 InputEvent::Resize {
@@ -3211,6 +4386,8 @@ impl EditorApp {
                     height_px,
                     scale,
                 } => {
+                    self.close_context_menu();
+                    host.set_cursor(CursorShape::Arrow);
                     self.framebuffer
                         .resize(width_px.max(1), height_px.max(1), scale);
                     self.recompute_layout();
@@ -3223,11 +4400,16 @@ impl EditorApp {
                     button: MouseButton::Left,
                     ..
                 } => {
-                    let act = self.sidebar.click_context_menu(x_px, y_px);
+                    let act = self
+                        .context_menu
+                        .click(x_px, y_px)
+                        .and_then(|id| self.context_menu_actions.get(id as usize).cloned());
+                    self.context_menu_actions.clear();
+                    host.set_cursor(CursorShape::Arrow);
                     self.mark_dirty();
                     host.request_redraw();
                     if let Some(a) = act {
-                        self.execute_sidebar_context_action(a, clipboard, host);
+                        self.execute_context_menu_action(a, clipboard, host);
                     }
                     return;
                 }
@@ -3237,27 +4419,51 @@ impl EditorApp {
                     button: MouseButton::Right,
                     ..
                 } => {
-                    if self.sidebar.open_context_menu(
-                        self.layout.sidebar,
-                        x_px,
-                        y_px,
-                        self.framebuffer.scale,
-                    ) {
+                    if !self.open_context_menu_at(x_px, y_px, host) {
+                        self.close_context_menu();
+                        host.set_cursor(CursorShape::Arrow);
+                    }
+                    self.mark_dirty();
+                    host.request_redraw();
+                    return;
+                }
+                InputEvent::KeyDown {
+                    key: Key::Escape, ..
+                } => {
+                    self.close_context_menu();
+                    host.set_cursor(CursorShape::Arrow);
+                    self.mark_dirty();
+                    host.request_redraw();
+                    return;
+                }
+                InputEvent::KeyDown { key: Key::Up, .. } => {
+                    if self.context_menu.move_selection(-1) {
                         self.mark_dirty();
                         host.request_redraw();
-                    } else {
-                        self.sidebar.close_context_menu();
+                    }
+                    return;
+                }
+                InputEvent::KeyDown { key: Key::Down, .. } => {
+                    if self.context_menu.move_selection(1) {
                         self.mark_dirty();
                         host.request_redraw();
                     }
                     return;
                 }
                 InputEvent::KeyDown {
-                    key: Key::Escape, ..
+                    key: Key::Enter, ..
                 } => {
-                    self.sidebar.close_context_menu();
+                    let act = self
+                        .context_menu
+                        .selected_id()
+                        .and_then(|id| self.context_menu_actions.get(id as usize).cloned());
+                    self.close_context_menu();
+                    host.set_cursor(CursorShape::Arrow);
                     self.mark_dirty();
                     host.request_redraw();
+                    if let Some(a) = act {
+                        self.execute_context_menu_action(a, clipboard, host);
+                    }
                     return;
                 }
                 InputEvent::FsChanged(paths) => {
@@ -3273,7 +4479,8 @@ impl EditorApp {
                     return;
                 }
                 _ => {
-                    self.sidebar.close_context_menu();
+                    self.close_context_menu();
+                    host.set_cursor(CursorShape::Arrow);
                     self.mark_dirty();
                     host.request_redraw();
                 }
@@ -3306,21 +4513,21 @@ impl EditorApp {
                     self.hovered_divider = None;
                     self.viewport.v_bar_hovered = false;
                     self.viewport.h_bar_hovered = false;
+                    // Event-driven Hot Exit & session flush on focus loss (0.00% idle CPU).
+                    match self.sync_backups_now(host) {
+                        Ok(_) => {}
+                        Err(_) if self.any_buffer_dirty() => {
+                            self.set_notice("Backup failed — save your changes", true);
+                        }
+                        Err(_) => {}
+                    }
+                    self.save_session_if_changed(host);
+                    self.gc_undo_now();
                 } else {
                     self.caret_visible = true;
                     self.last_blink_ms = self.now_ms;
                     self.sidebar.refresh(self.fs.as_ref());
-                    match self.doc.check_identity(self.fs.as_ref()) {
-                        IdentityCheck::ReloadedClean => {
-                            self.caret = self.caret.min(self.doc.len_bytes());
-                            self.anchor = self.caret;
-                            self.set_notice("Reloaded external changes", false);
-                        }
-                        IdentityCheck::StaleDirty => {
-                            self.set_notice("File changed on disk", true);
-                        }
-                        _ => {}
-                    }
+                    self.refresh_external_documents(false, host);
                     self.maybe_start_auto_update_check(host);
                     self.refresh_git_workspace(host, false);
                 }
@@ -3391,17 +4598,13 @@ impl EditorApp {
                 self.last_blink_ms = self.now_ms;
                 if button == MouseButton::Left {
                     self.handle_mouse_down(x_px, y_px, click_count, mods, rasterizer, host);
-                } else if button == MouseButton::Right
-                    && self.sidebar.is_visible()
-                    && self.sidebar.open_context_menu(
-                        self.layout.sidebar,
-                        x_px,
-                        y_px,
-                        self.framebuffer.scale,
-                    )
-                {
-                    self.mark_dirty();
-                    host.request_redraw();
+                } else if button == MouseButton::Right {
+                    if self.drag.is_some() {
+                        self.cancel_drag(host);
+                    } else if self.open_context_menu_at(x_px, y_px, host) {
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
                 }
             }
             InputEvent::MouseMove { x_px, y_px, .. } => {
@@ -3873,14 +5076,34 @@ impl EditorApp {
         let action = self.pending_discard.take();
         match choice {
             ConfirmChoice::Save => {
-                if self.save_current(host) {
+                if matches!(action, Some(PendingDiscardAction::ConfirmSaveConflict)) {
+                    match self.doc.save_force(self.fs.as_ref(), false) {
+                        Ok(report) => {
+                            self.sync_clean_sibling_panes_for_active_path();
+                            self.sync_active_buffer_meta();
+                            let _ = self.sync_backups_now(host);
+                            self.gc_undo_now();
+                            self.sync_title(host);
+                            self.refresh_git_workspace(host, true);
+                            self.set_notice(
+                                format!("Saved ({})", report.method.as_str()),
+                                false,
+                            );
+                        }
+                        Err(e) => {
+                            self.set_notice(format!("Save failed: {e}"), true);
+                        }
+                    }
+                } else if self.save_current(host) {
                     if let Some(a) = action {
                         self.execute_pending_action(a, host);
                     }
                 }
             }
             ConfirmChoice::Discard => {
-                if let Some(a) = action {
+                if matches!(action, Some(PendingDiscardAction::ConfirmSaveConflict)) {
+                    self.execute_pending_action(PendingDiscardAction::Reload, host);
+                } else if let Some(a) = action {
                     self.execute_pending_action(a, host);
                 }
             }
@@ -3893,12 +5116,70 @@ impl EditorApp {
     fn execute_pending_action(&mut self, action: PendingDiscardAction, host: &mut dyn PlatformHost) {
         match action {
             PendingDiscardAction::Reload => {
+                let prev = Self::capture_view_pos(
+                    &mut self.doc,
+                    self.caret,
+                    self.anchor,
+                    self.viewport.scroll_top_line,
+                    self.viewport.scroll_sub_y_px,
+                    self.viewport.scroll_x_px,
+                );
                 if let Err(e) = self.doc.reload(self.fs.as_ref()) {
                     self.set_notice(format!("Reload failed: {e}"), true);
                 } else {
-                    self.caret = self.caret.min(self.doc.len_bytes());
-                    self.anchor = self.caret;
+                    let collapsed = SavedViewPos {
+                        anchor_line: prev.line,
+                        anchor_col: prev.col,
+                        ..prev
+                    };
+                    Self::apply_view_pos(
+                        &mut self.doc,
+                        &mut self.caret,
+                        &mut self.anchor,
+                        &mut self.viewport.scroll_top_line,
+                        &mut self.viewport.scroll_sub_y_px,
+                        &mut self.viewport.scroll_x_px,
+                        collapsed,
+                    );
+                    self.extra_cursors.clear();
+                    self.working_set.set_undo_sig(self.active_buf_id, (0, false, 0));
+                    // Also keep any secondary split pane showing the same path in sync.
+                    if let Some(active_p) = self.doc.path().map(Path::to_path_buf) {
+                        for pane in &mut self.other_panes {
+                            if pane.doc.path() == Some(active_p.as_path()) {
+                                let p_prev = Self::capture_view_pos(
+                                    &mut pane.doc,
+                                    pane.caret,
+                                    pane.anchor,
+                                    pane.viewport.scroll_top_line,
+                                    pane.viewport.scroll_sub_y_px,
+                                    pane.viewport.scroll_x_px,
+                                );
+                                if pane.doc.reload(self.fs.as_ref()).is_ok() {
+                                    let p_col = SavedViewPos {
+                                        anchor_line: p_prev.line,
+                                        anchor_col: p_prev.col,
+                                        ..p_prev
+                                    };
+                                    Self::apply_view_pos(
+                                        &mut pane.doc,
+                                        &mut pane.caret,
+                                        &mut pane.anchor,
+                                        &mut pane.viewport.scroll_top_line,
+                                        &mut pane.viewport.scroll_sub_y_px,
+                                        &mut pane.viewport.scroll_x_px,
+                                        p_col,
+                                    );
+                                    pane.extra_cursors.clear();
+                                    self.working_set.set_undo_sig(pane.buf_id, (0, false, 0));
+                                }
+                            }
+                        }
+                    }
                     self.sync_active_buffer_meta();
+                    let _ = self.sync_backups_now(host);
+                    self.gc_undo_now();
+                    self.recompute_active_git_diff();
                     self.refresh_search();
                     self.sync_title(host);
                     self.set_notice("Reloaded", false);
@@ -3961,6 +5242,7 @@ impl EditorApp {
                     );
                 } else {
                     self.save_session(host);
+                    self.gc_undo_now();
                     host.relaunch_after_update(&target_app);
                     host.request_quit();
                 }
@@ -3973,6 +5255,7 @@ impl EditorApp {
             } => {
                 self.execute_replace_in_files(&query, &replacement, options, &files, host);
             }
+            PendingDiscardAction::ConfirmSaveConflict => {}
         }
     }
 
@@ -3997,14 +5280,14 @@ impl EditorApp {
 
         for path in files {
             // 1. Active pane buffer (stays in-memory and undoable with Cmd+Z!).
+            let mut handled_any = false;
             if self.doc.path() == Some(path.as_path()) {
                 let n = self
                     .doc
                     .replace_all(query, replacement, options, self.now_ms);
                 if n > 0 {
-                    let len = self.doc.len_bytes();
-                    self.caret = self.caret.min(len);
-                    self.anchor = self.anchor.min(len);
+                    self.caret = Self::snap_doc_offset(&mut self.doc, self.caret);
+                    self.anchor = Self::snap_doc_offset(&mut self.doc, self.anchor);
                     self.extra_cursors.clear();
                     self.sync_active_buffer_meta();
                     self.recompute_active_git_diff();
@@ -4014,10 +5297,10 @@ impl EditorApp {
                     total_matches += n;
                     total_files += 1;
                 }
-                continue;
+                handled_any = true;
             }
             // 2. Visible secondary split panes (also stays in-memory and undoable!).
-            let mut handled_split = false;
+            let mut dirty_pane_ids: Vec<BufferId> = Vec::new();
             for pane in &mut self.other_panes {
                 if pane.doc.path() == Some(path.as_path()) {
                     let n = pane.doc.replace_all(
@@ -4027,18 +5310,22 @@ impl EditorApp {
                         self.now_ms,
                     );
                     if n > 0 {
-                        let len = pane.doc.len_bytes();
-                        pane.caret = pane.caret.min(len);
-                        pane.anchor = pane.anchor.min(len);
+                        pane.caret = Self::snap_doc_offset(&mut pane.doc, pane.caret);
+                        pane.anchor = Self::snap_doc_offset(&mut pane.doc, pane.anchor);
                         pane.extra_cursors.clear();
-                        total_matches += n;
-                        total_files += 1;
+                        dirty_pane_ids.push(pane.buf_id);
+                        if !handled_any {
+                            total_matches += n;
+                            total_files += 1;
+                        }
                     }
-                    handled_split = true;
-                    break;
+                    handled_any = true;
                 }
             }
-            if handled_split {
+            for bid in dirty_pane_ids {
+                self.working_set.set_dirty(bid, true);
+            }
+            if handled_any {
                 continue;
             }
             // 3. Parked open buffers in WorkingSet (stays in-memory and undoable!).
@@ -4327,17 +5614,24 @@ impl EditorApp {
                 Ok(()) => {
                     self.available_update = None;
                     self.set_notice(format!("Updated to v{version} — restarting"), false);
-                    if let Some(dirty_id) = self.first_dirty_buffer() {
-                        self.activate_buffer(dirty_id, host);
-                        self.request_discard_or_run(
-                            PendingDiscardAction::RestartForUpdate(target_app),
-                            host,
-                        );
-                    } else {
-                        self.save_session(host);
-                        host.relaunch_after_update(&target_app);
-                        host.request_quit();
+                    let synced_ok = matches!(
+                        self.sync_backups_now(host),
+                        Ok(BackupSyncOutcome::AllBackedUp)
+                    );
+                    if !synced_ok {
+                        if let Some(dirty_id) = self.first_dirty_buffer() {
+                            self.activate_buffer(dirty_id, host);
+                            self.request_discard_or_run(
+                                PendingDiscardAction::RestartForUpdate(target_app),
+                                host,
+                            );
+                            return;
+                        }
                     }
+                    self.save_session(host);
+                    self.gc_undo_now();
+                    host.relaunch_after_update(&target_app);
+                    host.request_quit();
                 }
                 Err(e) => {
                     self.set_notice(format!("Update failed: {e}"), true);
@@ -4648,6 +5942,149 @@ impl EditorApp {
     /// - Only refreshes directories ALREADY loaded in `sidebar.dir_cache` (never scans collapsed dirs).
     /// - Silently reloads clean open/split/parked buffers whose on-disk identity changed.
     /// - Never overwrites dirty buffers (shows a quiet notice instead).
+    /// Zero-waste external identity check + UTF-8/scroll-safe reload helper:
+    /// checks `stat.rev` before touching `byte_to_line_col`, preserves `(line, col, scroll)`
+    /// clamped to valid UTF-8 char boundaries with `anchor = caret`, and preserves `Language`.
+    fn check_and_reload_preserving_view(
+        fs: &dyn FileSystem,
+        doc: &mut Document,
+        caret: &mut u64,
+        anchor: &mut u64,
+        scroll_top_line: &mut usize,
+        scroll_sub_y_px: &mut f32,
+        scroll_x_px: &mut f32,
+    ) -> IdentityCheck {
+        let Some(path) = doc.path() else {
+            return IdentityCheck::Unchanged;
+        };
+        match fs.stat(path) {
+            Ok(st) if st.rev == doc.rev() => return IdentityCheck::Unchanged,
+            Ok(_) if doc.is_dirty() => return IdentityCheck::StaleDirty,
+            Err(_) => return IdentityCheck::Missing,
+            Ok(_) => {}
+        }
+        let prev = Self::capture_view_pos(
+            doc,
+            *caret,
+            *anchor,
+            *scroll_top_line,
+            *scroll_sub_y_px,
+            *scroll_x_px,
+        );
+        if doc.reload(fs).is_ok() {
+            let collapsed = SavedViewPos {
+                anchor_line: prev.line,
+                anchor_col: prev.col,
+                ..prev
+            };
+            Self::apply_view_pos(
+                doc,
+                caret,
+                anchor,
+                scroll_top_line,
+                scroll_sub_y_px,
+                scroll_x_px,
+                collapsed,
+            );
+            IdentityCheck::ReloadedClean
+        } else {
+            IdentityCheck::StaleDirty
+        }
+    }
+
+    /// Unified external-document check across active pane, secondary split panes, and parked tabs.
+    /// Returns `true` if any document changed or surfaced a status notice.
+    fn refresh_external_documents(&mut self, notify_missing: bool, _host: &mut dyn PlatformHost) -> bool {
+        let mut any_changed = false;
+        let mut any_reloaded = false;
+
+        // 1. Active pane.
+        match Self::check_and_reload_preserving_view(
+            self.fs.as_ref(),
+            &mut self.doc,
+            &mut self.caret,
+            &mut self.anchor,
+            &mut self.viewport.scroll_top_line,
+            &mut self.viewport.scroll_sub_y_px,
+            &mut self.viewport.scroll_x_px,
+        ) {
+            IdentityCheck::ReloadedClean => {
+                self.extra_cursors.clear();
+                self.working_set.set_undo_sig(self.active_buf_id, (0, false, 0));
+                self.sync_active_buffer_meta();
+                self.recompute_active_git_diff();
+                if self.find_bar.visible {
+                    self.refresh_search();
+                }
+                self.set_notice("Reloaded external changes", false);
+                any_changed = true;
+                any_reloaded = true;
+            }
+            IdentityCheck::StaleDirty => {
+                self.set_notice("File changed on disk", true);
+                any_changed = true;
+            }
+            IdentityCheck::Missing if notify_missing => {
+                self.set_notice("File removed on disk", true);
+                any_changed = true;
+            }
+            _ => {}
+        }
+
+        // 2. Secondary visible split panes.
+        let mut reloaded_pane_ids: Vec<BufferId> = Vec::new();
+        for pane in &mut self.other_panes {
+            if Self::check_and_reload_preserving_view(
+                self.fs.as_ref(),
+                &mut pane.doc,
+                &mut pane.caret,
+                &mut pane.anchor,
+                &mut pane.viewport.scroll_top_line,
+                &mut pane.viewport.scroll_sub_y_px,
+                &mut pane.viewport.scroll_x_px,
+            ) == IdentityCheck::ReloadedClean
+            {
+                pane.extra_cursors.clear();
+                reloaded_pane_ids.push(pane.buf_id);
+                any_changed = true;
+                any_reloaded = true;
+            }
+        }
+        for bid in reloaded_pane_ids {
+            self.working_set.set_undo_sig(bid, (0, false, 0));
+        }
+
+        // 3. Clean parked tabs in the working set.
+        let parked_ids = self.working_set.parked_ids();
+        let mut reloaded_parked_ids: Vec<BufferId> = Vec::new();
+        for pid in parked_ids {
+            if let Some(parked) = self.working_set.parked_mut(pid) {
+                if Self::check_and_reload_preserving_view(
+                    self.fs.as_ref(),
+                    &mut parked.doc,
+                    &mut parked.caret,
+                    &mut parked.anchor,
+                    &mut parked.scroll_top_line,
+                    &mut parked.scroll_sub_y_px,
+                    &mut parked.scroll_x_px,
+                ) == IdentityCheck::ReloadedClean
+                {
+                    reloaded_parked_ids.push(pid);
+                    any_changed = true;
+                    any_reloaded = true;
+                }
+            }
+        }
+        for pid in reloaded_parked_ids {
+            self.working_set.set_undo_sig(pid, (0, false, 0));
+        }
+
+        if any_reloaded {
+            self.gc_undo_now();
+        }
+        any_changed
+    }
+
     fn handle_fs_changed(&mut self, raw_paths: &[PathBuf], host: &mut dyn PlatformHost) {
         let mut any_changed = false;
         let mut workspace_files_changed = raw_paths.is_empty();
@@ -4662,18 +6099,16 @@ impl EditorApp {
         } else {
             let mut dirs_to_check: Vec<PathBuf> = Vec::new();
             for p in raw_paths {
-                let s = p.to_string_lossy();
-                let in_git_dir = s.contains("/.git/")
+                let in_git_dir = p.components().any(|c| c.as_os_str() == ".git")
                     || active_git_dir.as_deref().is_some_and(|gd| p.starts_with(gd))
                     || sidebar_git_dir.as_deref().is_some_and(|gd| p.starts_with(gd));
                 if in_git_dir {
-                    let is_ref_or_head = s.ends_with("/HEAD")
-                        || s.ends_with("/MERGE_HEAD")
-                        || s.ends_with("/CHERRY_PICK_HEAD")
-                        || s.ends_with("/packed-refs")
-                        || s.contains("/refs/heads/")
-                        || s.contains("/refs/remotes/");
-                    if is_ref_or_head || s.ends_with("/index") {
+                    let fname = p.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    let is_ref_or_head = matches!(
+                        fname,
+                        "HEAD" | "MERGE_HEAD" | "CHERRY_PICK_HEAD" | "packed-refs"
+                    ) || p.components().any(|c| c.as_os_str() == "refs");
+                    if is_ref_or_head || fname == "index" {
                         git_meta_changed = true;
                     }
                     if is_ref_or_head {
@@ -4682,12 +6117,13 @@ impl EditorApp {
                     }
                     continue;
                 }
-                if s.contains("/target/")
-                    || s.contains("/node_modules/")
-                    || s.ends_with("/.DS_Store")
-                    || s.ends_with(".editor.lock")
-                    || s.contains(".editor.tmp")
-                {
+                let ignored_dir = p
+                    .components()
+                    .any(|c| matches!(c.as_os_str().to_str(), Some("target" | "node_modules")));
+                let ignored_file = p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n == ".DS_Store" || n.ends_with(".editor.lock") || n.contains(".editor.tmp")
+                });
+                if ignored_dir || ignored_file {
                     continue;
                 }
                 workspace_files_changed = true;
@@ -4709,61 +6145,9 @@ impl EditorApp {
         }
         if workspace_files_changed {
             self.palette.invalidate_file_index();
-        }
-
-        let path_matches = |doc_path: &Path| -> bool {
-            if raw_paths.is_empty() {
-                return true;
+            if self.refresh_external_documents(true, host) {
+                any_changed = true;
             }
-            raw_paths
-                .iter()
-                .any(|c| c == doc_path || doc_path.parent() == Some(c.as_path()))
-        };
-
-        // 2. Active document identity check (reloads clean external edits; guards dirty edits).
-        if let Some(active_p) = self.doc.path().map(Path::to_path_buf) {
-            if path_matches(&active_p) {
-                match self.doc.check_identity(self.fs.as_ref()) {
-                    IdentityCheck::ReloadedClean => {
-                        let len = self.doc.len_bytes();
-                        self.caret = self.caret.min(len);
-                        self.anchor = self.anchor.min(len);
-                        self.extra_cursors.clear();
-                        self.sync_active_buffer_meta();
-                        if self.find_bar.visible {
-                            self.refresh_search();
-                        }
-                        self.set_notice("Reloaded external changes", false);
-                        any_changed = true;
-                    }
-                    IdentityCheck::StaleDirty => {
-                        self.set_notice("File changed on disk", true);
-                        any_changed = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // 3. Secondary visible split panes.
-        for pane in &mut self.other_panes {
-            if let Some(p) = pane.doc.path().map(Path::to_path_buf) {
-                if path_matches(&p) && pane.doc.check_identity(self.fs.as_ref()) == IdentityCheck::ReloadedClean {
-                    let len = pane.doc.len_bytes();
-                    pane.caret = pane.caret.min(len);
-                    pane.anchor = pane.anchor.min(len);
-                    pane.extra_cursors.clear();
-                    any_changed = true;
-                }
-            }
-        }
-
-        // 4. Clean parked buffers in the working set.
-        if self
-            .working_set
-            .reload_clean_parked(self.fs.as_ref(), raw_paths)
-        {
-            any_changed = true;
         }
 
         if git_meta_changed || any_changed {
@@ -4776,6 +6160,353 @@ impl EditorApp {
             self.recompute_active_git_diff();
             self.mark_dirty();
             host.request_redraw();
+        }
+    }
+
+    fn close_context_menu(&mut self) {
+        self.context_menu.close();
+        self.context_menu_actions.clear();
+    }
+
+    fn relative_path_in_workspace(&self, path: &Path) -> Option<PathBuf> {
+        let root = self.sidebar.root()?;
+        let rel = path.strip_prefix(root).ok()?;
+        if rel.as_os_str().is_empty() {
+            None
+        } else {
+            Some(rel.to_path_buf())
+        }
+    }
+
+    fn path_for_buffer(&self, id: BufferId) -> Option<PathBuf> {
+        if id == self.active_buf_id {
+            return self.doc.path().map(Path::to_path_buf);
+        }
+        if let Some(p) = self.other_panes.iter().find(|p| p.buf_id == id) {
+            return p.doc.path().map(Path::to_path_buf);
+        }
+        self.working_set
+            .get_meta(id)
+            .and_then(|m| m.path.clone())
+    }
+
+    fn copy_path_to_clipboard(
+        &mut self,
+        path: &Path,
+        relative: bool,
+        clipboard: &mut dyn Clipboard,
+    ) {
+        if relative {
+            if let Some(rel) = self.relative_path_in_workspace(path) {
+                clipboard.set_text(&display_path_string(&rel));
+                self.set_notice("Copied relative path", false);
+            } else {
+                self.set_notice("File is outside the open folder", true);
+            }
+        } else {
+            clipboard.set_text(&display_path_string(path));
+            self.set_notice("Copied path", false);
+        }
+    }
+
+    fn reveal_path_in_file_manager(&mut self, path: &Path, host: &mut dyn PlatformHost) {
+        if self.fs.stat(path).is_err() {
+            self.set_notice("File not found on disk", true);
+            return;
+        }
+        if let Err(e) = host.reveal_in_file_manager(path) {
+            self.set_notice(e, true);
+        }
+    }
+
+    fn open_context_menu_at(&mut self, x_px: f32, y_px: f32, host: &dyn PlatformHost) -> bool {
+        let xi = x_px.round() as i32;
+        let yi = y_px.round() as i32;
+        let reveal_label = host.reveal_in_file_manager_label();
+        let mut entries: Vec<ContextMenuEntry> = Vec::new();
+        let mut actions: Vec<ContextMenuAction> = Vec::new();
+        let push_item = |entries: &mut Vec<ContextMenuEntry>,
+                         actions: &mut Vec<ContextMenuAction>,
+                         label: &str,
+                         danger: bool,
+                         act: ContextMenuAction| {
+            let id = actions.len() as u32;
+            actions.push(act);
+            entries.push(if danger {
+                ContextMenuEntry::danger_item(id, label)
+            } else {
+                ContextMenuEntry::item(id, label)
+            });
+        };
+
+        // 1. Sidebar row or empty sidebar space.
+        if self.sidebar.is_visible() && self.layout.sidebar.contains(xi, yi) {
+            match self.sidebar.select_at_for_context_menu(
+                self.layout.sidebar,
+                x_px,
+                y_px,
+                self.framebuffer.scale,
+            ) {
+                Some(Some(path)) => {
+                    push_item(
+                        &mut entries,
+                        &mut actions,
+                        "New File…",
+                        false,
+                        ContextMenuAction::SidebarNewFile,
+                    );
+                    push_item(
+                        &mut entries,
+                        &mut actions,
+                        "New Folder…",
+                        false,
+                        ContextMenuAction::SidebarNewFolder,
+                    );
+                    entries.push(ContextMenuEntry::Separator);
+                    push_item(
+                        &mut entries,
+                        &mut actions,
+                        reveal_label,
+                        false,
+                        ContextMenuAction::RevealPath(path.clone()),
+                    );
+                    push_item(
+                        &mut entries,
+                        &mut actions,
+                        "Copy Path",
+                        false,
+                        ContextMenuAction::CopyPath(path.clone()),
+                    );
+                    if self.relative_path_in_workspace(&path).is_some() {
+                        push_item(
+                            &mut entries,
+                            &mut actions,
+                            "Copy Relative Path",
+                            false,
+                            ContextMenuAction::CopyRelativePath(path),
+                        );
+                    }
+                    entries.push(ContextMenuEntry::Separator);
+                    push_item(
+                        &mut entries,
+                        &mut actions,
+                        "Rename…",
+                        false,
+                        ContextMenuAction::SidebarRename,
+                    );
+                    push_item(
+                        &mut entries,
+                        &mut actions,
+                        "Delete…",
+                        true,
+                        ContextMenuAction::SidebarDelete,
+                    );
+                }
+                Some(None) => {
+                    let Some(root) = self.sidebar.root().map(Path::to_path_buf) else {
+                        return false;
+                    };
+                    push_item(
+                        &mut entries,
+                        &mut actions,
+                        "New File…",
+                        false,
+                        ContextMenuAction::SidebarNewFile,
+                    );
+                    push_item(
+                        &mut entries,
+                        &mut actions,
+                        "New Folder…",
+                        false,
+                        ContextMenuAction::SidebarNewFolder,
+                    );
+                    entries.push(ContextMenuEntry::Separator);
+                    push_item(
+                        &mut entries,
+                        &mut actions,
+                        reveal_label,
+                        false,
+                        ContextMenuAction::RevealPath(root.clone()),
+                    );
+                    push_item(
+                        &mut entries,
+                        &mut actions,
+                        "Copy Path",
+                        false,
+                        ContextMenuAction::CopyPath(root),
+                    );
+                }
+                None => return false,
+            }
+            self.context_menu_actions = actions;
+            self.context_menu.open(x_px, y_px, entries);
+            return self.context_menu.is_open();
+        }
+
+        // 2. Working-Set Strip tab or split-pane header (does NOT steal active tab focus).
+        let tab_target: Option<(BufferId, Option<PaneId>)> = if self.layout.tab_strip.contains(xi, yi)
+        {
+            match self.tab_strip.hit_test(x_px, y_px) {
+                TabStripHit::Tab(buf_id) | TabStripHit::CloseTab(buf_id) => Some((buf_id, None)),
+                _ => None,
+            }
+        } else if !self.other_panes.is_empty() && !self.zoomed {
+            self.layout
+                .grid
+                .panes()
+                .iter()
+                .find(|pr| pr.header.contains(xi, yi))
+                .and_then(|pr| {
+                    let buf_id = if pr.id == self.active_id {
+                        Some(self.active_buf_id)
+                    } else {
+                        self.other_panes
+                            .iter()
+                            .find(|p| p.id == pr.id)
+                            .map(|p| p.buf_id)
+                    };
+                    buf_id.map(|b| (b, Some(pr.id)))
+                })
+        } else {
+            None
+        };
+
+        let Some((buf_id, pane_id)) = tab_target else {
+            return false;
+        };
+
+        if let Some(path) = self.path_for_buffer(buf_id) {
+            push_item(
+                &mut entries,
+                &mut actions,
+                reveal_label,
+                false,
+                ContextMenuAction::RevealPath(path.clone()),
+            );
+            push_item(
+                &mut entries,
+                &mut actions,
+                "Copy Path",
+                false,
+                ContextMenuAction::CopyPath(path.clone()),
+            );
+            if self.relative_path_in_workspace(&path).is_some() {
+                push_item(
+                    &mut entries,
+                    &mut actions,
+                    "Copy Relative Path",
+                    false,
+                    ContextMenuAction::CopyRelativePath(path),
+                );
+            }
+            entries.push(ContextMenuEntry::Separator);
+        }
+
+        let pin_label = if self.working_set.is_pinned(buf_id) {
+            "Unpin Tab"
+        } else {
+            "Pin Tab"
+        };
+        push_item(
+            &mut entries,
+            &mut actions,
+            pin_label,
+            false,
+            ContextMenuAction::TogglePin(buf_id),
+        );
+
+        let target_pane = pane_id.unwrap_or(self.active_id);
+        if self.arrangement.can_insert(target_pane, DropZone::Right) {
+            push_item(
+                &mut entries,
+                &mut actions,
+                "Split Right",
+                false,
+                ContextMenuAction::SplitBuffer {
+                    target_pane,
+                    zone: DropZone::Right,
+                    buf_id,
+                },
+            );
+        } else if self.arrangement.can_insert(target_pane, DropZone::Bottom) {
+            push_item(
+                &mut entries,
+                &mut actions,
+                "Split Down",
+                false,
+                ContextMenuAction::SplitBuffer {
+                    target_pane,
+                    zone: DropZone::Bottom,
+                    buf_id,
+                },
+            );
+        }
+
+        entries.push(ContextMenuEntry::Separator);
+        push_item(
+            &mut entries,
+            &mut actions,
+            "Close",
+            false,
+            ContextMenuAction::CloseBuffer(buf_id),
+        );
+
+        self.context_menu_actions = actions;
+        self.context_menu.open(x_px, y_px, entries);
+        self.context_menu.is_open()
+    }
+
+    fn execute_context_menu_action(
+        &mut self,
+        act: ContextMenuAction,
+        clipboard: &mut dyn Clipboard,
+        host: &mut dyn PlatformHost,
+    ) {
+        match act {
+            ContextMenuAction::SidebarNewFile => {
+                self.execute_sidebar_context_action(SidebarContextAction::NewFile, clipboard, host);
+            }
+            ContextMenuAction::SidebarNewFolder => {
+                self.execute_sidebar_context_action(
+                    SidebarContextAction::NewFolder,
+                    clipboard,
+                    host,
+                );
+            }
+            ContextMenuAction::SidebarRename => {
+                self.execute_sidebar_context_action(SidebarContextAction::Rename, clipboard, host);
+            }
+            ContextMenuAction::SidebarDelete => {
+                self.execute_sidebar_context_action(SidebarContextAction::Delete, clipboard, host);
+            }
+            ContextMenuAction::RevealPath(path) => {
+                self.reveal_path_in_file_manager(&path, host);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            ContextMenuAction::CopyPath(path) => {
+                self.copy_path_to_clipboard(&path, false, clipboard);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            ContextMenuAction::CopyRelativePath(path) => {
+                self.copy_path_to_clipboard(&path, true, clipboard);
+                self.mark_dirty();
+                host.request_redraw();
+            }
+            ContextMenuAction::TogglePin(buf_id) => {
+                self.toggle_pin_buffer(buf_id, host);
+            }
+            ContextMenuAction::SplitBuffer {
+                target_pane,
+                zone,
+                buf_id,
+            } => {
+                self.split_buffer_at(target_pane, zone, buf_id, host);
+            }
+            ContextMenuAction::CloseBuffer(buf_id) => {
+                self.request_close_buffer(buf_id, host);
+            }
         }
     }
 
@@ -4799,25 +6530,33 @@ impl EditorApp {
                     self.set_notice("Open a folder first", true);
                 }
             }
+            SidebarContextAction::RevealInFileManager => {
+                let target = self
+                    .sidebar
+                    .selected_row()
+                    .map(|r| r.path.clone())
+                    .or_else(|| self.sidebar.root().map(Path::to_path_buf));
+                if let Some(path) = target {
+                    self.reveal_path_in_file_manager(&path, host);
+                } else {
+                    self.set_notice("Open a folder first", true);
+                }
+            }
             SidebarContextAction::CopyPath => {
-                if let Some(row) = self.sidebar.selected_row() {
-                    let path_str = row.path.to_string_lossy().into_owned();
-                    clipboard.set_text(&path_str);
-                    self.set_notice("Copied path", false);
+                let target = self
+                    .sidebar
+                    .selected_row()
+                    .map(|r| r.path.clone())
+                    .or_else(|| self.sidebar.root().map(Path::to_path_buf));
+                if let Some(path) = target {
+                    self.copy_path_to_clipboard(&path, false, clipboard);
                 } else {
                     self.set_notice("Select a file or folder first", true);
                 }
             }
             SidebarContextAction::CopyRelativePath => {
-                if let Some(row) = self.sidebar.selected_row() {
-                    let rel = self
-                        .sidebar
-                        .root()
-                        .and_then(|r| row.path.strip_prefix(r).ok())
-                        .unwrap_or(&row.path);
-                    let path_str = rel.to_string_lossy().into_owned();
-                    clipboard.set_text(&path_str);
-                    self.set_notice("Copied relative path", false);
+                if let Some(path) = self.sidebar.selected_row().map(|r| r.path.clone()) {
+                    self.copy_path_to_clipboard(&path, true, clipboard);
                 } else {
                     self.set_notice("Select a file or folder first", true);
                 }
@@ -5006,12 +6745,16 @@ impl EditorApp {
                 }
             }
             FsOp::CreateFile { path } => {
+                let has_unsaved_edits = self
+                    .working_set
+                    .find_by_path(path)
+                    .is_some_and(|id| self.is_buffer_dirty(id));
                 let is_empty = self
                     .fs
                     .stat(path)
                     .map(|st| st.is_file && st.rev.size == 0)
                     .unwrap_or(false);
-                if !is_empty {
+                if has_unsaved_edits || !is_empty {
                     self.show_toast("Cannot undo create: file is no longer empty", false, true);
                     false
                 } else if let Err(e) = self.fs.remove_file(path) {
@@ -5102,7 +6845,10 @@ impl EditorApp {
                 }
             }
             FsOp::CreateFile { path } => {
-                if let Err(e) = self.fs.write_atomic(path, &mut |_| Ok(())) {
+                if self.fs.stat(path).is_ok() {
+                    self.show_toast("Cannot redo: file already exists", false, true);
+                    false
+                } else if let Err(e) = self.fs.write_atomic(path, &mut |_| Ok(())) {
                     self.show_toast(format!("Redo failed: {e}"), false, true);
                     false
                 } else {
@@ -5125,8 +6871,23 @@ impl EditorApp {
                     true
                 }
             }
-            FsOp::DeleteFile { path, .. } => {
-                if let Err(e) = self.fs.remove_file(path) {
+            FsOp::DeleteFile { path, content } => {
+                let has_unsaved_edits = self
+                    .working_set
+                    .find_by_path(path)
+                    .is_some_and(|id| self.is_buffer_dirty(id));
+                let mut cur_bytes = Vec::new();
+                let matches_snapshot = !has_unsaved_edits
+                    && self
+                        .fs
+                        .read_prefix_into(path, content.len().saturating_add(1), &mut cur_bytes)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|total| total as usize == content.len() && cur_bytes == *content);
+                if !matches_snapshot {
+                    self.show_toast("Cannot redo delete: file was modified", false, true);
+                    false
+                } else if let Err(e) = self.fs.remove_file(path) {
                     self.show_toast(format!("Redo failed: {e}"), false, true);
                     false
                 } else {
@@ -5137,6 +6898,7 @@ impl EditorApp {
             }
         };
         if ok {
+            self.palette.invalidate_file_index();
             self.fs_undo.push_undo_without_clearing_redo(op);
             self.show_toast(done_msg, true, false);
         } else {
@@ -5177,6 +6939,7 @@ impl EditorApp {
         };
         match res {
             Ok(()) => {
+                self.forget_evicted_views_under(path, is_dir);
                 self.close_buffers_under_path(path, host);
                 self.sidebar.invalidate_subtree(self.fs.as_ref(), path);
                 let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("item");
@@ -5295,22 +7058,69 @@ impl EditorApp {
                 None
             }
         };
+        let refresh_rename_rev = |fs: &dyn FileSystem, doc: &mut Document, new_p: &Path| {
+            let cur_rev = doc.rev();
+            if let Ok(st) = fs.stat(new_p) {
+                if st.rev.dev == cur_rev.dev
+                    && st.rev.ino == cur_rev.ino
+                    && st.rev.size == cur_rev.size
+                    && st.rev.mtime_ns == cur_rev.mtime_ns
+                {
+                    doc.set_rev(st.rev);
+                }
+            }
+        };
         if let Some(new_p) = self.doc.path().and_then(remap) {
-            self.doc.set_path(new_p);
-            let lang = Language::from_path_with_overrides(self.doc.path(), &self.syntax_ext_map);
-            self.doc.set_language(lang);
+            let old_default =
+                Language::from_path_with_overrides(self.doc.path(), &self.syntax_ext_map);
+            self.doc.set_path(new_p.clone());
+            refresh_rename_rev(self.fs.as_ref(), &mut self.doc, &new_p);
+            let new_default =
+                Language::from_path_with_overrides(self.doc.path(), &self.syntax_ext_map);
+            if old_default != new_default {
+                self.doc.set_language(new_default);
+            }
+            self.working_set.set_undo_sig(self.active_buf_id, (0, false, 0));
             self.sync_active_buffer_meta();
             self.sync_title(host);
         }
+        let mut remapped_pane_ids: Vec<BufferId> = Vec::new();
         for pane in &mut self.other_panes {
             if let Some(new_p) = pane.doc.path().and_then(remap) {
-                pane.doc.set_path(new_p);
-                let lang = Language::from_path_with_overrides(pane.doc.path(), &self.syntax_ext_map);
-                pane.doc.set_language(lang);
+                let old_default =
+                    Language::from_path_with_overrides(pane.doc.path(), &self.syntax_ext_map);
+                pane.doc.set_path(new_p.clone());
+                refresh_rename_rev(self.fs.as_ref(), &mut pane.doc, &new_p);
+                let new_default =
+                    Language::from_path_with_overrides(pane.doc.path(), &self.syntax_ext_map);
+                if old_default != new_default {
+                    pane.doc.set_language(new_default);
+                }
+                remapped_pane_ids.push(pane.buf_id);
             }
         }
+        for bid in remapped_pane_ids {
+            self.working_set.set_undo_sig(bid, (0, false, 0));
+        }
         self.working_set
-            .remap_paths(from, to, is_dir, &self.syntax_ext_map);
+            .remap_paths(self.fs.as_ref(), from, to, is_dir, &self.syntax_ext_map);
+        for (p, _) in &mut self.evicted_views {
+            if let Some(next) = remap(p) {
+                *p = next;
+            }
+        }
+        if self.session_store.remap_paths(from, to, is_dir) {
+            self.save_session_if_changed(host);
+        }
+        if self.draft_store.remap_paths(from, to, is_dir) {
+            if let Some(ref sd) = self.state_dir {
+                let _ = self.draft_store.commit_and_gc(self.fs.as_ref(), sd);
+            }
+        }
+        if let Some(sd) = self.state_dir.clone() {
+            self.sync_live_undo_files(&sd);
+            self.gc_undo_now();
+        }
     }
 
     fn close_buffers_under_path(&mut self, path: &Path, host: &mut dyn PlatformHost) {
@@ -5324,6 +7134,30 @@ impl EditorApp {
         self.atlas.metrics(rasterizer, FontStyle::Mono, font_px)
     }
 
+    /// Immediately refresh any clean sibling split panes viewing the exact same saved file path
+    /// so split-view saves reflect across panes on the same frame without waiting for FSEvents.
+    fn sync_clean_sibling_panes_for_active_path(&mut self) {
+        let Some(active_p) = self.doc.path().map(Path::to_path_buf) else {
+            return;
+        };
+        for pane in &mut self.other_panes {
+            if pane.doc.path() == Some(active_p.as_path()) && !pane.doc.is_dirty() {
+                if Self::check_and_reload_preserving_view(
+                    self.fs.as_ref(),
+                    &mut pane.doc,
+                    &mut pane.caret,
+                    &mut pane.anchor,
+                    &mut pane.viewport.scroll_top_line,
+                    &mut pane.viewport.scroll_sub_y_px,
+                    &mut pane.viewport.scroll_x_px,
+                ) == IdentityCheck::ReloadedClean
+                {
+                    pane.extra_cursors.clear();
+                }
+            }
+        }
+    }
+
     fn save_current(&mut self, host: &mut dyn PlatformHost) -> bool {
         if self.doc.path().is_none() {
             return self.save_as_dialog(host);
@@ -5331,12 +7165,23 @@ impl EditorApp {
         match self.doc.save(self.fs.as_ref(), None, false) {
             Ok(report) => {
                 // Saving NEVER removes a Kept tab from `open` or `pinned`!
+                self.sync_clean_sibling_panes_for_active_path();
                 self.sync_active_buffer_meta();
+                let _ = self.sync_backups_now(host);
+                self.gc_undo_now();
                 self.sync_title(host);
                 self.refresh_git_workspace(host, true);
                 self.set_notice(format!("Saved ({})", report.method.as_str()), false);
                 host.request_redraw();
                 true
+            }
+            Err(editor_core::DocumentError::Conflict { .. }) => {
+                let name = self.doc.file_name().to_string();
+                self.pending_discard = Some(PendingDiscardAction::ConfirmSaveConflict);
+                self.confirm_modal.open_save_conflict(&name);
+                self.mark_dirty();
+                host.request_redraw();
+                false
             }
             Err(e) => {
                 self.set_notice(format!("Save failed: {e}"), true);
@@ -5352,8 +7197,12 @@ impl EditorApp {
         };
         match self.doc.save_as(self.fs.as_ref(), &dst, None, false) {
             Ok(_) => {
+                self.working_set.set_undo_sig(self.active_buf_id, (0, false, 0));
                 self.sync_active_buffer_meta();
                 self.working_set.graduate_preview(self.active_buf_id);
+                let _ = self.sync_backups_now(host);
+                self.save_session_if_changed(host);
+                self.gc_undo_now();
                 self.sync_title(host);
                 self.sidebar.refresh(self.fs.as_ref());
                 if let Some(p) = self.doc.path().map(Path::to_path_buf) {
@@ -5391,9 +7240,11 @@ impl EditorApp {
                     self.doc.tree_mut().ensure_indexed_for_line(line + 16);
                     let clamped = line.min(self.doc.editable_line_count().saturating_sub(1));
                     if let Some((start, content_end, _)) = self.doc.line_byte_range(clamped) {
-                        let off = start + (col_bytes.unwrap_or(0) as u64).min(content_end - start);
+                        let raw_off = start + (col_bytes.unwrap_or(0) as u64).min(content_end - start);
+                        let off = Self::snap_doc_offset(&mut self.doc, raw_off);
                         self.caret = off;
                         self.anchor = off;
+                        self.extra_cursors.clear();
                         self.viewport.scroll_top_line = clamped.saturating_sub(6);
                         self.viewport.scroll_sub_y_px = 0.0;
                     }
@@ -5408,8 +7259,11 @@ impl EditorApp {
         }
     }
 
-    fn palette_command_entries(&self) -> Vec<editor_render::PaletteCommandEntry> {
-        let mut entries = Vec::with_capacity(72);
+    fn palette_command_entries(
+        &self,
+        host: &dyn PlatformHost,
+    ) -> Vec<editor_render::PaletteCommandEntry> {
+        let mut entries = Vec::with_capacity(76);
         for item in self.keymap.to_display_items() {
             if !item.runnable || item.id == "command-palette" {
                 continue;
@@ -5419,6 +7273,30 @@ impl EditorApp {
                 title: item.label.to_string(),
                 category: item.category.to_string(),
                 shortcut: item.keys,
+            });
+        }
+        if let Some(active_path) = self.doc.path() {
+            entries.push(editor_render::PaletteCommandEntry {
+                id: "copy-path".to_string(),
+                title: "Copy path".to_string(),
+                category: "File & Navigation".to_string(),
+                shortcut: String::new(),
+            });
+            if self.relative_path_in_workspace(active_path).is_some() {
+                entries.push(editor_render::PaletteCommandEntry {
+                    id: "copy-relative-path".to_string(),
+                    title: "Copy relative path".to_string(),
+                    category: "File & Navigation".to_string(),
+                    shortcut: String::new(),
+                });
+            }
+        }
+        if self.doc.path().is_some() || self.sidebar.root().is_some() {
+            entries.push(editor_render::PaletteCommandEntry {
+                id: "reveal-in-file-manager".to_string(),
+                title: host.reveal_in_file_manager_label().to_string(),
+                category: "File & Navigation".to_string(),
+                shortcut: String::new(),
             });
         }
         let extras: &[(&str, &str, &str)] = &[
@@ -5695,10 +7573,21 @@ impl EditorApp {
             }
             AppCommand::CloseWindow => {
                 if let Some(dirty_id) = self.first_dirty_buffer() {
-                    self.activate_buffer(dirty_id, host);
-                    self.request_discard_or_run(PendingDiscardAction::CloseWindow, host);
+                    if matches!(
+                        self.sync_backups_now(host),
+                        Ok(BackupSyncOutcome::AllBackedUp)
+                    ) {
+                        self.save_session(host);
+                        self.gc_undo_now();
+                        host.request_close_window();
+                    } else {
+                        self.activate_buffer(dirty_id, host);
+                        self.request_discard_or_run(PendingDiscardAction::CloseWindow, host);
+                    }
                 } else {
+                    let _ = self.sync_backups_now(host);
                     self.save_session(host);
+                    self.gc_undo_now();
                     host.request_close_window();
                 }
             }
@@ -5872,6 +7761,7 @@ impl EditorApp {
                 self.jump_search_match(false, rasterizer, host);
             }
             AppCommand::GoToLine => {
+                self.close_context_menu();
                 self.find_bar.close();
                 self.palette.close();
                 self.sidebar.set_focused(false);
@@ -5888,6 +7778,7 @@ impl EditorApp {
                 self.jump_git_change(false, rasterizer, host);
             }
             AppCommand::QuickOpen => {
+                self.close_context_menu();
                 self.goto_line.close();
                 self.sidebar.set_focused(false);
                 self.palette.set_async_runtime(
@@ -5905,16 +7796,18 @@ impl EditorApp {
                 host.request_redraw();
             }
             AppCommand::CommandPalette => {
+                self.close_context_menu();
                 self.goto_line.close();
                 self.shortcuts.close();
                 self.pins_overlay.close();
                 self.sidebar.set_focused(false);
-                let entries = self.palette_command_entries();
+                let entries = self.palette_command_entries(host);
                 self.palette.open_commands(entries);
                 self.mark_dirty();
                 host.request_redraw();
             }
             AppCommand::ProjectSearch => {
+                self.close_context_menu();
                 self.goto_line.close();
                 self.sidebar.set_focused(false);
                 self.palette.set_async_runtime(
@@ -6017,6 +7910,7 @@ impl EditorApp {
                 self.jump_to_pin(slot, host);
             }
             AppCommand::ShowPins => {
+                self.close_context_menu();
                 if self.pins_overlay.visible {
                     self.pins_overlay.close();
                 } else {
@@ -6126,10 +8020,21 @@ impl EditorApp {
             }
             AppCommand::Quit => {
                 if let Some(dirty_id) = self.first_dirty_buffer() {
-                    self.activate_buffer(dirty_id, host);
-                    self.request_discard_or_run(PendingDiscardAction::Quit, host);
+                    if matches!(
+                        self.sync_backups_now(host),
+                        Ok(BackupSyncOutcome::AllBackedUp)
+                    ) {
+                        self.save_session(host);
+                        self.gc_undo_now();
+                        host.request_quit();
+                    } else {
+                        self.activate_buffer(dirty_id, host);
+                        self.request_discard_or_run(PendingDiscardAction::Quit, host);
+                    }
                 } else {
+                    let _ = self.sync_backups_now(host);
                     self.save_session(host);
+                    self.gc_undo_now();
                     host.request_quit();
                 }
             }
@@ -7026,13 +8931,25 @@ impl EditorApp {
                 };
                 let (insert_str, caret_rel) = if self.auto_pairs {
                     let line_str = self.doc.line_content(line).unwrap_or_default();
-                    let before = &line_str[..col.min(line_str.len())];
+                    let mut safe_col = col.min(line_str.len());
+                    while safe_col > 0 && !line_str.is_char_boundary(safe_col) {
+                        safe_col -= 1;
+                    }
+                    let before = &line_str[..safe_col];
                     let after_owned;
                     let after: &str = if end_line == line {
-                        &line_str[end_col.min(line_str.len())..]
+                        let mut safe_end = end_col.min(line_str.len());
+                        while safe_end > 0 && !line_str.is_char_boundary(safe_end) {
+                            safe_end -= 1;
+                        }
+                        &line_str[safe_end..]
                     } else {
                         after_owned = self.doc.line_content(end_line).unwrap_or_default();
-                        &after_owned[end_col.min(after_owned.len())..]
+                        let mut safe_end = end_col.min(after_owned.len());
+                        while safe_end > 0 && !after_owned.is_char_boundary(safe_end) {
+                            safe_end -= 1;
+                        }
+                        &after_owned[safe_end..]
                     };
                     autopairs::smart_enter_insert(before, after, self.viewport.tab_width)
                 } else {
@@ -7040,7 +8957,11 @@ impl EditorApp {
                         .doc
                         .line_content(line)
                         .map(|l| {
-                            l[..col.min(l.len())]
+                            let mut safe_col = col.min(l.len());
+                            while safe_col > 0 && !l.is_char_boundary(safe_col) {
+                                safe_col -= 1;
+                            }
+                            l[..safe_col]
                                 .chars()
                                 .take_while(|&c| c == ' ' || c == '\t')
                                 .collect()
@@ -7051,7 +8972,16 @@ impl EditorApp {
                     (s, r)
                 };
                 if self.doc.edit(start, removed, &insert_str, self.now_ms, false).is_ok() {
-                    let new_pos = start + caret_rel as u64;
+                    // Account for `\n` -> `\r\n` expansion in `Document::normalize_insert_eol` on CRLF files!
+                    let eol_extra = if self.doc.eol() == editor_core::Eol::CrLf {
+                        insert_str[..caret_rel]
+                            .bytes()
+                            .filter(|&b| b == b'\n')
+                            .count()
+                    } else {
+                        0
+                    };
+                    let new_pos = start + (caret_rel + eol_extra) as u64;
                     self.caret = new_pos;
                     self.anchor = new_pos;
                     self.after_document_mutated(rasterizer, host);
@@ -7102,13 +9032,15 @@ impl EditorApp {
                                             wrapped.push(close);
                                             if wrapped.len() == sel_len as usize + 2 {
                                                 if let Ok(wstr) = std::str::from_utf8(&wrapped) {
-                                                    if self
-                                                        .doc
-                                                        .edit(a, sel_len, wstr, self.now_ms, false)
-                                                        .is_ok()
-                                                    {
+                                                    if let Ok(end_pos) = self.doc.edit(
+                                                        a,
+                                                        sel_len,
+                                                        wstr,
+                                                        self.now_ms,
+                                                        false,
+                                                    ) {
                                                         self.anchor = a + 1;
-                                                        self.caret = a + 1 + sel_len;
+                                                        self.caret = end_pos.saturating_sub(1);
                                                         self.after_document_mutated(
                                                             rasterizer, host,
                                                         );
@@ -7552,15 +9484,42 @@ impl EditorApp {
                     } else {
                         (0, 0)
                     };
-                    if let Some(last) = edits.last_mut() {
-                        if ds < last.0 + last.1 {
-                            let merged_end = (last.0 + last.1).max(ds + dl);
-                            last.1 = merged_end - last.0;
+                    let mut merged = false;
+                    while let Some(last) = edits.last_mut() {
+                        if ds <= last.0 + last.1 && ds + dl >= last.0 {
+                            let new_start = last.0.min(ds);
+                            let new_end = (last.0 + last.1).max(ds + dl);
+                            last.0 = new_start;
+                            last.1 = new_end - new_start;
                             if let Some(lf) = flags.last_mut() {
                                 *lf |= is_p;
                             }
-                            continue;
+                            merged = true;
+                            // Continue collapsing if lowering `new_start` now overlaps an even earlier edit.
+                            if edits.len() >= 2 {
+                                let (cur_s, cur_l, _) = edits.pop().unwrap();
+                                let cur_f = flags.pop().unwrap();
+                                let prev = edits.last_mut().unwrap();
+                                if cur_s <= prev.0 + prev.1 {
+                                    let ps = prev.0.min(cur_s);
+                                    let pe = (prev.0 + prev.1).max(cur_s + cur_l);
+                                    prev.0 = ps;
+                                    prev.1 = pe - ps;
+                                    if let Some(pf) = flags.last_mut() {
+                                        *pf |= cur_f;
+                                    }
+                                    continue;
+                                } else {
+                                    edits.push((cur_s, cur_l, String::new()));
+                                    flags.push(cur_f);
+                                }
+                            }
+                            break;
                         }
+                        break;
+                    }
+                    if merged {
+                        continue;
                     }
                     edits.push((ds, dl, String::new()));
                     flags.push(is_p);
@@ -7596,15 +9555,42 @@ impl EditorApp {
                     } else {
                         (s, 0)
                     };
-                    if let Some(last) = edits.last_mut() {
-                        if ds < last.0 + last.1 {
-                            let merged_end = (last.0 + last.1).max(ds + dl);
-                            last.1 = merged_end - last.0;
+                    let mut merged = false;
+                    while let Some(last) = edits.last_mut() {
+                        if ds <= last.0 + last.1 && ds + dl >= last.0 {
+                            let new_start = last.0.min(ds);
+                            let new_end = (last.0 + last.1).max(ds + dl);
+                            last.0 = new_start;
+                            last.1 = new_end - new_start;
                             if let Some(lf) = flags.last_mut() {
                                 *lf |= is_p;
                             }
-                            continue;
+                            merged = true;
+                            // Continue collapsing if lowering `new_start` now overlaps an even earlier edit.
+                            if edits.len() >= 2 {
+                                let (cur_s, cur_l, _) = edits.pop().unwrap();
+                                let cur_f = flags.pop().unwrap();
+                                let prev = edits.last_mut().unwrap();
+                                if cur_s <= prev.0 + prev.1 {
+                                    let ps = prev.0.min(cur_s);
+                                    let pe = (prev.0 + prev.1).max(cur_s + cur_l);
+                                    prev.0 = ps;
+                                    prev.1 = pe - ps;
+                                    if let Some(pf) = flags.last_mut() {
+                                        *pf |= cur_f;
+                                    }
+                                    continue;
+                                } else {
+                                    edits.push((cur_s, cur_l, String::new()));
+                                    flags.push(cur_f);
+                                }
+                            }
+                            break;
                         }
+                        break;
+                    }
+                    if merged {
+                        continue;
                     }
                     edits.push((ds, dl, String::new()));
                     flags.push(is_p);
@@ -7701,6 +9687,15 @@ impl EditorApp {
         host: &mut dyn PlatformHost,
     ) {
         self.sync_active_buffer_meta();
+        if !self.doc.is_dirty()
+            && self
+                .working_set
+                .get_meta(self.active_buf_id)
+                .is_some_and(|m| m.draft_id.is_some())
+        {
+            let _ = self.sync_backups_now(host);
+            self.gc_undo_now();
+        }
         self.recompute_active_git_diff();
         let metrics = self.doc_metrics(rasterizer);
         self.viewport
@@ -8653,14 +10648,26 @@ impl EditorApp {
             max_matches: 10_000,
         };
         let replacement = self.doc.expand_replacement_at(&query, opts, m, &template);
+        let was_zero_len = m.start == m.end;
         if let Ok(pos) = self
             .doc
             .edit(m.start, m.end - m.start, &replacement, self.now_ms, false)
         {
+            self.extra_cursors.clear();
             self.caret = pos;
             self.anchor = pos;
             self.after_document_mutated(rasterizer, host);
-            if let Some(next_idx) = self.active_match {
+            if was_zero_len && !self.search_matches.is_empty() {
+                // Avoid re-matching the exact same position forever on zero-length regexes (`a*`, `^`).
+                if let Some(next_idx) = self.search_matches.iter().position(|mm| mm.start > pos) {
+                    self.active_match = Some(next_idx);
+                    self.find_bar.active_match = Some(next_idx);
+                    self.select_match(next_idx, rasterizer);
+                } else {
+                    self.active_match = None;
+                    self.find_bar.active_match = None;
+                }
+            } else if let Some(next_idx) = self.active_match {
                 self.select_match(next_idx, rasterizer);
             }
         }
@@ -8683,10 +10690,28 @@ impl EditorApp {
             max_matches: 100_000,
         };
         let count = self.doc.replace_all(&query, &replacement, opts, self.now_ms);
-        self.caret = self.caret.min(self.doc.len_bytes());
+        self.extra_cursors.clear();
+        self.caret = Self::snap_doc_offset(&mut self.doc, self.caret);
         self.anchor = self.caret;
         self.after_document_mutated(rasterizer, host);
         self.set_notice(format!("Replaced {count} occurrence(s)"), false);
+    }
+
+    /// Snap any byte offset to a valid UTF-8 character boundary within `doc`.
+    fn snap_doc_offset(doc: &mut Document, offset: u64) -> u64 {
+        let clamped = offset.min(doc.len_bytes());
+        let (line, col) = doc.byte_to_line_col(clamped);
+        let Some((ls, _, _)) = doc.line_byte_range(line) else {
+            return clamped;
+        };
+        let Some(content) = doc.line_content(line) else {
+            return clamped;
+        };
+        let mut safe_col = col.min(content.len());
+        while safe_col > 0 && !content.is_char_boundary(safe_col) {
+            safe_col -= 1;
+        }
+        ls + safe_col as u64
     }
 
     // ========================================================================
@@ -8914,7 +10939,8 @@ impl EditorApp {
         let max_line = self.doc.editable_line_count().saturating_sub(1);
         let clamped = target.min(max_line);
         let (start, content_end, _) = self.doc.line_byte_range(clamped).unwrap_or((0, 0, 0));
-        start + (col_bytes as u64).min(content_end - start)
+        let raw_off = start + (col_bytes as u64).min(content_end - start);
+        Self::snap_doc_offset(&mut self.doc, raw_off)
     }
 
     /// Execute any CLI/agent IPC command directly against this live `EditorApp`.
@@ -9180,6 +11206,45 @@ impl EditorApp {
                     "sidebar-new-folder" => {
                         self.execute_sidebar_context_action(
                             SidebarContextAction::NewFolder,
+                            clipboard,
+                            host,
+                        );
+                    }
+                    "copy-path" => {
+                        if let Some(p) = self.doc.path().map(Path::to_path_buf) {
+                            self.copy_path_to_clipboard(&p, false, clipboard);
+                        } else {
+                            self.set_notice("Save file first", true);
+                        }
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    "copy-relative-path" => {
+                        if let Some(p) = self.doc.path().map(Path::to_path_buf) {
+                            self.copy_path_to_clipboard(&p, true, clipboard);
+                        } else {
+                            self.set_notice("Save file first", true);
+                        }
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    "reveal-in-file-manager" => {
+                        let target = self
+                            .doc
+                            .path()
+                            .map(Path::to_path_buf)
+                            .or_else(|| self.sidebar.root().map(Path::to_path_buf));
+                        if let Some(p) = target {
+                            self.reveal_path_in_file_manager(&p, host);
+                        } else {
+                            self.set_notice("Save file or open a folder first", true);
+                        }
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    "sidebar-reveal" => {
+                        self.execute_sidebar_context_action(
+                            SidebarContextAction::RevealInFileManager,
                             clipboard,
                             host,
                         );
@@ -9572,6 +11637,15 @@ impl EditorApp {
                                 host,
                             );
                         } else if let Ok(w) = raw.parse::<f32>() {
+                            if !w.is_finite() {
+                                return (
+                                    IpcReply::Error(format!(
+                                        "invalid sidebar width `{raw}` (use 160..480 or `reset`)"
+                                    )),
+                                    false,
+                                    false,
+                                );
+                            }
                             self.set_sidebar_width_pt(w, host);
                         } else {
                             return (
@@ -9597,11 +11671,21 @@ impl EditorApp {
                                     let v = pct.trim().parse::<f32>().map_err(|_| {
                                         format!("invalid ratio `{s}` (use 0.15..0.85, 15%..85%, or reset)")
                                     })?;
+                                    if !v.is_finite() {
+                                        return Err(format!(
+                                            "invalid ratio `{s}` (use 0.15..0.85, 15%..85%, or reset)"
+                                        ));
+                                    }
                                     Ok(v / 100.0)
                                 } else {
                                     let v = t.parse::<f32>().map_err(|_| {
                                         format!("invalid ratio `{s}` (use 0.15..0.85, 15%..85%, or reset)")
                                     })?;
+                                    if !v.is_finite() {
+                                        return Err(format!(
+                                            "invalid ratio `{s}` (use 0.15..0.85, 15%..85%, or reset)"
+                                        ));
+                                    }
                                     Ok(if v > 1.0 { v / 100.0 } else { v })
                                 }
                             };
@@ -9699,7 +11783,16 @@ impl EditorApp {
             }
             IpcCommand::Quit { force } => {
                 if *force || !self.any_buffer_dirty() {
+                    let _ = self.sync_backups_now(host);
                     self.save_session(host);
+                    self.gc_undo_now();
+                    (IpcReply::Quitting, false, true)
+                } else if matches!(
+                    self.sync_backups_now(host),
+                    Ok(BackupSyncOutcome::AllBackedUp)
+                ) {
+                    self.save_session(host);
+                    self.gc_undo_now();
                     (IpcReply::Quitting, false, true)
                 } else {
                     self.handle_command(AppCommand::Quit, rasterizer, clipboard, host);

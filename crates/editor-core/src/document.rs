@@ -176,6 +176,29 @@ impl Document {
         }
     }
 
+    /// Construct a document restored from an unsaved Hot Exit draft: starts marked `is_dirty() == true`
+    /// while preserving its original file path, optimistic `base_rev`, BOM, and dominant EOL.
+    pub fn from_unsaved_draft(
+        text: &str,
+        path: Option<PathBuf>,
+        base_rev: FileRev,
+        bom: bool,
+        eol: Eol,
+    ) -> Self {
+        let lang = Language::from_path(path.as_deref());
+        let tree = PieceTree::from_str(text);
+        Self {
+            path,
+            tree,
+            undo: UndoStack::new_dirty(),
+            syntax: SyntaxCache::new(lang),
+            rev: base_rev,
+            bom,
+            dominant_eol: eol,
+            generation: 1,
+        }
+    }
+
     /// Open a file lazily: O(1) BOM & first-8KB binary check + initial 64 KB index only.
     pub fn open(fs: &dyn FileSystem, path: &Path) -> Result<Self, DocumentError> {
         let canonical = fs.canonicalize(path)?;
@@ -227,9 +250,12 @@ impl Document {
     }
 
     pub fn set_path(&mut self, path: PathBuf) {
-        let lang = Language::from_path(Some(path.as_path()));
+        let old_default = Language::from_path(self.path.as_deref());
+        let new_default = Language::from_path(Some(path.as_path()));
         self.path = Some(path);
-        self.set_language(lang);
+        if old_default != new_default {
+            self.set_language(new_default);
+        }
     }
 
     #[inline]
@@ -246,6 +272,13 @@ impl Document {
         self.rev
     }
 
+    /// Update the cached file revision after an editor-initiated metadata change (such as
+    /// sidebar rename, which bumps POSIX `ctime` without changing file contents).
+    #[inline]
+    pub fn set_rev(&mut self, rev: FileRev) {
+        self.rev = rev;
+    }
+
     #[inline]
     pub fn has_bom(&self) -> bool {
         self.bom
@@ -259,6 +292,44 @@ impl Document {
     #[inline]
     pub fn is_dirty(&self) -> bool {
         self.undo.is_dirty()
+    }
+
+    #[inline]
+    pub fn undo_stack(&self) -> &UndoStack {
+        &self.undo
+    }
+
+    #[inline]
+    pub fn undo_stack_mut(&mut self) -> &mut UndoStack {
+        &mut self.undo
+    }
+
+    pub fn set_undo_stack(&mut self, undo: UndoStack) {
+        self.undo = undo;
+    }
+
+    /// Compute a fast content fingerprint for verifying persisted undo bindings:
+    /// - Files `<= 1 MiB`: full SHA-256 of document bytes.
+    /// - Files `> 1 MiB`: O(1) SHA-256 of `(len || first 64 KiB || last 64 KiB)` so huge
+    ///   files remain strictly lazy without full scans.
+    pub fn content_fingerprint(&mut self) -> [u8; 32] {
+        const FULL_HASH_MAX: u64 = 1024 * 1024;
+        const EDGE_BYTES: usize = 64 * 1024;
+        let len = self.tree.len_bytes();
+        if len <= FULL_HASH_MAX {
+            let mut buf = Vec::with_capacity(len as usize);
+            if len > 0 {
+                self.tree.read_range(0, len as usize, &mut buf);
+            }
+            editor_platform::sha256_bytes(&buf)
+        } else {
+            let mut buf = Vec::with_capacity(8 + EDGE_BYTES * 2);
+            buf.extend_from_slice(&len.to_le_bytes());
+            self.tree.read_range(0, EDGE_BYTES, &mut buf);
+            self.tree
+                .read_range(len - EDGE_BYTES as u64, EDGE_BYTES, &mut buf);
+            editor_platform::sha256_bytes(&buf)
+        }
     }
 
     /// Free cached base-file pages when parking this document in an inactive tab.
@@ -277,6 +348,9 @@ impl Document {
     }
 
     pub fn set_language(&mut self, language: Language) {
+        if self.syntax.language() == language {
+            return;
+        }
         self.syntax.set_language(language);
         self.generation += 1;
     }
@@ -513,6 +587,7 @@ impl Document {
             return Ok(offset);
         }
 
+        let lines_before = self.tree.editable_line_count();
         let (start_line, _) = self.tree.byte_to_line_col(offset);
         let deleted = if removed_len > 0 {
             self.tree.delete(offset, removed_len)
@@ -523,10 +598,7 @@ impl Document {
             self.tree.insert(offset, &inserted);
         }
         let after = offset + inserted.len() as u64;
-
-        let added_nl = inserted.iter().filter(|&&b| b == b'\n').count() as isize;
-        let removed_nl = deleted.iter().filter(|&&b| b == b'\n').count() as isize;
-        let delta_lines = added_nl - removed_nl;
+        let delta_lines = self.tree.editable_line_count() as isize - lines_before as isize;
 
         self.undo.record(
             EditOp {
@@ -654,13 +726,34 @@ impl Document {
         let mut earliest_line = usize::MAX;
 
         // Apply from back to front so earlier byte offsets remain valid!
+        let mut ctx_buf = [0u8; 4];
         for m in matches.into_iter().rev() {
             let (line, _) = self.tree.byte_to_line_col(m.start);
             earliest_line = earliest_line.min(line);
+            let prev_ch = if is_regex && m.start > 0 {
+                let back = m.start.min(4) as usize;
+                let n = self.tree.read_into_slice(m.start - back as u64, &mut ctx_buf[..back]);
+                crate::search::prev_char_in_bytes(&ctx_buf[..n])
+            } else {
+                None
+            };
+            let next_ch = if is_regex && m.end < self.tree.len_bytes() {
+                let fwd = (self.tree.len_bytes() - m.end).min(4) as usize;
+                let n = self.tree.read_into_slice(m.end, &mut ctx_buf[..fwd]);
+                crate::search::next_char_in_bytes(&ctx_buf[..n])
+            } else {
+                None
+            };
             let deleted = self.tree.delete(m.start, m.end - m.start);
             let inserted_bytes = if is_regex {
                 let matched_str = String::from_utf8_lossy(&deleted);
-                let expanded = compiled.expand_replacement(&matched_str, replacement, &mut scratch);
+                let expanded = compiled.expand_replacement_with_context(
+                    &matched_str,
+                    prev_ch,
+                    next_ch,
+                    replacement,
+                    &mut scratch,
+                );
                 self.normalize_insert_eol(&expanded)
             } else {
                 literal_bytes.clone()
@@ -704,8 +797,23 @@ impl Document {
         let mut buf = Vec::with_capacity((m.end - m.start) as usize);
         self.tree.read_range(m.start, (m.end - m.start) as usize, &mut buf);
         let matched = String::from_utf8_lossy(&buf);
+        let mut ctx_buf = [0u8; 4];
+        let prev_ch = if m.start > 0 {
+            let back = m.start.min(4) as usize;
+            let n = self.tree.read_into_slice(m.start - back as u64, &mut ctx_buf[..back]);
+            crate::search::prev_char_in_bytes(&ctx_buf[..n])
+        } else {
+            None
+        };
+        let next_ch = if m.end < self.tree.len_bytes() {
+            let fwd = (self.tree.len_bytes() - m.end).min(4) as usize;
+            let n = self.tree.read_into_slice(m.end, &mut ctx_buf[..fwd]);
+            crate::search::next_char_in_bytes(&ctx_buf[..n])
+        } else {
+            None
+        };
         let mut scratch = SearchScratch::new();
-        compiled.expand_replacement(&matched, replacement, &mut scratch)
+        compiled.expand_replacement_with_context(&matched, prev_ch, next_ch, replacement, &mut scratch)
     }
 
     pub fn find_all(&mut self, query: &str, options: SearchOptions) -> Vec<SearchMatch> {
@@ -733,21 +841,49 @@ impl Document {
     }
 
     /// Undo the last logical edit step, returning the restored cursor byte offset.
+    /// Verifies each op's bounds and matching bytes before mutating, rolling back atomically
+    /// if a stale persisted undo op ever disagrees with document content.
     pub fn undo(&mut self) -> Option<u64> {
         let ops = self.undo.pop_undo()?;
         let mut cursor = 0u64;
         let mut earliest_line = usize::MAX;
+        let mut verify = Vec::new();
+        let mut applied = 0usize;
         // Invert ops in reverse order of application.
         for op in ops.iter().rev() {
+            let ins_len = op.inserted.len() as u64;
+            let valid = op.offset.checked_add(ins_len).is_some_and(|end| end <= self.tree.len_bytes())
+                && if op.inserted.is_empty() {
+                    true
+                } else {
+                    verify.clear();
+                    self.tree.read_range(op.offset, op.inserted.len(), &mut verify);
+                    verify.as_slice() == op.inserted.as_slice()
+                };
+            if !valid {
+                // Roll back already-inverted ops in forward order so the document stays untouched.
+                let start = ops.len() - applied;
+                for prev in &ops[start..] {
+                    if !prev.deleted.is_empty() {
+                        self.tree.delete(prev.offset, prev.deleted.len() as u64);
+                    }
+                    if !prev.inserted.is_empty() {
+                        self.tree.insert(prev.offset, &prev.inserted);
+                    }
+                }
+                self.undo.clear_preserving_dirty();
+                return None;
+            }
             let (line, _) = self.tree.byte_to_line_col(op.offset);
             earliest_line = earliest_line.min(line);
             if !op.inserted.is_empty() {
-                self.tree.delete(op.offset, op.inserted.len() as u64);
+                self.tree.delete(op.offset, ins_len);
             }
             if !op.deleted.is_empty() {
                 self.tree.insert(op.offset, &op.deleted);
             }
             cursor = op.cursor_before;
+            applied += 1;
         }
         if earliest_line != usize::MAX {
             self.syntax.invalidate_from(earliest_line);
@@ -760,20 +896,45 @@ impl Document {
     }
 
     /// Redo the last undone step, returning the restored cursor byte offset.
+    /// Verifies bounds and matching bytes atomically, rolling back cleanly on any mismatch.
     pub fn redo(&mut self) -> Option<u64> {
         let ops = self.undo.pop_redo()?;
         let mut cursor = 0u64;
         let mut earliest_line = usize::MAX;
+        let mut verify = Vec::new();
+        let mut applied = 0usize;
         for op in ops.iter() {
+            let del_len = op.deleted.len() as u64;
+            let valid = op.offset.checked_add(del_len).is_some_and(|end| end <= self.tree.len_bytes())
+                && if op.deleted.is_empty() {
+                    true
+                } else {
+                    verify.clear();
+                    self.tree.read_range(op.offset, op.deleted.len(), &mut verify);
+                    verify.as_slice() == op.deleted.as_slice()
+                };
+            if !valid {
+                for prev in ops[..applied].iter().rev() {
+                    if !prev.inserted.is_empty() {
+                        self.tree.delete(prev.offset, prev.inserted.len() as u64);
+                    }
+                    if !prev.deleted.is_empty() {
+                        self.tree.insert(prev.offset, &prev.deleted);
+                    }
+                }
+                self.undo.clear_preserving_dirty();
+                return None;
+            }
             let (line, _) = self.tree.byte_to_line_col(op.offset);
             earliest_line = earliest_line.min(line);
             if !op.deleted.is_empty() {
-                self.tree.delete(op.offset, op.deleted.len() as u64);
+                self.tree.delete(op.offset, del_len);
             }
             if !op.inserted.is_empty() {
                 self.tree.insert(op.offset, &op.inserted);
             }
             cursor = op.cursor_after;
+            applied += 1;
         }
         if earliest_line != usize::MAX {
             self.syntax.invalidate_from(earliest_line);
@@ -830,7 +991,18 @@ impl Document {
         in_place: bool,
     ) -> Result<SaveReport, DocumentError> {
         let path = self.path.clone().ok_or(DocumentError::NoPath)?;
-        self.save_to_path(fs, &path, expected_rev, in_place, true)
+        self.save_to_path(fs, &path, expected_rev, in_place, true, false)
+    }
+
+    /// Force-save to the current path, intentionally bypassing the optimistic `self.rev` check
+    /// after the user explicitly confirmed overwriting external disk changes.
+    pub fn save_force(
+        &mut self,
+        fs: &dyn FileSystem,
+        in_place: bool,
+    ) -> Result<SaveReport, DocumentError> {
+        let path = self.path.clone().ok_or(DocumentError::NoPath)?;
+        self.save_to_path(fs, &path, None, in_place, true, true)
     }
 
     /// Save to a new path and update the document's open path and language.
@@ -843,7 +1015,7 @@ impl Document {
     ) -> Result<SaveReport, DocumentError> {
         let canonical = fs.canonicalize(dst)?;
         let same_target = self.path.as_deref() == Some(canonical.as_path());
-        self.save_to_path(fs, &canonical, expected_rev, in_place, same_target)
+        self.save_to_path(fs, &canonical, expected_rev, in_place, same_target, false)
     }
 
     fn save_to_path(
@@ -853,6 +1025,7 @@ impl Document {
         expected_rev: Option<FileRev>,
         in_place: bool,
         same_target: bool,
+        force_overwrite: bool,
     ) -> Result<SaveReport, DocumentError> {
         // Hold exclusive advisory lockfile for the entire check + write + commit critical section.
         let _lock = fs.lock_file(target)?;
@@ -866,7 +1039,7 @@ impl Document {
                     actual,
                 });
             }
-        } else if same_target && self.rev != FileRev::default() {
+        } else if !force_overwrite && same_target && self.rev != FileRev::default() {
             if let Ok(actual) = fs.stat(target) {
                 if actual.rev != self.rev {
                     return Err(DocumentError::Conflict {
@@ -888,8 +1061,12 @@ impl Document {
         let bom = self.bom;
         let bom_len = if bom { 3 } else { 0 };
 
+        // Only allow CoW / delta fast paths when `self.tree` is backed directly by the target file
+        // on disk AND we are not force-overwriting external disk modifications.
+        let can_use_delta = same_target && !force_overwrite && self.tree.is_file_backed();
+
         // Fast path 1a: Same-length APFS CoW clone + pwrite (O(changed) even on 5 GB files!).
-        if same_target && !in_place {
+        if can_use_delta && !in_place {
             if let Some(spans) = self.tree.same_length_changed_spans(bom_len) {
                 let parent = target.parent().unwrap_or_else(|| Path::new("."));
                 let name = target
@@ -954,7 +1131,7 @@ impl Document {
 
         // Fast path 2: Explicit `--in-place` same-length write.
         if in_place {
-            if same_target {
+            if can_use_delta {
                 if let Some(spans) = self.tree.same_length_changed_spans(bom_len) {
                     let slices: Vec<(u64, &[u8])> =
                         spans.iter().map(|(off, b)| (*off, b.as_slice())).collect();
@@ -1009,9 +1186,12 @@ impl Document {
         let start_off = if self.bom { 3 } else { 0 };
         self.tree = PieceTree::from_file_handle(handle, start_off);
         self.tree.set_clean();
+        let same_path = self.path.as_deref() == Some(canonical.as_path());
         self.path = Some(canonical.clone());
         self.rev = new_rev;
-        self.syntax.set_language(Language::from_path(Some(&canonical)));
+        if !same_path {
+            self.syntax.set_language(Language::from_path(Some(&canonical)));
+        }
         self.undo.mark_saved();
         self.generation += 1;
         Ok(())
@@ -1020,7 +1200,9 @@ impl Document {
     /// Reload from disk (discards unsaved edits and undo stack).
     pub fn reload(&mut self, fs: &dyn FileSystem) -> Result<(), DocumentError> {
         let path = self.path.clone().ok_or(DocumentError::NoPath)?;
-        let reloaded = Document::open(fs, &path)?;
+        let prev_lang = self.language();
+        let mut reloaded = Document::open(fs, &path)?;
+        reloaded.set_language(prev_lang);
         let gen = self.generation + 1;
         *self = reloaded;
         self.generation = gen;

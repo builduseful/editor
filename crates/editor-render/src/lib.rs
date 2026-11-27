@@ -6,6 +6,7 @@
 
 pub mod atlas;
 pub mod chrome;
+pub mod context_menu;
 pub mod painter;
 pub mod palette;
 pub mod pins;
@@ -21,6 +22,7 @@ pub use chrome::{
     A11yNode, A11yRole, ActionToast, ConfirmModal, FindBarAction, FindBarLayout, FindBarState,
     GotoLineState, ImeComposition, StatusBarData, ToastHit,
 };
+pub use context_menu::{ContextMenu, ContextMenuEntry};
 pub use painter::Painter;
 pub use palette::{
     fuzzy_score, CommandPalette, PaletteAction, PaletteCommandEntry, PaletteItem, PaletteMode,

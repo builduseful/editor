@@ -49,6 +49,7 @@ pub struct ShortcutsOverlay {
     items: Vec<ShortcutDisplayItem>,
     rows: Vec<DisplayRow>,
     selected_row: usize,
+    last_scrolled_row: Option<usize>,
     scroll_y_px: f32,
     card_rect: PixelRect,
     list_rect: PixelRect,
@@ -70,6 +71,7 @@ impl ShortcutsOverlay {
             items: Vec::new(),
             rows: Vec::new(),
             selected_row: 0,
+            last_scrolled_row: None,
             scroll_y_px: 0.0,
             card_rect: PixelRect::ZERO,
             list_rect: PixelRect::ZERO,
@@ -84,6 +86,7 @@ impl ShortcutsOverlay {
         self.input.set_text("");
         self.input.focused = true;
         self.scroll_y_px = 0.0;
+        self.last_scrolled_row = None;
         self.rebuild_rows();
         self.select_first_interactive();
     }
@@ -449,13 +452,16 @@ impl ShortcutsOverlay {
         }
         let total_h = y_acc;
         let max_scroll = (total_h - list_rect.h).max(0) as f32;
-        if let Some(&(sy, sh)) = row_offsets.get(self.selected_row) {
-            let sy_f = sy as f32;
-            let sb_f = (sy + sh) as f32;
-            if sy_f < self.scroll_y_px {
-                self.scroll_y_px = sy_f;
-            } else if sb_f > self.scroll_y_px + list_rect.h as f32 {
-                self.scroll_y_px = sb_f - list_rect.h as f32;
+        if self.last_scrolled_row != Some(self.selected_row) {
+            self.last_scrolled_row = Some(self.selected_row);
+            if let Some(&(sy, sh)) = row_offsets.get(self.selected_row) {
+                let sy_f = sy as f32;
+                let sb_f = (sy + sh) as f32;
+                if sy_f < self.scroll_y_px {
+                    self.scroll_y_px = sy_f;
+                } else if sb_f > self.scroll_y_px + list_rect.h as f32 {
+                    self.scroll_y_px = sb_f - list_rect.h as f32;
+                }
             }
         }
         self.scroll_y_px = self.scroll_y_px.clamp(0.0, max_scroll);
@@ -514,7 +520,10 @@ impl ShortcutsOverlay {
                     remaining,
                     expanded,
                 } => {
-                    self.row_rects.push((row_idx, row_rect));
+                    let clipped = row_rect.intersect(list_rect);
+                    if !clipped.is_empty() {
+                        self.row_rects.push((row_idx, clipped));
+                    }
                     let bg = if selected {
                         theme.selection
                     } else {
@@ -558,7 +567,10 @@ impl ShortcutsOverlay {
                     );
                 }
                 DisplayRow::Item(item_idx) => {
-                    self.row_rects.push((row_idx, row_rect));
+                    let clipped = row_rect.intersect(list_rect);
+                    if !clipped.is_empty() {
+                        self.row_rects.push((row_idx, clipped));
+                    }
                     let item = &self.items[*item_idx];
                     if selected {
                         painter.fill_rounded_rect(row_rect, 5.0 * scale, theme.current_line);

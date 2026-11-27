@@ -53,15 +53,19 @@ impl SyntaxPlugin for MarkdownPlugin {
             let sub_id = state.sub_lang();
             if sub_id > 0 {
                 let sub_lang = Language(sub_id as u16);
-                // Preserve embedded language's primary mode in `depth` (most modes are 0..15).
-                let sub_in = LexState::new(state.depth(), 0, 1, 0);
-                let sub_in = if state.depth() == 0 {
+                // Pack embedded language's `(mode 0..15, depth 0..15)` into our 8-bit `depth` byte
+                // so multi-line template literals, raw strings (0..15 hashes), and nested comments round-trip cleanly.
+                let packed = state.depth();
+                let sub_mode = packed & 0x0F;
+                let sub_depth = (packed >> 4) & 0x0F;
+                let sub_in = if sub_mode == 0 && sub_depth == 0 {
                     LexState::NORMAL
                 } else {
-                    sub_in
+                    LexState::new(sub_mode, 0, sub_depth, 0)
                 };
                 let sub_out = registry.plugin(sub_lang).lex_line(line, sub_in, registry, out);
-                return LexState::new(MODE_FENCE, sub_id, sub_out.mode(), state.detail());
+                let out_packed = (sub_out.mode() & 0x0F) | ((sub_out.depth().min(15)) << 4);
+                return LexState::new(MODE_FENCE, sub_id, out_packed, state.detail());
             } else {
                 push_span(out, 0, line.len(), TokenKind::String);
                 return state;

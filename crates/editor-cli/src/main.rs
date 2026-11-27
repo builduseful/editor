@@ -41,16 +41,45 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    // Extract global `--root DIR` whether passed before or after the subcommand.
+    // Extract global `--root DIR` whether passed before or after the subcommand,
+    // without stealing `--root` when it appears as the literal argument to a
+    // value-taking option (e.g. `editor edit f.txt --old --root --new bar`).
     let mut root: Option<PathBuf> = None;
     let mut args: Vec<String> = Vec::with_capacity(raw_args.len());
     let mut i = 0;
+    let mut expect_flag_value = false;
     while i < raw_args.len() {
-        if raw_args[i] == "--root" && i + 1 < raw_args.len() {
+        let arg = &raw_args[i];
+        if expect_flag_value {
+            args.push(arg.clone());
+            expect_flag_value = false;
+            i += 1;
+            continue;
+        }
+        if arg == "--root" && i + 1 < raw_args.len() {
             root = Some(PathBuf::from(&raw_args[i + 1]));
             i += 2;
         } else {
-            args.push(raw_args[i].clone());
+            expect_flag_value = matches!(
+                arg.as_str(),
+                "--old"
+                    | "--new"
+                    | "--text"
+                    | "--find"
+                    | "--replace"
+                    | "--query"
+                    | "--file"
+                    | "--expect"
+                    | "--at"
+                    | "--op"
+                    | "--from"
+                    | "--to"
+                    | "--from-offset"
+                    | "--length"
+                    | "--max-bytes"
+                    | "--count"
+            );
+            args.push(arg.clone());
             i += 1;
         }
     }
@@ -406,6 +435,7 @@ fn cmd_schema(args: &[String], start: Instant) -> u8 {
         "action",
         "close",
         "quit",
+        "update",
         "version",
         "schema",
     ];
@@ -595,11 +625,10 @@ fn cmd_read(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: I
             }
         }
         raw.truncate(read);
-        // Truncate cleanly at a UTF-8 codepoint boundary when output cap fired.
+        // Truncate cleanly at a UTF-8 codepoint boundary (trimming at most 3 trailing incomplete bytes) when output cap fired.
         if truncated {
-            while !raw.is_empty() && std::str::from_utf8(&raw).is_err() {
-                raw.pop();
-            }
+            let floored = editor_core::utf8_floor(&raw);
+            raw.truncate(floored);
         }
         let content = match String::from_utf8(raw) {
             Ok(s) => s,
@@ -1009,6 +1038,18 @@ fn cmd_edit(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: I
                 emit_err("edit", start, "E_RANGE", "column out of bounds", Some(&path));
                 return 2;
             }
+            if let Some(line_str) = doc.line_content(line1 - 1) {
+                if !line_str.is_char_boundary(col) {
+                    emit_err(
+                        "edit",
+                        start,
+                        "E_INVALID_UTF8",
+                        "column offset is not on a UTF-8 character boundary",
+                        Some(&path),
+                    );
+                    return 2;
+                }
+            }
             ls + col as u64
         } else {
             emit_err("edit", start, "E_RANGE", "line out of bounds", Some(&path));
@@ -1055,6 +1096,24 @@ fn cmd_edit(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: I
             }
         };
 
+        if removed > 0 {
+            let end_off = target_offset.saturating_add(removed);
+            if end_off <= doc.len_bytes() {
+                let (el, ec) = doc.byte_to_line_col(end_off);
+                if let Some(el_str) = doc.line_content(el) {
+                    if ec <= el_str.len() && !el_str.is_char_boundary(ec) {
+                        emit_err(
+                            "edit",
+                            start,
+                            "E_INVALID_UTF8",
+                            "delete/replace length ends mid-UTF-8 character",
+                            Some(&path),
+                        );
+                        return 2;
+                    }
+                }
+            }
+        }
         if let Err(e) = doc.edit(target_offset, removed, &insert_str, 0, false) {
             emit_err("edit", start, doc_err_code(&e), &e.to_string(), Some(&path));
             return 2;
@@ -1625,9 +1684,14 @@ fn cmd_open(
             (false, "focused")
         }
     } else {
-        if let Err(e) =
-            launch_gui_process(sidebar_root.as_deref().or(Some(&globals.root)), target.as_deref())
-        {
+        let launch_root = sidebar_root.as_deref().or_else(|| {
+            if target.as_deref().is_some_and(Path::is_dir) {
+                None
+            } else {
+                Some(globals.root.as_path())
+            }
+        });
+        if let Err(e) = launch_gui_process(launch_root, target.as_deref()) {
             emit_err(command_name, start, "E_IO", &e, target.as_deref());
             return 2;
         }
@@ -1853,12 +1917,12 @@ fn cmd_focus_pane(args: &[String], start: Instant) -> u8 {
         ),
         "left" => send_live_gui_command(
             "focus-pane",
-            &editor_platform::ipc::IpcCommand::FocusPane(0),
+            &editor_platform::ipc::IpcCommand::Action("focus-left".to_string()),
             start,
         ),
         "right" => send_live_gui_command(
             "focus-pane",
-            &editor_platform::ipc::IpcCommand::FocusPane(1),
+            &editor_platform::ipc::IpcCommand::Action("focus-right".to_string()),
             start,
         ),
         "up" | "top" => send_live_gui_command(

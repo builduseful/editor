@@ -137,7 +137,9 @@ struct CharClass {
     ascii_bits: [u64; 2],
     ranges: Vec<(char, char)>,
     unicode_word: bool,
+    unicode_non_word: bool,
     unicode_space: bool,
+    unicode_non_space: bool,
 }
 
 impl CharClass {
@@ -147,7 +149,9 @@ impl CharClass {
             ascii_bits: [0; 2],
             ranges: Vec::new(),
             unicode_word: false,
+            unicode_non_word: false,
             unicode_space: false,
+            unicode_non_space: false,
         }
     }
 
@@ -253,7 +257,9 @@ impl CharClass {
             }
         } else {
             (self.unicode_word && ch.is_alphanumeric())
+                || (self.unicode_non_word && !ch.is_alphanumeric())
                 || (self.unicode_space && ch.is_whitespace())
+                || (self.unicode_non_space && !ch.is_whitespace())
                 || self.ranges.iter().any(|&(a, b)| ch >= a && ch <= b)
         };
         hit ^ self.negated
@@ -591,6 +597,7 @@ impl<'a> Parser<'a> {
                                 cls.set_ascii(b);
                             }
                         }
+                        cls.unicode_non_word = true;
                         prev_literal = None;
                     }
                     's' => {
@@ -603,6 +610,7 @@ impl<'a> Parser<'a> {
                                 cls.set_ascii(b);
                             }
                         }
+                        cls.unicode_non_space = true;
                         prev_literal = None;
                     }
                     'n' => {
@@ -1011,7 +1019,9 @@ fn extract_start_filter(ast: &Ast, case_sensitive: bool) -> Option<StartFilter> 
                 StartFilter {
                     ascii_bits: cls.ascii_bits,
                     allow_non_ascii: cls.unicode_word
+                        || cls.unicode_non_word
                         || cls.unicode_space
+                        || cls.unicode_non_space
                         || !cls.ranges.is_empty(),
                 }
             };
@@ -1306,7 +1316,10 @@ impl Regex {
             let (lookahead, after_lookahead) = if has_assert {
                 let la = cur_ch.or(next_after_slice);
                 let after = if cur_ch.is_some() {
-                    bytes.get(next_pos).copied()
+                    bytes
+                        .get(next_pos)
+                        .copied()
+                        .or_else(|| next_after_slice.and_then(|c| c.is_ascii().then_some(c as u8)))
                 } else {
                     None
                 };
@@ -1351,7 +1364,10 @@ impl Regex {
                     } else {
                         haystack[next_pos..].chars().next().map_or(0, char::len_utf8)
                     };
-                    bytes.get(next_pos + step).copied()
+                    bytes
+                        .get(next_pos + step)
+                        .copied()
+                        .or_else(|| next_after_slice.and_then(|c| c.is_ascii().then_some(c as u8)))
                 } else {
                     None
                 };
@@ -1530,7 +1546,10 @@ impl Regex {
             };
             let lookahead = cur_ch.or(next_after_slice);
             let after_lookahead = if cur_ch.is_some() {
-                bytes.get(next_pos).copied()
+                bytes
+                    .get(next_pos)
+                    .copied()
+                    .or_else(|| next_after_slice.and_then(|c| c.is_ascii().then_some(c as u8)))
             } else {
                 None
             };
@@ -1574,7 +1593,10 @@ impl Regex {
                 } else {
                     haystack[next_pos..].chars().next().map_or(0, char::len_utf8)
                 };
-                bytes.get(next_pos + step).copied()
+                bytes
+                    .get(next_pos + step)
+                    .copied()
+                    .or_else(|| next_after_slice.and_then(|c| c.is_ascii().then_some(c as u8)))
             } else {
                 None
             };

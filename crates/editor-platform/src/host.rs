@@ -80,6 +80,110 @@ pub trait PlatformHost {
     }
     /// Schedule relaunching the newly swapped application bundle right after this process exits.
     fn relaunch_after_update(&mut self, _app_bundle: &Path) {}
+    /// Optional OS-standard persistent app state directory for Hot Exit unsaved drafts
+    /// (never inside user repositories).
+    /// Returns `None` on default headless/snapshot hosts so tests stay isolated unless configured.
+    fn state_dir(&self) -> Option<PathBuf> {
+        None
+    }
+    /// OS-idiomatic label for revealing a file or folder in the host's native file manager
+    /// (`"Reveal in Finder"` on macOS, `"Reveal in File Explorer"` on Windows,
+    /// `"Open Containing Folder"` on Linux/BSD).
+    fn reveal_in_file_manager_label(&self) -> &'static str {
+        default_reveal_in_file_manager_label()
+    }
+    /// Reveal a file or directory in the host OS's native file manager (selecting the item
+    /// where supported). Returns `Err(reason)` if unavailable or the path cannot be revealed.
+    fn reveal_in_file_manager(&mut self, _path: &Path) -> Result<(), String> {
+        Err("Reveal in file manager is unavailable".to_string())
+    }
+}
+
+/// Default OS-idiomatic label for revealing a file or directory in the native file manager.
+pub fn default_reveal_in_file_manager_label() -> &'static str {
+    #[cfg(target_os = "macos")]
+    {
+        "Reveal in Finder"
+    }
+    #[cfg(target_os = "windows")]
+    {
+        "Reveal in File Explorer"
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        "Open Containing Folder"
+    }
+}
+
+/// Format a filesystem path cleanly for clipboard copy and user-facing display.
+///
+/// On Windows, strips the `\\?\` and `\\?\UNC\` verbatim prefixes that `std::fs::canonicalize`
+/// produces so copied paths paste cleanly into shells, terminals, and dialogs.
+/// On Unix, returns the lossy UTF-8 string unchanged.
+pub fn display_path_string(path: &Path) -> String {
+    let s = path.to_string_lossy();
+    #[cfg(target_os = "windows")]
+    {
+        strip_windows_verbatim_prefix(&s).into_owned()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        s.into_owned()
+    }
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn strip_windows_verbatim_prefix(s: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+        return std::borrow::Cow::Owned(format!(r"\\{rest}"));
+    }
+    if let Some(rest) = s.strip_prefix(r"\\?\") {
+        return std::borrow::Cow::Borrowed(rest);
+    }
+    std::borrow::Cow::Borrowed(s)
+}
+
+/// Resolve the OS-standard per-user application state directory (`std` only, zero crates):
+/// - macOS: `$HOME/Library/Application Support/com.builduseful.editor`
+/// - Linux/BSD: `$XDG_STATE_HOME/editor` (only when absolute; fallback `$HOME/.local/state/editor`)
+/// - Windows: `%LOCALAPPDATA%\BuildUseful\editor` (fallback `%APPDATA%\BuildUseful\editor`)
+pub fn default_app_state_dir() -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())?;
+        Some(
+            home.join("Library")
+                .join("Application Support")
+                .join(crate::version::BUNDLE_IDENTIFIER),
+        )
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let base = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+            .or_else(|| {
+                std::env::var_os("APPDATA")
+                    .map(PathBuf::from)
+                    .filter(|p| p.is_absolute())
+            })?;
+        Some(base.join("BuildUseful").join("editor"))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        if let Some(xdg) = std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
+        {
+            return Some(xdg.join("editor"));
+        }
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())?;
+        Some(home.join(".local").join("state").join("editor"))
+    }
 }
 
 #[derive(Default)]
@@ -102,6 +206,13 @@ pub struct HeadlessHost {
     pub mock_http_fetcher: Option<HttpFetcher>,
     /// Recorded app bundle path if `relaunch_after_update` was invoked.
     pub relaunched_app: Option<PathBuf>,
+    /// Optional state directory for deterministic Hot Exit & view-memory tests.
+    pub state_dir: Option<PathBuf>,
+    /// Last path passed to `reveal_in_file_manager` (for headless/integration tests).
+    pub last_revealed_path: Option<PathBuf>,
+    /// Optional override for `reveal_in_file_manager_label` so tests can verify OS-agnostic
+    /// label sizing and dispatch across platforms.
+    pub reveal_label_override: Option<&'static str>,
 }
 
 impl std::fmt::Debug for HeadlessHost {
@@ -182,5 +293,50 @@ impl PlatformHost for HeadlessHost {
 
     fn relaunch_after_update(&mut self, app_bundle: &Path) {
         self.relaunched_app = Some(app_bundle.to_path_buf());
+    }
+
+    fn state_dir(&self) -> Option<PathBuf> {
+        self.state_dir.clone()
+    }
+
+    fn reveal_in_file_manager_label(&self) -> &'static str {
+        self.reveal_label_override
+            .unwrap_or_else(default_reveal_in_file_manager_label)
+    }
+
+    fn reveal_in_file_manager(&mut self, path: &Path) -> Result<(), String> {
+        self.last_revealed_path = Some(path.to_path_buf());
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_verbatim_prefix_is_stripped_cleanly() {
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\C:\src\main.rs"),
+            r"C:\src\main.rs"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"\\?\UNC\server\share\file.txt"),
+            r"\\server\share\file.txt"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix(r"C:\plain\path.rs"),
+            r"C:\plain\path.rs"
+        );
+        assert_eq!(
+            strip_windows_verbatim_prefix("/workspace/src/main.rs"),
+            "/workspace/src/main.rs"
+        );
+    }
+
+    #[test]
+    fn display_path_string_preserves_unix_paths() {
+        let p = Path::new("/workspace/src/lib.rs");
+        assert_eq!(display_path_string(p), "/workspace/src/lib.rs");
     }
 }

@@ -3204,13 +3204,28 @@ fn sidebar_file_operations_create_rename_delete_and_context_menu() {
         &mut clip,
         &mut host,
     );
-    assert!(app.sidebar.is_context_menu_open());
+    assert!(app.context_menu.is_open());
     app.render(&mut raster);
-    // Click "Copy Path" (item 2: pad 8 + 2*48 + sep 14 + half row 24 = +142 px from anchor y=120 -> y=262).
+    // Click "Reveal in Finder" (first item after separator).
+    let expected_reveal = editor_platform::PlatformHost::reveal_in_file_manager_label(&host);
+    let reveal_id = app
+        .context_menu
+        .entries()
+        .iter()
+        .find_map(|e| match e {
+            editor_render::ContextMenuEntry::Item { id, label, .. }
+                if label == expected_reveal =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("sidebar context menu must include OS reveal item");
+    let reveal_rect = app.context_menu.item_rect(reveal_id).unwrap();
     app.handle_event(
         InputEvent::MouseDown {
-            x_px: 120.0,
-            y_px: 262.0,
+            x_px: (reveal_rect.x + reveal_rect.w / 2) as f32,
+            y_px: (reveal_rect.y + reveal_rect.h / 2) as f32,
             button: MouseButton::Left,
             click_count: 1,
             mods: Modifiers::NONE,
@@ -3219,10 +3234,52 @@ fn sidebar_file_operations_create_rename_delete_and_context_menu() {
         &mut clip,
         &mut host,
     );
-    assert!(!app.sidebar.is_context_menu_open());
+    assert!(!app.context_menu.is_open());
+    assert_eq!(host.last_revealed_path.as_deref(), Some(Path::new("/proj/main.rs")));
+
+    // Right-click again and click "Copy Path".
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: 80.0,
+            y_px: 120.0,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.context_menu.is_open());
+    app.render(&mut raster);
+    let copy_path_id = app
+        .context_menu
+        .entries()
+        .iter()
+        .find_map(|e| match e {
+            editor_render::ContextMenuEntry::Item { id, label, .. } if label == "Copy Path" => {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("Copy Path entry");
+    let copy_rect = app.context_menu.item_rect(copy_path_id).unwrap();
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: (copy_rect.x + copy_rect.w / 2) as f32,
+            y_px: (copy_rect.y + copy_rect.h / 2) as f32,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.context_menu.is_open());
     assert_eq!(clip.get_text().as_deref(), Some("/proj/main.rs"));
 
-    // Right-click again and click "Copy Relative Path" (one row lower: y=310).
+    // Right-click again and click "Copy Relative Path".
     app.handle_event(
         InputEvent::MouseDown {
             x_px: 80.0,
@@ -3236,10 +3293,24 @@ fn sidebar_file_operations_create_rename_delete_and_context_menu() {
         &mut host,
     );
     app.render(&mut raster);
+    let copy_rel_id = app
+        .context_menu
+        .entries()
+        .iter()
+        .find_map(|e| match e {
+            editor_render::ContextMenuEntry::Item { id, label, .. }
+                if label == "Copy Relative Path" =>
+            {
+                Some(*id)
+            }
+            _ => None,
+        })
+        .expect("Copy Relative Path entry");
+    let rel_rect = app.context_menu.item_rect(copy_rel_id).unwrap();
     app.handle_event(
         InputEvent::MouseDown {
-            x_px: 120.0,
-            y_px: 310.0,
+            x_px: (rel_rect.x + rel_rect.w / 2) as f32,
+            y_px: (rel_rect.y + rel_rect.h / 2) as f32,
             button: MouseButton::Left,
             click_count: 1,
             mods: Modifiers::NONE,
@@ -3263,7 +3334,7 @@ fn sidebar_file_operations_create_rename_delete_and_context_menu() {
         &mut clip,
         &mut host,
     );
-    assert!(app.sidebar.is_context_menu_open());
+    assert!(app.context_menu.is_open());
     app.render(&mut raster);
     app.handle_event(
         InputEvent::MouseUp {
@@ -3293,7 +3364,7 @@ fn sidebar_file_operations_create_rename_delete_and_context_menu() {
         &mut host,
     );
     assert!(
-        app.sidebar.is_context_menu_open(),
+        app.context_menu.is_open(),
         "context menu must survive MouseUp, Tick, and MouseMove hover"
     );
     app.handle_event(
@@ -3306,7 +3377,7 @@ fn sidebar_file_operations_create_rename_delete_and_context_menu() {
         &mut clip,
         &mut host,
     );
-    assert!(!app.sidebar.is_context_menu_open());
+    assert!(!app.context_menu.is_open());
 
     // 5. Delete selected folder (`docs`) goes through ConfirmModal -> Enter confirms deletion!
     let _ = app.execute_ipc(
@@ -5102,4 +5173,1440 @@ fn idle_caret_settles_solid_pauses_timer_respects_notices_and_resumes_on_input()
     // 6. Unfocusing immediately turns off wants_tick_timer().
     app.handle_event(InputEvent::FocusChanged(false), &mut raster, &mut clip, &mut host);
     assert!(!app.wants_tick_timer());
+}
+
+#[test]
+fn hot_exit_persists_untitled_and_modified_files_across_restart_and_cleans_up() {
+    use editor_platform::{AppCommand, FileSystem, InputEvent, Key, Modifiers};
+    use std::path::{Path, PathBuf};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file(
+        "/proj/a.rs",
+        b"line 0\nline 1\nline 2 alpha\nline 3\nline 4 beta\nline 5\n".to_vec(),
+    );
+    fs.add_file(
+        "/proj/b.rs",
+        b"fn one() {}\nfn two() {}\nfn three() {}\n".to_vec(),
+    );
+    fs.add_file("/other/x.rs", b"fn other() {}\n".to_vec());
+
+    let state_dir = PathBuf::from("/state");
+    let mut host = HeadlessHost::new();
+    host.state_dir = Some(state_dir.clone());
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+
+    // 1. Open `/proj`, dirty pre-existing `a.rs` with selection + scroll, create dirty Untitled draft,
+    //    split right with dirty `b.rs`, then Quit (`⌘Q`) — must exit silently without modal!
+    {
+        let mut app = EditorApp::new(fs.clone(), 1280, 800, 1.0);
+        app.use_in_app_modal = true;
+        app.load_preferences(&host);
+        app.open_folder(Path::new("/proj"), &mut host);
+
+        app.open_file(Path::new("/proj/a.rs"), &mut host).unwrap();
+        app.doc.edit(0, 0, "// dirty a\n", 1, false).unwrap();
+        let a_anchor = app.doc.line_byte_range(2).unwrap().0 + 3;
+        let a_caret = app.doc.line_byte_range(4).unwrap().0 + 5;
+        app.anchor = a_anchor;
+        app.caret = a_caret;
+        app.viewport.scroll_top_line = 2;
+        app.viewport.scroll_sub_y_px = 5.5;
+        app.viewport.scroll_x_px = 24.0;
+
+        // New Untitled tab with unsaved text, selection, and scroll.
+        app.handle_event(
+            InputEvent::Command(AppCommand::NewTab),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        app.doc
+            .edit(
+                0,
+                0,
+                "unsaved draft line 0\nunsaved draft line 1\nunsaved draft line 2\n",
+                2,
+                false,
+            )
+            .unwrap();
+        let u_anchor = app.doc.line_byte_range(0).unwrap().0 + 4;
+        let u_caret = app.doc.line_byte_range(1).unwrap().0 + 7;
+        app.anchor = u_anchor;
+        app.caret = u_caret;
+        app.viewport.scroll_top_line = 1;
+        app.viewport.scroll_sub_y_px = 3.0;
+        app.viewport.scroll_x_px = 12.5;
+
+        // Split right with `/proj/b.rs` and dirty it as well.
+        app.split_pane_with(Some(Path::new("/proj/b.rs")), &mut host);
+        app.doc.edit(0, 0, "// dirty b\n", 3, false).unwrap();
+
+        app.handle_event(
+            InputEvent::Command(AppCommand::Quit),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(host.quit_requested, "Hot Exit must quit silently when backups succeed");
+        assert!(!app.confirm_modal.visible, "Hot Exit must not pop discard modal on Quit");
+    }
+
+    // Verify ONLY backup files exist in state_dir (zero `view_state.tsv` side-table!).
+    let backup_dir = state_dir.join("backups");
+    assert!(fs.stat(&backup_dir.join("index.tsv")).is_ok());
+    assert!(
+        fs.stat(&state_dir.join("view_state.tsv")).is_err(),
+        "view_state.tsv must not exist; open-tab views live directly on FolderSession"
+    );
+    let mut initial_bufs: Vec<String> = fs
+        .read_dir(&backup_dir)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.name.ends_with(".buf"))
+        .map(|e| e.name)
+        .collect();
+    initial_bufs.sort();
+    assert_eq!(initial_bufs.len(), 3, "expected 3 .buf drafts (a.rs, Untitled, b.rs)");
+
+    // 2. Cold restart #1: verify BOTH split panes + parked a.rs restored dirty with exact text & views!
+    {
+        host.quit_requested = false;
+        let mut app = EditorApp::new(fs.clone(), 1280, 800, 1.0);
+        app.use_in_app_modal = true;
+        app.load_preferences(&host);
+
+        assert_eq!(app.pane_count(), 2);
+        assert_eq!(app.doc.path(), Some(Path::new("/proj/b.rs")));
+        assert!(app.doc.is_dirty());
+        assert!(app.doc.to_string_lossy().starts_with("// dirty b\n"));
+
+        // Focus left pane -> Untitled draft with exact text, selection, and scroll!
+        let (ids, n) = app.arrangement.ordered();
+        assert_eq!(n, 2);
+        app.focus_pane_id(ids[0], &mut host);
+        assert!(app.doc.path().is_none(), "left pane must be restored Untitled draft");
+        assert!(app.doc.is_dirty());
+        assert_eq!(
+            app.doc.to_string_lossy(),
+            "unsaved draft line 0\nunsaved draft line 1\nunsaved draft line 2\n"
+        );
+        assert_eq!(app.doc.byte_to_line_col(app.anchor), (0, 4));
+        assert_eq!(app.doc.byte_to_line_col(app.caret), (1, 7));
+        assert_eq!(app.viewport.scroll_top_line, 1);
+        assert!((app.viewport.scroll_sub_y_px - 3.0).abs() < 0.2);
+        assert!((app.viewport.scroll_x_px - 12.5).abs() < 0.2);
+
+        // Open parked `a.rs` -> dirty with exact unsaved edits, selection, and scroll!
+        app.open_file(Path::new("/proj/a.rs"), &mut host).unwrap();
+        assert!(app.doc.is_dirty());
+        assert!(app.doc.to_string_lossy().starts_with("// dirty a\n"));
+        assert_eq!(app.doc.byte_to_line_col(app.anchor), (2, 3));
+        assert_eq!(app.doc.byte_to_line_col(app.caret), (4, 5));
+        assert_eq!(app.viewport.scroll_top_line, 2);
+        assert!((app.viewport.scroll_sub_y_px - 5.5).abs() < 0.2);
+        assert!((app.viewport.scroll_x_px - 24.0).abs() < 0.2);
+
+        // Quit without editing -> verify ZERO `.buf` revision churn!
+        app.handle_event(
+            InputEvent::Command(AppCommand::Quit),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(host.quit_requested);
+    }
+
+    let mut bufs_after_noop_quit: Vec<String> = fs
+        .read_dir(&backup_dir)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.name.ends_with(".buf"))
+        .map(|e| e.name)
+        .collect();
+    bufs_after_noop_quit.sort();
+    assert_eq!(
+        bufs_after_noop_quit, initial_bufs,
+        "re-quitting without edits must not churn immutable .buf revisions"
+    );
+
+    // 3. Cold restart #2: test Save cleanup, Save-Conflict 3-button modal, and explicit Cmd+W discard!
+    {
+        host.quit_requested = false;
+        let mut app = EditorApp::new(fs.clone(), 1280, 800, 1.0);
+        app.use_in_app_modal = true;
+        app.load_preferences(&host);
+
+        // Save `a.rs` -> writes disk, marks clean, immediately removes its `.buf`!
+        app.open_file(Path::new("/proj/a.rs"), &mut host).unwrap();
+        app.handle_event(
+            InputEvent::Command(AppCommand::Save),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(!app.doc.is_dirty());
+        let saved_a = fs.open_read(Path::new("/proj/a.rs")).unwrap();
+        let mut buf_a = vec![0u8; saved_a.len() as usize];
+        saved_a.read_at(0, &mut buf_a).unwrap();
+        assert!(String::from_utf8(buf_a).unwrap().starts_with("// dirty a\n"));
+        let remaining_bufs: Vec<_> = fs
+            .read_dir(&backup_dir)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.name.ends_with(".buf"))
+            .collect();
+        assert_eq!(remaining_bufs.len(), 2, "saving a.rs must immediately GC its .buf");
+
+        // Externally modify `b.rs` on disk -> Cmd+S on restored dirty `b.rs` opens Save-Conflict modal!
+        fs.add_file("/proj/b.rs", b"// external change on disk\n".to_vec());
+        app.open_file(Path::new("/proj/b.rs"), &mut host).unwrap();
+        assert!(app.doc.is_dirty());
+        app.handle_event(
+            InputEvent::Command(AppCommand::Save),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(app.confirm_modal.visible);
+        assert!(app.confirm_modal.is_save_conflict);
+
+        // Cancel (`Escape`) keeps draft dirty.
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Escape,
+                mods: Modifiers::NONE,
+                text: None,
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(!app.confirm_modal.visible);
+        assert!(app.doc.is_dirty());
+
+        // Trigger Cmd+S again and confirm Overwrite (`Enter`) -> writes draft & removes `.buf`!
+        app.handle_event(
+            InputEvent::Command(AppCommand::Save),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(app.confirm_modal.is_save_conflict);
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Enter,
+                mods: Modifiers::NONE,
+                text: None,
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(!app.confirm_modal.visible);
+        assert!(!app.doc.is_dirty());
+        let saved_b = fs.open_read(Path::new("/proj/b.rs")).unwrap();
+        let mut buf_b = vec![0u8; saved_b.len() as usize];
+        saved_b.read_at(0, &mut buf_b).unwrap();
+        assert!(String::from_utf8(buf_b).unwrap().starts_with("// dirty b\n"));
+
+        // Explicitly closing dirty Untitled (`⌘W` in single-pane mode) MUST prompt Save / Don't Save / Cancel!
+        app.only_active_pane(&mut host);
+        let untitled_id = app
+            .working_set
+            .ordered_ids()
+            .into_iter()
+            .find(|&id| app.working_set.get_meta(id).is_some_and(|m| m.path.is_none() && m.dirty))
+            .expect("restored dirty Untitled must be in working set");
+        app.activate_buffer(untitled_id, &mut host);
+        assert!(app.doc.path().is_none() && app.doc.is_dirty());
+        app.handle_event(
+            InputEvent::Command(AppCommand::CloseTab),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(app.confirm_modal.visible && !app.confirm_modal.is_save_conflict);
+
+        // Choose Don't Save (`d`) -> closes Untitled and cleans up the final `.buf`!
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char('d'),
+                mods: Modifiers::NONE,
+                text: None,
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(!app.confirm_modal.visible);
+        let remaining_bufs: Vec<_> = fs
+            .read_dir(&backup_dir)
+            .unwrap()
+            .into_iter()
+            .filter(|e| e.name.ends_with(".buf"))
+            .collect();
+        assert!(remaining_bufs.is_empty(), "all .buf drafts must be deleted after save/discard");
+
+        // 4. Folder isolation: dirty `/proj/a.rs`, switch to brand-new `/other` (must start clean
+        //    with zero leaked tabs!), then return to `/proj` and verify dirty `a.rs` comes back.
+        app.open_file(Path::new("/proj/a.rs"), &mut host).unwrap();
+        app.doc.edit(0, 0, "// folder-isolated edit\n", 4, false).unwrap();
+        app.open_folder(Path::new("/other"), &mut host);
+        assert!(
+            app.doc.path().is_none() && !app.doc.is_dirty(),
+            "switching to a brand-new folder must not leak outgoing tabs or drafts"
+        );
+        app.open_file(Path::new("/other/x.rs"), &mut host).unwrap();
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.doc.path(), Some(Path::new("/other/x.rs")));
+
+        app.open_folder(Path::new("/proj"), &mut host);
+        assert_eq!(app.doc.path(), Some(Path::new("/proj/a.rs")));
+        assert!(app.doc.is_dirty());
+        assert!(app.doc.to_string_lossy().starts_with("// folder-isolated edit\n"));
+
+        // 5. Undo (`⌘Z`) back to clean on a live edited buffer immediately deletes its `.buf` backup!
+        app.handle_event(InputEvent::Command(AppCommand::Save), &mut raster, &mut clip, &mut host);
+        assert!(!app.doc.is_dirty());
+        app.doc.edit(0, 0, "// temp edit\n", 5, false).unwrap();
+        assert!(app.doc.is_dirty());
+        app.handle_event(InputEvent::FocusChanged(false), &mut raster, &mut clip, &mut host);
+        assert!(fs.stat(&backup_dir.join("index.tsv")).is_ok());
+        app.handle_event(InputEvent::Command(AppCommand::Undo), &mut raster, &mut clip, &mut host);
+        assert!(!app.doc.is_dirty());
+        let after_undo: Vec<_> = fs
+            .read_dir(&backup_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| e.name.ends_with(".buf"))
+            .collect();
+        assert!(after_undo.is_empty(), "undoing back to clean must immediately GC its .buf");
+    }
+
+    // 6. Standalone (no-folder) Untitled draft survives `handle_will_terminate` (Dock Quit),
+    //    and closing it with `⌘W` removes `@standalone` so it does not zombie-reopen!
+    {
+        let mut standalone_host = HeadlessHost::new();
+        standalone_host.state_dir = Some(PathBuf::from("/standalone_state"));
+        let mut app = EditorApp::new(fs.clone(), 1000, 700, 1.0);
+        app.use_in_app_modal = true;
+        app.load_preferences(&standalone_host);
+        assert!(app.sidebar.root().is_none());
+        app.doc.edit(0, 0, "standalone scratchpad note\n", 5, false).unwrap();
+        app.handle_will_terminate(&mut standalone_host);
+
+        let mut app2 = EditorApp::new(fs.clone(), 1000, 700, 1.0);
+        app2.use_in_app_modal = true;
+        app2.load_preferences(&standalone_host);
+        assert!(app2.doc.path().is_none());
+        assert!(app2.doc.is_dirty());
+        assert_eq!(app2.doc.to_string_lossy(), "standalone scratchpad note\n");
+
+        // Close standalone draft via Cmd+W -> Don't Save -> Quit -> must NOT zombie-reopen!
+        app2.handle_event(
+            InputEvent::Command(AppCommand::CloseTab),
+            &mut raster,
+            &mut clip,
+            &mut standalone_host,
+        );
+        app2.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char('d'),
+                mods: Modifiers::NONE,
+                text: None,
+            },
+            &mut raster,
+            &mut clip,
+            &mut standalone_host,
+        );
+        app2.handle_will_terminate(&mut standalone_host);
+
+        let mut app3 = EditorApp::new(fs.clone(), 1000, 700, 1.0);
+        app3.load_preferences(&standalone_host);
+        assert!(!app3.doc.is_dirty() && app3.doc.is_empty());
+    }
+}
+
+#[test]
+fn open_tab_cursor_selection_and_scroll_persist_across_restart_and_forget_on_close() {
+    use editor_platform::{AppCommand, InputEvent};
+    use std::path::{Path, PathBuf};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    let mut content = String::new();
+    for i in 0..80 {
+        if i == 39 {
+            content.push_str("// café 🚀 line 39 with wide content for horizontal scroll\n");
+        } else {
+            content.push_str(&format!("let line_{i:02} = \"value_{i:02}\";\n"));
+        }
+    }
+    fs.add_file("/ws/long.rs", content.into_bytes());
+    fs.add_file("/ws/other.rs", b"fn other() {}\n".to_vec());
+
+    let mut host = HeadlessHost::new();
+    host.state_dir = Some(PathBuf::from("/view_state_root"));
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+
+    // 1. Open `long.rs` (parked) and `other.rs` (active) with exact selection & fractional scroll,
+    //    then Quit (`⌘Q`) — both open tabs must keep their exact view across restart!
+    {
+        let mut app = EditorApp::new(fs.clone(), 1200, 760, 1.0);
+        app.load_preferences(&host);
+        app.open_folder(Path::new("/ws"), &mut host);
+        app.open_file(Path::new("/ws/long.rs"), &mut host).unwrap();
+
+        let anchor_off = app.doc.line_byte_range(35).unwrap().0 + 4;
+        // Byte col 9 on "// café 🚀" lands on a valid char boundary (`// caf` + `é` = 8 bytes, ` ` = 9).
+        let caret_off = app.doc.line_byte_range(39).unwrap().0 + 9;
+        app.anchor = anchor_off;
+        app.caret = caret_off;
+        app.viewport.scroll_top_line = 25;
+        app.viewport.scroll_sub_y_px = 7.5;
+        app.viewport.scroll_x_px = 42.5;
+
+        // Switch to `other.rs` so `long.rs` is a parked open tab, then Quit.
+        app.open_file(Path::new("/ws/other.rs"), &mut host).unwrap();
+        app.handle_event(
+            InputEvent::Command(AppCommand::Quit),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(host.quit_requested);
+    }
+
+    // 2. Cold restart: parked `long.rs` restores exact selection + scroll!
+    {
+        host.quit_requested = false;
+        let mut app = EditorApp::new(fs.clone(), 1200, 760, 1.0);
+        app.load_preferences(&host);
+        assert_eq!(app.doc.path(), Some(Path::new("/ws/other.rs")));
+
+        app.open_file(Path::new("/ws/long.rs"), &mut host).unwrap();
+        assert_eq!(app.doc.byte_to_line_col(app.anchor), (35, 4));
+        assert_eq!(app.doc.byte_to_line_col(app.caret), (39, 9));
+        assert_eq!(app.viewport.scroll_top_line, 25);
+        assert!((app.viewport.scroll_sub_y_px - 7.5).abs() < 0.2);
+        assert!((app.viewport.scroll_x_px - 42.5).abs() < 0.2);
+
+        // 3. Explicit `⌘W` immediately forgets `long.rs`'s cursor & scroll (no closed-file pileup!).
+        app.handle_event(
+            InputEvent::Command(AppCommand::CloseTab),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert_eq!(app.doc.path(), Some(Path::new("/ws/other.rs")));
+
+        app.open_file(Path::new("/ws/long.rs"), &mut host).unwrap();
+        assert_eq!(app.caret, 0, "explicitly closed tab must reopen cleanly at line 1, col 1");
+        assert_eq!(app.anchor, 0);
+        assert_eq!(app.viewport.scroll_top_line, 0);
+
+        // Position deep again and Quit so we can test UTF-8 clamping on external truncation.
+        let caret_off = app.doc.line_byte_range(39).unwrap().0 + 9;
+        app.anchor = caret_off;
+        app.caret = caret_off;
+        app.viewport.scroll_top_line = 25;
+        app.handle_event(
+            InputEvent::Command(AppCommand::Quit),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+    }
+
+    // 4. External truncation with multi-byte UTF-8: clamping stays on valid char boundary with zero panic!
+    fs.add_file("/ws/long.rs", "é\n🚀\n".as_bytes().to_vec());
+    {
+        let mut app = EditorApp::new(fs.clone(), 1200, 760, 1.0);
+        app.load_preferences(&host);
+        assert_eq!(app.doc.path(), Some(Path::new("/ws/long.rs")));
+        let text = app.doc.to_string_lossy();
+        assert!(text.is_char_boundary(app.caret as usize));
+        assert!(text.is_char_boundary(app.anchor as usize));
+        assert!(app.viewport.scroll_top_line < app.doc.editable_line_count());
+    }
+}
+
+#[test]
+fn persisted_undo_redo_survives_restart_across_save_drafts_external_changes_and_cleans_up_on_close() {
+    use editor_platform::{AppCommand, FileSystem, InputEvent};
+    use std::path::{Path, PathBuf};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/uproj/a.rs", b"fn a() {}\n".to_vec());
+    fs.add_file("/uproj/b.rs", b"fn b() {}\n".to_vec());
+
+    let state_dir = PathBuf::from("/undo_state");
+    let mut host = HeadlessHost::new();
+    host.state_dir = Some(state_dir.clone());
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+
+    // 1. Edit `a.rs` (2 steps) and SAVE (`⌘S`), edit `b.rs` (2 steps, leave dirty),
+    //    and create a dirty Untitled draft (2 steps), then Quit (`⌘Q`).
+    {
+        let mut app = EditorApp::new(fs.clone(), 1200, 760, 1.0);
+        app.use_in_app_modal = true;
+        app.load_preferences(&host);
+        app.open_folder(Path::new("/uproj"), &mut host);
+
+        app.open_file(Path::new("/uproj/a.rs"), &mut host).unwrap();
+        app.doc.edit(0, 0, "// a1\n", 10, false).unwrap();
+        app.doc.edit(0, 0, "// a2\n", 20, false).unwrap();
+        app.handle_event(
+            InputEvent::Command(AppCommand::Save),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(!app.doc.is_dirty(), "a.rs must be saved clean before quit");
+
+        app.open_file(Path::new("/uproj/b.rs"), &mut host).unwrap();
+        app.doc.edit(0, 0, "// b1\n", 30, false).unwrap();
+        app.doc.edit(0, 0, "// b2\n", 40, false).unwrap();
+        assert!(app.doc.is_dirty());
+
+        app.handle_event(
+            InputEvent::Command(AppCommand::NewTab),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        app.doc.edit(0, 0, "draft step 1\n", 50, false).unwrap();
+        app.doc.edit(0, 0, "draft step 2\n", 60, false).unwrap();
+
+        app.handle_event(
+            InputEvent::Command(AppCommand::Quit),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(host.quit_requested);
+    }
+
+    // 2. Cold restart #1:
+    //    - Untitled draft undoes & redoes cleanly.
+    //    - Clean saved `a.rs` undoes past `⌘S` (becoming dirty) and redoes back to clean!
+    //    - Dirty `b.rs` undoes all the way back to clean (deleting its `.buf`), and keeps redo across quit!
+    {
+        host.quit_requested = false;
+        let mut app = EditorApp::new(fs.clone(), 1200, 760, 1.0);
+        app.use_in_app_modal = true;
+        app.load_preferences(&host);
+
+        // Active tab is the Untitled draft.
+        assert!(app.doc.path().is_none() && app.doc.is_dirty());
+        assert_eq!(app.doc.to_string_lossy(), "draft step 2\ndraft step 1\n");
+        app.handle_event(InputEvent::Command(AppCommand::Undo), &mut raster, &mut clip, &mut host);
+        assert_eq!(app.doc.to_string_lossy(), "draft step 1\n");
+        app.handle_event(InputEvent::Command(AppCommand::Redo), &mut raster, &mut clip, &mut host);
+        assert_eq!(app.doc.to_string_lossy(), "draft step 2\ndraft step 1\n");
+
+        // Saved clean `a.rs`: `⌘Z` undoes past the `⌘S` save, `⇧⌘Z` returns to clean!
+        app.open_file(Path::new("/uproj/a.rs"), &mut host).unwrap();
+        assert!(!app.doc.is_dirty());
+        assert_eq!(app.doc.to_string_lossy(), "// a2\n// a1\nfn a() {}\n");
+        app.handle_event(InputEvent::Command(AppCommand::Undo), &mut raster, &mut clip, &mut host);
+        assert!(app.doc.is_dirty(), "undoing past save must mark file dirty");
+        assert_eq!(app.doc.to_string_lossy(), "// a1\nfn a() {}\n");
+        app.handle_event(InputEvent::Command(AppCommand::Redo), &mut raster, &mut clip, &mut host);
+        assert!(!app.doc.is_dirty(), "redoing back to saved rev must mark file clean");
+        assert_eq!(app.doc.to_string_lossy(), "// a2\n// a1\nfn a() {}\n");
+
+        // Dirty `b.rs`: 2 Undos return to original clean disk content and keep Redo across next restart!
+        app.open_file(Path::new("/uproj/b.rs"), &mut host).unwrap();
+        assert!(app.doc.is_dirty());
+        app.handle_event(InputEvent::Command(AppCommand::Undo), &mut raster, &mut clip, &mut host);
+        assert!(app.doc.is_dirty());
+        assert_eq!(app.doc.to_string_lossy(), "// b1\nfn b() {}\n");
+        app.handle_event(InputEvent::Command(AppCommand::Undo), &mut raster, &mut clip, &mut host);
+        assert!(!app.doc.is_dirty(), "undoing all the way to original must mark b.rs clean");
+        assert_eq!(app.doc.to_string_lossy(), "fn b() {}\n");
+
+        app.handle_event(
+            InputEvent::Command(AppCommand::Quit),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(host.quit_requested);
+    }
+
+    // 3. Cold restart #2: `b.rs` (clean after Undo) still Redoes via `⇧⌘Z`, and `⌘W` on `a.rs`
+    //    deletes `a.rs`'s `.undo` immediately so reopening `a.rs` starts with empty undo!
+    {
+        host.quit_requested = false;
+        let mut app = EditorApp::new(fs.clone(), 1200, 760, 1.0);
+        app.use_in_app_modal = true;
+        app.load_preferences(&host);
+
+        assert_eq!(app.doc.path(), Some(Path::new("/uproj/b.rs")));
+        assert!(!app.doc.is_dirty());
+        app.handle_event(InputEvent::Command(AppCommand::Redo), &mut raster, &mut clip, &mut host);
+        assert!(app.doc.is_dirty());
+        assert_eq!(app.doc.to_string_lossy(), "// b1\nfn b() {}\n");
+
+        // Close clean `a.rs` with `⌘W` -> immediately deletes its `.undo` file!
+        let a_key = editor_app::UndoStore::key_for_path(Path::new("/uproj/a.rs"));
+        assert!(fs.stat(&editor_app::UndoStore::undo_dir(&state_dir).join(&a_key)).is_ok());
+        app.open_file(Path::new("/uproj/a.rs"), &mut host).unwrap();
+        app.handle_event(
+            InputEvent::Command(AppCommand::CloseTab),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(
+            fs.stat(&editor_app::UndoStore::undo_dir(&state_dir).join(&a_key)).is_err(),
+            "closing a saved edited tab via Cmd+W must immediately remove its .undo file"
+        );
+        app.open_file(Path::new("/uproj/a.rs"), &mut host).unwrap();
+        assert!(!app.doc.undo_stack().can_undo(), "reopening closed tab must start with empty undo");
+
+        // Re-edit `a.rs` (save clean) and keep `b.rs` dirty, then Quit to test external edits!
+        app.doc.edit(0, 0, "// fresh\n", 70, false).unwrap();
+        app.handle_event(InputEvent::Command(AppCommand::Save), &mut raster, &mut clip, &mut host);
+        app.handle_event(InputEvent::Command(AppCommand::Quit), &mut raster, &mut clip, &mut host);
+    }
+
+    // 4. External disk changes while closed:
+    //    - Clean `a.rs` modified externally -> stale `.undo` silently ignored (zero corruption).
+    //    - Dirty `b.rs` modified externally -> `⌘Z` still works, AND `saved_rev` is cleared so
+    //      undoing back to pre-edit text keeps `b.rs` marked dirty!
+    fs.add_file("/uproj/a.rs", b"// external git pull on a\n".to_vec());
+    fs.add_file("/uproj/b.rs", b"// external git pull on b\n".to_vec());
+    {
+        host.quit_requested = false;
+        let mut app = EditorApp::new(fs.clone(), 1200, 760, 1.0);
+        app.use_in_app_modal = true;
+        app.load_preferences(&host);
+
+        app.open_file(Path::new("/uproj/a.rs"), &mut host).unwrap();
+        assert_eq!(app.doc.to_string_lossy(), "// external git pull on a\n");
+        assert!(
+            !app.doc.undo_stack().can_undo(),
+            "stale .undo on externally changed clean file must be ignored"
+        );
+
+        app.open_file(Path::new("/uproj/b.rs"), &mut host).unwrap();
+        assert!(app.doc.is_dirty());
+        assert_eq!(app.doc.to_string_lossy(), "// b1\nfn b() {}\n");
+        app.handle_event(InputEvent::Command(AppCommand::Undo), &mut raster, &mut clip, &mut host);
+        assert_eq!(app.doc.to_string_lossy(), "fn b() {}\n");
+        assert!(
+            app.doc.is_dirty(),
+            "undoing a draft whose disk file changed externally must stay dirty"
+        );
+    }
+}
+
+#[test]
+fn external_agent_edit_preserves_utf8_cursor_scroll_language_syncs_splits_and_cleans_undo() {
+    use editor_platform::{AppCommand, FileSystem, InputEvent};
+    use std::path::{Path, PathBuf};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    let mut big = String::new();
+    for i in 0..40 {
+        big.push_str(&format!("line_{i:02}_abcdef\n"));
+    }
+    fs.add_file("/ext/notes.txt", big.into_bytes());
+    fs.add_file("/ext/src/nested.rs", b"fn old_nested() {}\n".to_vec());
+    fs.add_file("/ext/parked.rs", b"fn old_parked() {}\n".to_vec());
+
+    let state_dir = PathBuf::from("/ext_state");
+    let mut host = HeadlessHost::new();
+    host.state_dir = Some(state_dir.clone());
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+
+    let mut app = EditorApp::new(fs.clone(), 1200, 760, 1.0);
+    app.load_preferences(&host);
+    app.open_folder(Path::new("/ext"), &mut host);
+
+    // 1. Open parked.rs (parked), nested.rs (right split), and notes.txt (active left pane).
+    app.open_file(Path::new("/ext/parked.rs"), &mut host).unwrap();
+    app.open_file(Path::new("/ext/notes.txt"), &mut host).unwrap();
+    // Apply custom Language override (JSON on `.txt`), make a saved edit so `.undo` exists on disk!
+    app.set_active_language("json", &mut host).unwrap();
+    app.doc.edit(0, 0, "// edit\n", 1, false).unwrap();
+    app.handle_event(InputEvent::Command(AppCommand::Save), &mut raster, &mut clip, &mut host);
+    let notes_undo_key = editor_app::UndoStore::key_for_path(Path::new("/ext/notes.txt"));
+    assert!(fs.stat(&editor_app::UndoStore::undo_dir(&state_dir).join(&notes_undo_key)).is_ok());
+
+    // Position deep in notes.txt with a selection and scroll offset.
+    app.anchor = app.doc.line_byte_range(10).unwrap().0 + 3;
+    app.caret = app.doc.line_byte_range(30).unwrap().0 + 5;
+    app.viewport.scroll_top_line = 25;
+
+    // Split right with `/ext/src/nested.rs`, then focus left pane (`notes.txt`) again.
+    app.split_pane_with(Some(Path::new("/ext/src/nested.rs")), &mut host);
+    let (ids, _) = app.arrangement.ordered();
+    app.focus_pane_id(ids[0], &mut host);
+    assert_eq!(app.doc.path(), Some(Path::new("/ext/notes.txt")));
+
+    // 2. Agent overwrites `notes.txt` with short multi-byte UTF-8 AND updates `nested.rs` & `parked.rs`!
+    //    Deliver a coalesced ancestor directory `FsChanged(["/ext"])` -> MUST reload all 3!
+    fs.add_file("/ext/notes.txt", "é\n🚀🎉\n".as_bytes().to_vec());
+    fs.add_file("/ext/src/nested.rs", b"fn new_nested() {}\n".to_vec());
+    fs.add_file("/ext/parked.rs", b"fn new_parked() {}\n".to_vec());
+
+    app.handle_event(
+        InputEvent::FsChanged(vec![PathBuf::from("/ext")]),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+
+    // Verify UTF-8 char-boundary safety, scroll clamping, collapsed selection, preserved JSON language,
+    // AND immediate stale `.undo` file removal!
+    let text = app.doc.to_string_lossy();
+    assert_eq!(text, "é\n🚀🎉\n");
+    assert!(text.is_char_boundary(app.caret as usize));
+    assert_eq!(app.anchor, app.caret, "external reload must collapse stale selection");
+    assert!(app.viewport.scroll_top_line < app.doc.editable_line_count());
+    assert_eq!(app.doc.language().id(), "json", "custom Language override must survive reload");
+    assert!(
+        fs.stat(&editor_app::UndoStore::undo_dir(&state_dir).join(&notes_undo_key))
+            .is_err(),
+        "stale .undo must be GC'd immediately on external reload"
+    );
+
+    // Secondary split pane (`nested.rs`) and parked tab (`parked.rs`) both reloaded!
+    assert_eq!(app.other_panes[0].doc.to_string_lossy(), "fn new_nested() {}\n");
+    app.open_file(Path::new("/ext/parked.rs"), &mut host).unwrap();
+    assert_eq!(app.doc.to_string_lossy(), "fn new_parked() {}\n");
+
+    // 3. `FocusChanged(true)` (without FsChanged!) also reloads split panes & parked tabs!
+    fs.add_file("/ext/src/nested.rs", b"fn nested_on_focus() {}\n".to_vec());
+    app.handle_event(InputEvent::FocusChanged(true), &mut raster, &mut clip, &mut host);
+    assert_eq!(
+        app.other_panes[0].doc.to_string_lossy(),
+        "fn nested_on_focus() {}\n"
+    );
+
+    // 4. Manual `Reload` syncs two split panes viewing the same file!
+    app.only_active_pane(&mut host);
+    app.open_file(Path::new("/ext/parked.rs"), &mut host).unwrap();
+    app.split_pane_with(None, &mut host);
+    fs.add_file("/ext/parked.rs", b"fn manual_reloaded() {}\n".to_vec());
+    app.handle_event(InputEvent::Command(AppCommand::Reload), &mut raster, &mut clip, &mut host);
+    assert_eq!(app.doc.to_string_lossy(), "fn manual_reloaded() {}\n");
+    assert_eq!(app.other_panes[0].doc.to_string_lossy(), "fn manual_reloaded() {}\n");
+}
+
+#[test]
+fn context_menu_on_tabs_pane_headers_sidebar_empty_and_command_palette() {
+    use editor_render::ContextMenuEntry;
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/proj/src/a.rs", b"fn a() {}\n".to_vec());
+    fs.add_file("/proj/src/b.rs", b"fn b() {}\n".to_vec());
+    fs.add_file("/external/c.rs", b"fn c() {}\n".to_vec());
+
+    let mut app = EditorApp::new(fs, 1600, 1000, 2.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+    host.reveal_label_override = Some("Reveal in File Explorer");
+
+    app.open_folder(Path::new("/proj"), &mut host);
+    app.open_file(Path::new("/proj/src/a.rs"), &mut host).unwrap();
+    app.open_file(Path::new("/proj/src/b.rs"), &mut host).unwrap();
+    app.open_file(Path::new("/external/c.rs"), &mut host).unwrap();
+    app.new_tab(&mut host);
+    // Switch active tab back to `b.rs` so `a.rs`, `c.rs`, and `Untitled` are inactive tabs.
+    let buf_a = app.working_set.find_by_path(Path::new("/proj/src/a.rs")).unwrap();
+    let buf_b = app.working_set.find_by_path(Path::new("/proj/src/b.rs")).unwrap();
+    let buf_c = app.working_set.find_by_path(Path::new("/external/c.rs")).unwrap();
+    let buf_untitled = app.active_buf_id;
+    assert!(app.activate_buffer(buf_b, &mut host));
+    app.render(&mut raster);
+
+    let find_tab_center = |app: &EditorApp, target: editor_app::BufferId| -> (f32, f32) {
+        let strip = app.layout.tab_strip;
+        let y = (strip.y + strip.h / 2) as f32;
+        for x in (strip.x + 4..strip.right() - 4).step_by(4) {
+            if app.tab_strip.hit_test(x as f32, y) == editor_render::TabStripHit::Tab(target) {
+                return (x as f32, y);
+            }
+        }
+        panic!("tab {target:?} not found in tab strip");
+    };
+
+    let labels_of = |app: &EditorApp| -> Vec<String> {
+        app.context_menu
+            .entries()
+            .iter()
+            .filter_map(|e| match e {
+                ContextMenuEntry::Item { label, .. } => Some(label.clone()),
+                ContextMenuEntry::Separator => None,
+            })
+            .collect()
+    };
+
+    let click_menu_label = |app: &mut EditorApp,
+                            target_label: &str,
+                            raster: &mut BuiltinBitmapRasterizer,
+                            clip: &mut MemoryClipboard,
+                            host: &mut HeadlessHost| {
+        app.render(raster);
+        let id = app
+            .context_menu
+            .entries()
+            .iter()
+            .find_map(|e| match e {
+                ContextMenuEntry::Item { id, label, .. } if label == target_label => Some(*id),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("menu label `{target_label}` not found"));
+        let r = app.context_menu.item_rect(id).unwrap();
+        app.handle_event(
+            InputEvent::MouseDown {
+                x_px: (r.x + r.w / 2) as f32,
+                y_px: (r.y + r.h / 2) as f32,
+                button: MouseButton::Left,
+                click_count: 1,
+                mods: Modifiers::NONE,
+            },
+            raster,
+            clip,
+            host,
+        );
+    };
+
+    // 1. Right-click INACTIVE tab `a.rs`: must NOT steal focus from `b.rs`!
+    let (ax, ay) = find_tab_center(&app, buf_a);
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: ax,
+            y_px: ay,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.context_menu.is_open());
+    assert_eq!(app.active_buf_id, buf_b, "right-clicking inactive tab must not steal focus");
+    assert_eq!(
+        labels_of(&app),
+        vec![
+            "Reveal in File Explorer",
+            "Copy Path",
+            "Copy Relative Path",
+            "Pin Tab",
+            "Split Right",
+            "Close",
+        ]
+    );
+    click_menu_label(&mut app, "Copy Relative Path", &mut raster, &mut clip, &mut host);
+    assert_eq!(clip.get_text().as_deref(), Some("src/a.rs"));
+    assert_eq!(app.active_buf_id, buf_b);
+
+    // 2. Keyboard navigation (`Down` + `Enter`) activates first item ("Reveal in File Explorer").
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: ax,
+            y_px: ay,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Down,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.context_menu.is_open());
+    assert_eq!(
+        host.last_revealed_path.as_deref(),
+        Some(Path::new("/proj/src/a.rs"))
+    );
+
+    // 3. Pin inactive tab `a.rs` via context menu, then split right!
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: ax,
+            y_px: ay,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    click_menu_label(&mut app, "Pin Tab", &mut raster, &mut clip, &mut host);
+    assert!(app.working_set.is_pinned(buf_a));
+    assert_eq!(app.active_buf_id, buf_b);
+    app.render(&mut raster);
+
+    let (ax2, ay2) = find_tab_center(&app, buf_a);
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: ax2,
+            y_px: ay2,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(labels_of(&app).iter().any(|l| l == "Unpin Tab"));
+    click_menu_label(&mut app, "Split Right", &mut raster, &mut clip, &mut host);
+    assert_eq!(app.other_panes.len(), 1);
+    assert_eq!(app.active_buf_id, buf_a);
+    app.render(&mut raster);
+
+    // 4. Right-click INACTIVE split-pane header (`b.rs`) -> Copy Path targets `b.rs`, active stays `a.rs`!
+    let inactive_pane_id = app.other_panes[0].id;
+    let header_rect = app.layout.grid.get(inactive_pane_id).unwrap().header;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: (header_rect.x + header_rect.w / 2) as f32,
+            y_px: (header_rect.y + header_rect.h / 2) as f32,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.context_menu.is_open());
+    assert_eq!(app.active_buf_id, buf_a);
+    click_menu_label(&mut app, "Copy Path", &mut raster, &mut clip, &mut host);
+    assert_eq!(clip.get_text().as_deref(), Some("/proj/src/b.rs"));
+    assert_eq!(app.active_buf_id, buf_a);
+
+    // 5. External file tab (`/external/c.rs`): omits "Copy Relative Path".
+    let (cx, cy) = find_tab_center(&app, buf_c);
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: cx,
+            y_px: cy,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let c_labels = labels_of(&app);
+    assert!(c_labels.iter().any(|l| l == "Reveal in File Explorer"));
+    assert!(c_labels.iter().any(|l| l == "Copy Path"));
+    assert!(!c_labels.iter().any(|l| l == "Copy Relative Path"));
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+
+    // 6. Untitled tab: omits Reveal, Copy Path, and Copy Relative Path cleanly.
+    let (ux, uy) = find_tab_center(&app, buf_untitled);
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: ux,
+            y_px: uy,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let u_labels = labels_of(&app);
+    assert!(!u_labels.iter().any(|l| l == "Reveal in File Explorer"));
+    assert!(!u_labels.iter().any(|l| l == "Copy Path"));
+    assert!(!u_labels.iter().any(|l| l == "Copy Relative Path"));
+    assert!(u_labels.iter().any(|l| l == "Pin Tab"));
+    assert!(u_labels.iter().any(|l| l == "Close"));
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+
+    // 7. Empty space in sidebar: clears stale row selection so New File targets root,
+    //    reveals/copies workspace root, and omits Copy Relative Path / Rename / Delete.
+    app.sidebar
+        .set_selected(Some(std::path::PathBuf::from("/proj/src/a.rs")));
+    let sb = app.layout.sidebar;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: (sb.x + sb.w / 2) as f32,
+            y_px: (sb.bottom() - 40) as f32,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.context_menu.is_open());
+    assert_eq!(
+        app.sidebar.selected(),
+        None,
+        "right-clicking empty sidebar space must clear stale subfolder selection"
+    );
+    assert_eq!(
+        labels_of(&app),
+        vec![
+            "New File…",
+            "New Folder…",
+            "Reveal in File Explorer",
+            "Copy Path",
+        ]
+    );
+    click_menu_label(
+        &mut app,
+        "Reveal in File Explorer",
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(host.last_revealed_path.as_deref(), Some(Path::new("/proj")));
+
+    // 7b. Splitting an INACTIVE dirty split-pane buffer via header context menu preserves unsaved text!
+    let pane_b_id = app.other_panes[0].id;
+    app.other_panes[0]
+        .doc
+        .edit(0, 0, "// dirty in pane b\n", 1, false)
+        .unwrap();
+    let header_b = app.layout.grid.get(pane_b_id).unwrap().header;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: (header_b.x + header_b.w / 2) as f32,
+            y_px: (header_b.y + header_b.h / 2) as f32,
+            button: MouseButton::Right,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    click_menu_label(&mut app, "Split Down", &mut raster, &mut clip, &mut host);
+    assert!(
+        app.doc.to_string_lossy().starts_with("// dirty in pane b\n"),
+        "splitting an inactive dirty pane must preserve its unsaved in-memory edits"
+    );
+    // Switch active back to `a.rs` for Command Palette check.
+    assert!(app.activate_buffer(buf_a, &mut host));
+
+    // 8. Command Palette exposes Copy path, Copy relative path, and OS reveal label!
+    app.handle_event(
+        InputEvent::Command(AppCommand::CommandPalette),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let pal_titles: Vec<String> = app.palette.items.iter().map(|i| i.primary.clone()).collect();
+    assert!(pal_titles.iter().any(|t| t == "Copy path"));
+    assert!(pal_titles.iter().any(|t| t == "Copy relative path"));
+    assert!(pal_titles.iter().any(|t| t == "Reveal in File Explorer"));
+}
+
+#[test]
+fn real_disk_hot_exit_permissions_rename_undo_rekey_and_sibling_pane_save_sync() {
+    use editor_platform::StdFileSystem;
+    use std::path::PathBuf;
+
+    let uniq = format!(
+        "editor-audit-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    );
+    let base = std::env::temp_dir().join(uniq);
+    let proj = base.join("proj");
+    let state_dir = base.join("state");
+    std::fs::create_dir_all(&proj).unwrap();
+    let notes_path = proj.join("notes.txt");
+    let renamed_path = proj.join("renamed.txt");
+    std::fs::write(&notes_path, "line1\nline2\n").unwrap();
+
+    let fs: Arc<dyn editor_platform::FileSystem> = Arc::new(StdFileSystem);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+    host.state_dir = Some(state_dir.clone());
+
+    {
+        let mut app = EditorApp::new(Arc::clone(&fs), 1200, 800, 2.0);
+        app.load_preferences(&host);
+        app.open_folder(&proj, &mut host);
+        app.open_file(&notes_path, &mut host).unwrap();
+
+        // Set a manual JSON language override on `.txt`, edit + save so undo persists.
+        app.doc
+            .set_language(editor_core::Language::from_id("json").unwrap());
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char('a'),
+                mods: Modifiers::NONE,
+                text: Some("{\"k\":1}\n".into()),
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        // Split right to view the same file in Pane 2 (clean once we save Pane 1).
+        app.split_pane_with(Some(&notes_path), &mut host);
+        // Focus back to Pane 1 (dirty) and save -> Pane 2 (clean) must sync immediately!
+        let pane1_id = app.other_panes[0].id;
+        app.focus_pane_id(pane1_id, &mut host);
+        assert!(app.doc.is_dirty());
+        app.handle_event(
+            InputEvent::Command(AppCommand::Save),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert!(!app.doc.is_dirty());
+        assert!(
+            app.other_panes[0].doc.to_string_lossy().starts_with("{\"k\":1}\n"),
+            "saving Pane 1 must immediately refresh clean sibling Pane 2 viewing the same file"
+        );
+        app.only_active_pane(&mut host);
+
+        // Verify private 0o700/0o600 permissions on real disk undo dir & file (Unix).
+        let undo_dir = editor_app::UndoStore::undo_dir(&state_dir);
+        let canonical_notes = std::fs::canonicalize(&notes_path).unwrap();
+        let old_key = editor_app::UndoStore::key_for_path(&canonical_notes);
+        let old_undo_file = undo_dir.join(&old_key);
+        assert!(old_undo_file.exists(), "undo file must exist on real disk after save");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(&undo_dir).unwrap().permissions().mode() & 0o777;
+            let file_mode = std::fs::metadata(&old_undo_file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(dir_mode, 0o700);
+            assert_eq!(file_mode, 0o600);
+        }
+
+        // Rename `notes.txt` -> `renamed.txt` (same extension) via sidebar inline rename!
+        app.sidebar.set_selected(Some(canonical_notes.clone()));
+        assert!(app.sidebar.start_rename());
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char('r'),
+                mods: Modifiers::NONE,
+                text: Some("renamed".into()),
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Enter,
+                mods: Modifiers::NONE,
+                text: None,
+            },
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        let canonical_renamed = std::fs::canonicalize(&renamed_path).unwrap();
+        assert_eq!(app.doc.path(), Some(canonical_renamed.as_path()));
+        assert_eq!(
+            app.doc.language().id(),
+            "json",
+            "same-extension rename must preserve manual Language override"
+        );
+        // Undo file must have been re-keyed to `renamed.txt` and old key GC'd!
+        let new_key = editor_app::UndoStore::key_for_path(&canonical_renamed);
+        assert!(undo_dir.join(&new_key).exists());
+        assert!(!old_undo_file.exists());
+
+        // Quit cleanly via will-terminate hook.
+        app.handle_will_terminate(&mut host);
+    }
+
+    // Restart: open app and verify persisted undo survives across the rename!
+    {
+        let mut app2 = EditorApp::new(Arc::clone(&fs), 1200, 800, 2.0);
+        app2.load_preferences(&host);
+        app2.open_folder(&proj, &mut host);
+        let canonical_renamed = std::fs::canonicalize(&renamed_path).unwrap();
+        assert_eq!(app2.doc.path(), Some(canonical_renamed.as_path()));
+        assert!(app2.doc.can_undo(), "re-keyed undo history must survive restart after rename");
+        app2.handle_event(
+            InputEvent::Command(AppCommand::Undo),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        assert_eq!(app2.doc.to_string_lossy(), "line1\nline2\n");
+
+        // Close & discard -> zero leftover backup/undo files on disk!
+        app2.handle_event(
+            InputEvent::Command(AppCommand::Save),
+            &mut raster,
+            &mut clip,
+            &mut host,
+        );
+        app2.request_close_buffer(app2.active_buf_id, &mut host);
+        let undo_dir = editor_app::UndoStore::undo_dir(&state_dir);
+        let backups_dir = editor_app::DraftStore::backups_dir(&state_dir);
+        assert!(
+            !undo_dir.exists() || std::fs::read_dir(&undo_dir).unwrap().count() == 0,
+            "closing last file must leave zero stale .undo files"
+        );
+        assert!(
+            !backups_dir.exists() || std::fs::read_dir(&backups_dir).unwrap().count() == 0,
+            "saving and closing must leave zero stale .buf files"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(PathBuf::from(&base));
+}
+
+#[test]
+fn audit_regressions_crlf_enter_vim_visual_text_objects_and_zero_len_regex() {
+    use std::path::Path;
+    use editor_core::Document;
+    use editor_platform::ipc::{IpcCommand, IpcReply};
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/crlf.txt", b"hello\r\nworld\r\n".to_vec());
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+    let mut app = EditorApp::new(fs.clone(), 960, 640, 2.0);
+    app.open_file(Path::new("/crlf.txt"), &mut host).unwrap();
+
+    // 1. Pressing Enter in a CRLF file places caret after `\r\n`, never between `\r` and `\n`.
+    app.caret = 5;
+    app.anchor = 5;
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Enter,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.to_string_lossy(), "hello\r\n\r\nworld\r\n");
+    assert_eq!(app.caret, 7, "caret must land after full CRLF, not between \\r and \\n");
+
+    // 2. Non-finite IPC floats (`NaN` / `inf`) are rejected cleanly without corrupting layout.
+    let (r_nan, _, _) = app.execute_ipc(
+        &IpcCommand::Action("sidebar-width:NaN".to_string()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(matches!(r_nan, IpcReply::Error(_)));
+    let (r_inf, _, _) = app.execute_ipc(
+        &IpcCommand::Action("pane-ratio:cols=inf".to_string()),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(matches!(r_inf, IpcReply::Error(_)));
+
+    // 3. NewTab clears extra_cursors so multi-cursor state never leaks into the new document.
+    app.doc = Document::from_str("foo bar foo\n", None);
+    app.caret = 0;
+    app.anchor = 0;
+    app.handle_event(
+        InputEvent::Command(AppCommand::SelectNextOccurrence),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::Command(AppCommand::SelectNextOccurrence),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.extra_cursors.is_empty());
+    app.handle_event(
+        InputEvent::Command(AppCommand::NewTab),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.extra_cursors.is_empty());
+
+    // 4. Zero-length regex replace (`^`) advances cleanly without infinite loop.
+    app.doc = Document::from_str("aaa\nbbb\n", None);
+    app.caret = 0;
+    app.anchor = 0;
+    app.handle_event(
+        InputEvent::Command(AppCommand::Replace),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.find_bar.regex = true;
+    app.find_bar.find_input.set_text("^");
+    app.find_bar.replace_input.set_text("> ");
+    app.refresh_search();
+    assert_eq!(app.search_matches.len(), 3);
+    app.render(&mut raster);
+    let rbtn = app.find_bar.layout.btn_replace;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: (rbtn.x + rbtn.w / 2) as f32,
+            y_px: (rbtn.y + rbtn.h / 2) as f32,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.to_string_lossy(), "> aaa\nbbb\n");
+    assert_eq!(app.active_match, Some(1), "must advance to second line match");
+    // Close find bar before testing Vim viewport keys.
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Escape,
+            mods: Modifiers::NONE,
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+
+    // 5. Vim fixes: `di(` on empty line & multibyte `(café)`, charwise `p` UTF-8 boundary,
+    // `dt)` deleting up to `)`, immediate `Vd` linewise delete, and failed `cfz` staying Normal.
+    app.vim.set_enabled(true);
+    let send_key = |app: &mut EditorApp,
+                    c: char,
+                    r: &mut BuiltinBitmapRasterizer,
+                    cl: &mut MemoryClipboard,
+                    h: &mut HeadlessHost| {
+        let mut s = String::new();
+        s.push(c);
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(c.to_ascii_lowercase()),
+                mods: if c.is_ascii_uppercase() {
+                    Modifiers {
+                        shift: true,
+                        ..Modifiers::NONE
+                    }
+                } else {
+                    Modifiers::NONE
+                },
+                text: Some(s),
+            },
+            r,
+            cl,
+            h,
+        );
+    };
+
+    // 5a. `di(` on empty line does not panic.
+    app.doc = Document::from_str("\n", None);
+    app.caret = 0;
+    app.anchor = 0;
+    for c in ['d', 'i', '('] {
+        send_key(&mut app, c, &mut raster, &mut clip, &mut host);
+    }
+    assert_eq!(app.doc.to_string_lossy(), "\n");
+
+    // 5b. `di(` on `(café)` deletes `"café"` cleanly.
+    app.doc = Document::from_str("(café)", None);
+    app.caret = 4; // inside `café` (at `é` byte offset 4)
+    app.anchor = 4;
+    for c in ['d', 'i', '('] {
+        send_key(&mut app, c, &mut raster, &mut clip, &mut host);
+    }
+    assert_eq!(app.doc.to_string_lossy(), "()");
+
+    // 5c. Charwise `p` with multi-byte `"café"` lands caret on a valid UTF-8 boundary.
+    clip.set_text("café");
+    app.vim.last_yank_linewise = false;
+    app.doc = Document::from_str("ab", None);
+    app.caret = 0;
+    app.anchor = 0;
+    send_key(&mut app, 'p', &mut raster, &mut clip, &mut host);
+    assert_eq!(app.doc.to_string_lossy(), "acaféb");
+    let text_now = app.doc.to_string_lossy();
+    assert!(text_now.is_char_boundary(app.caret as usize));
+
+    // 5d. `dt)` on `foo(bar)` from `'b'` deletes `"bar"`, keeping `)`.
+    app.doc = Document::from_str("foo(bar)", None);
+    app.caret = 4;
+    app.anchor = 4;
+    for c in ['d', 't', ')'] {
+        send_key(&mut app, c, &mut raster, &mut clip, &mut host);
+    }
+    assert_eq!(app.doc.to_string_lossy(), "foo()");
+
+    // 5e. Immediate `Vd` deletes the current line cleanly without needing a motion first.
+    app.doc = Document::from_str("line1\nline2\n", None);
+    app.caret = 0;
+    app.anchor = 0;
+    for c in ['V', 'd'] {
+        send_key(&mut app, c, &mut raster, &mut clip, &mut host);
+    }
+    assert_eq!(app.doc.to_string_lossy(), "line2\n");
+    assert!(app.vim.last_yank_linewise);
+
+    // 5f. Failed `cfz` stays in Normal mode instead of dropping into Insert mode.
+    app.doc = Document::from_str("hello", None);
+    app.caret = 0;
+    app.anchor = 0;
+    for c in ['c', 'f', 'z'] {
+        send_key(&mut app, c, &mut raster, &mut clip, &mut host);
+    }
+    assert_eq!(app.vim.mode, editor_app::VimMode::Normal);
+    assert_eq!(app.doc.to_string_lossy(), "hello");
 }

@@ -882,6 +882,7 @@ fn find_nth_break_end_in_piece(
         let take = ((len - pos) as usize).min(scratch.len());
         read_piece_bytes(piece.source, piece.offset + pos, &mut scratch[..take], base, add);
         let mut i = 0usize;
+        let mut crossed_chunk = false;
         while i < take {
             if let Some((rel, brk_len)) = find_next_line_break(&scratch[i..take]) {
                 let abs_end = pos + (i + rel) as u64;
@@ -902,9 +903,10 @@ fn find_nth_break_end_in_piece(
                     return after;
                 }
                 if actual_brk_len == 2 && i + rel + 1 == take {
-                    // Consumed 1 byte from next chunk.
+                    // Consumed 1 byte from next chunk; `pos` is already positioned past `\r\n`.
                     pos = after;
-                    i = take;
+                    crossed_chunk = true;
+                    break;
                 } else {
                     i = i + rel + actual_brk_len as usize;
                 }
@@ -912,10 +914,8 @@ fn find_nth_break_end_in_piece(
                 break;
             }
         }
-        if pos + take as u64 > pos {
-            if i <= take {
-                pos += take as u64;
-            }
+        if !crossed_chunk {
+            pos += take as u64;
         }
     }
     len
@@ -935,6 +935,10 @@ pub struct PieceTree {
     indexed_base_end: u64,
     /// Accumulated EOL break counts observed during base indexing.
     base_eol_counts: LineBreakCounts,
+    /// Whether the previously indexed base byte ended with `\r` (for CRLF spanning lazy chunks).
+    indexed_base_ended_cr: bool,
+    /// `true` iff `base` was loaded directly from the target file on disk (required for CoW/delta save).
+    base_from_file: bool,
     /// Whether any edit has modified the piece table relative to the original base.
     dirty: bool,
 }
@@ -948,6 +952,8 @@ impl PieceTree {
             base_start_offset: 0,
             indexed_base_end: 0,
             base_eol_counts: LineBreakCounts::default(),
+            indexed_base_ended_cr: false,
+            base_from_file: false,
             dirty: false,
         }
     }
@@ -962,6 +968,8 @@ impl PieceTree {
             base_start_offset: 0,
             indexed_base_end: 0,
             base_eol_counts: LineBreakCounts::default(),
+            indexed_base_ended_cr: false,
+            base_from_file: false,
             dirty: false,
         };
         tree.index_base_until(len);
@@ -1001,6 +1009,8 @@ impl PieceTree {
             base_start_offset: start,
             indexed_base_end: start,
             base_eol_counts: LineBreakCounts::default(),
+            indexed_base_ended_cr: false,
+            base_from_file: true,
             dirty: false,
         };
 
@@ -1066,6 +1076,13 @@ impl PieceTree {
         self.base_eol_counts
     }
 
+    /// True iff this tree's base backing came directly from opening the target file on disk
+    /// (as opposed to an in-memory draft or `from_str`).
+    #[inline]
+    pub fn is_file_backed(&self) -> bool {
+        self.base_from_file
+    }
+
     /// Incrementally index base-file chunks until at least `target_base_offset` is indexed.
     pub fn index_base_until(&mut self, target_base_offset: u64) {
         let base_len = self.base.len();
@@ -1079,7 +1096,6 @@ impl PieceTree {
             let chunk_len = (target - chunk_start).min(LAZY_CHUNK_BYTES);
             let mut summary = Summary::EMPTY;
             let mut done = 0u64;
-            let mut prev_ended_cr = false;
             while done < chunk_len {
                 let take = ((chunk_len - done) as usize).min(scratch.len());
                 self.base.read_slice(chunk_start + done, &mut scratch[..take]);
@@ -1088,12 +1104,12 @@ impl PieceTree {
                 self.base_eol_counts.lf += counts.lf;
                 self.base_eol_counts.crlf += counts.crlf;
                 self.base_eol_counts.cr += counts.cr;
-                if prev_ended_cr && slice[0] == b'\n' {
+                if self.indexed_base_ended_cr && slice[0] == b'\n' {
                     self.base_eol_counts.cr = self.base_eol_counts.cr.saturating_sub(1);
                     self.base_eol_counts.lf = self.base_eol_counts.lf.saturating_sub(1);
                     self.base_eol_counts.crlf += 1;
                 }
-                prev_ended_cr = slice[take - 1] == b'\r';
+                self.indexed_base_ended_cr = slice[take - 1] == b'\r';
                 summary = summary.combine(Summary::from_bytes(slice));
                 done += take as u64;
             }
@@ -1260,8 +1276,8 @@ impl PieceTree {
 
     /// Map a byte offset in the document to `(line_0based, col_byte_offset_in_line)`.
     pub fn byte_to_line_col(&mut self, byte_offset: u64) -> (usize, usize) {
-        if byte_offset > self.root.summary().bytes && !self.is_fully_indexed() {
-            let delta = byte_offset - self.root.summary().bytes;
+        if byte_offset >= self.root.summary().bytes && !self.is_fully_indexed() {
+            let delta = byte_offset.saturating_sub(self.root.summary().bytes);
             let target = self.indexed_base_end + delta + LAZY_CHUNK_BYTES;
             self.index_base_until(target);
         }

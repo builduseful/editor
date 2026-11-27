@@ -258,11 +258,9 @@ pub fn parse_porcelain_z(workdir: &Path, bytes: &[u8]) -> GitStatusMap {
         let x = entry[0];
         let y = entry[1];
         let path_bytes = &entry[3..];
-        let Ok(rel_str) = std::str::from_utf8(path_bytes) else {
-            continue;
-        };
 
-        // Renames/copies (`R` or `C` in X or Y) emit a second NUL-terminated old-path token; skip it.
+        // Renames/copies (`R` or `C` in X or Y) emit a second NUL-terminated old-path token;
+        // always consume it before any UTF-8 early `continue` so subsequent records stay aligned.
         if matches!(x, b'R' | b'C') || matches!(y, b'R' | b'C') {
             if i < bytes.len() {
                 let next_end = bytes[i..]
@@ -274,11 +272,16 @@ pub fn parse_porcelain_z(workdir: &Path, bytes: &[u8]) -> GitStatusMap {
             }
         }
 
+        let Ok(rel_str) = std::str::from_utf8(path_bytes) else {
+            continue;
+        };
+
         let status = classify_xy(x, y);
         let Some(status) = status else {
             continue;
         };
 
+        let is_untracked_dir = rel_str.ends_with('/');
         let rel_trimmed = rel_str.trim_end_matches('/');
         if rel_trimmed.is_empty() {
             continue;
@@ -290,6 +293,9 @@ pub fn parse_porcelain_z(workdir: &Path, bytes: &[u8]) -> GitStatusMap {
             }
         }
         map.files.insert(full.clone(), status);
+        if is_untracked_dir {
+            map.dirty_dirs.insert(full.clone());
+        }
 
         // Roll up dirty indicator to ancestor directories up to `workdir`.
         let mut anc = full.parent();
@@ -376,17 +382,29 @@ pub fn read_head_file(workdir: &Path, path: &Path) -> Option<Vec<u8>> {
         .arg(workdir)
         .args(["show", &spec])
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null());
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
     }
-    let out = cmd.output().ok()?;
-    if !out.status.success() || out.stdout.len() > MAX_GIT_HEAD_FILE_BYTES {
+    let mut child = cmd.spawn().ok()?;
+    let mut stdout = child.stdout.take()?;
+    let mut buf = Vec::new();
+    let limit = (MAX_GIT_HEAD_FILE_BYTES + 1) as u64;
+    let read_ok = std::io::Read::read_to_end(&mut std::io::Read::take(&mut stdout, limit), &mut buf).is_ok();
+    drop(stdout);
+    if !read_ok || buf.len() > MAX_GIT_HEAD_FILE_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
         return None;
     }
-    Some(out.stdout)
+    let status = child.wait().ok()?;
+    if !status.success() {
+        return None;
+    }
+    Some(buf)
 }
 
 #[cfg(test)]
@@ -511,5 +529,22 @@ mod tests {
         cache.upsert(inner.clone(), GitStatusMap::default());
         assert!(!cache.dir_has_changes(&inner.join("src")));
         assert!(cache.dir_has_changes(&inner));
+    }
+
+    #[test]
+    fn audit_regressions_untracked_dir_and_non_utf8_rename() {
+        let root = PathBuf::from("/ws/repo");
+        // Untracked directory entry (`?? new_dir/`) marks `new_dir` itself in `dirty_dirs`.
+        let m1 = parse_porcelain_z(&root, b"?? new_dir/\0");
+        assert!(m1.dirty_dirs.contains(&root.join("new_dir")));
+        assert!(m1.dirty_dirs.contains(&root));
+
+        // Non-UTF-8 rename still consumes its second NUL-delimited old-path token so subsequent
+        // entries parse cleanly without desynchronizing.
+        let m2 = parse_porcelain_z(&root, b"R  \xff\xfe\0old_name.rs\0 M after.rs\0");
+        assert_eq!(
+            m2.files.get(&root.join("after.rs")),
+            Some(&GitFileStatus::Modified)
+        );
     }
 }

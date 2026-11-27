@@ -199,7 +199,7 @@ fn cli_ipc_open_close_and_quit_commands() {
                         assert!(p.ends_with("hello.rs"));
                         pending.respond(IpcReply::Json("{\"running\":true,\"split\":true,\"active_pane\":1}".into()));
                     }
-                    IpcCommand::FocusPane(0) => {
+                    IpcCommand::Action(act) if act == "focus-left" => {
                         pending.respond(IpcReply::Json("{\"running\":true,\"split\":true,\"active_pane\":0}".into()));
                     }
                     IpcCommand::Unsplit => {

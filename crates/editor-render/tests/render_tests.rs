@@ -587,3 +587,233 @@ fn glyph_atlas_inline_and_long_cluster_keys_and_compact_palette_index() {
     assert_eq!(pal.items.len(), 1, "uppercase .PNG binary extension must be skipped");
     assert_eq!(pal.items[0].path, root.join("Src/MyComponent.rs"));
 }
+
+#[test]
+fn context_menu_dynamic_width_keyboard_nav_and_clamping() {
+    use editor_render::{ContextMenu, ContextMenuEntry};
+
+    let mut atlas = GlyphAtlas::new();
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut fb = Framebuffer::new(800, 600, 2.0);
+    let bounds = fb.bounds();
+    let theme = Theme::dark();
+
+    let mut menu = ContextMenu::new();
+    menu.open(
+        760.0,
+        560.0,
+        vec![
+            ContextMenuEntry::item(10, "Reveal in File Explorer (Extended Label)"),
+            ContextMenuEntry::Separator,
+            ContextMenuEntry::item(20, "Copy Path"),
+            ContextMenuEntry::danger_item(30, "Delete…"),
+        ],
+    );
+    assert!(menu.is_open());
+
+    {
+        let mut p = Painter::new(&mut fb);
+        menu.draw(&mut p, bounds, &theme, &mut atlas, &mut raster);
+    }
+
+    let card = menu.card_rect();
+    // Dynamic width must expand past the 168pt (336px at 2x) minimum to fit the long label.
+    assert!(
+        card.w > 336,
+        "expected dynamic width > 336px for long label, got {}",
+        card.w
+    );
+    // Viewport clamping keeps the menu fully inside the window bounds.
+    assert!(card.x >= bounds.x && card.right() <= bounds.right());
+    assert!(card.y >= bounds.y && card.bottom() <= bounds.bottom());
+
+    // Keyboard navigation skips separators and wraps cleanly.
+    assert_eq!(menu.selected_id(), None);
+    assert!(menu.move_selection(1));
+    assert_eq!(menu.selected_id(), Some(10));
+    assert!(menu.move_selection(1));
+    assert_eq!(menu.selected_id(), Some(20));
+    assert!(menu.move_selection(1));
+    assert_eq!(menu.selected_id(), Some(30));
+    assert!(menu.move_selection(1));
+    assert_eq!(menu.selected_id(), Some(10));
+    assert!(menu.move_selection(-1));
+    assert_eq!(menu.selected_id(), Some(30));
+
+    let r20 = menu.item_rect(20).expect("item 20 rect");
+    let clicked = menu.click((r20.x + r20.w / 2) as f32, (r20.y + r20.h / 2) as f32);
+    assert_eq!(clicked, Some(20));
+    assert!(!menu.is_open());
+}
+
+#[test]
+fn audit_regressions_hex_utf8_wrap_hit_test_tab_scroll_and_palette_scroll() {
+    use editor_core::Document;
+    use editor_platform::GlyphRasterizer;
+    use editor_render::{
+        Color, CommandPalette, ImeComposition, PaletteCommandEntry, TabDisplayItem, TabStrip,
+        Viewport,
+    };
+
+    // 1. Non-ASCII hex color strings return None instead of panicking on UTF-8 slice boundaries.
+    assert_eq!(Color::parse_hex("éa"), None);
+    assert_eq!(Color::parse_hex("🔥🚀"), None);
+    assert_eq!(Color::parse_hex("#112233"), Some(Color::rgb(0x11, 0x22, 0x33)));
+
+    // 2. Wrapped single-line hit_test_text hits segment 1+ AND survives edits without repaint.
+    let mut atlas = GlyphAtlas::new();
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut fb = Framebuffer::new(320, 240, 1.0);
+    let bounds = fb.bounds();
+    let theme = Theme::light();
+
+    let mut doc = Document::from_str(&"word ".repeat(30), None);
+    let mut vp = Viewport::new();
+    vp.word_wrap = true;
+    let metrics = raster.metrics(FontStyle::Mono, 13.0);
+    {
+        let mut p = Painter::new(&mut fb);
+        vp.draw(
+            &mut p,
+            bounds,
+            &mut doc,
+            0,
+            None,
+            &[],
+            None,
+            None,
+            &ImeComposition::default(),
+            true,
+            true,
+            &theme,
+            &mut atlas,
+            &mut raster,
+        );
+    }
+    assert!(vp.last_caret_rect.w > 0);
+    // Click on wrapped visual row 1 (second segment of line 0): must return byte > 10!
+    let hit_row1 = vp.hit_test_text(
+        (vp.layout.text.x + 20) as f32,
+        (vp.layout.text.y + metrics.line_height as i32 + 4) as f32,
+        &mut doc,
+        metrics,
+        1.0,
+    );
+    assert!(
+        hit_row1.byte_offset > 10,
+        "clicking segment 1 of wrapped last line must not clamp to segment 0 (got {})",
+        hit_row1.byte_offset
+    );
+    // Shrink document without redrawing: stale wrap_cache must refresh cleanly instead of panicking.
+    doc.edit(0, doc.len_bytes() - 4, "", 1, false).unwrap();
+    let _ = vp.hit_test_text(
+        (vp.layout.text.x + 12) as f32,
+        (vp.layout.text.y + 4) as f32,
+        &mut doc,
+        metrics,
+        1.0,
+    );
+    // Moving caret resets `last_caret_rect` per frame instead of monotonically unioning old rects.
+    let mut multi = Document::from_str(&"line\n".repeat(40), None);
+    vp.word_wrap = false;
+    vp.scroll_top_line = 20; // caret at byte 0 is scrolled off-screen
+    {
+        let mut p = Painter::new(&mut fb);
+        vp.draw(
+            &mut p,
+            bounds,
+            &mut multi,
+            0,
+            None,
+            &[],
+            None,
+            None,
+            &ImeComposition::default(),
+            true,
+            true,
+            &theme,
+            &mut atlas,
+            &mut raster,
+        );
+    }
+    assert_eq!(vp.last_caret_rect.w, 0, "off-screen caret must reset last_caret_rect to ZERO");
+
+    // 3. TabStrip preserves manual horizontal scroll when active tab does not change.
+    let mut strip = TabStrip::new();
+    let tabs: Vec<TabDisplayItem> = (1..=12u32)
+        .map(|i| TabDisplayItem {
+            id: i,
+            label: format!("file_number_{i:02}.rs"),
+            pin_slot: None,
+            dirty: false,
+            is_preview: false,
+            is_active: i == 1,
+            in_other_pane: false,
+        })
+        .collect();
+    let strip_rect = PixelRect::new(0, 0, 300, 30);
+    {
+        let mut p = Painter::new(&mut fb);
+        strip.draw(
+            &mut p,
+            strip_rect,
+            &tabs,
+            false,
+            false,
+            true,
+            None,
+            None,
+            &theme,
+            &mut atlas,
+            &mut raster,
+        );
+    }
+    strip.scroll_by(80.0);
+    let scrolled = strip.scroll_x_px;
+    assert!(scrolled > 0.0);
+    {
+        let mut p = Painter::new(&mut fb);
+        strip.draw(
+            &mut p,
+            strip_rect,
+            &tabs,
+            false,
+            false,
+            true,
+            None,
+            None,
+            &theme,
+            &mut atlas,
+            &mut raster,
+        );
+    }
+    assert_eq!(strip.scroll_x_px, scrolled, "manual tab strip scroll must not snap back");
+
+    // 4. CommandPalette wheel scroll down (`dy_px > 0`) advances selection down the list.
+    let fs = MemoryFileSystem::new();
+    let mut pal = CommandPalette::new();
+    let cmds: Vec<PaletteCommandEntry> = (0..30)
+        .map(|i| PaletteCommandEntry {
+            id: format!("cmd-{i}"),
+            title: format!("Command {i}"),
+            category: "Test".to_string(),
+            shortcut: String::new(),
+        })
+        .collect();
+    pal.open_commands(cmds);
+    let mut fb_big = Framebuffer::new(800, 600, 1.0);
+    let big_bounds = fb_big.bounds();
+    {
+        let mut p = Painter::new(&mut fb_big);
+        pal.draw(&mut p, big_bounds, &theme, &mut atlas, &mut raster, true);
+    }
+    let before = pal.selected;
+    let cx = 400.0;
+    let cy = 260.0;
+    assert!(pal.handle_scroll(&fs, cx, cy, 120.0));
+    assert!(
+        pal.selected > before,
+        "positive dy_px must scroll palette selection down (before={before}, after={})",
+        pal.selected
+    );
+}

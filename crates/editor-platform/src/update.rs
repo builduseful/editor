@@ -383,8 +383,28 @@ impl<'a> JsonCursor<'a> {
                             let code = u32::from_str_radix(hex, 16)
                                 .map_err(|_| "invalid hex in \\u escape")?;
                             self.pos += 4;
-                            let ch = char::from_u32(code)
-                                .ok_or_else(|| "invalid Unicode scalar in \\u escape")?;
+                            let scalar = if (0xD800..=0xDBFF).contains(&code) {
+                                // UTF-16 high surrogate: expect trailing `\uXXXX` low surrogate.
+                                if self.pos + 6 > self.bytes.len()
+                                    || self.bytes[self.pos] != b'\\'
+                                    || self.bytes[self.pos + 1] != b'u'
+                                {
+                                    return Err("unpaired UTF-16 surrogate in JSON string".to_string());
+                                }
+                                let lo_hex = std::str::from_utf8(&self.bytes[self.pos + 2..self.pos + 6])
+                                    .map_err(|_| "invalid UTF-8 in \\u escape")?;
+                                let lo = u32::from_str_radix(lo_hex, 16)
+                                    .map_err(|_| "invalid hex in \\u escape")?;
+                                if !(0xDC00..=0xDFFF).contains(&lo) {
+                                    return Err("invalid UTF-16 low surrogate in JSON string".to_string());
+                                }
+                                self.pos += 6;
+                                0x10000 + (((code - 0xD800) << 10) | (lo - 0xDC00))
+                            } else {
+                                code
+                            };
+                            let ch = char::from_u32(scalar)
+                                .ok_or("invalid Unicode scalar in \\u escape")?;
                             out.push(ch);
                         }
                         _ => return Err("unknown escape sequence in JSON string".to_string()),
@@ -733,7 +753,10 @@ pub fn is_dev_build_path(path: &Path) -> bool {
 
 /// Probe whether `dir` is genuinely writable by the current user (respecting ACLs/SIP).
 pub fn is_dir_writable(dir: &Path) -> bool {
-    let probe = dir.join(format!(".editor-write-probe-{}", std::process::id()));
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let probe = dir.join(format!(".editor-write-probe-{}-{seq}", std::process::id()));
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -790,7 +813,7 @@ pub fn atomic_swap_bundle(target_app: &Path, staged_app: &Path) -> Result<(), St
         let _ = fs::remove_dir_all(&prev_app);
     }
 
-    let had_existing = target_app.exists();
+    let had_existing = fs::symlink_metadata(target_app).is_ok();
     if had_existing {
         fs::rename(target_app, &prev_app)
             .map_err(|e| format!("failed to move current bundle aside: {e}"))?;
@@ -917,7 +940,8 @@ pub fn install_macos_tar_gz(
         return Err("staged binary failed version self-check".to_string());
     }
     let ver_stdout = String::from_utf8_lossy(&ver_out.stdout);
-    let expected_needle = format!("\"version\":\"{expected_version}\"");
+    let norm_expected = expected_version.trim_start_matches('v');
+    let expected_needle = format!("\"version\":\"{norm_expected}\"");
     if !ver_stdout.contains(&expected_needle) {
         return Err(format!(
             "staged bundle version does not match manifest ({expected_version})"
@@ -1089,5 +1113,24 @@ mod tests {
         assert!(https_get_via_curl("file:///etc/passwd", 1024).is_err());
         assert!(https_get_via_curl("https://evil.example/release.json", 1024).is_err());
         assert!(https_get_via_curl("--config=/tmp/evil", 1024).is_err());
+    }
+
+    #[test]
+    fn audit_regressions_json_utf16_surrogate_pairs() {
+        let sample = r#"{
+            "version": "0.4.1",
+            "build": 401,
+            "notes_url": "https://github.com/builduseful/editor/releases/tag/v0.4.1",
+            "emoji_note": "rocket \uD83D\uDE80 launch",
+            "assets": {
+                "macos-universal": {
+                    "url": "https://github.com/builduseful/editor/releases/download/v0.4.1/Editor.tar.gz",
+                    "sha256": "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                }
+            }
+        }"#;
+        let m = parse_release_manifest(sample).expect("UTF-16 surrogate pair in JSON must parse");
+        assert_eq!(m.version, "0.4.1");
+        assert_eq!(m.build, 401);
     }
 }

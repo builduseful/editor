@@ -115,7 +115,10 @@ pub enum VimAction {
         op: VimOperator,
         obj: TextObject,
     },
-    VisualApply(VimOperator),
+    VisualApply {
+        op: VimOperator,
+        linewise: bool,
+    },
     EnterInsert {
         kind: InsertEntry,
     },
@@ -273,9 +276,6 @@ impl VimState {
         let count = self.take_count();
         self.pending = VimPending::None;
         if let Some(op) = self.operator.take() {
-            if op == VimOperator::Change {
-                self.mode = VimMode::Insert;
-            }
             VimAction::OperatorMotion { op, motion, count }
         } else {
             let extend_visual = matches!(self.mode, VimMode::Visual | VimMode::VisualLine);
@@ -373,9 +373,6 @@ impl VimState {
                         _ => None,
                     };
                     if let Some(obj) = obj {
-                        if op == VimOperator::Change {
-                            self.mode = VimMode::Insert;
-                        }
                         return VimAction::OperatorTextObject { op, obj };
                     }
                 }
@@ -597,29 +594,49 @@ impl VimState {
                     return VimAction::Consumed;
                 }
                 'd' | 'x' => {
+                    let linewise = self.mode == VimMode::VisualLine;
                     self.mode = VimMode::Normal;
                     self.reset_pending();
-                    return VimAction::VisualApply(VimOperator::Delete);
+                    return VimAction::VisualApply {
+                        op: VimOperator::Delete,
+                        linewise,
+                    };
                 }
                 'c' | 's' => {
-                    self.mode = VimMode::Insert;
+                    let linewise = self.mode == VimMode::VisualLine;
+                    self.mode = VimMode::Normal;
                     self.reset_pending();
-                    return VimAction::VisualApply(VimOperator::Change);
+                    return VimAction::VisualApply {
+                        op: VimOperator::Change,
+                        linewise,
+                    };
                 }
                 'y' => {
+                    let linewise = self.mode == VimMode::VisualLine;
                     self.mode = VimMode::Normal;
                     self.reset_pending();
-                    return VimAction::VisualApply(VimOperator::Yank);
+                    return VimAction::VisualApply {
+                        op: VimOperator::Yank,
+                        linewise,
+                    };
                 }
                 '>' => {
+                    let linewise = self.mode == VimMode::VisualLine;
                     self.mode = VimMode::Normal;
                     self.reset_pending();
-                    return VimAction::VisualApply(VimOperator::Indent);
+                    return VimAction::VisualApply {
+                        op: VimOperator::Indent,
+                        linewise,
+                    };
                 }
                 '<' => {
+                    let linewise = self.mode == VimMode::VisualLine;
                     self.mode = VimMode::Normal;
                     self.reset_pending();
-                    return VimAction::VisualApply(VimOperator::Outdent);
+                    return VimAction::VisualApply {
+                        op: VimOperator::Outdent,
+                        linewise,
+                    };
                 }
                 _ => return VimAction::Consumed,
             }

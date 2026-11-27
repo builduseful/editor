@@ -110,6 +110,9 @@ impl Color {
     /// Parse `#RGB`, `#RRGGBB`, `RRGGBB`, or `#RRGGBBAA` hex colours.
     pub fn parse_hex(raw: &str) -> Option<Self> {
         let s = raw.trim().strip_prefix('#').unwrap_or(raw.trim());
+        if !s.is_ascii() {
+            return None;
+        }
         match s.len() {
             3 => {
                 let r = u8::from_str_radix(&s[0..1], 16).ok()?;

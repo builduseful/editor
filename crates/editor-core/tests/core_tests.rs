@@ -950,3 +950,158 @@ fn evict_page_cache_preserves_unsaved_edits_and_refills_paged_reads() {
     );
     assert_eq!(doc.line_content(7999).unwrap(), "line_07999_payload_0123456789_abcdef_xyz");
 }
+
+#[test]
+fn audit_regressions_draft_save_crlf_chunks_syntax_utf8_and_regex() {
+    use editor_core::regex::{PikeVmScratch, Regex};
+    use editor_core::{
+        prev_grapheme_boundary, utf8_floor, CompiledQuery, Eol, Language, SaveMethod,
+        SearchOptions, SearchScratch, SyntaxCache, TokenSpan,
+    };
+    use editor_platform::FileSystem;
+
+    // 1. Hot-exit draft / from_unsaved_draft saved over an existing disk file must NEVER use
+    // delta/CoW fast paths against the mismatched disk file (would wipe draft content on APFS).
+    let fs = MemoryFileSystem::new();
+    let p = PathBuf::from("/draft_target.txt");
+    fs.add_file(&p, b"old on disk content that is completely different\n".to_vec());
+    let disk_rev = fs.stat(&p).unwrap().rev;
+    let mut draft = Document::from_unsaved_draft(
+        "fresh recovered hot-exit draft content\n",
+        Some(p.clone()),
+        disk_rev,
+        false,
+        Eol::Lf,
+    );
+    let report = draft.save(&fs, None, true).unwrap();
+    assert_eq!(report.method, SaveMethod::InPlace);
+    let mut reloaded = Document::open(&fs, &p).unwrap();
+    assert_eq!(
+        reloaded.to_string_lossy(),
+        "fresh recovered hot-exit draft content\n"
+    );
+
+    // Also verify normal atomic save (`in_place = false`) on a recovered draft writes full content.
+    let disk_rev2 = fs.stat(&p).unwrap().rev;
+    let mut draft2 = Document::from_unsaved_draft(
+        "second recovered draft\n",
+        Some(p.clone()),
+        disk_rev2,
+        false,
+        Eol::Lf,
+    );
+    let report2 = draft2.save(&fs, None, false).unwrap();
+    assert_eq!(report2.method, SaveMethod::AtomicRewrite);
+    let mut reloaded2 = Document::open(&fs, &p).unwrap();
+    assert_eq!(reloaded2.to_string_lossy(), "second recovered draft\n");
+
+    // 2. Pure CRLF file >16 KB with `\r\n` straddling the exact 16,384-byte lazy chunk boundary.
+    // Make byte 16,383 = '\r' and byte 16,384 = '\n'.
+    let mut crlf_bytes = Vec::with_capacity(20_000);
+    // 16384 = 16 * 1024. If each line is 32 bytes ("a"*30 + "\r\n"), 511 lines = 16352 bytes.
+    // Then 31 'b's + "\r\n" puts '\r' at 16383 and '\n' at 16384!
+    for _ in 0..511 {
+        crlf_bytes.extend_from_slice(b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n");
+    }
+    crlf_bytes.extend_from_slice(&[b'b'; 31]);
+    crlf_bytes.extend_from_slice(b"\r\n");
+    assert_eq!(crlf_bytes[16383], b'\r');
+    assert_eq!(crlf_bytes[16384], b'\n');
+    for i in 0..50 {
+        crlf_bytes.extend_from_slice(format!("tail_line_{i:02}\r\n").as_bytes());
+    }
+    let crlf_path = PathBuf::from("/crlf_boundary.txt");
+    fs.add_file(&crlf_path, crlf_bytes.clone());
+    let mut crlf_doc = Document::open(&fs, &crlf_path).unwrap();
+    crlf_doc.tree_mut().ensure_fully_indexed();
+    assert_eq!(
+        crlf_doc.info().eol,
+        Eol::CrLf,
+        "CRLF straddling 16KB lazy boundary must stay Eol::CrLf, not Mixed"
+    );
+    assert_eq!(crlf_doc.line_content(511).unwrap(), "b".repeat(31));
+    assert_eq!(crlf_doc.line_content(512).unwrap(), "tail_line_00");
+    assert_eq!(crlf_doc.byte_to_line_col(16385), (512, 0));
+
+    // 3. Syntax lexers with escaped multi-byte UTF-8 must produce valid char-boundary spans.
+    let mut spans: Vec<TokenSpan> = Vec::new();
+    for (lang_id, sample) in [
+        ("rust", "let s = \"a\\é\"; let c = '\\🦀';"),
+        ("javascript", "const a = `hello\\é`; const b = \"x\\🦀\";"),
+        ("powershell", "$s = \"a`é\" + \"b`🦀\""),
+        ("python", "s = 'a\\é'"),
+    ] {
+        let lang = Language::from_id(lang_id).unwrap();
+        let mut cache = SyntaxCache::new(lang);
+        spans.clear();
+        cache.lex_line(0, sample, &mut spans);
+        for sp in &spans {
+            assert!(sample.is_char_boundary(sp.start as usize));
+            assert!(sample.is_char_boundary(sp.end as usize));
+        }
+    }
+
+    // Markdown fenced JS template literal & Rust raw string preserve inner state across lines.
+    let md = Language::from_id("markdown").unwrap();
+    let mut md_cache = SyntaxCache::new(md);
+    let md_lines = [
+        "```js",
+        "const s = `line1",
+        "line2`;",
+        "```",
+        "```rust",
+        "let r = r##\"raw1",
+        "raw2\"##;",
+        "```",
+    ];
+    for (idx, line) in md_lines.iter().enumerate() {
+        spans.clear();
+        md_cache.lex_line(idx, line, &mut spans);
+        assert!(!spans.is_empty(), "md line {idx} should lex cleanly");
+    }
+
+    // 4. `utf8_floor`, CRLF regex `$`, `[\W]`/`[\S]` non-ASCII, `\B` capture replacement, grapheme.
+    assert_eq!(utf8_floor("xéabc".as_bytes()), 6);
+    assert_eq!(utf8_floor(&"xé".as_bytes()[..2]), 1);
+
+    let mut vm_scratch = PikeVmScratch::new();
+    let re_eol = Regex::compile("foo$", true, false).unwrap();
+    assert_eq!(
+        re_eol.find_span_with_context("foo\r\n", 0, None, None, &mut vm_scratch),
+        Some((0, 3))
+    );
+
+    let re_non_word = Regex::compile(r"[\W]+", true, false).unwrap();
+    assert_eq!(
+        re_non_word.find_span_with_context("a🚀 b", 0, None, None, &mut vm_scratch),
+        Some((1, 6))
+    );
+    let re_non_space = Regex::compile(r"[\S]+", true, false).unwrap();
+    assert_eq!(
+        re_non_space.find_span_with_context(" aé ", 0, None, None, &mut vm_scratch),
+        Some((1, 4))
+    );
+
+    let q_word_cap = CompiledQuery::compile(
+        r"\B(bar)",
+        SearchOptions {
+            regex: true,
+            case_sensitive: true,
+            ..SearchOptions::default()
+        },
+    )
+    .unwrap()
+    .unwrap();
+    let mut search_scratch = SearchScratch::new();
+    assert_eq!(
+        q_word_cap.expand_replacement_with_context("bar", Some('o'), None, "[$1]", &mut search_scratch),
+        "[bar]"
+    );
+
+    let zwj_ascii = "👩\u{200D}a";
+    assert_eq!(next_grapheme_boundary(zwj_ascii, 0), zwj_ascii.len());
+    assert_eq!(prev_grapheme_boundary(zwj_ascii, zwj_ascii.len()), 0);
+    let long_comb = format!("a{}", "\u{0301}".repeat(40));
+    assert_eq!(next_grapheme_boundary(&long_comb, 0), long_comb.len());
+    assert_eq!(prev_grapheme_boundary(&long_comb, long_comb.len()), 0);
+}

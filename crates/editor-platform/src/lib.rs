@@ -18,11 +18,14 @@ pub mod update;
 pub mod version;
 
 pub use fs::{
-    DirEntry, EntryKind, FileHandle, FileLock, FileRev, FileStat, FileSystem, FsError, FsResult,
-    MemoryFileSystem, StdFileSystem,
+    ensure_private_dir, set_private_file_permissions, DirEntry, EntryKind, FileHandle, FileLock,
+    FileRev, FileStat, FileSystem, FsError, FsResult, MemoryFileSystem, StdFileSystem,
 };
 pub use git::{GitFileStatus, GitRepo, GitStatusCache, GitStatusMap};
-pub use host::{Clipboard, HeadlessHost, HttpFetcher, MainLoopWaker, MemoryClipboard, PlatformHost};
+pub use host::{
+    default_app_state_dir, default_reveal_in_file_manager_label, display_path_string, Clipboard,
+    HeadlessHost, HttpFetcher, MainLoopWaker, MemoryClipboard, PlatformHost,
+};
 pub use ignore::{
     collect_ancestor_gitignores, is_gitignored, matches_path_filter, GitIgnoreLayer, IgnoreRules,
 };
@@ -35,7 +38,7 @@ pub use raster::{
 };
 pub use surface::{DirtyRegion, Framebuffer, PixelRect, SurfaceMut};
 pub use update::{
-    check_manifest_bytes, enclosing_app_bundle, sha256_hex, ReleaseAsset, ReleaseManifest,
-    UpdateCheckOutcome, UpdateInfo, RELEASE_MANIFEST_URL,
+    check_manifest_bytes, enclosing_app_bundle, sha256_bytes, sha256_hex, ReleaseAsset,
+    ReleaseManifest, UpdateCheckOutcome, UpdateInfo, RELEASE_MANIFEST_URL,
 };
 pub use version::{compare_semver, SemVer, APP_VERSION, BUNDLE_IDENTIFIER};

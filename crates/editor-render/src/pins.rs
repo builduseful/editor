@@ -493,7 +493,10 @@ impl PinsOverlay {
                     Row::Item(entry_idx) => {
                         let e = &self.entries[entry_idx];
                         let r = PixelRect::new(list_clip.x, cy, list_clip.w, row_h);
-                        self.item_rects.push((entry_idx, r));
+                        let clipped_r = r.intersect(list_clip);
+                        if !clipped_r.is_empty() {
+                            self.item_rects.push((entry_idx, clipped_r));
+                        }
 
                         if r_idx == self.selected_row {
                             painter.fill_rounded_rect(r, 5.0 * scale, theme.selection);

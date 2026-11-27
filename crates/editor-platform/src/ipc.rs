@@ -332,8 +332,8 @@ impl IpcServer {
         socket_path: PathBuf,
         on_wake: Arc<dyn Fn() + Send + Sync>,
     ) -> std::io::Result<Self> {
-        if socket_path.exists() {
-            if send_ping(&socket_path).is_ok() {
+        if std::fs::symlink_metadata(&socket_path).is_ok() {
+            if matches!(send_ping(&socket_path), Ok(IpcReply::Pong)) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AddrInUse,
                     "another editor GUI instance is already listening",
@@ -405,12 +405,15 @@ fn handle_client(
     queue: &Arc<Mutex<VecDeque<PendingIpc>>>,
     on_wake: &Arc<dyn Fn() + Send + Sync>,
 ) {
-    let mut reader = BufReader::new(match stream.try_clone() {
+    use std::io::Read;
+    const MAX_IPC_LINE_BYTES: u64 = 1024 * 1024;
+    let cloned = match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
-    });
+    };
+    let mut reader = BufReader::new(cloned.take(MAX_IPC_LINE_BYTES));
     let mut line = String::new();
-    if reader.read_line(&mut line).is_err() {
+    if reader.read_line(&mut line).is_err() || line.is_empty() {
         return;
     }
     let trimmed = line.trim_end_matches(['\r', '\n']);
