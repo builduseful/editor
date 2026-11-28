@@ -4,6 +4,12 @@ All notable user-facing changes to `editor` are documented here.
 The workspace version in `Cargo.toml` (`[workspace.package] version`) is the
 single source of truth for `editor`, `editor-gui`, `Editor.app`, and GitHub Releases.
 
+## [0.4.1] - 2026-11-28
+
+### Fixed
+- **Security hardening:** prevented untrusted Git repositories from executing repo-configured programs on folder open by passing `-c core.fsmonitor=false -c core.untrackedCache=false`, switching `HEAD` reads to filter-free `git cat-file blob`, and skipping Git queries when repo-local config defines `[include]`/`[includeIf]` or non-LFS `[filter]` drivers; restricted updater release URL hostnames to strict ASCII hostname characters; verified Unix IPC socket type and UID ownership in `/tmp` on both client and server.
+- **Regex & CLI:** fixed `$` matching twice per CRLF line ending (between `\r` and `\n`), fixed `editor batch` applying multiple operations on the same file sequentially and aborting cleanly if backup read fails, enforced `--expect REV` in `editor edit --dry-run`, and fixed `editor-cli` compilation on Linux and Windows.
+
 ## [0.4.0] - 2026-11-27
 
 ### Added

@@ -1065,6 +1065,17 @@ fn audit_regressions_draft_save_crlf_chunks_syntax_utf8_and_regex() {
     assert_eq!(utf8_floor(&"xé".as_bytes()[..2]), 1);
 
     let mut vm_scratch = PikeVmScratch::new();
+    // `$` must match once per CRLF line end (never between `\r` and `\n`).
+    let re_dollar = Regex::compile("$", true, false).unwrap();
+    assert_eq!(
+        re_dollar.find_span_with_context("foo\r\n", 3, Some('o'), Some('\r'), &mut vm_scratch),
+        Some((3, 3))
+    );
+    // Starting between `\r` and `\n` must not match there; the next match is the true end (5).
+    assert_eq!(
+        re_dollar.find_span_with_context("foo\r\n", 4, Some('\r'), Some('\n'), &mut vm_scratch),
+        Some((5, 5))
+    );
     let re_eol = Regex::compile("foo$", true, false).unwrap();
     assert_eq!(
         re_eol.find_span_with_context("foo\r\n", 0, None, None, &mut vm_scratch),

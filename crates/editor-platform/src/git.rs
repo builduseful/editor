@@ -337,14 +337,83 @@ fn classify_xy(x: u8, y: u8) -> Option<GitFileStatus> {
     None
 }
 
+/// Config overrides that neutralise repo-controlled command execution (`core.fsmonitor` runs an
+/// arbitrary program on every `git status`). `-c` takes precedence over repo-local config.
+const HARDENING_ARGS: [&str; 4] = ["-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"];
+
+/// Opening an untrusted folder must never run code. Besides the `-c` overrides above, refuse to
+/// run `git` at all when the repo-local config (or `info/attributes`) could make Git spawn a
+/// repo-chosen program: `[include]` / `[includeIf]` (can pull in unscanned files) and `[filter]`
+/// drivers whose `clean` / `smudge` / `process` command is not Git LFS. Normal repositories are
+/// unaffected; hostile ones simply get no Git decorations.
+pub fn repo_config_is_trusted(workdir: &Path) -> bool {
+    let Some(repo) = discover_repo(workdir) else {
+        return true;
+    };
+    let mut dirs = vec![repo.git_dir.clone()];
+    if let Ok(raw) = fs::read_to_string(repo.git_dir.join("commondir")) {
+        let p = PathBuf::from(raw.trim());
+        dirs.push(if p.is_absolute() { p } else { repo.git_dir.join(p) });
+    }
+    for dir in dirs {
+        for name in ["config", "config.worktree"] {
+            if let Ok(text) = fs::read_to_string(dir.join(name)) {
+                if !config_text_is_trusted(&text) {
+                    return false;
+                }
+            }
+        }
+        if let Ok(text) = fs::read_to_string(dir.join("info/attributes")) {
+            if text.to_ascii_lowercase().contains("filter=") && !text.contains("filter=lfs") {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+fn config_text_is_trusted(text: &str) -> bool {
+    let mut section = String::new();
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.starts_with('[') {
+            section = line.to_ascii_lowercase();
+            if section.starts_with("[include") {
+                return false;
+            }
+            continue;
+        }
+        if section.starts_with("[filter") {
+            let lower = line.to_ascii_lowercase();
+            let is_cmd = ["clean", "smudge", "process"].iter().any(|k| {
+                lower
+                    .strip_prefix(k)
+                    .is_some_and(|r| r.trim_start().starts_with('='))
+            });
+            if is_cmd {
+                let value = line.split_once('=').map(|(_, v)| v.trim()).unwrap_or("");
+                let value = value.trim_matches('"').trim();
+                if !(value.starts_with("git-lfs ") || value.starts_with("git lfs ")) {
+                    return false;
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Run `git --no-optional-locks status --porcelain=v1 -z --untracked-files=normal --ignore-submodules=dirty`
 /// inside `workdir`. When `scope` is strictly a subdirectory inside `workdir` (e.g. an open
 /// monorepo package folder), passes `-- <rel_scope>` so Git only walks that subtree.
 /// Returns `None` if `git` is unavailable or fails.
 pub fn query_status(workdir: &Path, scope: Option<&Path>) -> Option<GitStatusMap> {
+    if !repo_config_is_trusted(workdir) {
+        return None;
+    }
     let mut cmd = Command::new("git");
     cmd.env("GIT_OPTIONAL_LOCKS", "0")
         .arg("--no-optional-locks")
+        .args(HARDENING_ARGS)
         .arg("-C")
         .arg(workdir)
         .args([
@@ -373,14 +442,19 @@ pub fn query_status(workdir: &Path, scope: Option<&Path>) -> Option<GitStatusMap
 /// Fetch `HEAD:<rel_slash>` content bytes via `git --no-optional-locks show`, capped at
 /// [`MAX_GIT_HEAD_FILE_BYTES`]. Returns `None` for untracked, binary/oversized, or unavailable files.
 pub fn read_head_file(workdir: &Path, path: &Path) -> Option<Vec<u8>> {
+    if !repo_config_is_trusted(workdir) {
+        return None;
+    }
     let rel = repo_relative_slash_path(workdir, path)?;
     let spec = format!("HEAD:{rel}");
     let mut cmd = Command::new("git");
+    // `cat-file blob` never applies textconv / smudge / clean filters (unlike `show`).
     cmd.env("GIT_OPTIONAL_LOCKS", "0")
         .arg("--no-optional-locks")
+        .args(HARDENING_ARGS)
         .arg("-C")
         .arg(workdir)
-        .args(["show", &spec])
+        .args(["cat-file", "blob", &spec])
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -529,6 +603,27 @@ mod tests {
         cache.upsert(inner.clone(), GitStatusMap::default());
         assert!(!cache.dir_has_changes(&inner.join("src")));
         assert!(cache.dir_has_changes(&inner));
+    }
+
+    #[test]
+    fn security_untrusted_repo_config_never_reaches_git() {
+        // Repo-chosen programs (fsmonitor is overridden via -c; filters/includes make us skip git).
+        assert!(config_text_is_trusted("[core]\n\trepositoryformatversion = 0\n[remote \"origin\"]\n\turl = x\n"));
+        assert!(!config_text_is_trusted("[include]\n\tpath = ../evil\n"));
+        assert!(!config_text_is_trusted("[includeIf \"gitdir:/\"]\n\tpath = x\n"));
+        assert!(!config_text_is_trusted("[filter \"x\"]\n\tclean = sh -c 'touch /tmp/pwn'\n"));
+        assert!(!config_text_is_trusted("[filter \"x\"]\n\tSmudge=/tmp/evil\n"));
+        assert!(config_text_is_trusted("[filter \"lfs\"]\n\tclean = git-lfs clean -- %f\n\trequired = true\n"));
+        assert!(HARDENING_ARGS.contains(&"core.fsmonitor=false"));
+
+        let base = std::env::temp_dir().join(format!("editor_git_sec_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join(".git")).unwrap();
+        fs::write(base.join(".git/config"), "[core]\n\tfsmonitor = touch /tmp/pwned\n[filter \"a\"]\n\tclean = evil\n").unwrap();
+        assert!(!repo_config_is_trusted(&base));
+        assert!(query_status(&base, None).is_none());
+        assert!(read_head_file(&base, &base.join("f.txt")).is_none());
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]

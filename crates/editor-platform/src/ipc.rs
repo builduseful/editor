@@ -333,6 +333,12 @@ impl IpcServer {
         on_wake: Arc<dyn Fn() + Send + Sync>,
     ) -> std::io::Result<Self> {
         if std::fs::symlink_metadata(&socket_path).is_ok() {
+            if verify_socket_owner(&socket_path).is_err() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "IPC socket path is occupied by a file owned by another user",
+                ));
+            }
             if matches!(send_ping(&socket_path), Ok(IpcReply::Pong)) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::AddrInUse,
@@ -447,6 +453,25 @@ fn handle_client(
     let _ = stream.flush();
 }
 
+/// `/tmp` is world-writable: refuse to talk to (or replace) a socket that is not a real socket
+/// owned by the current user, so another local account can never impersonate the editor.
+#[cfg(unix)]
+fn verify_socket_owner(socket_path: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    extern "C" {
+        fn getuid() -> u32;
+    }
+    let meta = std::fs::symlink_metadata(socket_path)?;
+    let uid = unsafe { getuid() };
+    if !meta.file_type().is_socket() || meta.uid() != uid {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "IPC socket is not owned by the current user",
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 pub fn send_ping(socket_path: &Path) -> std::io::Result<IpcReply> {
     send_raw(socket_path, "PING\n")
@@ -459,6 +484,7 @@ pub fn send_command(socket_path: &Path, cmd: &IpcCommand) -> std::io::Result<Ipc
 
 #[cfg(unix)]
 fn send_raw(socket_path: &Path, wire: &str) -> std::io::Result<IpcReply> {
+    verify_socket_owner(socket_path)?;
     let mut stream = UnixStream::connect(socket_path)?;
     stream.set_read_timeout(Some(Duration::from_secs(3)))?;
     stream.set_write_timeout(Some(Duration::from_secs(3)))?;

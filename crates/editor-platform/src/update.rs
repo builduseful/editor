@@ -135,6 +135,15 @@ pub fn validate_release_url(url: &str) -> Result<(), String> {
         return Err("release URL has disallowed authority".to_string());
     }
     let host = authority.to_ascii_lowercase();
+    // Strict hostname alphabet: blocks `\`, `%`, `[`, unicode lookalikes, and parser-differential tricks.
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+        || host.starts_with('.')
+        || host.contains("..")
+    {
+        return Err("release URL has an invalid host".to_string());
+    }
     let allowed = host == "github.com" || host.ends_with(".githubusercontent.com");
     if !allowed {
         return Err(format!("disallowed release host: {host}"));
@@ -1113,6 +1122,26 @@ mod tests {
         assert!(https_get_via_curl("file:///etc/passwd", 1024).is_err());
         assert!(https_get_via_curl("https://evil.example/release.json", 1024).is_err());
         assert!(https_get_via_curl("--config=/tmp/evil", 1024).is_err());
+    }
+
+    #[test]
+    fn security_release_url_host_allowlist_blocks_parser_tricks() {
+        assert!(validate_release_url("https://github.com/builduseful/editor/releases").is_ok());
+        assert!(validate_release_url("https://objects.githubusercontent.com/x").is_ok());
+        for bad in [
+            "https://github.com@evil.com/x",
+            "https://github.com:443@evil.com/x",
+            "https://evil.com\\.githubusercontent.com/x",
+            "https://github.com.evil.com/x",
+            "https://evilgithubusercontent.com/x",
+            "https://..githubusercontent.com/x",
+            "https://github.com%2f@evil.com/x",
+            "https://[::1]/x",
+            "http://github.com/x",
+            "https://github.com/a b",
+        ] {
+            assert!(validate_release_url(bad).is_err(), "{bad} must be rejected");
+        }
     }
 
     #[test]

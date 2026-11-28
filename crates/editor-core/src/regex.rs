@@ -1761,7 +1761,7 @@ fn eval_assert(
         AssertKind::StartLine => prev_ch.is_none() || prev_ch == Some('\n'),
         AssertKind::EndLine => {
             next_ch.is_none()
-                || next_ch == Some('\n')
+                || (next_ch == Some('\n') && prev_ch != Some('\r'))
                 || (next_ch == Some('\r') && byte_after_next == Some(b'\n'))
         }
         AssertKind::WordBoundary => {

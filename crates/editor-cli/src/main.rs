@@ -1177,6 +1177,18 @@ fn cmd_edit(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: I
     }
 
     if dry_run {
+        if let Some(exp) = expect {
+            if rev_before != exp {
+                emit_err(
+                    "edit",
+                    start,
+                    "E_CONFLICT",
+                    "expect rev mismatch (file changed since the given revision)",
+                    Some(&path),
+                );
+                return 2;
+            }
+        }
         let info = doc.info();
         let mut jb = JsonBuf::new();
         jb.push_raw("[{");
@@ -1399,8 +1411,19 @@ fn cmd_batch(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: 
     // Dry-validate each op against original files.
     let mut prepared: Vec<(ParsedBatchOp, Document, bool)> = Vec::with_capacity(ops.len());
     for op in ops {
-        let existed = fs.stat(&op.path).is_ok();
-        let mut doc = if existed {
+        // Multiple ops on one path apply sequentially to ONE in-memory document and commit once;
+        // otherwise a later op would overwrite an earlier op's result from a stale disk read.
+        let carried = prepared
+            .iter()
+            .position(|(p, _, _)| p.path == op.path)
+            .map(|i| prepared.remove(i));
+        let (first_op, carried_doc, existed) = match carried {
+            Some((o, d, e)) => (Some(o), Some(d), e),
+            None => (None, None, fs.stat(&op.path).is_ok()),
+        };
+        let mut doc = if let Some(d) = carried_doc {
+            d
+        } else if existed {
             match Document::open(fs, &op.path) {
                 Ok(d) => d,
                 Err(e) => {
@@ -1414,7 +1437,7 @@ fn cmd_batch(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: 
             emit_err_extra("batch", start, "E_NOT_FOUND", "edit target not found", Some(&op.path), "\"rolled_back\":false");
             return 2;
         };
-        if let Some(exp) = op.expect {
+        if let Some(exp) = op.expect.filter(|_| first_op.is_none()) {
             if doc.rev() != exp {
                 emit_err_extra("batch", start, "E_CONFLICT", "expect rev mismatch", Some(&op.path), "\"rolled_back\":false");
                 return 2;
@@ -1438,7 +1461,7 @@ fn cmd_batch(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: 
                 doc.replace_all(old, new, SearchOptions::default(), 0);
             }
         }
-        prepared.push((op, doc, existed));
+        prepared.push((first_op.unwrap_or(op), doc, existed));
     }
 
     if check_only {
@@ -1450,7 +1473,14 @@ fn cmd_batch(fs: &dyn FileSystem, globals: &GlobalOpts, args: &[String], start: 
     let mut backups: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::with_capacity(prepared.len());
     for (op, _, existed) in &prepared {
         let orig = if *existed {
-            std::fs::read(&op.path).ok()
+            match std::fs::read(&op.path) {
+                Ok(bytes) => Some(bytes),
+                Err(e) => {
+                    // Never proceed without a backup: a missing backup would make rollback delete the file.
+                    emit_err_extra("batch", start, "E_IO", &e.to_string(), Some(&op.path), "\"rolled_back\":false");
+                    return 2;
+                }
+            }
         } else {
             None
         };
@@ -1527,7 +1557,6 @@ fn resolve_open_path(
         .map_err(|e| ("E_NOT_FOUND", e.to_string()))
 }
 
-#[cfg(target_os = "macos")]
 fn launch_gui_process(sidebar_root: Option<&Path>, target: Option<&Path>) -> Result<(), String> {
     // Prefer the enclosing `Editor.app` bundle when `editor` is invoked from inside
     // `Editor.app/Contents/MacOS/editor` (including via a `/usr/local/bin/editor` symlink),
