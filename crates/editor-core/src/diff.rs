@@ -44,7 +44,7 @@ fn hash_line_bytes(mut bytes: &[u8]) -> u64 {
     h
 }
 
-/// Hash every logical line of raw file bytes (CRLF-normalized).
+/// Hash every logical line of raw file bytes (handling `\r\n`, `\n`, and lone `\r` identically to `PieceTree`).
 /// Returns `None` if the input exceeds [`MAX_DIFF_LINES`].
 pub fn hash_lines_bytes(bytes: &[u8]) -> Option<Vec<u64>> {
     if bytes.is_empty() {
@@ -52,19 +52,22 @@ pub fn hash_lines_bytes(bytes: &[u8]) -> Option<Vec<u64>> {
     }
     let mut out = Vec::with_capacity((bytes.len() / 32).min(4096));
     let mut start = 0usize;
-    for (i, &b) in bytes.iter().enumerate() {
-        if b == b'\n' {
-            out.push(hash_line_bytes(&bytes[start..i]));
-            if out.len() > MAX_DIFF_LINES {
-                return None;
+    while start < bytes.len() {
+        match crate::swar::find_next_line_break(&bytes[start..]) {
+            Some((rel, brk_len)) => {
+                out.push(hash_line_bytes(&bytes[start..start + rel]));
+                if out.len() > MAX_DIFF_LINES {
+                    return None;
+                }
+                start += rel + brk_len;
             }
-            start = i + 1;
-        }
-    }
-    if start < bytes.len() {
-        out.push(hash_line_bytes(&bytes[start..]));
-        if out.len() > MAX_DIFF_LINES {
-            return None;
+            None => {
+                out.push(hash_line_bytes(&bytes[start..]));
+                if out.len() > MAX_DIFF_LINES {
+                    return None;
+                }
+                break;
+            }
         }
     }
     Some(out)

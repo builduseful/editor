@@ -274,6 +274,7 @@ impl TabStrip {
             return;
         }
 
+        painter.push_clip(rect);
         let scale = painter.scale();
         let hairline = (1.0 * scale).round().max(1.0) as i32;
 
@@ -709,6 +710,7 @@ impl TabStrip {
             );
         }
 
+        painter.pop_clip();
         painter.pop_clip();
     }
 }

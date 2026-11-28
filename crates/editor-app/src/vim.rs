@@ -177,6 +177,7 @@ pub struct VimState {
     pub enabled: bool,
     pub mode: VimMode,
     count: usize,
+    op_count: usize,
     operator: Option<VimOperator>,
     pending: VimPending,
     last_find: Option<(FindCharKind, char)>,
@@ -195,6 +196,7 @@ impl VimState {
             enabled: false,
             mode: VimMode::Normal,
             count: 0,
+            op_count: 0,
             operator: None,
             pending: VimPending::None,
             last_find: None,
@@ -216,6 +218,7 @@ impl VimState {
 
     pub fn reset_pending(&mut self) {
         self.count = 0;
+        self.op_count = 0;
         self.operator = None;
         self.pending = VimPending::None;
     }
@@ -231,8 +234,8 @@ impl VimState {
         }
         let mut s = self.mode.label().to_string();
         let mut suffix = String::new();
-        if self.count > 0 {
-            suffix.push_str(&self.count.to_string());
+        if self.op_count > 0 {
+            suffix.push_str(&self.op_count.to_string());
         }
         if let Some(op) = self.operator {
             suffix.push(match op {
@@ -242,6 +245,9 @@ impl VimState {
                 VimOperator::Indent => '>',
                 VimOperator::Outdent => '<',
             });
+        }
+        if self.count > 0 {
+            suffix.push_str(&self.count.to_string());
         }
         match self.pending {
             VimPending::None => {}
@@ -267,8 +273,13 @@ impl VimState {
     }
 
     fn take_count(&mut self) -> usize {
-        let c = self.count.max(1);
+        let c = self
+            .op_count
+            .max(1)
+            .saturating_mul(self.count.max(1))
+            .min(9999);
         self.count = 0;
+        self.op_count = 0;
         c
     }
 
@@ -660,6 +671,8 @@ impl VimState {
                 }
                 return VimAction::OperatorLines { op, count };
             }
+            self.op_count = self.count;
+            self.count = 0;
             self.operator = Some(op);
             return VimAction::Consumed;
         }

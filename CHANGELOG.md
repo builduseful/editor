@@ -4,6 +4,14 @@ All notable user-facing changes to `editor` are documented here.
 The workspace version in `Cargo.toml` (`[workspace.package] version`) is the
 single source of truth for `editor`, `editor-gui`, `Editor.app`, and GitHub Releases.
 
+## [0.4.2] - 2026-11-28
+
+### Fixed
+- **macOS FFI & adapter hardening:** added null/nil guards for UTF-8 strings, preferences, window titles, discard alerts, and FSEvents watchers in `mac_adapter.m`, clamped `IOSurface` and framebuffer dimensions (`<= 16384` / `--size <= 8192`), forwarded `rightMouseUp:`, added `@autoreleasepool` and bounds checks in `fsevents_callback`, and cleared callbacks/timers/FSEvents on teardown.
+- **Core engine, search, diff & syntax:** indexed lazy piece-tree regions before sampling `lines_before` in `Document::edit` so `SyntaxCache` stays aligned, preserved adjacent regex match context and CRLF `$` capture expansion in `Document::replace_all`, matched `PieceTree` line breaks (including lone `\r`) in `diff::hash_lines_bytes`, added a 4096-byte overlap window to `find_regex_in_tree` for >256 KB single-line and multiline matches, and preserved multiline lexer state across multi-line HTML `<script>`/`<style>` tags, Markdown fenced C++ raw strings, and JS block comments inside `${ ... }`.
+- **Split panes, multi-cursor, Vim & keymap:** prevented same-buffer split-pane data loss across Hot Exit backups, undo sync, and pane closing, wired full post-save housekeeping for `IpcCommand::Save`, cancelled in-flight drags on focus loss, propagated zoom changes to all split panes, synced word-wrap on file rename, included 0-byte dirty files in Project Search overrides, fixed multi-cursor `Shift+Tab` (preserving per-cursor columns and leaving clean unindented files untouched), fixed rightward tab-drag off-by-one, snapped UTF-8 carets on parked `replace_all` and `move_current_line`, cleared `extra_cursors` on Go-To-Line and IPC navigation/insert, exited Vim Visual mode on unmodified single-click, fixed Vim `2d3w`, `Vjj`/`Vjk`, `dd` at EOF, and linewise `p` at EOF, and resolved the non-macOS `swap-panes` chord collision.
+- **Renderer, theme tokens & overlays:** moved modal scrim colors into `Theme::scrim`, made `SyntaxThemeConfig::apply_json` atomic on error, fixed windowed >16 KB line caret/selection boundaries, clamped horizontal scroll on zoom-out and window widen, preserved `last_caret_rect` during partial redraws, added vertical scrolling and scrollbar to `PinsOverlay`, fixed Project Search >4 KB single-line previews, indentation highlight end-offsets, chunk-overlap deduplication, glyph advance, and narrow-window card clipping across `CommandPalette`, `TabStrip`, `FindBarState`, and `ShortcutsOverlay`.
+
 ## [0.4.1] - 2026-11-28
 
 ### Fixed

@@ -629,14 +629,20 @@ fn find_regex_in_tree(
 
         let is_eof = offset + got as u64 >= total_len;
         let mut usable = if is_eof { got } else { utf8_floor(win) };
+        let mut ended_at_nl = false;
         if !is_eof && !multiline {
             if let Some(last_nl) = rfind_byte(&win[..usable], b'\n') {
                 usable = last_nl + 1;
+                ended_at_nl = true;
             }
         }
         if usable == 0 {
             usable = utf8_floor(win).max(1);
         }
+        // Keep an overlap window when a multiline match OR a >256 KB single-line match could
+        // straddle the right edge of the current chunk.
+        let need_overlap = !is_eof && (multiline || !ended_at_nl);
+        let overlap = if need_overlap && usable > 4096 { 4096 } else { 0 };
 
         let prev_ch = if offset > 0 {
             let back = offset.min(4) as usize;
@@ -672,6 +678,11 @@ fn find_regex_in_tree(
             if !is_eof && s == usable && e == usable {
                 continue;
             }
+            // Defer matches touching the chunk boundary in overlap mode so the next chunk
+            // captures the full, untruncated match spanning the boundary.
+            if overlap > 0 && e == usable && s >= usable - overlap {
+                continue;
+            }
             if matches.last().is_some_and(|prev| prev.start == abs_s && prev.end == abs_e) {
                 continue;
             }
@@ -685,8 +696,8 @@ fn find_regex_in_tree(
         if chunk_end >= total_len {
             break;
         }
-        if multiline {
-            let target_step = usable.saturating_sub(4096).max(last_match_end).max(1);
+        if overlap > 0 {
+            let target_step = usable.saturating_sub(overlap).max(last_match_end).max(1);
             let mut step = target_step.min(usable);
             while step < usable && (win[step] & 0xC0) == 0x80 {
                 step += 1;

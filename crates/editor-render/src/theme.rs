@@ -625,9 +625,10 @@ impl SyntaxThemeConfig {
     /// `{"preset":"editorial","replace":false,"light":{"keyword":"#27467a bold","comment":{"color":"#6c7480","style":"italic"}},"dark":{...}}`
     pub fn apply_json(&mut self, json: &str) -> Result<(), String> {
         let root = parse_simple_json_object(json)?;
+        let mut next = self.clone();
         if let Some(JsonNode::Bool(true)) = root.get("replace") {
-            self.light_overrides.clear();
-            self.dark_overrides.clear();
+            next.light_overrides.clear();
+            next.dark_overrides.clear();
         }
         if let Some(node) = root.get("preset") {
             let s = node
@@ -636,7 +637,7 @@ impl SyntaxThemeConfig {
             let preset = SyntaxThemePreset::parse(s).ok_or_else(|| {
                 format!("unknown syntax preset `{s}` (use editorial|monochrome|studio|warm)")
             })?;
-            self.preset = preset;
+            next.preset = preset;
         }
         for (section, is_dark) in [("light", false), ("dark", true)] {
             if let Some(node) = root.get(section) {
@@ -644,9 +645,9 @@ impl SyntaxThemeConfig {
                     .as_object()
                     .ok_or_else(|| format!("`{section}` must be a JSON object"))?;
                 let target = if is_dark {
-                    &mut self.dark_overrides
+                    &mut next.dark_overrides
                 } else {
-                    &mut self.light_overrides
+                    &mut next.light_overrides
                 };
                 for (tok_name, val) in obj {
                     let kind = TokenKind::parse(tok_name).ok_or_else(|| {
@@ -711,6 +712,7 @@ impl SyntaxThemeConfig {
                 }
             }
         }
+        *self = next;
         Ok(())
     }
 }
@@ -742,6 +744,8 @@ pub struct Theme {
     pub state_danger: Color,
     pub state_success: Color,
     pub state_info: Color,
+    /// Quiet modal/overlay backdrop scrim
+    pub scrim: Color,
     /// Pre-baked O(1) flat syntax palette (`~95 bytes`, zero branches on glyph draw loop).
     pub syntax: SyntaxPalette,
 }
@@ -782,6 +786,7 @@ impl Theme {
             state_danger: Color::rgb(0xb4, 0x23, 0x18),
             state_success: Color::rgb(0x06, 0x76, 0x47),
             state_info: Color::rgb(0x1d, 0x4e, 0xd8),
+            scrim: Color::rgba(0x17, 0x1a, 0x1f, 68),
             syntax: SyntaxPalette::editorial_light(),
         }
     }
@@ -802,6 +807,7 @@ impl Theme {
             state_danger: Color::rgb(0xf9, 0x70, 0x66),
             state_success: Color::rgb(0x47, 0xcd, 0x89),
             state_info: Color::rgb(0x60, 0xa5, 0xfa),
+            scrim: Color::rgba(0x00, 0x00, 0x00, 136),
             syntax: SyntaxPalette::editorial_dark(),
         }
     }

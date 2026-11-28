@@ -817,3 +817,264 @@ fn audit_regressions_hex_utf8_wrap_hit_test_tab_scroll_and_palette_scroll() {
         pal.selected
     );
 }
+
+#[test]
+fn audit_pass2_scrim_token_atomic_json_shortcuts_caret_and_partial_redraw_caret_rect() {
+    use editor_core::Document;
+    use editor_render::{
+        ImeComposition, ShortcutDisplayItem, ShortcutsAction, ShortcutsOverlay, SyntaxThemeConfig,
+        Viewport,
+    };
+
+    // 1. Theme scrim tokens exist in both light and dark themes.
+    assert!(Theme::light().scrim.a > 0 && Theme::light().scrim.a < 255);
+    assert!(Theme::dark().scrim.a > 0 && Theme::dark().scrim.a < 255);
+
+    // 2. SyntaxThemeConfig::apply_json is atomic on error (does not wipe existing overrides).
+    let mut cfg = SyntaxThemeConfig::default();
+    cfg.apply_json(r##"{"light":{"keyword":"#112233 bold"}}"##).unwrap();
+    let before_json = cfg.to_json(false);
+    assert!(
+        cfg.apply_json(r##"{"replace":true,"light":{"not_a_real_token":"#ffffff"}}"##)
+            .is_err()
+    );
+    assert_eq!(cfg.to_json(false), before_json, "failed apply_json must not mutate config");
+
+    // 3. ShortcutsOverlay returns Changed on caret navigation (Left/Home) so search box redraws.
+    let mut sc = ShortcutsOverlay::new();
+    sc.open(vec![ShortcutDisplayItem {
+        id: "save",
+        label: "Save",
+        category: "File",
+        keys: "⌘S".to_string(),
+        featured: true,
+        runnable: true,
+    }]);
+    sc.handle_key(Key::Char('s'), Modifiers::NONE, Some("s"));
+    sc.handle_key(Key::Char('a'), Modifiers::NONE, Some("a"));
+    assert_eq!(
+        sc.handle_key(Key::Left, Modifiers::NONE, None),
+        ShortcutsAction::Changed,
+        "caret navigation in ShortcutsOverlay search box must trigger redraw"
+    );
+
+    // 4. Partial dirty-rect Viewport::draw off the caret line preserves `last_caret_rect`.
+    let mut atlas = GlyphAtlas::new();
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut fb = Framebuffer::new(400, 300, 1.0);
+    let bounds = fb.bounds();
+    let theme = Theme::light();
+    let mut doc = Document::from_str(&"hello world\n".repeat(20), None);
+    let mut vp = Viewport::new();
+    {
+        let mut p = Painter::new(&mut fb);
+        vp.draw(
+            &mut p,
+            bounds,
+            &mut doc,
+            0,
+            None,
+            &[],
+            None,
+            None,
+            &ImeComposition::default(),
+            true,
+            true,
+            &theme,
+            &mut atlas,
+            &mut raster,
+        );
+    }
+    let saved_rect = vp.last_caret_rect;
+    assert!(saved_rect.w > 0);
+    // Partial repaint of only the bottom strip (excludes line 0 caret): must preserve `last_caret_rect`.
+    {
+        let mut p = Painter::new(&mut fb);
+        p.push_clip(PixelRect::new(0, 220, 400, 80));
+        vp.draw(
+            &mut p,
+            bounds,
+            &mut doc,
+            0,
+            None,
+            &[],
+            None,
+            None,
+            &ImeComposition::default(),
+            true,
+            true,
+            &theme,
+            &mut atlas,
+            &mut raster,
+        );
+        p.pop_clip();
+    }
+    assert_eq!(vp.last_caret_rect, saved_rect);
+}
+
+#[test]
+fn audit_pass2_huge_line_window_caret_scroll_clamp_pins_and_palette() {
+    use editor_core::Document;
+    use editor_platform::{
+        BuiltinBitmapRasterizer, Framebuffer, Key, MemoryFileSystem, Modifiers, PixelRect,
+    };
+    use editor_render::{
+        CommandPalette, GlyphAtlas, ImeComposition, Painter, PinEntry, PinsOverlay, Theme,
+        Viewport,
+    };
+    use std::path::Path;
+
+    let mut atlas = GlyphAtlas::new();
+    let mut raster = BuiltinBitmapRasterizer;
+    let theme = Theme::light();
+
+    // 1. Windowed >16 KB huge line: caret past 4096-byte window must NOT draw a phantom caret at window end.
+    let mut fb = Framebuffer::new(500, 200, 1.0);
+    let bounds = fb.bounds();
+    let huge = "x".repeat(20_000);
+    let mut huge_doc = Document::from_str(&huge, None);
+    let mut vp = Viewport::new();
+    vp.word_wrap = false;
+    vp.scroll_x_px = 0.0;
+    {
+        let mut p = Painter::new(&mut fb);
+        vp.draw(
+            &mut p,
+            bounds,
+            &mut huge_doc,
+            8000, // strictly past the 4096-byte window!
+            None,
+            &[],
+            None,
+            None,
+            &ImeComposition::default(),
+            true,
+            true,
+            &theme,
+            &mut atlas,
+            &mut raster,
+        );
+    }
+    assert!(
+        vp.last_caret_rect.is_empty(),
+        "caret outside windowed huge-line slice must not render at window edge, got {:?}",
+        vp.last_caret_rect
+    );
+
+    // 2. Horizontal scroll_x_px clamps back to 0.0 on zoom-out once content fits in viewport.
+    let mut wide_doc = Document::from_str(&"a".repeat(70), None);
+    let mut vp2 = Viewport::new();
+    vp2.word_wrap = false;
+    vp2.font_size_pt = 24.0;
+    {
+        let mut p = Painter::new(&mut fb);
+        vp2.draw(
+            &mut p,
+            bounds,
+            &mut wide_doc,
+            0,
+            None,
+            &[],
+            None,
+            None,
+            &ImeComposition::default(),
+            true,
+            true,
+            &theme,
+            &mut atlas,
+            &mut raster,
+        );
+    }
+    vp2.scroll_x_px = 200.0;
+    for _ in 0..10 {
+        vp2.zoom_out();
+    }
+    {
+        let mut p = Painter::new(&mut fb);
+        vp2.draw(
+            &mut p,
+            bounds,
+            &mut wide_doc,
+            0,
+            None,
+            &[],
+            None,
+            None,
+            &ImeComposition::default(),
+            true,
+            true,
+            &theme,
+            &mut atlas,
+            &mut raster,
+        );
+    }
+    assert_eq!(vp2.scroll_x_px, 0.0, "scroll_x_px must clamp to 0 when zoomed-out line fits");
+
+    // 3. PinsOverlay scrolls cleanly when 20+ open files overflow card height.
+    let mut pins = PinsOverlay::new();
+    let entries: Vec<PinEntry> = (0..20)
+        .map(|i| PinEntry {
+            id: i + 1,
+            name: format!("file_{i}.rs"),
+            rel_path: format!("src/file_{i}.rs"),
+            pin_slot: None,
+            dirty: false,
+            is_preview: false,
+            is_active: i == 0,
+            in_other_pane: false,
+        })
+        .collect();
+    pins.open(entries);
+    let mut fb_small = Framebuffer::new(600, 300, 1.0);
+    let small_bounds = fb_small.bounds();
+    {
+        let mut p = Painter::new(&mut fb_small);
+        pins.draw(&mut p, small_bounds, &theme, &mut atlas, &mut raster);
+    }
+    assert!(pins.handle_scroll(120.0));
+    {
+        let mut p = Painter::new(&mut fb_small);
+        pins.draw(&mut p, small_bounds, &theme, &mut atlas, &mut raster);
+    }
+    assert!(pins.scroll_y_px() > 0.0, "PinsOverlay should scroll vertically on wheel");
+    for _ in 0..16 {
+        pins.handle_key(Key::Down, Modifiers::NONE);
+    }
+    {
+        let mut p = Painter::new(&mut fb_small);
+        pins.draw(&mut p, small_bounds, &theme, &mut atlas, &mut raster);
+    }
+    assert!(
+        pins.scroll_y_px() > 120.0,
+        "keyboard navigation in PinsOverlay must auto-scroll selected row into view"
+    );
+
+    // 4. CommandPalette ProjectSearch indentation match highlight & >4 KB single-line preview.
+    let fs = MemoryFileSystem::new();
+    fs.add_file("/ws/indent.txt", b"    foo bar\n".to_vec());
+    let mut long_single = vec![b'a'; 6000];
+    long_single[5000..5006].copy_from_slice(b"NEEDLE");
+    fs.add_file("/ws/long.txt", long_single);
+
+    let mut pal = CommandPalette::new();
+    pal.open_project_search(&fs, Some(Path::new("/ws")), None);
+    pal.input.set_text("  foo".to_string());
+    pal.refresh_results(&fs);
+    assert_eq!(pal.items.len(), 1);
+    assert_eq!(
+        pal.items[0].snippet_match,
+        Some((0, 3)),
+        "match starting in leading whitespace must highlight only the visible non-whitespace portion"
+    );
+
+    pal.input.set_text("NEEDLE".to_string());
+    pal.refresh_results(&fs);
+    assert_eq!(pal.items.len(), 1);
+    let mut fb_wide = Framebuffer::new(1200, 700, 1.0);
+    {
+        let mut p = Painter::new(&mut fb_wide);
+        pal.draw(&mut p, PixelRect::new(0, 0, 1200, 700), &theme, &mut atlas, &mut raster, true);
+    }
+    // Preview draw must succeed without dropping the >4 KB single-line match.
+    assert!(pal.is_open());
+}

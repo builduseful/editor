@@ -24,7 +24,8 @@ const META: LanguageMeta = LanguageMeta {
     default_word_wrap: true,
 };
 
-const MODE_FENCE: u8 = 1;
+const MODE_FENCE_BACKTICK: u8 = 1;
+const MODE_FENCE_TILDE: u8 = 2;
 
 impl SyntaxPlugin for MarkdownPlugin {
     fn meta(&self) -> &'static LanguageMeta {
@@ -42,30 +43,29 @@ impl SyntaxPlugin for MarkdownPlugin {
         let indent = line.len() - trimmed.len();
 
         // 1. Inside a fenced code block: check for closing fence, else delegate to embedded plugin!
-        if state.mode() == MODE_FENCE {
-            let fence_char = if state.detail() == b'~' { '~' } else { '`' };
-            if trimmed.starts_with("```") && fence_char == '`'
-                || trimmed.starts_with("~~~") && fence_char == '~'
-            {
+        if state.mode() == MODE_FENCE_BACKTICK || state.mode() == MODE_FENCE_TILDE {
+            let is_tilde = state.mode() == MODE_FENCE_TILDE;
+            if (!is_tilde && trimmed.starts_with("```")) || (is_tilde && trimmed.starts_with("~~~")) {
                 push_span(out, indent, line.len(), TokenKind::Comment);
                 return LexState::NORMAL;
             }
             let sub_id = state.sub_lang();
             if sub_id > 0 {
                 let sub_lang = Language(sub_id as u16);
-                // Pack embedded language's `(mode 0..15, depth 0..15)` into our 8-bit `depth` byte
-                // so multi-line template literals, raw strings (0..15 hashes), and nested comments round-trip cleanly.
+                // Pack embedded language's `(mode 0..15, depth 0..15)` into `depth` and round-trip
+                // its full 8-bit `detail` byte (e.g. C++ raw-string delimiter hash, JS template depth).
                 let packed = state.depth();
                 let sub_mode = packed & 0x0F;
                 let sub_depth = (packed >> 4) & 0x0F;
-                let sub_in = if sub_mode == 0 && sub_depth == 0 {
+                let sub_detail = state.detail();
+                let sub_in = if sub_mode == 0 && sub_depth == 0 && sub_detail == 0 {
                     LexState::NORMAL
                 } else {
-                    LexState::new(sub_mode, 0, sub_depth, 0)
+                    LexState::new(sub_mode, 0, sub_depth, sub_detail)
                 };
                 let sub_out = registry.plugin(sub_lang).lex_line(line, sub_in, registry, out);
                 let out_packed = (sub_out.mode() & 0x0F) | ((sub_out.depth().min(15)) << 4);
-                return LexState::new(MODE_FENCE, sub_id, out_packed, state.detail());
+                return LexState::new(state.mode(), sub_id, out_packed, sub_out.detail());
             } else {
                 push_span(out, 0, line.len(), TokenKind::String);
                 return state;
@@ -92,7 +92,12 @@ impl SyntaxPlugin for MarkdownPlugin {
                 .filter(|l| *l != Language::PLAIN_TEXT && l.id() != "markdown")
                 .map(|l| l.0 as u8)
                 .unwrap_or(0);
-            return LexState::new(MODE_FENCE, sub_id, 0, fc);
+            let mode = if fc == b'~' {
+                MODE_FENCE_TILDE
+            } else {
+                MODE_FENCE_BACKTICK
+            };
+            return LexState::new(mode, sub_id, 0, 0);
         }
 
         // 3. ATX Heading (`# Title`).

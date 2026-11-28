@@ -1116,3 +1116,126 @@ fn audit_regressions_draft_save_crlf_chunks_syntax_utf8_and_regex() {
     assert_eq!(next_grapheme_boundary(&long_comb, 0), long_comb.len());
     assert_eq!(prev_grapheme_boundary(&long_comb, long_comb.len()), 0);
 }
+
+#[test]
+fn audit_pass2_lazy_edit_regex_replace_diff_cr_and_syntax_states() {
+    use editor_core::diff::{compute_line_diff, hash_lines_bytes, lookup_line_diff, LineDiffKind};
+    use editor_core::search::find_all_matches;
+    use editor_core::syntax::{Language, SyntaxCache, TokenKind};
+    use editor_core::{Document, SearchOptions};
+    use editor_platform::MemoryFileSystem;
+    use std::path::Path;
+
+    // 1. Document::edit on lazily-indexed large file keeps SyntaxCache line count in sync.
+    let mut big_rs = String::with_capacity(200_000);
+    for i in 0..8000 {
+        big_rs.push_str(&format!("let v{i} = {i};\n"));
+    }
+    let fs = MemoryFileSystem::new();
+    fs.add_file("/big.rs", big_rs.as_bytes().to_vec());
+    let mut doc = Document::open(&fs, Path::new("/big.rs")).unwrap();
+    // Edit deep in the unindexed region (around byte 100_000) inserting 1 newline.
+    let insert_at = 100_000u64;
+    let lines_before_total = big_rs.bytes().filter(|&b| b == b'\n').count();
+    doc.edit(insert_at, 0, "\n/* block */\n", 10, false).unwrap();
+    doc.tree_mut().ensure_indexed_for_line(lines_before_total + 10);
+    assert_eq!(doc.editable_line_count(), lines_before_total + 3);
+
+    // 2. Document::replace_all preserves CRLF `(foo)$` captures and adjacent `\B` match context.
+    let mut crlf_doc = Document::from_str("foo\r\nbar\r\n", None);
+    let re_opts = SearchOptions {
+        regex: true,
+        case_sensitive: true,
+        ..SearchOptions::default()
+    };
+    let n1 = crlf_doc.replace_all("(foo)$", "[$1]", re_opts, 1);
+    assert_eq!(n1, 1);
+    assert_eq!(crlf_doc.to_string_lossy(), "[foo]\r\nbar\r\n");
+
+    let mut adj_doc = Document::from_str("foobar", None);
+    let n2 = adj_doc.replace_all(r"(foo)\B|bar", "<$0>", re_opts, 2);
+    assert_eq!(n2, 2);
+    assert_eq!(adj_doc.to_string_lossy(), "<foo><bar>");
+
+    // 3. Diff handles lone `\r` line breaks identically to PieceTree.
+    let old_h = hash_lines_bytes(b"a\rb\rc").unwrap();
+    let new_h = hash_lines_bytes(b"a\rX\rc").unwrap();
+    assert_eq!(old_h.len(), 3);
+    let diff = compute_line_diff(&old_h, &new_h);
+    assert_eq!(lookup_line_diff(&diff, 1), Some(LineDiffKind::Modified));
+    assert_eq!(lookup_line_diff(&diff, 0), None);
+    assert_eq!(lookup_line_diff(&diff, 2), None);
+
+    // 4. Regex search across >256 KB single-line chunk boundary finds match spanning 262_144.
+    let mut huge_line = vec![b'a'; 300_000];
+    let needle = b"NEEDLE_BOUNDARY";
+    huge_line[262_140..262_140 + needle.len()].copy_from_slice(needle);
+    let mut huge_doc = Document::from_str(&String::from_utf8(huge_line).unwrap(), None);
+    let hits = find_all_matches(huge_doc.tree_mut(), "NEEDLE_BOUNDARY", re_opts);
+    assert_eq!(hits.len(), 1);
+    assert_eq!((hits[0].start, hits[0].end), (262_140, 262_140 + needle.len() as u64));
+
+    // 5. HTML multi-line `<script\n type="module">` still enters JS embedded lexer.
+    let mut html_cache = SyntaxCache::new(Language::from_path(Some(Path::new("index.html"))));
+    let mut spans = Vec::new();
+    for (idx, line) in [
+        "<script",
+        "  type=\"module\">",
+        "const answer = 42;",
+        "</script>",
+    ]
+    .iter()
+    .enumerate()
+    {
+        spans.clear();
+        html_cache.lex_line(idx, line, &mut spans);
+        if idx == 2 {
+            assert!(
+                spans.iter().any(|s| s.kind == TokenKind::Keyword && &line[s.start as usize..s.end as usize] == "const"),
+                "const inside multiline <script> tag must be highlighted as Keyword, got: {spans:?}"
+            );
+        }
+    }
+
+    // 6. Markdown fenced C++ raw string `R"tag(... )tag"` preserves sub-lexer detail across lines.
+    let mut md_cache = SyntaxCache::new(Language::from_path(Some(Path::new("notes.md"))));
+    for (idx, line) in [
+        "```cpp",
+        "const char* s = R\"tag(line1",
+        "still_raw_string",
+        ")tag\";",
+        "```",
+    ]
+    .iter()
+    .enumerate()
+    {
+        spans.clear();
+        md_cache.lex_line(idx, line, &mut spans);
+        if idx == 2 {
+            assert!(
+                spans.iter().any(|s| s.kind == TokenKind::String),
+                "C++ raw string continuation inside ```cpp must remain TokenKind::String, got: {spans:?}"
+            );
+        }
+    }
+
+    // 7. JS multi-line `/* */` inside template literal `${ ... }` preserves template_brace_depth.
+    let mut js_cache = SyntaxCache::new(Language::from_path(Some(Path::new("app.js"))));
+    for (idx, line) in [
+        "const s = `head${ /*",
+        "  comment inside interp",
+        "*/ 42 }tail`;",
+    ]
+    .iter()
+    .enumerate()
+    {
+        spans.clear();
+        js_cache.lex_line(idx, line, &mut spans);
+        if idx == 2 {
+            assert!(
+                spans.iter().any(|s| s.kind == TokenKind::String && &line[s.start as usize..s.end as usize] == "tail`"),
+                "template tail after multiline block comment inside ${{}} must stay String, got: {spans:?}"
+            );
+        }
+    }
+}

@@ -222,9 +222,22 @@ impl WorkingSet {
                 let n = parked
                     .doc
                     .replace_all(query, replacement, options, now_ms);
-                let len = parked.doc.len_bytes();
-                parked.caret = parked.caret.min(len);
-                parked.anchor = parked.anchor.min(len);
+                let snap = |doc: &mut Document, raw: u64| -> u64 {
+                    let clamped = raw.min(doc.len_bytes());
+                    let (line, col) = doc.byte_to_line_col(clamped);
+                    if let Some((ls, _, _)) = doc.line_byte_range(line) {
+                        if let Some(content) = doc.line_content(line) {
+                            let mut c = col.min(content.len());
+                            while c > 0 && !content.is_char_boundary(c) {
+                                c -= 1;
+                            }
+                            return ls + c as u64;
+                        }
+                    }
+                    clamped
+                };
+                parked.caret = snap(&mut parked.doc, parked.caret);
+                parked.anchor = snap(&mut parked.doc, parked.anchor);
                 found = Some((id, n));
                 break;
             }
@@ -254,7 +267,7 @@ impl WorkingSet {
                 continue;
             };
             let len = parked.doc.len_bytes();
-            if len == 0 || len > max_bytes {
+            if len > max_bytes {
                 continue;
             }
             let mut buf = Vec::with_capacity(len as usize);
@@ -504,7 +517,8 @@ impl WorkingSet {
         }
         if let Some(cur) = self.pinned.iter().position(|&b| b == id) {
             self.pinned.remove(cur);
-            let dst = index.min(self.pinned.len());
+            let adj = if cur < index { index - 1 } else { index };
+            let dst = adj.min(self.pinned.len());
             self.pinned.insert(dst, id);
             return true;
         }
@@ -529,8 +543,13 @@ impl WorkingSet {
         if self.preview == Some(id) {
             self.preview = None;
         }
-        self.open.retain(|&b| b != id);
-        let dst = index.min(self.open.len());
+        let adj = if let Some(cur) = self.open.iter().position(|&b| b == id) {
+            self.open.remove(cur);
+            if cur < index { index - 1 } else { index }
+        } else {
+            index
+        };
+        let dst = adj.min(self.open.len());
         self.open.insert(dst, id);
         true
     }

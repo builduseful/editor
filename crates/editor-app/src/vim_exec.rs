@@ -46,12 +46,59 @@ impl EditorApp {
                 count,
                 extend_visual,
             } => {
-                let target = self.resolve_vim_motion(motion, count, false, rasterizer);
-                self.caret = target;
-                if !extend_visual {
-                    self.anchor = target;
-                } else if self.vim.mode == VimMode::VisualLine {
-                    self.expand_visual_line_selection();
+                if extend_visual && self.vim.mode == VimMode::VisualLine {
+                    // In VisualLine mode, `expand_visual_line_selection` places the trailing edge
+                    // at `full_end` (byte 0 of the line AFTER `lb`). Resolve motions from inside
+                    // the actual selected head line so `Vjj` doesn't skip lines and `Vjk` shrinks!
+                    let (anchor_line, head_pos) = if self.caret > self.anchor {
+                        let (la, _) = self.doc.byte_to_line_col(self.anchor);
+                        let (_, col_c) = self.doc.byte_to_line_col(self.caret);
+                        let hp = if col_c == 0 && self.caret > 0 {
+                            self.caret - 1
+                        } else {
+                            self.caret
+                        };
+                        (la, hp)
+                    } else if self.anchor > self.caret {
+                        let (_, col_a) = self.doc.byte_to_line_col(self.anchor);
+                        let ap = if col_a == 0 && self.anchor > 0 {
+                            self.anchor - 1
+                        } else {
+                            self.anchor
+                        };
+                        let (la, _) = self.doc.byte_to_line_col(ap);
+                        (la, self.caret)
+                    } else {
+                        let (la, _) = self.doc.byte_to_line_col(self.anchor);
+                        (la, self.caret)
+                    };
+                    self.caret = head_pos;
+                    let target = self.resolve_vim_motion(motion, count, false, rasterizer);
+                    let (head_line, _) = self.doc.byte_to_line_col(target);
+                    let (lo, hi) = if anchor_line <= head_line {
+                        (anchor_line, head_line)
+                    } else {
+                        (head_line, anchor_line)
+                    };
+                    let start = self.doc.line_byte_range(lo).map(|r| r.0).unwrap_or(0);
+                    let end = self
+                        .doc
+                        .line_byte_range(hi)
+                        .map(|r| r.2)
+                        .unwrap_or_else(|| self.doc.len_bytes());
+                    if head_line >= anchor_line {
+                        self.anchor = start;
+                        self.caret = end;
+                    } else {
+                        self.anchor = end;
+                        self.caret = start;
+                    }
+                } else {
+                    let target = self.resolve_vim_motion(motion, count, false, rasterizer);
+                    self.caret = target;
+                    if !extend_visual {
+                        self.anchor = target;
+                    }
                 }
                 let m = self.doc_metrics(rasterizer);
                 self.viewport
@@ -335,10 +382,11 @@ impl EditorApp {
                         let (ins_at, ins_text) = if full_end > content_end {
                             (full_end, payload)
                         } else {
-                            (
-                                content_end,
-                                format!("\n{}", payload.trim_end_matches('\n')),
-                            )
+                            let body = payload
+                                .strip_suffix("\r\n")
+                                .or_else(|| payload.strip_suffix('\n'))
+                                .unwrap_or(&payload);
+                            (content_end, format!("\n{body}"))
                         };
                         if self.doc.edit(ins_at, 0, &ins_text, self.now_ms, false).is_ok() {
                             self.caret = self.first_non_blank_offset(line + 1);
@@ -449,29 +497,6 @@ impl EditorApp {
         let content = self.doc.line_content(line).unwrap_or_default();
         let ws = content.len() - content.trim_start_matches([' ', '\t']).len();
         ls + ws as u64
-    }
-
-    fn expand_visual_line_selection(&mut self) {
-        let (a, b) = if self.anchor <= self.caret {
-            (self.anchor, self.caret)
-        } else {
-            (self.caret, self.anchor)
-        };
-        let (la, _) = self.doc.byte_to_line_col(a);
-        let (lb, _) = self.doc.byte_to_line_col(b);
-        let start = self.doc.line_byte_range(la).map(|r| r.0).unwrap_or(0);
-        let end = self
-            .doc
-            .line_byte_range(lb)
-            .map(|r| r.2)
-            .unwrap_or_else(|| self.doc.len_bytes());
-        if self.anchor <= self.caret {
-            self.anchor = start;
-            self.caret = end;
-        } else {
-            self.anchor = end;
-            self.caret = start;
-        }
     }
 
     fn resolve_vim_motion(
@@ -872,19 +897,31 @@ impl EditorApp {
             }
             VimOperator::Delete => {
                 self.vim.last_yank_linewise = true;
-                let (del_s, del_e) = if end_full_b > start_b {
-                    (start_b, end_full_b)
-                } else {
-                    (start_b, end_content_b)
-                };
-                let len = (del_e - del_s) as usize;
+                // When deleting the final line with no trailing newline (and there is a preceding
+                // line), also remove the preceding line break so `dd` actually deletes the line
+                // instead of leaving an undeletable empty trailing line.
+                let (del_s, del_e, yank_s, yank_e) =
+                    if end_full_b == end_content_b && start_line > 0 {
+                        let prev_content_end = self
+                            .doc
+                            .line_byte_range(start_line - 1)
+                            .map(|r| r.1)
+                            .unwrap_or(start_b);
+                        (prev_content_end, end_content_b, start_b, end_content_b)
+                    } else if end_full_b > start_b {
+                        (start_b, end_full_b, start_b, end_full_b)
+                    } else {
+                        (start_b, end_content_b, start_b, end_content_b)
+                    };
+                let yank_len = (yank_e - yank_s) as usize;
                 let mut text =
-                    String::from_utf8_lossy(&self.doc.read_range(del_s, len)).into_owned();
+                    String::from_utf8_lossy(&self.doc.read_range(yank_s, yank_len)).into_owned();
                 if !text.ends_with('\n') {
                     text.push('\n');
                 }
                 clipboard.set_text(&text);
-                if let Ok(pos) = self.doc.edit(del_s, len as u64, "", self.now_ms, false) {
+                let del_len = del_e - del_s;
+                if let Ok(pos) = self.doc.edit(del_s, del_len, "", self.now_ms, false) {
                     let (new_l, _) = self.doc.byte_to_line_col(pos);
                     self.caret = self.first_non_blank_offset(new_l);
                     self.anchor = self.caret;

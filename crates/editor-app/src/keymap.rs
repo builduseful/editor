@@ -430,7 +430,26 @@ fn default_shortcuts() -> Vec<ShortcutEntry> {
         // ── Panes & View ──
         bind("split-down", "Split editor down", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Char('\\'))], Some("⌥⌘\\"), false, AppCommand::SplitPaneDown),
         bind("close-pane", "Close active split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_shift(Key::Char('\\'))], Some("⇧⌘\\"), false, AppCommand::CloseSplit),
-        bind("swap-panes", "Swap split panes", "Panes & View", KeyScope::Global, vec![KeyChord::primary_ctrl(Key::Char('\\'))], Some("⌃⌘\\"), false, AppCommand::SwapPanes),
+        bind(
+            "swap-panes",
+            "Swap split panes",
+            "Panes & View",
+            KeyScope::Global,
+            vec![{
+                #[cfg(target_os = "macos")]
+                { KeyChord::primary_ctrl(Key::Char('\\')) }
+                #[cfg(not(target_os = "macos"))]
+                { KeyChord::new(Key::Char('\\'), true, true, true, false) }
+            }],
+            {
+                #[cfg(target_os = "macos")]
+                { Some("⌃⌘\\") }
+                #[cfg(not(target_os = "macos"))]
+                { Some("Ctrl+Alt+Shift+\\") }
+            },
+            false,
+            AppCommand::SwapPanes,
+        ),
         bind("focus-left", "Focus left split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Left)], Some("⌥⌘←"), false, AppCommand::FocusLeftPane),
         bind("focus-right", "Focus right split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Right)], Some("⌥⌘→"), false, AppCommand::FocusRightPane),
         bind("focus-up", "Focus upper split pane", "Panes & View", KeyScope::Global, vec![KeyChord::primary_alt(Key::Up)], Some("⌥⌘↑"), false, AppCommand::FocusUpPane),

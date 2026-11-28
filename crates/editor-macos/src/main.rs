@@ -926,12 +926,18 @@ extern "C" fn cb_render_into(
     out_w: *mut i32,
     out_h: *mut i32,
 ) -> c_int {
-    if dst_pixels.is_null() || w == 0 || h == 0 || stride_u32 < w as usize {
+    if dst_pixels.is_null() || w == 0 || h == 0 || w > 16384 || h > 16384 || stride_u32 < w as usize
+    {
+        return 0;
+    }
+    let Some(pixel_count) = stride_u32.checked_mul(h as usize) else {
+        return 0;
+    };
+    if pixel_count > 16384 * 16384 {
         return 0;
     }
     with_bridge(ud, 0, |b| {
-        let slice =
-            unsafe { std::slice::from_raw_parts_mut(dst_pixels, stride_u32 * (h as usize)) };
+        let slice = unsafe { std::slice::from_raw_parts_mut(dst_pixels, pixel_count) };
         let surf = editor_platform::SurfaceMut {
             width: w,
             height: h,
@@ -973,7 +979,9 @@ extern "C" fn cb_render_into(
 
 fn parse_size(s: &str) -> Option<(u32, u32)> {
     let (w, h) = s.split_once('x')?;
-    Some((w.parse().ok()?, h.parse().ok()?))
+    let w: u32 = w.parse().ok()?;
+    let h: u32 = h.parse().ok()?;
+    Some((w.clamp(1, 8192), h.clamp(1, 8192)))
 }
 
 fn main() {

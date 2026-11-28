@@ -746,6 +746,16 @@ impl EditorApp {
         }
     }
 
+    fn apply_language_override_to_active(&mut self) {
+        if self.syntax_ext_map.is_empty() {
+            return;
+        }
+        if let Some(p) = self.doc.path().map(Path::to_path_buf) {
+            let lang = Language::from_path_with_overrides(Some(p.as_path()), &self.syntax_ext_map);
+            self.doc.set_language(lang);
+        }
+    }
+
     fn sync_languages_for_panes(&mut self) {
         if let Some(p) = self.doc.path().map(Path::to_path_buf) {
             let lang = Language::from_path_with_overrides(Some(p.as_path()), &self.syntax_ext_map);
@@ -1195,9 +1205,17 @@ impl EditorApp {
         let scope = self.current_scope_folder();
 
         // Collect all live buffers across active pane, secondary panes, and parked pool
-        // (deduplicated by `BufferId`, preferring active pane / highest generation).
+        // (deduplicated by `BufferId`, preferring dirty / highest-generation copy).
+        #[derive(Clone, Copy)]
+        enum LiveDocSource {
+            Active,
+            OtherPane(usize),
+            Parked(BufferId),
+        }
+
         struct LiveBufInfo {
             buf_id: BufferId,
+            source: LiveDocSource,
             path: Option<PathBuf>,
             dirty: bool,
             len_bytes: u64,
@@ -1209,99 +1227,138 @@ impl EditorApp {
             view: SavedViewPos,
         }
 
-        let mut seen: Vec<BufferId> = Vec::new();
-        let mut live: Vec<LiveBufInfo> = Vec::new();
+        let mut all_ids: Vec<BufferId> = Vec::with_capacity(1 + self.other_panes.len());
+        all_ids.push(self.active_buf_id);
+        for pane in &self.other_panes {
+            if !all_ids.contains(&pane.buf_id) {
+                all_ids.push(pane.buf_id);
+            }
+        }
+        for pid in self.working_set.parked_ids() {
+            if !all_ids.contains(&pid) {
+                all_ids.push(pid);
+            }
+        }
 
-        {
-            let v = Self::capture_view_pos(
-                &mut self.doc,
-                self.caret,
-                self.anchor,
-                self.viewport.scroll_top_line,
-                self.viewport.scroll_sub_y_px,
-                self.viewport.scroll_x_px,
-            );
-            let path = self.doc.path().map(Path::to_path_buf);
-            let default_lang = Language::from_path_with_overrides(path.as_deref(), &self.syntax_ext_map);
-            let lang_ov = (self.doc.language() != default_lang)
-                .then(|| self.doc.language().id().to_string());
-            seen.push(self.active_buf_id);
-            live.push(LiveBufInfo {
-                buf_id: self.active_buf_id,
-                path,
-                dirty: self.doc.is_dirty(),
-                len_bytes: self.doc.len_bytes(),
-                generation: self.doc.generation(),
-                base_rev: self.doc.rev(),
-                bom: self.doc.has_bom(),
-                eol: self.doc.eol(),
-                lang_override: lang_ov,
-                view: v,
-            });
-        }
-        for pane in &mut self.other_panes {
-            if seen.contains(&pane.buf_id) {
+        let mut live: Vec<LiveBufInfo> = Vec::with_capacity(all_ids.len());
+        for buf_id in all_ids {
+            // Always pick the dirty / highest-generation copy across active, split panes, and
+            // parked storage so a clean split pane never shadows unsaved edits in a sibling pane!
+            let mut best: Option<(LiveDocSource, (bool, u64))> = None;
+            let consider = |best: &mut Option<(LiveDocSource, (bool, u64))>,
+                            src: LiveDocSource,
+                            doc: &Document| {
+                let key = (doc.is_dirty(), doc.generation());
+                if best.is_none_or(|(_, prev)| key > prev) {
+                    *best = Some((src, key));
+                }
+            };
+            if buf_id == self.active_buf_id {
+                consider(&mut best, LiveDocSource::Active, &self.doc);
+            }
+            for (idx, pane) in self.other_panes.iter().enumerate() {
+                if pane.buf_id == buf_id {
+                    consider(&mut best, LiveDocSource::OtherPane(idx), &pane.doc);
+                }
+            }
+            if let Some(parked) = self.working_set.parked_ref(buf_id) {
+                consider(&mut best, LiveDocSource::Parked(buf_id), &parked.doc);
+            }
+            let Some((source, _)) = best else {
                 continue;
-            }
-            let v = Self::capture_view_pos(
-                &mut pane.doc,
-                pane.caret,
-                pane.anchor,
-                pane.viewport.scroll_top_line,
-                pane.viewport.scroll_sub_y_px,
-                pane.viewport.scroll_x_px,
-            );
-            let path = pane.doc.path().map(Path::to_path_buf);
-            let default_lang = Language::from_path_with_overrides(path.as_deref(), &self.syntax_ext_map);
-            let lang_ov = (pane.doc.language() != default_lang)
-                .then(|| pane.doc.language().id().to_string());
-            seen.push(pane.buf_id);
-            live.push(LiveBufInfo {
-                buf_id: pane.buf_id,
-                path,
-                dirty: pane.doc.is_dirty(),
-                len_bytes: pane.doc.len_bytes(),
-                generation: pane.doc.generation(),
-                base_rev: pane.doc.rev(),
-                bom: pane.doc.has_bom(),
-                eol: pane.doc.eol(),
-                lang_override: lang_ov,
-                view: v,
-            });
-        }
-        let parked_ids = self.working_set.parked_ids();
-        for pid in parked_ids {
-            if seen.contains(&pid) {
-                continue;
-            }
-            if let Some(parked) = self.working_set.parked_mut(pid) {
-                let v = Self::capture_view_pos(
-                    &mut parked.doc,
-                    parked.caret,
-                    parked.anchor,
-                    parked.scroll_top_line,
-                    parked.scroll_sub_y_px,
-                    parked.scroll_x_px,
-                );
-                let path = parked.doc.path().map(Path::to_path_buf);
-                let default_lang =
-                    Language::from_path_with_overrides(path.as_deref(), &self.syntax_ext_map);
-                let lang_ov = (parked.doc.language() != default_lang)
-                    .then(|| parked.doc.language().id().to_string());
-                seen.push(pid);
-                live.push(LiveBufInfo {
-                    buf_id: pid,
-                    path,
-                    dirty: parked.doc.is_dirty(),
-                    len_bytes: parked.doc.len_bytes(),
-                    generation: parked.doc.generation(),
-                    base_rev: parked.doc.rev(),
-                    bom: parked.doc.has_bom(),
-                    eol: parked.doc.eol(),
-                    lang_override: lang_ov,
-                    view: v,
-                });
-            }
+            };
+
+            let info = match source {
+                LiveDocSource::Active => {
+                    let v = Self::capture_view_pos(
+                        &mut self.doc,
+                        self.caret,
+                        self.anchor,
+                        self.viewport.scroll_top_line,
+                        self.viewport.scroll_sub_y_px,
+                        self.viewport.scroll_x_px,
+                    );
+                    let path = self.doc.path().map(Path::to_path_buf);
+                    let default_lang =
+                        Language::from_path_with_overrides(path.as_deref(), &self.syntax_ext_map);
+                    let lang_ov = (self.doc.language() != default_lang)
+                        .then(|| self.doc.language().id().to_string());
+                    LiveBufInfo {
+                        buf_id,
+                        source,
+                        path,
+                        dirty: self.doc.is_dirty(),
+                        len_bytes: self.doc.len_bytes(),
+                        generation: self.doc.generation(),
+                        base_rev: self.doc.rev(),
+                        bom: self.doc.has_bom(),
+                        eol: self.doc.eol(),
+                        lang_override: lang_ov,
+                        view: v,
+                    }
+                }
+                LiveDocSource::OtherPane(idx) => {
+                    let pane = &mut self.other_panes[idx];
+                    let v = Self::capture_view_pos(
+                        &mut pane.doc,
+                        pane.caret,
+                        pane.anchor,
+                        pane.viewport.scroll_top_line,
+                        pane.viewport.scroll_sub_y_px,
+                        pane.viewport.scroll_x_px,
+                    );
+                    let path = pane.doc.path().map(Path::to_path_buf);
+                    let default_lang =
+                        Language::from_path_with_overrides(path.as_deref(), &self.syntax_ext_map);
+                    let lang_ov = (pane.doc.language() != default_lang)
+                        .then(|| pane.doc.language().id().to_string());
+                    LiveBufInfo {
+                        buf_id,
+                        source,
+                        path,
+                        dirty: pane.doc.is_dirty(),
+                        len_bytes: pane.doc.len_bytes(),
+                        generation: pane.doc.generation(),
+                        base_rev: pane.doc.rev(),
+                        bom: pane.doc.has_bom(),
+                        eol: pane.doc.eol(),
+                        lang_override: lang_ov,
+                        view: v,
+                    }
+                }
+                LiveDocSource::Parked(pid) => {
+                    let Some(parked) = self.working_set.parked_mut(pid) else {
+                        continue;
+                    };
+                    let v = Self::capture_view_pos(
+                        &mut parked.doc,
+                        parked.caret,
+                        parked.anchor,
+                        parked.scroll_top_line,
+                        parked.scroll_sub_y_px,
+                        parked.scroll_x_px,
+                    );
+                    let path = parked.doc.path().map(Path::to_path_buf);
+                    let default_lang =
+                        Language::from_path_with_overrides(path.as_deref(), &self.syntax_ext_map);
+                    let lang_ov = (parked.doc.language() != default_lang)
+                        .then(|| parked.doc.language().id().to_string());
+                    LiveBufInfo {
+                        buf_id,
+                        source,
+                        path,
+                        dirty: parked.doc.is_dirty(),
+                        len_bytes: parked.doc.len_bytes(),
+                        generation: parked.doc.generation(),
+                        base_rev: parked.doc.rev(),
+                        bom: parked.doc.has_bom(),
+                        eol: parked.doc.eol(),
+                        lang_override: lang_ov,
+                        view: v,
+                    }
+                }
+            };
+            live.push(info);
         }
 
         let mut clean_paths: Vec<PathBuf> = Vec::new();
@@ -1369,21 +1426,26 @@ impl EditorApp {
             let (rev, byte_len, sha256) = if needs_content_write {
                 let next_rev = prev_rec.as_ref().map_or(1, |r| r.rev + 1);
                 let mut bytes = Vec::with_capacity(info.len_bytes as usize);
-                if info.buf_id == self.active_buf_id {
-                    self.doc
-                        .tree_mut()
-                        .read_range(0, info.len_bytes as usize, &mut bytes);
-                } else if let Some(pane) =
-                    self.other_panes.iter_mut().find(|p| p.buf_id == info.buf_id)
-                {
-                    pane.doc
-                        .tree_mut()
-                        .read_range(0, info.len_bytes as usize, &mut bytes);
-                } else if let Some(parked) = self.working_set.parked_mut(info.buf_id) {
-                    parked
-                        .doc
-                        .tree_mut()
-                        .read_range(0, info.len_bytes as usize, &mut bytes);
+                match info.source {
+                    LiveDocSource::Active => {
+                        self.doc
+                            .tree_mut()
+                            .read_range(0, info.len_bytes as usize, &mut bytes);
+                    }
+                    LiveDocSource::OtherPane(idx) => {
+                        self.other_panes[idx]
+                            .doc
+                            .tree_mut()
+                            .read_range(0, info.len_bytes as usize, &mut bytes);
+                    }
+                    LiveDocSource::Parked(pid) => {
+                        if let Some(parked) = self.working_set.parked_mut(pid) {
+                            parked
+                                .doc
+                                .tree_mut()
+                                .read_range(0, info.len_bytes as usize, &mut bytes);
+                        }
+                    }
                 }
                 let (blen, hash) = DraftStore::write_draft_bytes(
                     self.fs.as_ref(),
@@ -1494,6 +1556,13 @@ impl EditorApp {
             }
         }
 
+        #[derive(Clone, Copy)]
+        enum UndoDocSource {
+            Active,
+            OtherPane(usize),
+            Parked(BufferId),
+        }
+
         for buf_id in ids {
             let meta_snap = self.working_set.get_meta(buf_id).cloned();
             let prev_sig = meta_snap
@@ -1505,39 +1574,74 @@ impl EditorApp {
                 .and_then(|did| self.draft_store.find_by_id(did))
                 .cloned();
 
+            let mut best: Option<(UndoDocSource, (bool, bool, u64, u64))> = None;
+            let consider = |best: &mut Option<(UndoDocSource, (bool, bool, u64, u64))>,
+                            src: UndoDocSource,
+                            doc: &Document| {
+                let key = (
+                    doc.is_dirty(),
+                    !doc.undo_stack().is_empty(),
+                    doc.undo_stack().current_rev(),
+                    doc.generation(),
+                );
+                if best.is_none_or(|(_, prev)| key > prev) {
+                    *best = Some((src, key));
+                }
+            };
+            if buf_id == self.active_buf_id {
+                consider(&mut best, UndoDocSource::Active, &self.doc);
+            }
+            for (idx, p) in self.other_panes.iter().enumerate() {
+                if p.buf_id == buf_id {
+                    consider(&mut best, UndoDocSource::OtherPane(idx), &p.doc);
+                }
+            }
+            if let Some(parked) = self.working_set.parked_ref(buf_id) {
+                consider(&mut best, UndoDocSource::Parked(buf_id), &parked.doc);
+            }
+            let Some((source, _)) = best else {
+                continue;
+            };
+
             let (doc_empty_undo, cur_sig, path_opt, is_valid_disk, doc_rev, doc_len) =
-                if buf_id == self.active_buf_id {
-                    let sig = Self::undo_sig_for_doc(&self.doc, draft_rec.as_ref());
-                    (
-                        self.doc.undo_stack().is_empty(),
-                        sig,
-                        self.doc.path().map(Path::to_path_buf),
-                        self.doc.rev() != editor_platform::FileRev::default(),
-                        self.doc.rev(),
-                        self.doc.len_bytes(),
-                    )
-                } else if let Some(pane) = self.other_panes.iter().find(|p| p.buf_id == buf_id) {
-                    let sig = Self::undo_sig_for_doc(&pane.doc, draft_rec.as_ref());
-                    (
-                        pane.doc.undo_stack().is_empty(),
-                        sig,
-                        pane.doc.path().map(Path::to_path_buf),
-                        pane.doc.rev() != editor_platform::FileRev::default(),
-                        pane.doc.rev(),
-                        pane.doc.len_bytes(),
-                    )
-                } else if let Some(parked) = self.working_set.parked_ref(buf_id) {
-                    let sig = Self::undo_sig_for_doc(&parked.doc, draft_rec.as_ref());
-                    (
-                        parked.doc.undo_stack().is_empty(),
-                        sig,
-                        parked.doc.path().map(Path::to_path_buf),
-                        parked.doc.rev() != editor_platform::FileRev::default(),
-                        parked.doc.rev(),
-                        parked.doc.len_bytes(),
-                    )
-                } else {
-                    continue;
+                match source {
+                    UndoDocSource::Active => {
+                        let sig = Self::undo_sig_for_doc(&self.doc, draft_rec.as_ref());
+                        (
+                            self.doc.undo_stack().is_empty(),
+                            sig,
+                            self.doc.path().map(Path::to_path_buf),
+                            self.doc.rev() != editor_platform::FileRev::default(),
+                            self.doc.rev(),
+                            self.doc.len_bytes(),
+                        )
+                    }
+                    UndoDocSource::OtherPane(idx) => {
+                        let pane = &self.other_panes[idx];
+                        let sig = Self::undo_sig_for_doc(&pane.doc, draft_rec.as_ref());
+                        (
+                            pane.doc.undo_stack().is_empty(),
+                            sig,
+                            pane.doc.path().map(Path::to_path_buf),
+                            pane.doc.rev() != editor_platform::FileRev::default(),
+                            pane.doc.rev(),
+                            pane.doc.len_bytes(),
+                        )
+                    }
+                    UndoDocSource::Parked(pid) => {
+                        let Some(parked) = self.working_set.parked_ref(pid) else {
+                            continue;
+                        };
+                        let sig = Self::undo_sig_for_doc(&parked.doc, draft_rec.as_ref());
+                        (
+                            parked.doc.undo_stack().is_empty(),
+                            sig,
+                            parked.doc.path().map(Path::to_path_buf),
+                            parked.doc.rev() != editor_platform::FileRev::default(),
+                            parked.doc.rev(),
+                            parked.doc.len_bytes(),
+                        )
+                    }
                 };
 
             if doc_empty_undo {
@@ -1565,15 +1669,13 @@ impl EditorApp {
                     len: doc_len,
                 }
             } else if path_opt.is_some() && is_valid_disk {
-                let fp = if buf_id == self.active_buf_id {
-                    self.doc.content_fingerprint()
-                } else if let Some(pane) = self.other_panes.iter_mut().find(|p| p.buf_id == buf_id)
-                {
-                    pane.doc.content_fingerprint()
-                } else if let Some(parked) = self.working_set.parked_mut(buf_id) {
-                    parked.doc.content_fingerprint()
-                } else {
-                    continue;
+                let fp = match source {
+                    UndoDocSource::Active => self.doc.content_fingerprint(),
+                    UndoDocSource::OtherPane(idx) => self.other_panes[idx].doc.content_fingerprint(),
+                    UndoDocSource::Parked(pid) => match self.working_set.parked_mut(pid) {
+                        Some(parked) => parked.doc.content_fingerprint(),
+                        None => continue,
+                    },
                 };
                 UndoBinding::OnDisk {
                     rev: doc_rev,
@@ -1584,32 +1686,31 @@ impl EditorApp {
                 continue;
             };
 
-            let wrote = if buf_id == self.active_buf_id {
-                UndoStore::write_undo(
+            let wrote = match source {
+                UndoDocSource::Active => UndoStore::write_undo(
                     self.fs.as_ref(),
                     state_dir,
                     &key,
                     binding,
                     self.doc.undo_stack(),
-                )
-            } else if let Some(pane) = self.other_panes.iter().find(|p| p.buf_id == buf_id) {
-                UndoStore::write_undo(
+                ),
+                UndoDocSource::OtherPane(idx) => UndoStore::write_undo(
                     self.fs.as_ref(),
                     state_dir,
                     &key,
                     binding,
-                    pane.doc.undo_stack(),
-                )
-            } else if let Some(parked) = self.working_set.parked_ref(buf_id) {
-                UndoStore::write_undo(
-                    self.fs.as_ref(),
-                    state_dir,
-                    &key,
-                    binding,
-                    parked.doc.undo_stack(),
-                )
-            } else {
-                Ok(false)
+                    self.other_panes[idx].doc.undo_stack(),
+                ),
+                UndoDocSource::Parked(pid) => match self.working_set.parked_ref(pid) {
+                    Some(parked) => UndoStore::write_undo(
+                        self.fs.as_ref(),
+                        state_dir,
+                        &key,
+                        binding,
+                        parked.doc.undo_stack(),
+                    ),
+                    None => Ok(false),
+                },
             };
 
             match wrote {
@@ -2390,11 +2491,15 @@ impl EditorApp {
     }
 
     fn is_buffer_dirty(&self, id: BufferId) -> bool {
-        if id == self.active_buf_id {
-            return self.doc.is_dirty();
+        if id == self.active_buf_id && self.doc.is_dirty() {
+            return true;
         }
-        if let Some(p) = self.other_panes.iter().find(|p| p.buf_id == id) {
-            return p.doc.is_dirty();
+        if self
+            .other_panes
+            .iter()
+            .any(|p| p.buf_id == id && p.doc.is_dirty())
+        {
+            return true;
         }
         self.working_set
             .get_parked(id)
@@ -2794,19 +2899,37 @@ impl EditorApp {
         }
         let others = std::mem::take(&mut self.other_panes);
         for p in others {
-            if p.buf_id != self.active_buf_id && self.working_set.contains(p.buf_id) {
-                self.working_set.park(
-                    p.buf_id,
-                    ParkedBuffer {
-                        doc: p.doc,
-                        caret: p.caret,
-                        anchor: p.anchor,
-                        preferred_x_px: p.preferred_x_px,
-                        scroll_top_line: p.viewport.scroll_top_line,
-                        scroll_sub_y_px: p.viewport.scroll_sub_y_px,
-                        scroll_x_px: p.viewport.scroll_x_px,
-                    },
-                );
+            if p.buf_id == self.active_buf_id {
+                // Never silently discard unsaved edits from a closing sibling pane sharing our buffer!
+                if p.doc.is_dirty() && !self.doc.is_dirty() {
+                    self.doc = p.doc;
+                    self.caret = p.caret;
+                    self.anchor = p.anchor;
+                    self.extra_cursors = p.extra_cursors;
+                    self.preferred_x_px = p.preferred_x_px;
+                    self.viewport = p.viewport;
+                    self.search_matches = p.search_matches;
+                    self.active_match = p.active_match;
+                }
+            } else if self.working_set.contains(p.buf_id) {
+                let already_dirty_parked = self
+                    .working_set
+                    .parked_ref(p.buf_id)
+                    .is_some_and(|pk| pk.doc.is_dirty());
+                if p.doc.is_dirty() || !already_dirty_parked {
+                    self.working_set.park(
+                        p.buf_id,
+                        ParkedBuffer {
+                            doc: p.doc,
+                            caret: p.caret,
+                            anchor: p.anchor,
+                            preferred_x_px: p.preferred_x_px,
+                            scroll_top_line: p.viewport.scroll_top_line,
+                            scroll_sub_y_px: p.viewport.scroll_sub_y_px,
+                            scroll_x_px: p.viewport.scroll_x_px,
+                        },
+                    );
+                }
             }
         }
         self.arrangement = Arrangement::new(self.active_id);
@@ -3094,8 +3217,8 @@ impl EditorApp {
             let wrap = self.effective_word_wrap(parked.doc.path());
             let mut pane = PaneState::new_from_font(pane_id, buf_id, self.viewport.font_size_pt, wrap);
             pane.doc = parked.doc;
-            pane.caret = parked.caret;
-            pane.anchor = parked.anchor;
+            pane.caret = Self::snap_doc_offset(&mut pane.doc, parked.caret);
+            pane.anchor = Self::snap_doc_offset(&mut pane.doc, parked.anchor);
             pane.preferred_x_px = parked.preferred_x_px;
             pane.viewport.scroll_top_line = parked.scroll_top_line;
             pane.viewport.scroll_sub_y_px = parked.scroll_sub_y_px;
@@ -3258,6 +3381,7 @@ impl EditorApp {
             return;
         }
         self.sync_active_buffer_meta();
+        let closing_buf_id = self.active_buf_id;
         let old_frame = self.layout.grid.get(self.active_id).map(|r| r.frame);
         self.park_active_into_pool(false);
         self.arrangement.remove(self.active_id);
@@ -3282,6 +3406,22 @@ impl EditorApp {
         self.viewport = next.viewport;
         self.search_matches = next.search_matches;
         self.active_match = next.active_match;
+        // If the closed pane shared the same `buf_id` as the promoted pane and had unsaved edits
+        // while the promoted pane was clean, carry those edits forward so they are never orphaned!
+        if self.active_buf_id == closing_buf_id {
+            if let Some(parked) = self.working_set.take_parked(closing_buf_id) {
+                if parked.doc.is_dirty() && !self.doc.is_dirty() {
+                    self.doc = parked.doc;
+                    self.caret = Self::snap_doc_offset(&mut self.doc, parked.caret);
+                    self.anchor = Self::snap_doc_offset(&mut self.doc, parked.anchor);
+                    self.extra_cursors.clear();
+                    self.preferred_x_px = parked.preferred_x_px;
+                    self.viewport.scroll_top_line = parked.scroll_top_line;
+                    self.viewport.scroll_sub_y_px = parked.scroll_sub_y_px;
+                    self.viewport.scroll_x_px = parked.scroll_x_px;
+                }
+            }
+        }
         self.working_set.touch_mru(self.active_buf_id);
         if self.find_bar.visible {
             self.refresh_search();
@@ -4159,6 +4299,13 @@ impl EditorApp {
                     self.handle_pins_action(act, host);
                     return;
                 }
+                InputEvent::Scroll { dy_px, .. } => {
+                    if self.pins_overlay.handle_scroll(dy_px) {
+                        self.mark_dirty();
+                        host.request_redraw();
+                    }
+                    return;
+                }
                 InputEvent::Command(AppCommand::ShowPins) => {
                     self.pins_overlay.close();
                     self.mark_dirty();
@@ -4507,10 +4654,20 @@ impl EditorApp {
             InputEvent::FocusChanged(focused) => {
                 self.window_focused = focused;
                 if !focused {
+                    self.cancel_drag(host);
+                    self.sidebar.set_edge_active(false);
                     let _ = self.sidebar.clear_hover();
                     let _ = self.tab_strip.clear_hover();
                     let _ = self.toast.clear_hover();
                     self.hovered_divider = None;
+                    self.dragging_selection = false;
+                    self.dragging_gutter_anchor_line = None;
+                    self.dragging_find_input = false;
+                    self.dragging_replace_input = false;
+                    self.dragging_sidebar_input = false;
+                    self.dragging_sidebar_edge = false;
+                    self.dragging_divider = None;
+                    self.viewport.end_scrollbar_drag();
                     self.viewport.v_bar_hovered = false;
                     self.viewport.h_bar_hovered = false;
                     // Event-driven Hot Exit & session flush on focus loss (0.00% idle CPU).
@@ -7104,6 +7261,7 @@ impl EditorApp {
         }
         self.working_set
             .remap_paths(self.fs.as_ref(), from, to, is_dir, &self.syntax_ext_map);
+        self.sync_wrap_for_panes();
         for (p, _) in &mut self.evicted_views {
             if let Some(next) = remap(p) {
                 *p = next;
@@ -7140,8 +7298,13 @@ impl EditorApp {
         let Some(active_p) = self.doc.path().map(Path::to_path_buf) else {
             return;
         };
+        let active_len = self.doc.len_bytes();
+        let mut active_fp: Option<[u8; 32]> = None;
         for pane in &mut self.other_panes {
-            if pane.doc.path() == Some(active_p.as_path()) && !pane.doc.is_dirty() {
+            if pane.doc.path() != Some(active_p.as_path()) {
+                continue;
+            }
+            if !pane.doc.is_dirty() {
                 if Self::check_and_reload_preserving_view(
                     self.fs.as_ref(),
                     &mut pane.doc,
@@ -7153,6 +7316,35 @@ impl EditorApp {
                 ) == IdentityCheck::ReloadedClean
                 {
                     pane.extra_cursors.clear();
+                }
+            } else if pane.doc.len_bytes() == active_len {
+                // If a sibling pane was cloned from the same dirty buffer (or edited to identical
+                // bytes) and the active pane just saved those exact bytes to disk, mark the
+                // sibling clean by reloading from disk while preserving its view & language!
+                let fp = *active_fp.get_or_insert_with(|| self.doc.content_fingerprint());
+                if pane.doc.content_fingerprint() == fp {
+                    let prev_lang = pane.doc.language();
+                    let view = Self::capture_view_pos(
+                        &mut pane.doc,
+                        pane.caret,
+                        pane.anchor,
+                        pane.viewport.scroll_top_line,
+                        pane.viewport.scroll_sub_y_px,
+                        pane.viewport.scroll_x_px,
+                    );
+                    if pane.doc.reload(self.fs.as_ref()).is_ok() {
+                        pane.doc.set_language(prev_lang);
+                        Self::apply_view_pos(
+                            &mut pane.doc,
+                            &mut pane.caret,
+                            &mut pane.anchor,
+                            &mut pane.viewport.scroll_top_line,
+                            &mut pane.viewport.scroll_sub_y_px,
+                            &mut pane.viewport.scroll_x_px,
+                            view,
+                        );
+                        pane.extra_cursors.clear();
+                    }
                 }
             }
         }
@@ -7197,6 +7389,8 @@ impl EditorApp {
         };
         match self.doc.save_as(self.fs.as_ref(), &dst, None, false) {
             Ok(_) => {
+                self.apply_language_override_to_active();
+                self.sync_wrap_for_panes();
                 self.working_set.set_undo_sig(self.active_buf_id, (0, false, 0));
                 self.sync_active_buffer_meta();
                 self.working_set.graduate_preview(self.active_buf_id);
@@ -7340,7 +7534,7 @@ impl EditorApp {
         if self.doc.is_dirty() {
             if let Some(p) = self.doc.path().map(Path::to_path_buf) {
                 let len = self.doc.len_bytes();
-                if len > 0 && len <= MAX_DIRTY_BYTES {
+                if len <= MAX_DIRTY_BYTES {
                     let mut buf = Vec::with_capacity(len as usize);
                     self.doc.tree_mut().read_range(0, len as usize, &mut buf);
                     out.push((p, buf));
@@ -7352,7 +7546,7 @@ impl EditorApp {
                 if let Some(p) = pane.doc.path().map(Path::to_path_buf) {
                     if !out.iter().any(|(ep, _)| ep == &p) {
                         let len = pane.doc.len_bytes();
-                        if len > 0 && len <= MAX_DIRTY_BYTES {
+                        if len <= MAX_DIRTY_BYTES {
                             let mut buf = Vec::with_capacity(len as usize);
                             pane.doc.tree_mut().read_range(0, len as usize, &mut buf);
                             out.push((p, buf));
@@ -7535,7 +7729,13 @@ impl EditorApp {
         if self.shortcuts.visible {
             Some(&mut self.shortcuts.input)
         } else if self.palette.is_open() {
-            Some(&mut self.palette.input)
+            if self.palette.replace_input.focused {
+                Some(&mut self.palette.replace_input)
+            } else if self.palette.path_filter_input.focused {
+                Some(&mut self.palette.path_filter_input)
+            } else {
+                Some(&mut self.palette.input)
+            }
         } else if self.sidebar.is_prompt_open() {
             self.sidebar.active_prompt_input_mut()
         } else if self.goto_line.visible {
@@ -7656,14 +7856,17 @@ impl EditorApp {
                 }
             }
             AppCommand::Cut => {
+                let in_shortcuts = self.shortcuts.visible;
                 let in_find = self.find_bar.visible && self.find_bar.find_input.focused;
-                let in_palette = self.palette.is_open();
+                let in_palette_query = self.palette.is_open() && !self.palette.replace_input.focused;
                 if let Some(inp) = self.active_text_input_mut() {
                     if inp.has_selection() {
                         let s = inp.selected_text().to_string();
                         clipboard.set_text(&s);
                         inp.delete_selection();
-                        if in_palette {
+                        if in_shortcuts {
+                            self.shortcuts.refresh_filter();
+                        } else if in_palette_query {
                             self.palette.refresh_results(self.fs.as_ref());
                         } else if in_find {
                             self.refresh_search();
@@ -7691,12 +7894,15 @@ impl EditorApp {
                 }
             }
             AppCommand::Paste => {
+                let in_shortcuts = self.shortcuts.visible;
                 let in_find = self.find_bar.visible && self.find_bar.find_input.focused;
-                let in_palette = self.palette.is_open();
+                let in_palette_query = self.palette.is_open() && !self.palette.replace_input.focused;
                 if let Some(clip) = clipboard.get_text() {
                     if let Some(inp) = self.active_text_input_mut() {
                         inp.insert_str(&clip);
-                        if in_palette {
+                        if in_shortcuts {
+                            self.shortcuts.refresh_filter();
+                        } else if in_palette_query {
                             self.palette.refresh_results(self.fs.as_ref());
                         } else if in_find {
                             self.refresh_search();
@@ -7961,18 +8167,27 @@ impl EditorApp {
             }
             AppCommand::ZoomIn => {
                 self.viewport.zoom_in();
+                for pane in &mut self.other_panes {
+                    pane.viewport.zoom_in();
+                }
                 self.save_preferences(host);
                 self.mark_dirty();
                 host.request_redraw();
             }
             AppCommand::ZoomOut => {
                 self.viewport.zoom_out();
+                for pane in &mut self.other_panes {
+                    pane.viewport.zoom_out();
+                }
                 self.save_preferences(host);
                 self.mark_dirty();
                 host.request_redraw();
             }
             AppCommand::ZoomReset => {
                 self.viewport.zoom_reset();
+                for pane in &mut self.other_panes {
+                    pane.viewport.zoom_reset();
+                }
                 self.save_preferences(host);
                 self.mark_dirty();
                 host.request_redraw();
@@ -8079,6 +8294,7 @@ impl EditorApp {
                     if let Some((start, _, _)) = self.doc.line_byte_range(clamped) {
                         self.caret = start;
                         self.anchor = start;
+                        self.extra_cursors.clear();
                         let m = self.doc_metrics(rasterizer);
                         self.viewport
                             .ensure_caret_visible(&mut self.doc, self.caret, m, self.framebuffer.scale);
@@ -8481,8 +8697,9 @@ impl EditorApp {
             .edit(a_start, b_content_end - a_start, &swapped, self.now_ms, false)
             .is_ok()
         {
+            self.extra_cursors.clear();
             if let Some((ns, ne, _)) = self.doc.line_byte_range(target_line) {
-                self.caret = ns + (col as u64).min(ne - ns);
+                self.caret = Self::snap_doc_offset(&mut self.doc, ns + (col as u64).min(ne - ns));
                 self.anchor = self.caret;
             }
             self.after_document_mutated(rasterizer, host);
@@ -9615,21 +9832,17 @@ impl EditorApp {
                 self.preferred_x_px = None;
                 if mods.shift {
                     let all = self.all_cursors_sorted();
-                    let mut lines: Vec<(usize, bool)> = Vec::with_capacity(all.len());
-                    for (_, c, is_p) in all {
+                    let mut lines: Vec<usize> = Vec::with_capacity(all.len());
+                    for &(_, c, _) in &all {
                         let (line, _) = self.doc.byte_to_line_col(c);
-                        if let Some(last) = lines.last_mut() {
-                            if last.0 == line {
-                                last.1 |= is_p;
-                                continue;
-                            }
+                        if lines.last() != Some(&line) {
+                            lines.push(line);
                         }
-                        lines.push((line, is_p));
                     }
                     let tw = self.viewport.tab_width;
                     let mut edits: Vec<(u64, u64, String)> = Vec::with_capacity(lines.len());
-                    let mut flags: Vec<bool> = Vec::with_capacity(lines.len());
-                    for &(line, is_p) in &lines {
+                    let mut removed_spans: Vec<(u64, u64)> = Vec::with_capacity(lines.len());
+                    for line in lines {
                         let Some((ls, _, _)) = self.doc.line_byte_range(line) else {
                             continue;
                         };
@@ -9643,14 +9856,28 @@ impl EditorApp {
                                 .take_while(|&b| b == b' ')
                                 .count()
                         };
-                        edits.push((ls, strip as u64, String::new()));
-                        flags.push(is_p);
+                        if strip > 0 {
+                            edits.push((ls, strip as u64, String::new()));
+                            removed_spans.push((ls, strip as u64));
+                        }
                     }
-                    if let Ok(ends) = self.doc.edit_multi(&edits, self.now_ms) {
-                        let next: Vec<(u64, u64, bool)> = ends
+                    if edits.is_empty() {
+                        return true;
+                    }
+                    if self.doc.edit_multi(&edits, self.now_ms).is_ok() {
+                        let adjust = |pos: u64| -> u64 {
+                            let mut delta = 0u64;
+                            for &(ls, strip) in &removed_spans {
+                                if pos <= ls {
+                                    break;
+                                }
+                                delta += strip.min(pos - ls);
+                            }
+                            pos.saturating_sub(delta)
+                        };
+                        let next: Vec<(u64, u64, bool)> = all
                             .into_iter()
-                            .zip(flags)
-                            .map(|(end, is_p)| (end, end, is_p))
+                            .map(|(a, c, is_p)| (adjust(a), adjust(c), is_p))
                             .collect();
                         self.set_cursors_from_list(next);
                         self.after_document_mutated(rasterizer, host);
@@ -10197,6 +10424,12 @@ impl EditorApp {
                     self.caret = hit.byte_offset;
                     if !mods.shift {
                         self.anchor = hit.byte_offset;
+                        if self.vim.enabled
+                            && matches!(self.vim.mode, VimMode::Visual | VimMode::VisualLine)
+                        {
+                            self.vim.mode = VimMode::Normal;
+                            self.vim.reset_pending();
+                        }
                     }
                 }
                 2 => {
@@ -10975,6 +11208,7 @@ impl EditorApp {
                 let off = self.resolve_line_col_offset(*line_1based, *col_bytes);
                 self.caret = off;
                 self.anchor = off;
+                self.extra_cursors.clear();
                 self.preferred_x_px = None;
                 let m = self.doc_metrics(rasterizer);
                 self.viewport
@@ -10993,6 +11227,7 @@ impl EditorApp {
                 let b = self.resolve_line_col_offset(*end_line, *end_col);
                 self.anchor = a;
                 self.caret = b;
+                self.extra_cursors.clear();
                 let m = self.doc_metrics(rasterizer);
                 self.viewport
                     .ensure_caret_visible(&mut self.doc, self.caret, m, self.framebuffer.scale);
@@ -11001,6 +11236,7 @@ impl EditorApp {
                 (IpcReply::Json(self.status_json()), false, false)
             }
             IpcCommand::Insert { text } => {
+                self.extra_cursors.clear();
                 let (start, removed) = self
                     .selection()
                     .map(|(a, b)| (a, b - a))
@@ -11051,15 +11287,32 @@ impl EditorApp {
                 (IpcReply::Json(self.status_json()), false, false)
             }
             IpcCommand::Save { as_path } => {
+                let is_save_as = as_path.is_some();
                 let res = match as_path {
                     Some(dst) => self.doc.save_as(self.fs.as_ref(), dst, None, false),
                     None => self.doc.save(self.fs.as_ref(), None, false),
                 };
                 match res {
                     Ok(rep) => {
+                        if is_save_as {
+                            self.apply_language_override_to_active();
+                            self.sync_wrap_for_panes();
+                            self.working_set.set_undo_sig(self.active_buf_id, (0, false, 0));
+                            self.working_set.graduate_preview(self.active_buf_id);
+                        }
+                        self.sync_clean_sibling_panes_for_active_path();
                         self.sync_active_buffer_meta();
+                        let _ = self.sync_backups_now(host);
+                        if is_save_as {
+                            self.save_session_if_changed(host);
+                        }
+                        self.gc_undo_now();
                         self.sync_title(host);
                         self.sidebar.refresh(self.fs.as_ref());
+                        self.refresh_git_workspace(host, true);
+                        if is_save_as {
+                            self.refresh_git_head_for_active_doc(host);
+                        }
                         self.set_notice(format!("Saved ({})", rep.method.as_str()), false);
                         host.request_redraw();
                         (IpcReply::Json(self.status_json()), false, false)

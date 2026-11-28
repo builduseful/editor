@@ -58,7 +58,7 @@ impl SyntaxPlugin for HtmlPlugin {
                 }
                 let mut cur = ByteCursor::new(line);
                 cur.pos = close_pos;
-                return lex_html_from(&mut cur, false, registry, out);
+                return lex_html_from(&mut cur, false, None, registry, out);
             } else {
                 let next_sub = registry
                     .plugin(sub_lang)
@@ -69,6 +69,7 @@ impl SyntaxPlugin for HtmlPlugin {
 
         let mut cur = ByteCursor::new(line);
         let mut in_tag = false;
+        let mut pending_embed: Option<u8> = None;
 
         match state.mode() {
             MODE_COMMENT => {
@@ -78,21 +79,25 @@ impl SyntaxPlugin for HtmlPlugin {
             }
             MODE_IN_TAG => {
                 in_tag = true;
+                let d = state.detail();
+                if d == MODE_EMBED_SCRIPT || d == MODE_EMBED_STYLE {
+                    pending_embed = Some(d);
+                }
             }
             _ => {}
         }
 
-        lex_html_from(&mut cur, in_tag, registry, out)
+        lex_html_from(&mut cur, in_tag, pending_embed, registry, out)
     }
 }
 
 fn lex_html_from(
     cur: &mut ByteCursor<'_>,
     mut in_tag: bool,
+    mut pending_embed: Option<u8>,
     registry: &LanguageRegistry,
     out: &mut Vec<TokenSpan>,
 ) -> LexState {
-    let mut pending_embed: Option<u8> = None;
 
     while !cur.is_eof() {
         if in_tag {
@@ -259,7 +264,7 @@ fn lex_html_from(
     }
 
     if in_tag {
-        LexState::new(MODE_IN_TAG, 0, 0, 0)
+        LexState::new(MODE_IN_TAG, 0, 0, pending_embed.unwrap_or(0))
     } else {
         LexState::NORMAL
     }

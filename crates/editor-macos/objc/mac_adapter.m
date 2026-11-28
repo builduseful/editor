@@ -113,7 +113,9 @@ void mac_free_glyph_pixels(uint8_t* ptr) {
 
 void mac_rasterize_cluster(uint32_t style, float size_px, const uint8_t* utf8, size_t utf8_len,
                            MacRasterGlyph* out) {
+    if (!out) return;
     memset(out, 0, sizeof(*out));
+    if (!utf8 || utf8_len == 0) return;
     @autoreleasepool {
         NSString* str = [[NSString alloc] initWithBytes:utf8
                                                  length:utf8_len
@@ -251,8 +253,11 @@ char* mac_clipboard_get(void) {
 }
 
 void mac_clipboard_set(const uint8_t* utf8, size_t len) {
+    if (!utf8 && len > 0) return;
     @autoreleasepool {
-        NSString* s = [[NSString alloc] initWithBytes:utf8 length:len encoding:NSUTF8StringEncoding];
+        NSString* s = len == 0
+            ? @""
+            : [[NSString alloc] initWithBytes:utf8 length:len encoding:NSUTF8StringEncoding];
         if (!s) return;
         NSPasteboard* pb = [NSPasteboard generalPasteboard];
         [pb clearContents];
@@ -268,6 +273,7 @@ char* mac_pref_get(const char* key) {
     if (!key) return NULL;
     @autoreleasepool {
         NSString* k = [NSString stringWithUTF8String:key];
+        if (!k) return NULL;
         NSString* v = [[NSUserDefaults standardUserDefaults] stringForKey:k];
         if (!v) return NULL;
         const char* utf8 = [v UTF8String];
@@ -280,6 +286,7 @@ void mac_pref_set(const char* key, const char* val) {
     @autoreleasepool {
         NSString* k = [NSString stringWithUTF8String:key];
         NSString* v = [NSString stringWithUTF8String:val];
+        if (!k || !v) return;
         [[NSUserDefaults standardUserDefaults] setObject:v forKey:k];
     }
 }
@@ -324,7 +331,8 @@ int mac_confirm_discard(const char* file_name) {
     @autoreleasepool {
         NSAlert* alert = [[NSAlert alloc] init];
         alert.alertStyle = NSAlertStyleWarning;
-        NSString* name = file_name ? [NSString stringWithUTF8String:file_name] : @"Untitled";
+        NSString* name = file_name ? [NSString stringWithUTF8String:file_name] : nil;
+        if (!name) name = @"Untitled";
         alert.messageText = [NSString stringWithFormat:@"Save changes to \"%@\"?", name];
         alert.informativeText = @"Your changes will be lost if you do not save them.";
         [alert addButtonWithTitle:@"Save"];
@@ -637,6 +645,9 @@ static void purge_and_release_surface(IOSurfaceRef surf) {
 }
 
 - (IOSurfaceRef)createSurfaceWidth:(uint32_t)w height:(uint32_t)h {
+    if (w == 0 || h == 0 || w > 16384 || h > 16384) {
+        return NULL;
+    }
     size_t bpr = IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, (size_t)w * 4);
     size_t alloc_size = IOSurfaceAlignProperty(kIOSurfaceAllocSize, bpr * (size_t)h);
     NSDictionary* props = @{
@@ -890,6 +901,12 @@ static void mac_ensure_blink_timer(void);
                      encode_mods(event.modifierFlags));
 }
 
+- (void)rightMouseUp:(NSEvent*)event {
+    NSPoint p = [self pixelPointFromEvent:event];
+    self.cb.on_mouse(self.cb.userdata, 2, (float)p.x, (float)p.y, 1, 1,
+                     encode_mods(event.modifierFlags));
+}
+
 - (void)scrollWheel:(NSEvent*)event {
     mac_ensure_blink_timer();
     NSPoint p = [self pixelPointFromEvent:event];
@@ -954,7 +971,8 @@ static void stop_fs_watcher_stream(void) {
 void mac_set_title(const char* title) {
     if (!g_window || !title) return;
     @autoreleasepool {
-        g_window.title = [NSString stringWithUTF8String:title];
+        NSString* t = [NSString stringWithUTF8String:title];
+        if (t) g_window.title = t;
     }
 }
 
@@ -1000,26 +1018,31 @@ static void fsevents_callback(
     (void)eventIds;
     if (!g_delegate || !g_delegate.cb.on_fs_changed || numEvents == 0) return;
 
-    NSArray* nsPaths = (__bridge NSArray*)eventPaths;
-    if (!nsPaths) return;
+    @autoreleasepool {
+        NSArray* nsPaths = (__bridge NSArray*)eventPaths;
+        if (!nsPaths) return;
+        size_t nsCount = (size_t)nsPaths.count;
+        if (numEvents > nsCount) numEvents = nsCount;
+        if (numEvents == 0) return;
 
-    // Filter noisy VCS/build/lock paths BEFORE crossing FFI or waking Rust.
-    size_t cap = numEvents < 256 ? numEvents : 256;
-    const char** filtered = (const char**)calloc(cap, sizeof(const char*));
-    if (!filtered) return;
-    size_t out_n = 0;
-    for (size_t i = 0; i < numEvents && out_n < cap; i++) {
-        id item = nsPaths[i];
-        if (![item isKindOfClass:[NSString class]]) continue;
-        const char* utf8 = [(NSString*)item UTF8String];
-        if (!is_noisy_fs_path(utf8)) {
-            filtered[out_n++] = utf8;
+        // Filter noisy VCS/build/lock paths BEFORE crossing FFI or waking Rust.
+        size_t cap = numEvents < 256 ? numEvents : 256;
+        const char** filtered = (const char**)calloc(cap, sizeof(const char*));
+        if (!filtered) return;
+        size_t out_n = 0;
+        for (size_t i = 0; i < numEvents && out_n < cap; i++) {
+            id item = nsPaths[i];
+            if (![item isKindOfClass:[NSString class]]) continue;
+            const char* utf8 = [(NSString*)item UTF8String];
+            if (!is_noisy_fs_path(utf8)) {
+                filtered[out_n++] = utf8;
+            }
         }
+        if (out_n > 0) {
+            g_delegate.cb.on_fs_changed(g_delegate.cb.userdata, filtered, out_n);
+        }
+        free(filtered);
     }
-    if (out_n > 0) {
-        g_delegate.cb.on_fs_changed(g_delegate.cb.userdata, filtered, out_n);
-    }
-    free(filtered);
 }
 
 static void start_fs_watcher_stream_if_needed(void) {
@@ -1068,6 +1091,7 @@ void mac_watch_directory(const char* dir_path) {
             return;
         }
         NSString* next = [NSString stringWithUTF8String:dir_path];
+        if (!next) return;
         if (g_watched_dir && [g_watched_dir isEqualToString:next] && g_fs_stream != NULL) {
             return;
         }
@@ -1086,6 +1110,7 @@ void mac_watch_extra_directory(const char* dir_path) {
             return;
         }
         NSString* next = [NSString stringWithUTF8String:dir_path];
+        if (!next) return;
         if (g_watched_extra_dir && [g_watched_extra_dir isEqualToString:next] && g_fs_stream != NULL) {
             return;
         }
@@ -1275,8 +1300,17 @@ void mac_activate_app(void) {
 
 - (void)applicationWillTerminate:(NSNotification*)note {
     (void)note;
-    if (self.cb.on_will_terminate) {
+    stop_fs_watcher_stream();
+    [self stopBlinkTimer];
+    if (self.cb.on_will_terminate && self.cb.userdata) {
         self.cb.on_will_terminate(self.cb.userdata);
+    }
+    // Clear raw Rust userdata pointers so no late AppKit/dispatch callback can dereference
+    // `BridgeCell` after `mac_run_app` returns and Rust drops it.
+    MacCallbacks cleared = {0};
+    self.cb = cleared;
+    if (g_view) {
+        g_view.cb = cleared;
     }
 }
 
@@ -1492,6 +1526,15 @@ void mac_run_app(MacCallbacks cb) {
         g_delegate = del;
         [NSApp setDelegate:del];
         [NSApp run];
+        stop_fs_watcher_stream();
+        [del stopBlinkTimer];
+        MacCallbacks cleared = {0};
+        del.cb = cleared;
+        if (g_view) {
+            g_view.cb = cleared;
+        }
+        g_view = nil;
+        g_window = nil;
         g_delegate = nil;
     }
 }

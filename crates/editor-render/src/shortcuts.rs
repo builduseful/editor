@@ -13,7 +13,7 @@ use crate::atlas::GlyphAtlas;
 use crate::painter::Painter;
 use crate::palette::fuzzy_score;
 use crate::text_input::TextInput;
-use crate::theme::{px, Color, Theme};
+use crate::theme::{px, Theme};
 
 #[derive(Debug, Clone)]
 pub struct ShortcutDisplayItem {
@@ -262,12 +262,22 @@ impl ShortcutsOverlay {
             _ => {}
         }
 
+        let prev_caret = self.input.caret;
+        let prev_anchor = self.input.anchor;
         let (changed, _) = self.input.handle_key(key, mods, text, None);
         if changed {
             self.rebuild_rows();
             return ShortcutsAction::Changed;
         }
+        if self.input.caret != prev_caret || self.input.anchor != prev_anchor {
+            return ShortcutsAction::Changed;
+        }
         ShortcutsAction::None
+    }
+
+    /// Re-filter shortcut rows after programmatic edits to `self.input` (e.g. Edit-menu Cut/Paste).
+    pub fn refresh_filter(&mut self) {
+        self.rebuild_rows();
     }
 
     fn activate_row(&mut self, row_idx: usize) -> ShortcutsAction {
@@ -335,9 +345,8 @@ impl ShortcutsOverlay {
         let scale = painter.scale();
         let hairline = (1.0 * scale).round().max(1.0) as i32;
 
-        // Subtle dim scrim over the editor.
-        let scrim = Color::rgba(0, 0, 0, if theme.is_dark { 140 } else { 65 });
-        painter.fill_rect(bounds, scrim);
+        // Subtle dim scrim from theme tokens.
+        painter.fill_rect(bounds, theme.scrim);
 
         let card_w = (bounds.w - px(64.0, scale))
             .min(px(620.0, scale))
@@ -413,6 +422,12 @@ impl ShortcutsOverlay {
         let hint = format!("↑↓ Navigate   ·   ↵ Run   ·   {toggle_hint}   ·   Esc Close");
         let fm = atlas.metrics(rasterizer, FontStyle::Ui, 11.0 * scale);
         let footer_base = footer_y as f32 + (footer_h as f32 + fm.ascent - fm.descent) * 0.5;
+        painter.push_clip(PixelRect::new(
+            card.x + pad,
+            footer_y,
+            (card.w - pad * 2).max(0),
+            footer_h,
+        ));
         painter.draw_text_ui(
             (card.x + pad) as f32,
             footer_base,
@@ -423,6 +438,7 @@ impl ShortcutsOverlay {
             atlas,
             rasterizer,
         );
+        painter.pop_clip();
 
         // Scrollable rows viewport.
         let list_rect = PixelRect::new(
@@ -575,19 +591,8 @@ impl ShortcutsOverlay {
                     if selected {
                         painter.fill_rounded_rect(row_rect, 5.0 * scale, theme.current_line);
                     }
-                    let base = ry as f32 + (rh as f32 + lm.ascent - lm.descent) * 0.5;
-                    painter.draw_text_ui(
-                        (row_rect.x + inner_pad) as f32,
-                        base,
-                        item.label,
-                        FontStyle::Ui,
-                        label_font,
-                        theme.text,
-                        atlas,
-                        rasterizer,
-                    );
 
-                    // Tactile keycap pill on the right.
+                    // Tactile keycap pill on the right (computed first so label clips cleanly before it).
                     let key_w = Painter::measure_text_ui(
                         &item.keys,
                         FontStyle::Mono,
@@ -605,6 +610,23 @@ impl ShortcutsOverlay {
                         cap_w,
                         cap_h,
                     );
+
+                    let label_x = row_rect.x + inner_pad;
+                    let label_max_w = (cap_rect.x - px(8.0, scale) - label_x).max(0);
+                    let base = ry as f32 + (rh as f32 + lm.ascent - lm.descent) * 0.5;
+                    painter.push_clip(PixelRect::new(label_x, ry, label_max_w, rh));
+                    painter.draw_text_ui(
+                        label_x as f32,
+                        base,
+                        item.label,
+                        FontStyle::Ui,
+                        label_font,
+                        theme.text,
+                        atlas,
+                        rasterizer,
+                    );
+                    painter.pop_clip();
+
                     painter.fill_rounded_rect(cap_rect, 4.0 * scale, theme.page);
                     painter.stroke_rounded_rect(cap_rect, 4.0 * scale, hairline as f32, theme.border_subtle);
                     let kbase = cap_rect.y as f32 + (cap_rect.h as f32 + km.ascent - km.descent) * 0.5;

@@ -156,6 +156,8 @@ impl FindBarState {
             FindBarAction::FocusFind
         } else if self.show_replace && l.replace_input.contains(xi, yi) {
             FindBarAction::FocusReplace
+        } else if l.btn_close.contains(xi, yi) {
+            FindBarAction::Close
         } else if l.btn_case.contains(xi, yi) {
             FindBarAction::ToggleCase
         } else if l.btn_word.contains(xi, yi) {
@@ -170,8 +172,6 @@ impl FindBarState {
             FindBarAction::ReplaceOne
         } else if self.show_replace && l.btn_replace_all.contains(xi, yi) {
             FindBarAction::ReplaceAll
-        } else if l.btn_close.contains(xi, yi) {
-            FindBarAction::Close
         } else {
             FindBarAction::None
         }
@@ -190,6 +190,7 @@ impl FindBarState {
             self.layout = FindBarLayout::default();
             return;
         }
+        painter.push_clip(rect);
         let scale = painter.scale();
         let hairline = (1.0 * scale).round().max(1.0) as i32;
         let pad = px(8.0, scale);
@@ -203,7 +204,7 @@ impl FindBarState {
         );
 
         let y1 = rect.y + px(7.0, scale);
-        let input_w = (rect.w - px(340.0, scale)).clamp(px(120.0, scale), px(320.0, scale));
+        let input_w = (rect.w - px(214.0, scale)).clamp(px(48.0, scale), px(320.0, scale));
         let find_rect = PixelRect::new(rect.x + pad, y1, input_w, row_h);
         self.find_input
             .draw(painter, find_rect, theme, atlas, rasterizer, caret_visible);
@@ -307,6 +308,7 @@ impl FindBarState {
             btn_replace_all,
             btn_close,
         };
+        painter.pop_clip();
     }
 }
 
@@ -740,15 +742,10 @@ impl ConfirmModal {
             return;
         }
         let scale = painter.scale();
-        // Subtle scrim over window.
-        let scrim = if theme.is_dark {
-            crate::theme::Color::rgba(0, 0, 0, 140)
-        } else {
-            crate::theme::Color::rgba(0x17, 0x1a, 0x1f, 80)
-        };
-        painter.fill_rect(bounds, scrim);
+        // Subtle scrim from theme tokens.
+        painter.fill_rect(bounds, theme.scrim);
 
-        let card_w = px(400.0, scale).min(bounds.w - px(32.0, scale));
+        let card_w = px(400.0, scale).min(bounds.w - px(32.0, scale)).max(0);
         let card_h = px(136.0, scale);
         let card = PixelRect::new(
             bounds.x + (bounds.w - card_w) / 2,

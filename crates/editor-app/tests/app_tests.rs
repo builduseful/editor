@@ -6610,3 +6610,381 @@ fn audit_regressions_crlf_enter_vim_visual_text_objects_and_zero_len_regex() {
     assert_eq!(app.vim.mode, editor_app::VimMode::Normal);
     assert_eq!(app.doc.to_string_lossy(), "hello");
 }
+
+#[test]
+fn audit_pass2_split_pane_data_loss_ipc_save_tab_drag_and_vim_regressions() {
+    use std::path::Path;
+    use editor_core::Document;
+    use editor_platform::ipc::{IpcCommand, IpcReply};
+
+    // 1. Same-buffer split pane data loss protection:
+    //    only_active_pane, close_split, and Quit/Hot Exit must preserve dirty sibling edits!
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/proj/a.txt", b"original\n".to_vec());
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+    let state_dir = PathBuf::from("/state");
+    host.state_dir = Some(state_dir.clone());
+
+    let mut app = EditorApp::new(fs.clone(), 960, 640, 2.0);
+    app.load_preferences(&host);
+    app.open_folder(Path::new("/proj"), &mut host);
+    app.open_file(Path::new("/proj/a.txt"), &mut host).unwrap();
+
+    // 1a. Split same buffer -> edit Pane 2 (dirty) -> focus Pane 1 (clean) -> only_active_pane.
+    app.split_pane_with(None, &mut host);
+    assert_eq!(app.other_panes.len(), 1);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('x'),
+            mods: Modifiers::NONE,
+            text: Some("EDITED_P2 ".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.doc.is_dirty());
+    let pane1_id = app.other_panes[0].id;
+    app.focus_pane_id(pane1_id, &mut host);
+    assert!(!app.doc.is_dirty(), "Pane 1 is clean while Pane 2 is dirty");
+    app.only_active_pane(&mut host);
+    assert!(
+        app.doc.is_dirty() && app.doc.to_string_lossy().starts_with("EDITED_P2 "),
+        "only_active_pane must preserve dirty edits from closing sibling pane"
+    );
+
+    // 1b. Save clean, split again, edit active pane, close_split -> heir pane receives edits!
+    app.handle_event(
+        InputEvent::Command(AppCommand::Save),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.doc.is_dirty());
+    app.split_pane_with(None, &mut host);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('y'),
+            mods: Modifiers::NONE,
+            text: Some("CLOSING_DIRTY ".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.doc.is_dirty());
+    app.close_split(&mut host);
+    assert!(
+        app.doc.is_dirty() && app.doc.to_string_lossy().starts_with("CLOSING_DIRTY "),
+        "close_split must carry dirty edits to the surviving same-buffer pane"
+    );
+
+    // 1c. Hot Exit / Quit when Pane 1 (active) is clean and Pane 2 (same buf_id) is dirty.
+    app.handle_event(
+        InputEvent::Command(AppCommand::Save),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.split_pane_with(None, &mut host);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('z'),
+            mods: Modifiers::NONE,
+            text: Some("QUIT_BACKUP ".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    let clean_pane_id = app.other_panes[0].id;
+    app.focus_pane_id(clean_pane_id, &mut host);
+    assert!(!app.doc.is_dirty());
+    app.handle_will_terminate(&mut host);
+
+    let mut app_restarted = EditorApp::new(fs.clone(), 960, 640, 2.0);
+    app_restarted.load_preferences(&host);
+    app_restarted.open_folder(Path::new("/proj"), &mut host);
+    assert!(
+        app_restarted.doc.to_string_lossy().starts_with("QUIT_BACKUP ")
+            || app_restarted
+                .other_panes
+                .iter_mut()
+                .any(|p| p.doc.to_string_lossy().starts_with("QUIT_BACKUP ")),
+        "Hot Exit must back up and restore dirty sibling pane even when active pane was clean"
+    );
+
+    // 2. IpcCommand::Save cleans up Hot Exit backups so relaunch loads saved disk content.
+    app.only_active_pane(&mut host);
+    let (reply, _, _) = app.execute_ipc(
+        &IpcCommand::Save { as_path: None },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(matches!(reply, IpcReply::Json(_)));
+    let ds = editor_app::DraftStore::load(fs.as_ref(), &state_dir);
+    assert!(
+        ds.find_by_path(Path::new("/proj/a.txt")).is_none(),
+        "IpcCommand::Save must remove the Hot Exit draft for the saved file"
+    );
+
+    // 3. Tab-strip drag rightward off-by-one (`move_to_open` on `[A, B, C]`).
+    let mut ws = editor_app::WorkingSet::new(1);
+    let id_b = ws.alloc_buffer(None, "b.rs".into(), false);
+    ws.register_buffer(id_b, editor_app::OpenMode::Keep);
+    let id_c = ws.alloc_buffer(None, "c.rs".into(), false);
+    ws.register_buffer(id_c, editor_app::OpenMode::Keep);
+    assert_eq!(ws.open, vec![1, id_b, id_c]);
+    ws.move_to_open(1, 1); // drop gap between A and B -> no-op
+    assert_eq!(ws.open, vec![1, id_b, id_c]);
+    ws.move_to_open(1, 2); // drop gap between B and C -> [B, A, C]
+    assert_eq!(ws.open, vec![id_b, 1, id_c]);
+
+    // 4. Vim regressions: `2d3w`, `dd` at EOF without newline, linewise `p` at EOF, and `Vjj`/`Vjk`.
+    app.vim.set_enabled(true);
+    let send_key = |app: &mut EditorApp,
+                    c: char,
+                    r: &mut BuiltinBitmapRasterizer,
+                    cl: &mut MemoryClipboard,
+                    h: &mut HeadlessHost| {
+        let mut s = String::new();
+        s.push(c);
+        app.handle_event(
+            InputEvent::KeyDown {
+                key: Key::Char(c.to_ascii_lowercase()),
+                mods: if c.is_ascii_uppercase() {
+                    Modifiers {
+                        shift: true,
+                        ..Modifiers::NONE
+                    }
+                } else {
+                    Modifiers::NONE
+                },
+                text: Some(s),
+            },
+            r,
+            cl,
+            h,
+        );
+    };
+
+    // 4a. `2d3w` deletes 6 words (2 * 3), not 23!
+    app.doc = Document::from_str("w1 w2 w3 w4 w5 w6 w7 w8\n", None);
+    app.caret = 0;
+    app.anchor = 0;
+    for c in ['2', 'd', '3', 'w'] {
+        send_key(&mut app, c, &mut raster, &mut clip, &mut host);
+    }
+    assert_eq!(app.doc.to_string_lossy(), " w7 w8\n");
+
+    // 4b. `dd` on final line without trailing newline removes the line and preceding `\n`.
+    app.doc = Document::from_str("line1\nline2", None);
+    app.caret = 6;
+    app.anchor = 6;
+    for c in ['d', 'd'] {
+        send_key(&mut app, c, &mut raster, &mut clip, &mut host);
+    }
+    assert_eq!(app.doc.to_string_lossy(), "line1");
+
+    // 4c. Linewise `p` at EOF without trailing newline preserves blank lines & strips `\r\n`.
+    clip.set_text("added\n\n");
+    app.vim.last_yank_linewise = true;
+    app.doc = Document::from_str("base", None);
+    app.caret = 0;
+    app.anchor = 0;
+    send_key(&mut app, 'p', &mut raster, &mut clip, &mut host);
+    assert_eq!(app.doc.to_string_lossy(), "base\nadded\n");
+
+    // 4d. `Vjj` selects 3 lines (not 4) and `k` shrinks back to 2 lines!
+    app.doc = Document::from_str("a\nb\nc\nd\n", None);
+    app.caret = 0;
+    app.anchor = 0;
+    for c in ['V', 'j', 'j', 'k', 'd'] {
+        send_key(&mut app, c, &mut raster, &mut clip, &mut host);
+    }
+    assert_eq!(app.doc.to_string_lossy(), "c\nd\n");
+}
+
+#[test]
+fn audit_pass2_focus_loss_zoom_sync_multicursor_dedent_dirty_empty_and_vim_click() {
+    use editor_platform::{AppCommand, InputEvent, Key, Modifiers, MouseButton};
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/proj/a.rs", b"fn alpha() {}\nfn beta() {}\n".to_vec());
+    fs.add_file("/proj/b.rs", b"    first\n    second\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1200, 800, 1.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+    app.open_folder(Path::new("/proj"), &mut host);
+    app.open_file(Path::new("/proj/a.rs"), &mut host).unwrap();
+    app.render(&mut raster);
+
+    // 1. ZoomIn / ZoomOut / ZoomReset propagates to all split panes.
+    app.handle_event(
+        InputEvent::Command(AppCommand::SplitPaneDown),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.other_panes.len(), 1);
+    let base_font = app.viewport.font_size_pt;
+    app.handle_event(
+        InputEvent::Command(AppCommand::ZoomIn),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(app.viewport.font_size_pt > base_font);
+    assert_eq!(
+        app.other_panes[0].viewport.font_size_pt,
+        app.viewport.font_size_pt,
+        "ZoomIn must propagate to every split pane"
+    );
+    app.handle_event(
+        InputEvent::Command(AppCommand::ZoomReset),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.other_panes[0].viewport.font_size_pt, app.viewport.font_size_pt);
+
+    // 2. FocusChanged(false) cancels active drags cleanly.
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: (app.layout.viewport.x + 80) as f32,
+            y_px: (app.layout.viewport.y + 8) as f32,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::FocusChanged(false),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    // Moving mouse after focus loss must NOT drag-select!
+    let anchor_before = app.anchor;
+    let caret_before = app.caret;
+    app.handle_event(
+        InputEvent::MouseMove {
+            x_px: (app.layout.viewport.x + 180) as f32,
+            y_px: (app.layout.viewport.y + 24) as f32,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!((app.anchor, app.caret), (anchor_before, caret_before));
+
+    // 3. Multi-cursor Shift+Tab: no-op on unindented lines keeps file clean; on indented lines preserves col!
+    app.only_active_pane(&mut host);
+    app.open_file(Path::new("/proj/a.rs"), &mut host).unwrap();
+    app.caret = 3;
+    app.anchor = 3;
+    app.extra_cursors = vec![(17, 17)];
+    assert!(!app.doc.is_dirty());
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Tab,
+            mods: Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(
+        !app.doc.is_dirty(),
+        "Shift+Tab with multi-cursors on unindented lines must not dirty a clean file"
+    );
+
+    app.open_file(Path::new("/proj/b.rs"), &mut host).unwrap();
+    // Place two carets after the 4-space indent + 2 chars ("    fi|rst", "    se|cond").
+    app.caret = 6;
+    app.anchor = 6;
+    app.extra_cursors = vec![(16, 16)];
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Tab,
+            mods: Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.doc.to_string_lossy(), "first\nsecond\n");
+    assert_eq!(app.caret, 2, "primary cursor column must shift left by stripped indent, not collapse to 0");
+    assert_eq!(app.extra_cursors, vec![(8, 8)], "secondary cursor column must shift left by stripped indent");
+
+    // 4. 0-byte dirty file override in ProjectSearch hides stale disk contents.
+    app.open_file(Path::new("/proj/a.rs"), &mut host).unwrap();
+    app.extra_cursors.clear();
+    let total = app.doc.len_bytes();
+    app.doc.edit(0, total, "", 100, false).unwrap();
+    assert!(app.doc.is_dirty() && app.doc.len_bytes() == 0);
+    app.handle_event(
+        InputEvent::Command(AppCommand::ProjectSearch),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.palette.input.set_text("alpha".to_string());
+    app.palette.refresh_results(fs.as_ref());
+    assert!(
+        app.palette.items.is_empty(),
+        "0-byte dirty buffer must override stale on-disk bytes in ProjectSearch"
+    );
+    app.palette.close();
+
+    // 5. Single-click inside editor while in Vim Visual mode exits back to Normal mode.
+    app.open_file(Path::new("/proj/b.rs"), &mut host).unwrap();
+    app.vim.set_enabled(true);
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('v'),
+            mods: Modifiers::NONE,
+            text: Some("v".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.vim.mode, editor_app::VimMode::Visual);
+    app.render(&mut raster);
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: (app.layout.viewport.x + 80) as f32,
+            y_px: (app.layout.viewport.y + 8) as f32,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(
+        app.vim.mode,
+        editor_app::VimMode::Normal,
+        "unmodified single-click must exit Vim Visual mode back to Normal"
+    );
+}

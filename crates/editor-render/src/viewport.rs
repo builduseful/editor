@@ -160,20 +160,29 @@ impl Viewport {
     }
 
     pub fn zoom_in(&mut self) {
+        let old = self.font_size_pt.max(1.0);
         self.font_size_pt = (self.font_size_pt + 1.5).min(36.0);
-        self.max_line_width_px = 0.0;
+        let ratio = self.font_size_pt / old;
+        self.max_line_width_px *= ratio;
+        self.scroll_x_px *= ratio;
         self.clear_wrap_caches();
     }
 
     pub fn zoom_out(&mut self) {
+        let old = self.font_size_pt.max(1.0);
         self.font_size_pt = (self.font_size_pt - 1.5).max(8.0);
-        self.max_line_width_px = 0.0;
+        let ratio = self.font_size_pt / old;
+        self.max_line_width_px *= ratio;
+        self.scroll_x_px *= ratio;
         self.clear_wrap_caches();
     }
 
     pub fn zoom_reset(&mut self) {
+        let old = self.font_size_pt.max(1.0);
         self.font_size_pt = 13.5;
-        self.max_line_width_px = 0.0;
+        let ratio = self.font_size_pt / old;
+        self.max_line_width_px *= ratio;
+        self.scroll_x_px *= ratio;
         self.clear_wrap_caches();
     }
 
@@ -369,7 +378,7 @@ impl Viewport {
         metrics: FontMetrics,
         scale: f32,
     ) -> ViewportLayout {
-        let gutter_w = self.compute_gutter_width(doc, metrics.cell_width, scale);
+        let gutter_w = self.compute_gutter_width(doc, metrics.cell_width, scale).min(rect.w);
         let h_strip = if self.word_wrap {
             0
         } else {
@@ -413,6 +422,16 @@ impl Viewport {
         } else {
             PixelRect::ZERO
         };
+
+        // Clamp horizontal scroll when measured content fits (e.g. window widen or zoom out).
+        if !self.word_wrap && text_w > 0 && self.max_line_width_px > 0.0 {
+            let max_x = if self.max_line_width_px > text_w as f32 {
+                (self.max_line_width_px + 32.0 * scale - text_w as f32).max(0.0)
+            } else {
+                0.0
+            };
+            self.scroll_x_px = self.scroll_x_px.clamp(0.0, max_x);
+        }
 
         // Compute horizontal thumb.
         let h_thumb = if !self.word_wrap && self.max_line_width_px > text_w as f32 && text_w > 0 {
@@ -634,8 +653,8 @@ impl Viewport {
         while line > 0 {
             line -= 1;
             let content = doc.line_content(line).unwrap_or_default();
-            let segs = self.layout_line(line, &content, metrics.cell_width, max_wrap_w);
-            let block_h = segs.len() as f32 * line_h;
+            let vis = self.count_wrapped_visual_lines(&content, metrics.cell_width, max_wrap_w);
+            let block_h = vis as f32 * line_h;
             if acc_h + block_h >= text_h {
                 let overflow = (acc_h + block_h - text_h).max(0.0);
                 return (line, overflow);
@@ -1091,8 +1110,6 @@ impl Viewport {
         if rect.is_empty() {
             return;
         }
-        // Reset per-frame caret bounding rect so partial dirty-rect redraws stay tight!
-        self.last_caret_rect = PixelRect::ZERO;
         let scale = painter.scale();
         let font_px = self.font_px(scale);
         let metrics = atlas.metrics(rasterizer, FontStyle::Mono, font_px);
@@ -1109,6 +1126,12 @@ impl Viewport {
         let layout = self.compute_layout(rect, doc, metrics, scale);
 
         let clip = painter.current_clip();
+        // Reset per-frame caret bounding rect only on full text-area redraws or when unfocused,
+        // so partial dirty-rect repaints (toast expiry, scrollbar hover, single-caret blink) never
+        // discard off-clip multi-cursor rects or clear the IME caret anchor.
+        if !focused || layout.text.intersect(clip) == layout.text {
+            self.last_caret_rect = PixelRect::ZERO;
+        }
         let hairline = (1.0 * scale).round().max(1.0) as i32;
         let text_pad_x = px(12.0, scale) as f32;
         let cell_w = metrics.cell_width;
@@ -1338,6 +1361,7 @@ impl Viewport {
                 let seg_str = &line_text[seg.byte_start..seg.byte_end];
                 let seg_abs_start = line_start + (win_rel_start + seg.byte_start) as u64;
                 let seg_abs_end = line_start + (win_rel_start + seg.byte_end) as u64;
+                let is_line_end = seg_abs_end == line_content_end;
                 let seg_origin_x = text_origin_x + win_x_shift;
 
                 // Selection highlights on this visual segment (primary + any extra cursors).
@@ -1367,7 +1391,7 @@ impl Viewport {
                                 (ov_end.saturating_sub(seg_abs_start)) as usize,
                                 cell_w,
                             );
-                        if seg_idx + 1 == segs.len() && sel_b > line_content_end {
+                        if is_line_end && sel_b > line_content_end {
                             x1 += cell_w * 0.65;
                         }
                         if x1 > x0 {
@@ -1491,11 +1515,12 @@ impl Viewport {
 
                 // Track & draw blinking caret if it falls on this visual segment.
                 if is_current_line && focused {
-                    let rel_caret = caret_col.saturating_sub(win_rel_start);
-                    let in_seg = caret_col >= win_rel_start + seg.byte_start
-                        && (caret_col < win_rel_start + seg.byte_end || seg_idx + 1 == segs.len());
+                    let caret_abs = line_start + caret_col as u64;
+                    let in_seg = caret_abs >= seg_abs_start
+                        && (caret_abs < seg_abs_end
+                            || (is_line_end && caret_abs <= line_content_end));
                     if in_seg {
-                        let local_col = rel_caret.saturating_sub(seg.byte_start).min(seg_str.len());
+                        let local_col = ((caret_abs - seg_abs_start) as usize).min(seg_str.len());
                         let cx = seg_origin_x + self.measure_prefix_px(seg_str, local_col, cell_w);
                         let caret_w = if self.block_caret {
                             cell_w.round().max(4.0) as i32
@@ -1556,8 +1581,7 @@ impl Viewport {
                     let caret_w = (2.0 * scale).round().max(1.0) as i32;
                     for &(_, ec) in &self.extra_cursors {
                         let in_seg = ec >= seg_abs_start
-                            && (ec < seg_abs_end
-                                || (seg_idx + 1 == segs.len() && ec <= line_content_end));
+                            && (ec < seg_abs_end || (is_line_end && ec <= line_content_end));
                         if in_seg {
                             let local_col = ((ec - seg_abs_start) as usize).min(seg_str.len());
                             let cx =
@@ -1586,7 +1610,15 @@ impl Viewport {
             line_idx += 1;
         }
 
-        // 3. Recompute scrollbar thumbs with updated `max_line_width_px` and draw quiet overlay thumbs.
+        // 3. Clamp horizontal scroll against measured line width and recompute scrollbar thumbs.
+        if !self.word_wrap && layout.text.w > 0 {
+            let max_x = if self.max_line_width_px > layout.text.w as f32 {
+                (self.max_line_width_px + 32.0 * scale - layout.text.w as f32).max(0.0)
+            } else {
+                0.0
+            };
+            self.scroll_x_px = self.scroll_x_px.clamp(0.0, max_x);
+        }
         let layout = self.compute_layout(rect, doc, metrics, scale);
         if !layout.v_thumb.is_empty() && !layout.v_bar.intersect(clip).is_empty() {
             let alpha = if self.v_bar_dragging || self.v_bar_hovered {

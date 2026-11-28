@@ -11,7 +11,7 @@ use editor_platform::{FontStyle, GlyphRasterizer, Key, Modifiers, PixelRect};
 use crate::atlas::GlyphAtlas;
 use crate::painter::Painter;
 use crate::palette::PaletteOpenTarget;
-use crate::theme::{px, Color, Theme};
+use crate::theme::{px, Theme};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PinEntry {
@@ -49,6 +49,8 @@ pub struct PinsOverlay {
     entries: Vec<PinEntry>,
     rows: Vec<Row>,
     selected_row: usize,
+    scroll_y_px: f32,
+    scroll_to_selected: bool,
     card_rect: PixelRect,
     item_rects: Vec<(usize, PixelRect)>,
 }
@@ -66,6 +68,8 @@ impl PinsOverlay {
             entries: Vec::new(),
             rows: Vec::new(),
             selected_row: 0,
+            scroll_y_px: 0.0,
+            scroll_to_selected: false,
             card_rect: PixelRect::ZERO,
             item_rects: Vec::new(),
         }
@@ -73,6 +77,7 @@ impl PinsOverlay {
 
     pub fn open(&mut self, entries: Vec<PinEntry>) {
         self.visible = true;
+        self.scroll_y_px = 0.0;
         self.refresh(entries, None);
     }
 
@@ -81,6 +86,21 @@ impl PinsOverlay {
         self.entries.clear();
         self.rows.clear();
         self.item_rects.clear();
+        self.scroll_y_px = 0.0;
+        self.scroll_to_selected = false;
+    }
+
+    pub fn handle_scroll(&mut self, dy_px: f32) -> bool {
+        if !self.visible {
+            return false;
+        }
+        self.scroll_y_px = (self.scroll_y_px + dy_px).max(0.0);
+        self.scroll_to_selected = false;
+        true
+    }
+
+    pub fn scroll_y_px(&self) -> f32 {
+        self.scroll_y_px
     }
 
     pub fn refresh(&mut self, entries: Vec<PinEntry>, keep_selected_id: Option<u32>) {
@@ -119,6 +139,7 @@ impl PinsOverlay {
                 Row::Header(_) => false,
             }) {
                 self.selected_row = r_idx;
+                self.scroll_to_selected = true;
                 return;
             }
         }
@@ -135,6 +156,7 @@ impl PinsOverlay {
                 .position(|r| matches!(r, Row::Item(_)))
                 .unwrap_or(0);
         }
+        self.scroll_to_selected = true;
     }
 
     fn selected_entry(&self) -> Option<&PinEntry> {
@@ -154,6 +176,7 @@ impl PinsOverlay {
             idx = (idx + delta).clamp(0, len - 1);
             if matches!(self.rows[idx as usize], Row::Item(_)) {
                 self.selected_row = idx as usize;
+                self.scroll_to_selected = true;
                 return;
             }
             if (delta < 0 && idx == 0) || (delta > 0 && idx == len - 1) {
@@ -363,13 +386,8 @@ impl PinsOverlay {
         let scale = painter.scale();
         let hairline = (1.0 * scale).round().max(1.0) as i32;
 
-        // Quiet scrim matching CommandPalette / ShortcutsOverlay.
-        let scrim = if theme.is_dark {
-            Color::rgba(0, 0, 0, 128)
-        } else {
-            Color::rgba(0x17, 0x1a, 0x1f, 64)
-        };
-        painter.fill_rect(bounds, scrim);
+        // Quiet scrim from theme tokens.
+        painter.fill_rect(bounds, theme.scrim);
 
         let pad = px(12.0, scale);
         let title_h = px(22.0, scale);
@@ -378,14 +396,24 @@ impl PinsOverlay {
         let footer_h = px(22.0, scale);
 
         let mut list_h = 0i32;
+        let mut row_offsets: Vec<(i32, i32)> = Vec::with_capacity(self.rows.len());
         if self.rows.is_empty() {
             list_h = px(34.0, scale);
         } else {
             for (i, r) in self.rows.iter().enumerate() {
-                list_h += match r {
-                    Row::Header(_) => section_h + if i > 0 { px(4.0, scale) } else { 0 },
-                    Row::Item(_) => row_h,
-                };
+                match r {
+                    Row::Header(_) => {
+                        if i > 0 {
+                            list_h += px(4.0, scale);
+                        }
+                        row_offsets.push((list_h, section_h));
+                        list_h += section_h;
+                    }
+                    Row::Item(_) => {
+                        row_offsets.push((list_h, row_h));
+                        list_h += row_h;
+                    }
+                }
             }
         }
 
@@ -404,6 +432,7 @@ impl PinsOverlay {
         let radius = 8.0 * scale;
         painter.fill_rounded_rect(card, radius, theme.surface);
         painter.stroke_rounded_rect(card, radius, hairline as f32, theme.border_control);
+        painter.push_clip(card);
 
         // Title bar
         let title_px = 12.5 * scale;
@@ -448,6 +477,22 @@ impl PinsOverlay {
             (card.w - pad * 2).max(0),
             (footer_y - px(6.0, scale) - list_y).max(0),
         );
+        let max_scroll = (list_h - list_clip.h).max(0) as f32;
+        if self.scroll_to_selected {
+            self.scroll_to_selected = false;
+            if let Some(&(ry, rh)) = row_offsets.get(self.selected_row) {
+                let top = ry as f32;
+                let bot = (ry + rh) as f32;
+                if top < self.scroll_y_px {
+                    self.scroll_y_px = top;
+                } else if bot > self.scroll_y_px + list_clip.h as f32 {
+                    self.scroll_y_px = bot - list_clip.h as f32;
+                }
+            }
+        }
+        self.scroll_y_px = self.scroll_y_px.clamp(0.0, max_scroll);
+        let scroll_i = self.scroll_y_px.round() as i32;
+        let right_gutter = if max_scroll > 0.0 { px(8.0, scale) } else { 0 };
         painter.push_clip(list_clip);
 
         self.item_rects.clear();
@@ -470,13 +515,15 @@ impl PinsOverlay {
                 rasterizer,
             );
         } else {
-            let mut cy = list_clip.y;
-            for (r_idx, row) in self.rows.iter().enumerate() {
+            for (r_idx, (row, &(ry_rel, rh))) in
+                self.rows.iter().zip(row_offsets.iter()).enumerate()
+            {
+                let cy = list_clip.y + ry_rel - scroll_i;
+                if cy + rh <= list_clip.y || cy >= list_clip.bottom() {
+                    continue;
+                }
                 match *row {
                     Row::Header(title) => {
-                        if r_idx > 0 {
-                            cy += px(4.0, scale);
-                        }
                         let base = cy as f32 + (section_h as f32 + hm.ascent - hm.descent) * 0.5;
                         painter.draw_text_ui(
                             (list_clip.x + px(6.0, scale)) as f32,
@@ -488,11 +535,15 @@ impl PinsOverlay {
                             atlas,
                             rasterizer,
                         );
-                        cy += section_h;
                     }
                     Row::Item(entry_idx) => {
                         let e = &self.entries[entry_idx];
-                        let r = PixelRect::new(list_clip.x, cy, list_clip.w, row_h);
+                        let r = PixelRect::new(
+                            list_clip.x,
+                            cy,
+                            (list_clip.w - right_gutter).max(0),
+                            row_h,
+                        );
                         let clipped_r = r.intersect(list_clip);
                         if !clipped_r.is_empty() {
                             self.item_rects.push((entry_idx, clipped_r));
@@ -623,11 +674,24 @@ impl PinsOverlay {
                             );
                         }
                         painter.pop_clip();
-
-                        cy += row_h;
                     }
                 }
             }
+        }
+        if max_scroll > 0.0 && list_clip.h > 0 {
+            let thumb_w = px(4.0, scale);
+            let thumb_h = ((list_clip.h as f32 * list_clip.h as f32) / list_h as f32)
+                .max(24.0 * scale)
+                .min(list_clip.h as f32)
+                .round() as i32;
+            let travel = (list_clip.h - thumb_h).max(0);
+            let frac = (self.scroll_y_px / max_scroll).clamp(0.0, 1.0);
+            let ty = list_clip.y + (frac * travel as f32).round() as i32;
+            painter.fill_rounded_rect(
+                PixelRect::new(list_clip.right() - thumb_w, ty, thumb_w, thumb_h),
+                thumb_w as f32 * 0.5,
+                theme.border_control.with_alpha(120),
+            );
         }
         painter.pop_clip();
 
@@ -637,6 +701,12 @@ impl PinsOverlay {
             theme.border_subtle,
         );
         let fbase = footer_y as f32 + (footer_h as f32 + hm.ascent - hm.descent) * 0.5;
+        painter.push_clip(PixelRect::new(
+            card.x + pad,
+            footer_y,
+            (card.w - pad * 2).max(0),
+            footer_h,
+        ));
         painter.draw_text_ui(
             (card.x + pad) as f32,
             fbase,
@@ -647,5 +717,7 @@ impl PinsOverlay {
             atlas,
             rasterizer,
         );
+        painter.pop_clip();
+        painter.pop_clip();
     }
 }

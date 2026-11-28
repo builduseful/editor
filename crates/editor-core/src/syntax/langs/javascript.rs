@@ -58,8 +58,10 @@ pub(crate) fn lex_js_ts(
         MODE_BLOCK_COMMENT => {
             let rem = cur.scan_block_comment(1, false, out);
             if rem > 0 {
-                return LexState::new(MODE_BLOCK_COMMENT, 0, 1, 0);
+                return state;
             }
+            // Restore enclosing `${ ... }` template brace depth after a multi-line comment closes!
+            template_brace_depth = state.detail();
         }
         MODE_TEMPLATE => {
             if state.depth() == 0 {
@@ -92,7 +94,7 @@ pub(crate) fn lex_js_ts(
         if b == b'/' && cur.peek_at(1) == Some(b'*') {
             let rem = cur.scan_block_comment(0, false, out);
             if rem > 0 {
-                return LexState::new(MODE_BLOCK_COMMENT, 0, 1, 0);
+                return LexState::new(MODE_BLOCK_COMMENT, 0, 1, template_brace_depth);
             }
             continue;
         }

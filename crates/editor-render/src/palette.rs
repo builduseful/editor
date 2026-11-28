@@ -36,7 +36,7 @@ use editor_platform::{
 use crate::atlas::GlyphAtlas;
 use crate::painter::Painter;
 use crate::text_input::TextInput;
-use crate::theme::{px, Color, Theme};
+use crate::theme::{px, Theme};
 
 const MAX_PROJECT_FILES: usize = 50_000;
 const MAX_WALK_DEPTH: usize = 24;
@@ -1541,9 +1541,17 @@ impl CommandPalette {
             return;
         }
 
-        // If we sought mid-file, discard the leading partial line so every line starts at col 0.
+        // If we sought mid-file, discard any leading partial line strictly before the match anchor
+        // so every line starts at col 0 without dropping >4 KB single-line matches.
         let slice_skip = if win_start > 0 {
-            find_byte(&raw_bytes, b'\n').map(|p| p + 1).unwrap_or(0)
+            let anchor_rel = item
+                .byte_offset
+                .map(|abs| abs.saturating_sub(win_start) as usize)
+                .unwrap_or(raw_bytes.len())
+                .min(raw_bytes.len());
+            find_byte(&raw_bytes[..anchor_rel], b'\n')
+                .map(|p| p + 1)
+                .unwrap_or(0)
         } else {
             0
         };
@@ -1924,12 +1932,7 @@ impl CommandPalette {
 
         let scale = painter.scale();
         let hairline = (1.0 * scale).round().max(1.0) as i32;
-        let scrim = if theme.is_dark {
-            Color::rgba(0, 0, 0, 128)
-        } else {
-            Color::rgba(0x17, 0x1a, 0x1f, 64)
-        };
-        painter.fill_rect(bounds, scrim);
+        painter.fill_rect(bounds, theme.scrim);
 
         let pad = px(10.0, scale);
         let input_h = px(28.0, scale);
@@ -1952,7 +1955,21 @@ impl CommandPalette {
             let vis_n = self.items.len().clamp(1, 10);
             let cw = px(580.0, scale).min((bounds.w - px(32.0, scale)).max(px(280.0, scale)));
             let list_h = (vis_n as i32) * row_h + px(8.0, scale);
-            let ch = pad + header_h + px(4.0, scale) + input_h + px(8.0, scale) + list_h + footer_h + pad;
+            let extra_rows_h = if self.mode == PaletteMode::ProjectSearch {
+                (if self.show_path_filter { px(32.0, scale) } else { 0 })
+                    + (if self.show_replace { px(32.0, scale) } else { 0 })
+            } else {
+                0
+            };
+            let ch = pad
+                + header_h
+                + px(4.0, scale)
+                + input_h
+                + extra_rows_h
+                + px(8.0, scale)
+                + list_h
+                + footer_h
+                + pad;
             (cw, ch.min((bounds.h - px(64.0, scale)).max(px(180.0, scale))))
         };
 
@@ -1967,6 +1984,7 @@ impl CommandPalette {
         let radius = 8.0 * scale;
         painter.fill_rounded_rect(card, radius, theme.surface);
         painter.stroke_rounded_rect(card, radius, (1.0 * scale).max(1.0), theme.border_control);
+        painter.push_clip(card);
 
         // 1. Header row (Title + quiet root folder scope + summary / regex error).
         let heading = match self.mode {
@@ -2045,7 +2063,7 @@ impl CommandPalette {
                 28.0 + 4.0 + 26.0 + 4.0 + 28.0 + 4.0 + 46.0 + 4.0 + 56.0 + 6.0,
                 scale,
             );
-            (card.w - pad * 2 - toggle_block).max(px(120.0, scale))
+            (card.w - pad * 2 - toggle_block).max(px(64.0, scale))
         } else {
             card.w - pad * 2
         };
@@ -2131,7 +2149,7 @@ impl CommandPalette {
                 let rr = PixelRect::new(
                     card.x + pad,
                     ry,
-                    (card.w - pad * 2 - btn_w - px(6.0, scale)).max(px(120.0, scale)),
+                    (card.w - pad * 2 - btn_w - px(6.0, scale)).max(px(64.0, scale)),
                     sub_h,
                 );
                 self.replace_rect = rr;
@@ -2398,6 +2416,7 @@ impl CommandPalette {
             atlas,
             rasterizer,
         );
+        painter.pop_clip();
         painter.pop_clip();
     }
 
@@ -3382,9 +3401,13 @@ fn push_chunk_hits(
     if file_hits.is_empty() || limit == 0 {
         return 0;
     }
+    let file_abs = file.abs_path(root);
     let mut cur_line = base_line;
     let mut scan_pos = 0usize;
-    let mut last_pushed_line: Option<usize> = None;
+    let mut last_pushed_line: Option<usize> = out
+        .last()
+        .filter(|it| it.path == file_abs)
+        .and_then(|it| it.line_0based);
     let mut pushed = 0usize;
 
     for &(hit_s, hit_e) in file_hits {
@@ -3419,7 +3442,9 @@ fn push_chunk_hits(
         let col_in_line = hit_s.saturating_sub(actual_line_start);
         let match_len = hit_e.saturating_sub(hit_s);
         let snip_start = col_in_line.saturating_sub(leading_ws).min(snippet.len());
-        let snip_end = (snip_start + match_len).min(snippet.len());
+        let snip_end = (col_in_line + match_len)
+            .saturating_sub(leading_ws)
+            .min(snippet.len());
         let snippet_match = if snip_end > snip_start
             && snippet.is_char_boundary(snip_start)
             && snippet.is_char_boundary(snip_end)
@@ -3514,10 +3539,8 @@ fn draw_preview_code_line(
             if ch == '\t' {
                 if rel > sub_start {
                     let run = &seg[sub_start..rel];
-                    painter.draw_text_ui(x, baseline, run, style, font_px, color, atlas, rasterizer);
-                    let chars = run.chars().count();
-                    col += chars;
-                    x += chars as f32 * cell_w;
+                    x = painter.draw_text_ui(x, baseline, run, style, font_px, color, atlas, rasterizer);
+                    col += run.chars().count();
                 }
                 let adv = 4 - (col % 4);
                 col += adv;
@@ -3527,10 +3550,8 @@ fn draw_preview_code_line(
         }
         if sub_start < seg.len() {
             let run = &seg[sub_start..];
-            painter.draw_text_ui(x, baseline, run, style, font_px, color, atlas, rasterizer);
-            let chars = run.chars().count();
-            col += chars;
-            x += chars as f32 * cell_w;
+            x = painter.draw_text_ui(x, baseline, run, style, font_px, color, atlas, rasterizer);
+            col += run.chars().count();
         }
         byte_pos = end;
     }

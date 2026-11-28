@@ -587,8 +587,13 @@ impl Document {
             return Ok(offset);
         }
 
-        let lines_before = self.tree.editable_line_count();
+        // Ensure lazy base indexing covers the full edited range BEFORE sampling `lines_before`
+        // so newly indexed base lines never inflate `delta_lines` and desync `SyntaxCache`.
         let (start_line, _) = self.tree.byte_to_line_col(offset);
+        if removed_len > 0 {
+            let _ = self.tree.byte_to_line_col(offset + removed_len);
+        }
+        let lines_before = self.tree.editable_line_count();
         let deleted = if removed_len > 0 {
             self.tree.delete(offset, removed_len)
         } else {
@@ -726,7 +731,10 @@ impl Document {
         let mut earliest_line = usize::MAX;
 
         // Apply from back to front so earlier byte offsets remain valid!
+        // Preserve the original leading bytes of the previously replaced match so adjacent
+        // regex matches (e.g. `(foo)\B|bar`) see the true pre-replacement `next_ch`.
         let mut ctx_buf = [0u8; 4];
+        let mut prev_match_head: Option<(u64, [u8; 4], usize)> = None;
         for m in matches.into_iter().rev() {
             let (line, _) = self.tree.byte_to_line_col(m.start);
             earliest_line = earliest_line.min(line);
@@ -737,14 +745,36 @@ impl Document {
             } else {
                 None
             };
-            let next_ch = if is_regex && m.end < self.tree.len_bytes() {
-                let fwd = (self.tree.len_bytes() - m.end).min(4) as usize;
-                let n = self.tree.read_into_slice(m.end, &mut ctx_buf[..fwd]);
-                crate::search::next_char_in_bytes(&ctx_buf[..n])
+            let next_ch = if is_regex {
+                let (head_slice, head_len) = match prev_match_head {
+                    Some((pm_start, ref pm_buf, pm_len)) if pm_start == m.end && pm_len > 0 => {
+                        (pm_buf, pm_len)
+                    }
+                    _ if m.end < self.tree.len_bytes() => {
+                        let fwd = (self.tree.len_bytes() - m.end).min(4) as usize;
+                        let n = self.tree.read_into_slice(m.end, &mut ctx_buf[..fwd]);
+                        (&ctx_buf, n)
+                    }
+                    _ => (&ctx_buf, 0),
+                };
+                if head_len >= 2 && head_slice[0] == b'\r' && head_slice[1] == b'\n' {
+                    // Normalize CRLF lookahead to `\n` so `$` anchors match in single-char context.
+                    Some('\n')
+                } else {
+                    crate::search::next_char_in_bytes(&head_slice[..head_len])
+                }
             } else {
                 None
             };
             let deleted = self.tree.delete(m.start, m.end - m.start);
+            if is_regex && !deleted.is_empty() {
+                let mut h = [0u8; 4];
+                let n = deleted.len().min(4);
+                h[..n].copy_from_slice(&deleted[..n]);
+                prev_match_head = Some((m.start, h, n));
+            } else {
+                prev_match_head = None;
+            }
             let inserted_bytes = if is_regex {
                 let matched_str = String::from_utf8_lossy(&deleted);
                 let expanded = compiled.expand_replacement_with_context(
@@ -808,7 +838,11 @@ impl Document {
         let next_ch = if m.end < self.tree.len_bytes() {
             let fwd = (self.tree.len_bytes() - m.end).min(4) as usize;
             let n = self.tree.read_into_slice(m.end, &mut ctx_buf[..fwd]);
-            crate::search::next_char_in_bytes(&ctx_buf[..n])
+            if n >= 2 && ctx_buf[0] == b'\r' && ctx_buf[1] == b'\n' {
+                Some('\n')
+            } else {
+                crate::search::next_char_in_bytes(&ctx_buf[..n])
+            }
         } else {
             None
         };
