@@ -7418,6 +7418,30 @@ impl EditorApp {
         }
     }
 
+    fn jump_active_to_location(
+        &mut self,
+        line_0based: Option<usize>,
+        col_bytes: Option<usize>,
+        rasterizer: &mut dyn GlyphRasterizer,
+    ) {
+        if let Some(line) = line_0based {
+            self.doc.tree_mut().ensure_indexed_for_line(line + 16);
+            let clamped = line.min(self.doc.editable_line_count().saturating_sub(1));
+            if let Some((start, content_end, _)) = self.doc.line_byte_range(clamped) {
+                let raw_off = start + (col_bytes.unwrap_or(0) as u64).min(content_end - start);
+                let off = Self::snap_doc_offset(&mut self.doc, raw_off);
+                self.caret = off;
+                self.anchor = off;
+                self.extra_cursors.clear();
+                self.viewport.scroll_top_line = clamped.saturating_sub(6);
+                self.viewport.scroll_sub_y_px = 0.0;
+            }
+            let m = self.doc_metrics(rasterizer);
+            self.viewport
+                .ensure_caret_visible(&mut self.doc, self.caret, m, self.framebuffer.scale);
+        }
+    }
+
     fn open_at_location(
         &mut self,
         path: &Path,
@@ -7430,22 +7454,7 @@ impl EditorApp {
         match res {
             Ok(_) => {
                 self.sidebar.set_focused(false);
-                if let Some(line) = line_0based {
-                    self.doc.tree_mut().ensure_indexed_for_line(line + 16);
-                    let clamped = line.min(self.doc.editable_line_count().saturating_sub(1));
-                    if let Some((start, content_end, _)) = self.doc.line_byte_range(clamped) {
-                        let raw_off = start + (col_bytes.unwrap_or(0) as u64).min(content_end - start);
-                        let off = Self::snap_doc_offset(&mut self.doc, raw_off);
-                        self.caret = off;
-                        self.anchor = off;
-                        self.extra_cursors.clear();
-                        self.viewport.scroll_top_line = clamped.saturating_sub(6);
-                        self.viewport.scroll_sub_y_px = 0.0;
-                    }
-                    let m = self.doc_metrics(rasterizer);
-                    self.viewport
-                        .ensure_caret_visible(&mut self.doc, self.caret, m, self.framebuffer.scale);
-                }
+                self.jump_active_to_location(line_0based, col_bytes, rasterizer);
                 self.mark_dirty();
                 host.request_redraw();
             }
@@ -7582,16 +7591,35 @@ impl EditorApp {
                 col_bytes,
                 target,
             } => {
-                match target {
-                    PaletteOpenTarget::Current => {}
+                let opened_in_split = match target {
+                    PaletteOpenTarget::Current => false,
                     PaletteOpenTarget::SplitRight => {
-                        self.split_pane_with(None, host);
+                        let a = self.active_id;
+                        let zone = if self.arrangement.can_insert(a, DropZone::Right) {
+                            DropZone::Right
+                        } else {
+                            DropZone::Bottom
+                        };
+                        self.split_pane_at(a, zone, Some(&path), host)
                     }
                     PaletteOpenTarget::SplitDown => {
-                        self.split_pane_down(None, host);
+                        let a = self.active_id;
+                        let zone = if self.arrangement.can_insert(a, DropZone::Bottom) {
+                            DropZone::Bottom
+                        } else {
+                            DropZone::Right
+                        };
+                        self.split_pane_at(a, zone, Some(&path), host)
                     }
+                };
+                if opened_in_split {
+                    self.sidebar.set_focused(false);
+                    self.jump_active_to_location(line_0based, col_bytes, rasterizer);
+                    self.mark_dirty();
+                    host.request_redraw();
+                } else {
+                    self.open_at_location(&path, line_0based, col_bytes, rasterizer, host);
                 }
-                self.open_at_location(&path, line_0based, col_bytes, rasterizer, host);
             }
             PaletteAction::RunCommand(id) => {
                 if let Some(cmd) = self.keymap.command_for_id(&id) {
@@ -10333,6 +10361,10 @@ impl EditorApp {
                         self.toggle_zoom_pane(host);
                         return;
                     }
+                    self.sidebar.set_focused(false);
+                    self.find_bar.find_input.focused = false;
+                    self.find_bar.replace_input.focused = false;
+                    self.goto_line.close();
                     self.focus_pane_id(pr.id, host);
                     self.begin_drag(DragPayload::Pane(pr.id), x_px, y_px, false, click_count);
                     return;

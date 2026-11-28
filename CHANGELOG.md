@@ -4,6 +4,11 @@ All notable user-facing changes to `editor` are documented here.
 The workspace version in `Cargo.toml` (`[workspace.package] version`) is the
 single source of truth for `editor`, `editor-gui`, `Editor.app`, and GitHub Releases.
 
+## [0.4.3] - 2026-11-28
+
+### Fixed
+- **Split-pane focus & Quick Open split:** clicking a split pane's header now clears sidebar, Find/Replace, and Go-To-Line focus so keyboard and Vim shortcuts (`<Space>1`–`9`, `g1`–`g9`) route immediately to the clicked pane; Quick Open and Search in Files split actions (`⌃V` / `⌃X`) now open already-open files directly in the new split pane instead of teleporting back to the existing pane.
+
 ## [0.4.2] - 2026-11-28
 
 ### Fixed

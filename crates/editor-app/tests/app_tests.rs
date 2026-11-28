@@ -6988,3 +6988,173 @@ fn audit_pass2_focus_loss_zoom_sync_multicursor_dedent_dirty_empty_and_vim_click
         "unmodified single-click must exit Vim Visual mode back to Normal"
     );
 }
+
+#[test]
+fn split_pane_pin_jumps_header_focus_and_palette_split_open() {
+    use editor_app::{OpenMode, PaneSlot};
+    use editor_platform::{AppCommand, InputEvent, Key, Modifiers, MouseButton};
+    use std::path::Path;
+
+    let fs = Arc::new(MemoryFileSystem::new());
+    fs.add_file("/ws/a.rs", b"fn a() {}\n".to_vec());
+    fs.add_file("/ws/b.rs", b"fn b() {}\n".to_vec());
+    fs.add_file("/ws/c.rs", b"fn c() {}\n".to_vec());
+    fs.add_file("/ws/d.rs", b"fn d() {}\n".to_vec());
+
+    let mut app = EditorApp::new(fs.clone(), 1200, 800, 1.0);
+    let mut raster = BuiltinBitmapRasterizer;
+    let mut clip = MemoryClipboard::new();
+    let mut host = HeadlessHost::new();
+
+    app.open_folder(Path::new("/ws"), &mut host);
+    let a_id = app
+        .open_file_with_mode(Path::new("/ws/a.rs"), OpenMode::Keep, &mut host)
+        .unwrap();
+    let b_id = app
+        .open_file_with_mode(Path::new("/ws/b.rs"), OpenMode::Keep, &mut host)
+        .unwrap();
+    let c_id = app
+        .open_file_with_mode(Path::new("/ws/c.rs"), OpenMode::Keep, &mut host)
+        .unwrap();
+    let d_id = app
+        .open_file_with_mode(Path::new("/ws/d.rs"), OpenMode::Keep, &mut host)
+        .unwrap();
+    for id in [a_id, b_id, c_id, d_id] {
+        app.toggle_pin_buffer(id, &mut host);
+    }
+    assert_eq!(app.working_set.pinned, vec![a_id, b_id, c_id, d_id]);
+
+    // 1. 2-pane split: Left = a.rs, Right = b.rs (active).
+    app.activate_buffer(a_id, &mut host);
+    app.split_pane_with(Some(Path::new("/ws/b.rs")), &mut host);
+    app.render(&mut raster);
+    let left_id = app.arrangement.id_at(PaneSlot::new(0, 0)).unwrap();
+    let right_id = app.arrangement.id_at(PaneSlot::new(1, 0)).unwrap();
+    assert_eq!(app.active_id, right_id);
+    assert_eq!(app.doc.file_name(), "b.rs");
+
+    // Non-visible Pin 3 (`c.rs`) pressed while on Right pane MUST open in Right pane, leaving Left untouched!
+    app.handle_event(
+        InputEvent::Command(AppCommand::JumpPin(3)),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.active_id, right_id, "non-visible pin must stay in the right pane");
+    assert_eq!(app.doc.file_name(), "c.rs");
+    assert_eq!(
+        app.other_panes.iter().find(|p| p.id == left_id).unwrap().doc.file_name(),
+        "a.rs",
+        "left pane must remain untouched"
+    );
+
+    // 2. Clicking the right pane's header while sidebar is focused clears sidebar focus so Vim `<Space>4` opens in Right!
+    app.vim.set_enabled(true);
+    app.sidebar.set_focused(true);
+    app.render(&mut raster);
+    let right_hdr = app.layout.grid.get(right_id).unwrap().header;
+    app.handle_event(
+        InputEvent::MouseDown {
+            x_px: (right_hdr.x + 20) as f32,
+            y_px: (right_hdr.y + right_hdr.h / 2) as f32,
+            button: MouseButton::Left,
+            click_count: 1,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::MouseUp {
+            x_px: (right_hdr.x + 20) as f32,
+            y_px: (right_hdr.y + right_hdr.h / 2) as f32,
+            button: MouseButton::Left,
+            mods: Modifiers::NONE,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert!(!app.sidebar.is_focused(), "clicking a pane header must clear sidebar focus");
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char(' '),
+            mods: Modifiers::NONE,
+            text: Some(" ".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('4'),
+            mods: Modifiers::NONE,
+            text: Some("4".into()),
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.active_id, right_id);
+    assert_eq!(app.doc.file_name(), "d.rs");
+    assert_eq!(
+        app.other_panes.iter().find(|p| p.id == left_id).unwrap().doc.file_name(),
+        "a.rs"
+    );
+
+    // 3. 3-pane split (two panes on the left: TL=a.rs, BL=b.rs; Right=d.rs): Pin 3 (`c.rs`) opens in Right half!
+    app.focus_pane_id(left_id, &mut host);
+    app.split_pane_down(Some(Path::new("/ws/b.rs")), &mut host);
+    let bl_id = app.arrangement.id_at(PaneSlot::new(0, 1)).unwrap();
+    app.focus_pane_id(right_id, &mut host);
+    app.handle_event(
+        InputEvent::Command(AppCommand::JumpPin(3)),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.active_id, right_id);
+    assert_eq!(app.doc.file_name(), "c.rs");
+    assert_eq!(
+        app.other_panes.iter().find(|p| p.id == left_id).unwrap().doc.file_name(),
+        "a.rs"
+    );
+    assert_eq!(
+        app.other_panes.iter().find(|p| p.id == bl_id).unwrap().doc.file_name(),
+        "b.rs"
+    );
+
+    // 4. Quick Open `Ctrl+V` (SplitRight) on an already-open file opens it directly in the new right split pane!
+    app.only_active_pane(&mut host);
+    app.activate_buffer(a_id, &mut host);
+    app.handle_event(
+        InputEvent::Command(AppCommand::QuickOpen),
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    app.palette.input.set_text("a.rs".to_string());
+    app.palette.refresh_results(fs.as_ref());
+    app.handle_event(
+        InputEvent::KeyDown {
+            key: Key::Char('v'),
+            mods: Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+            text: None,
+        },
+        &mut raster,
+        &mut clip,
+        &mut host,
+    );
+    assert_eq!(app.pane_count(), 2);
+    assert_eq!(
+        app.arrangement.slot_of(app.active_id),
+        Some(PaneSlot::new(1, 0)),
+        "Quick Open SplitRight on an already-open file must stay focused in the new right pane"
+    );
+    assert_eq!(app.doc.file_name(), "a.rs");
+}
